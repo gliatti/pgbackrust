@@ -467,6 +467,33 @@ testRun(void)
             ",SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
             ",Signature=85278841678ccbc0f137759265030d7b5e237868dd36eea658426b18344d1685",
             "check authorization header");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("AWS_EC2_METADATA_SERVICE_ENDPOINT overrides default IMDS endpoint");
+
+        argList = strLstDup(commonArgList);
+        hrnCfgArgRaw(argList, cfgOptRepoS3Role, credRole);
+        hrnCfgArgRawZ(argList, cfgOptRepoS3KeyType, "auto");
+
+        // Empty env var falls back to the AWS default
+        setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "", true);
+        HRN_CFG_LOAD(cfgCmdArchivePush, argList);
+        driver = (StorageS3 *)storageDriver(storageRepoGet(0, false));
+        TEST_RESULT_STR_Z(driver->credHost, "169.254.169.254", "default credHost when env var empty");
+
+        // HTTP override (typical IAM Roles Anywhere setup)
+        setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://imds.example.com:9911", true);
+        HRN_CFG_LOAD(cfgCmdArchivePush, argList);
+        driver = (StorageS3 *)storageDriver(storageRepoGet(0, false));
+        TEST_RESULT_STR_Z(driver->credHost, "imds.example.com", "credHost from http env var");
+
+        // HTTPS override (URL parser must recognize the scheme)
+        setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "https://imds.example.org", true);
+        HRN_CFG_LOAD(cfgCmdArchivePush, argList);
+        driver = (StorageS3 *)storageDriver(storageRepoGet(0, false));
+        TEST_RESULT_STR_Z(driver->credHost, "imds.example.org", "credHost from https env var");
+
+        unsetenv("AWS_EC2_METADATA_SERVICE_ENDPOINT");
     }
 
     // *****************************************************************************************************************************
@@ -1085,6 +1112,31 @@ testRun(void)
                 // Testing requires the auth http client to be redirected
                 driver->credHost = hrnServerHost();
                 driver->credHttpClient = httpClientNew(sckClientNew(host, testPortAuth, 5000, 5000), 5000);
+
+                // -----------------------------------------------------------------------------------------------------------------
+                TEST_TITLE("STS error response surfaces structured Code/Message (issue #1997)");
+
+                hrnServerScriptAccept(auth);
+
+                testRequestP(auth, NULL, HTTP_VERB_GET, TEST_SERVICE_URI);
+                testResponseP(
+                    auth, .code = 400,
+                    .content =
+                        "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n"
+                        "  <Error>\n"
+                        "    <Type>Sender</Type>\n"
+                        "    <Code>InvalidIdentityToken</Code>\n"
+                        "    <Message>OpenIDConnect provider's HTTPS certificate doesn't match configured thumbprint</Message>\n"
+                        "  </Error>\n"
+                        "  <RequestId>2d8fc0e3-ac00-4bbe-8bff-bf57499e5de2</RequestId>\n"
+                        "</ErrorResponse>");
+
+                hrnServerScriptClose(auth);
+
+                TEST_ERROR(
+                    storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
+                    "AssumeRoleWithWebIdentity failed [400]: InvalidIdentityToken: OpenIDConnect provider's HTTPS certificate"
+                    " doesn't match configured thumbprint");
 
                 hrnServerScriptAccept(service);
 

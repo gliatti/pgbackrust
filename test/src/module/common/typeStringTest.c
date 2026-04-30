@@ -139,17 +139,27 @@ testRun(void)
         TEST_RESULT_STR_Z(strPath(STRDEF("/file")), "/", "root path");
         TEST_RESULT_STR_Z(strPath(STRDEF("/dir1/dir2/file")), "/dir1/dir2", "subdirectory file");
 
-        TEST_ERROR(strPathAbsolute(STRDEF("/.."), NULL), AssertError, "result path '/..' is not absolute");
-        TEST_ERROR(strPathAbsolute(STRDEF("//"), NULL), AssertError, "result path '//' is not absolute");
+        TEST_ERROR(
+            strPathAbsolute(STRDEF("/.."), NULL), AssertError, "path '/..' goes back too far in base path '/'");
+        TEST_ERROR(strPathAbsolute(STRDEF("//"), NULL), AssertError, "'//' is not a valid path");
         TEST_ERROR(strPathAbsolute(STRDEF(".."), STRDEF("path1")), AssertError, "base path 'path1' is not absolute");
         TEST_ERROR(
-            strPathAbsolute(STRDEF(".."), STRDEF("/")), AssertError, "relative path '..' goes back too far in base path '/'");
-        TEST_ERROR(strPathAbsolute(STRDEF("path1//"), STRDEF("/")), AssertError, "'path1//' is not a valid relative path");
+            strPathAbsolute(STRDEF(".."), STRDEF("/")), AssertError, "path '..' goes back too far in base path '/'");
+        TEST_ERROR(strPathAbsolute(STRDEF("path1//"), STRDEF("/")), AssertError, "'path1//' is not a valid path");
         TEST_RESULT_STR_Z(strPathAbsolute(STRDEF("/"), NULL), "/", "path is already absolute");
         TEST_RESULT_STR_Z(strPathAbsolute(STRDEF(".."), STRDEF("/path1")), "/", "simple relative path");
         TEST_RESULT_STR_Z(strPathAbsolute(STRDEF("../"), STRDEF("/path1")), "/", "simple relative path with trailing /");
         TEST_RESULT_STR_Z(
             strPathAbsolute(STRDEF("../path2/.././path3"), STRDEF("/base1/base2")), "/base1/path3", "complex relative path");
+
+        // Absolute paths with intermediate ".." or "." segments are normalized (issue #1258 — symlink targets such as
+        // /u01/app/postgres/local/../admin/conf/pg_hba.conf were rejected even though readlink -f resolved them correctly).
+        TEST_RESULT_STR_Z(strPathAbsolute(STRDEF("/foo/.."), NULL), "/", "absolute path resolving to root");
+        TEST_RESULT_STR_Z(strPathAbsolute(STRDEF("/foo/../bar"), NULL), "/bar", "absolute path with ..");
+        TEST_RESULT_STR_Z(strPathAbsolute(STRDEF("/foo/./bar"), NULL), "/foo/bar", "absolute path with .");
+        TEST_RESULT_STR_Z(
+            strPathAbsolute(STRDEF("/u01/app/postgres/local/../admin/conf/pg_hba.conf"), NULL),
+            "/u01/app/postgres/admin/conf/pg_hba.conf", "symlink target with intermediate ..");
     }
 
     // *****************************************************************************************************************************

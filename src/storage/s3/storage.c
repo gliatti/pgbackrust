@@ -3,6 +3,7 @@ S3 Storage
 ***********************************************************************************************************************************/
 #include <build.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "common/crypto/hash.h"
@@ -410,7 +411,42 @@ storageS3AuthWebId(StorageS3 *const this, const HttpHeader *const header)
             this->credHttpClient, HTTP_VERB_GET_STR, FSLASH_STR, .header = header, .query = query);
         HttpResponse *const response = httpRequestResponse(request, true);
 
-        CHECK(FormatError, httpResponseCode(response) != HTTP_RESPONSE_CODE_NOT_FOUND, "invalid response code");
+        // On any non-success response, surface the STS error structure (Code + Message) instead of the cryptic "unable to find
+        // child 'AssumeRoleWithWebIdentityResult'" that comes from the happy-path XML extraction below. STS returns errors as
+        // <ErrorResponse><Error><Code>...</Code><Message>...</Message></Error>...</ErrorResponse>. (issue #1997)
+        if (!httpResponseCodeOk(response))
+        {
+            XmlDocument *errorDoc = NULL;
+
+            TRY_BEGIN()
+            {
+                errorDoc = xmlDocumentNewBuf(httpResponseContent(response));
+            }
+            CATCH_ANY()
+            {
+                // Body could not be parsed as XML; fall through to the generic HTTP error
+            }
+            TRY_END();
+
+            if (errorDoc != NULL && strEqZ(xmlNodeName(xmlDocumentRoot(errorDoc)), "ErrorResponse"))
+            {
+                const XmlNode *const errorNode = xmlNodeChild(xmlDocumentRoot(errorDoc), STRDEF("Error"), false);
+
+                if (errorNode != NULL)
+                {
+                    const String *const code = xmlNodeContent(xmlNodeChild(errorNode, STRDEF("Code"), false));
+                    const String *const message = xmlNodeContent(xmlNodeChild(errorNode, STRDEF("Message"), false));
+
+                    THROW_FMT(
+                        ProtocolError, "AssumeRoleWithWebIdentity failed [%u]: %s%s%s", httpResponseCode(response),
+                        code != NULL ? strZ(code) : "unknown",
+                        message != NULL ? ": " : "", message != NULL ? strZ(message) : "");
+                }
+            }
+
+            // Fall back to the generic HTTP error dump (request/response headers and body)
+            httpRequestError(request, response);
+        }
 
         // Copy credentials
         const XmlNode *const xmlCred =
@@ -1334,10 +1370,39 @@ storageS3New(
                 ASSERT(accessKey == NULL && secretAccessKey == NULL && securityToken == NULL);
 
                 this->credRole = strDup(credRole);
-                this->credHost = S3_CREDENTIAL_HOST_STR;
                 this->credExpirationTime = time(NULL);
-                this->credHttpClient = httpClientNew(
-                    sckClientNew(this->credHost, S3_CREDENTIAL_PORT, timeout, timeout), timeout);
+
+                // Allow the IMDS endpoint to be overridden via AWS_EC2_METADATA_SERVICE_ENDPOINT for IAM Roles Anywhere
+                // (typically http://localhost:9911) and other non-default IMDS providers
+                const char *const imdsEndpointZ = getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+
+                if (imdsEndpointZ != NULL && imdsEndpointZ[0] != '\0')
+                {
+                    const HttpUrl *const credUrlObj = httpUrlNewParseP(
+                        STR(imdsEndpointZ), .type = httpProtocolTypeAny, .defaultType = httpProtocolTypeHttp);
+                    const HttpProtocolType credProtocolType = httpUrlProtocolType(credUrlObj);
+
+                    this->credHost = httpUrlHost(credUrlObj);
+
+                    IoClient *credIoClient;
+
+                    if (credProtocolType == httpProtocolTypeHttp)
+                        credIoClient = sckClientNew(this->credHost, httpUrlPort(credUrlObj), timeout, timeout);
+                    else
+                    {
+                        credIoClient = tlsClientNewP(
+                            sckClientNew(this->credHost, httpUrlPort(credUrlObj), timeout, timeout), this->credHost, timeout,
+                            timeout, verifyPeer, .caFile = caFile, .caPath = caPath);
+                    }
+
+                    this->credHttpClient = httpClientNew(credIoClient, timeout);
+                }
+                else
+                {
+                    this->credHost = S3_CREDENTIAL_HOST_STR;
+                    this->credHttpClient = httpClientNew(
+                        sckClientNew(this->credHost, S3_CREDENTIAL_PORT, timeout, timeout), timeout);
+                }
 
                 break;
             }
