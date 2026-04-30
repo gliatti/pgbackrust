@@ -843,73 +843,82 @@ strPathAbsolute(const String *const this, const String *const base)
 
     String *result = NULL;
 
-    // Path is already absolute so just return it
-    if (strBeginsWith(this, FSLASH_STR))
+    // Construct the absolute path by walking the path components against the base. Even already-absolute paths go through this so
+    // intermediate "." and ".." segments are normalized (e.g. a symlink target like "/u01/local/../admin/file"). You would hope we
+    // could use realpath() here but it is so broken in the Posix spec that is seems best avoided.
+    MEM_CONTEXT_TEMP_BEGIN()
     {
-        result = strDup(this);
-    }
-    // Else we'll need to construct the absolute path. You would hope we could use realpath() here but it is so broken in the Posix
-    // spec that is seems best avoided.
-    else
-    {
-        ASSERT(base != NULL);
+        StringList *baseList;
+        StringList *const pathList = strLstNewSplit(this, FSLASH_STR);
 
-        // Base must be absolute to start
-        if (!strBeginsWith(base, FSLASH_STR))
-            THROW_FMT(AssertError, "base path '%s' is not absolute", strZ(base));
-
-        MEM_CONTEXT_TEMP_BEGIN()
+        if (strBeginsWith(this, FSLASH_STR))
         {
-            StringList *const baseList = strLstNewSplit(base, FSLASH_STR);
-            StringList *const pathList = strLstNewSplit(this, FSLASH_STR);
-
-            while (!strLstEmpty(pathList))
-            {
-                const String *const pathPart = strLstGet(pathList, 0);
-
-                // If the last part is empty
-                if (strSize(pathPart) == 0)
-                {
-                    // Allow when this is the last part since it just means there was a trailing /
-                    if (strLstSize(pathList) == 1)
-                    {
-                        strLstRemoveIdx(pathList, 0);
-                        break;
-                    }
-
-                    THROW_FMT(AssertError, "'%s' is not a valid relative path", strZ(this));
-                }
-
-                if (strEq(pathPart, DOTDOT_STR))
-                {
-                    const String *const basePart = strLstGet(baseList, strLstSize(baseList) - 1);
-
-                    if (strSize(basePart) == 0)
-                        THROW_FMT(AssertError, "relative path '%s' goes back too far in base path '%s'", strZ(this), strZ(base));
-
-                    strLstRemoveIdx(baseList, strLstSize(baseList) - 1);
-                }
-                else if (!strEq(pathPart, DOT_STR))
-                    strLstAdd(baseList, pathPart);
-
-                strLstRemoveIdx(pathList, 0);
-            }
-
-            MEM_CONTEXT_PRIOR_BEGIN()
-            {
-                if (strLstSize(baseList) == 1)
-                    result = strDup(FSLASH_STR);
-                else
-                    result = strLstJoin(baseList, "/");
-            }
-            MEM_CONTEXT_PRIOR_END();
+            // Absolute path: start from root and consume the path components below. The leading empty element produced by the split
+            // represents the leading slash; move it from the path list to the base list.
+            baseList = strLstNew();
+            strLstAdd(baseList, strLstGet(pathList, 0));
+            strLstRemoveIdx(pathList, 0);
         }
-        MEM_CONTEXT_TEMP_END();
-    }
+        else
+        {
+            ASSERT(base != NULL);
 
-    // There should not be any stray .. or // in the final result
-    if (strstr(strZ(result), "/..") != NULL || strstr(strZ(result), "//") != NULL)
-        THROW_FMT(AssertError, "result path '%s' is not absolute", strZ(result));
+            // Base must be absolute to start
+            if (!strBeginsWith(base, FSLASH_STR))
+                THROW_FMT(AssertError, "base path '%s' is not absolute", strZ(base));
+
+            baseList = strLstNewSplit(base, FSLASH_STR);
+        }
+
+        while (!strLstEmpty(pathList))
+        {
+            const String *const pathPart = strLstGet(pathList, 0);
+
+            // If the part is empty
+            if (strSize(pathPart) == 0)
+            {
+                // Allow when this is the last part since it just means there was a trailing /
+                if (strLstSize(pathList) == 1)
+                {
+                    strLstRemoveIdx(pathList, 0);
+                    break;
+                }
+
+                THROW_FMT(AssertError, "'%s' is not a valid path", strZ(this));
+            }
+
+            if (strEq(pathPart, DOTDOT_STR))
+            {
+                const String *const basePart = strLstGet(baseList, strLstSize(baseList) - 1);
+
+                if (strSize(basePart) == 0)
+                {
+                    THROW_FMT(
+                        AssertError, "path '%s' goes back too far in base path '%s'", strZ(this),
+                        base != NULL ? strZ(base) : "/");
+                }
+
+                strLstRemoveIdx(baseList, strLstSize(baseList) - 1);
+            }
+            else if (!strEq(pathPart, DOT_STR))
+                strLstAdd(baseList, pathPart);
+
+            strLstRemoveIdx(pathList, 0);
+        }
+
+        MEM_CONTEXT_PRIOR_BEGIN()
+        {
+            if (strLstSize(baseList) == 1)
+                result = strDup(FSLASH_STR);
+            else
+                result = strLstJoin(baseList, "/");
+        }
+        MEM_CONTEXT_PRIOR_END();
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    // The walk above must produce a clean absolute path
+    ASSERT(strstr(strZ(result), "/..") == NULL && strstr(strZ(result), "//") == NULL);
 
     FUNCTION_TEST_RETURN(STRING, result);
 }
