@@ -224,7 +224,7 @@ testRun(void)
 
         TEST_ERROR(
             pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultColumn), DbQueryError,
-            "unable to cancel query '" TEST_QUERY "': " TEST_PQ_ERROR);
+            "unable to cancel query '" TEST_QUERY "' after 500ms: " TEST_PQ_ERROR);
 
         #undef TEST_PQ_ERROR
         #undef TEST_QUERY
@@ -251,7 +251,7 @@ testRun(void)
 
         TEST_ERROR(
             pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultColumn), DbQueryError,
-            "unable to cancel query 'select 1': connection was lost");
+            "unable to cancel query 'select 1' after 500ms: connection was lost");
 
         #undef TEST_QUERY
 #endif
