@@ -347,7 +347,14 @@ pgClientQuery(PgClient *const this, const String *const query, const PgClientQue
             // Free the result
             PQclear(pgResult);
 
-            CHECK(ServiceError, PQgetResult(this->connection) == NULL, "NULL result required to complete request");
+            // Drain any additional results. After a server-side error or a dropped connection libpq can leave extra results
+            // queued; if they are not consumed the connection is left in a state where the next query immediately fails. The
+            // previous version asserted that no extra results existed, which surfaced as a cryptic ServiceError instead of the
+            // real failure. (issue #1233)
+            PGresult *extraResult;
+
+            while ((extraResult = PQgetResult(this->connection)) != NULL)
+                PQclear(extraResult);
         }
         TRY_END();
     }

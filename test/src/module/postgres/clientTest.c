@@ -525,6 +525,33 @@ testRun(void)
         #undef TEST_QUERY
 
         // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("drain extra results left on the connection (issue #1233)");
+
+        #define TEST_QUERY                                          "set client_encoding = 'UTF8'"
+
+#ifndef HARNESS_PQ_REAL
+        HRN_PQ_SCRIPT_SET(
+            {.function = HRN_PQ_SENDQUERY, .param = "[\"" TEST_QUERY "\"]", .resultInt = 1},
+            {.function = HRN_PQ_CONSUMEINPUT},
+            {.function = HRN_PQ_ISBUSY},
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_RESULTSTATUS, .resultInt = PGRES_COMMAND_OK},
+            {.function = HRN_PQ_CLEAR},
+            // Two extra results queued (e.g. after a server-side error or dropped connection); both must be cleared so the
+            // connection is left consistent for the next query.
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_CLEAR},
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_CLEAR},
+            {.function = HRN_PQ_GETRESULT, .resultNull = true});
+#endif
+
+        TEST_RESULT_PTR(
+            pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultAny), NULL, "extras drained without error");
+
+        #undef TEST_QUERY
+
+        // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("close connection");
 
 #ifndef HARNESS_PQ_REAL
