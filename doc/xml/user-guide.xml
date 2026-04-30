@@ -1154,6 +1154,8 @@
                 <list-item>[global]</list-item>
             </list>
 
+            <admonition type="note">Stanza-scoped sections ([<i>stanza</i>] and [<i>stanza</i>:<i>command</i>]) are only consulted when a stanza is selected with the <br-option>--stanza</br-option> option. Commands that can run without a stanza (such as <cmd>info</cmd>) will therefore not see settings placed only in stanza-scoped sections; place repository and other shared settings in [global] (or [global:<i>command</i>]) when you need them to apply across stanzas.</admonition>
+
             <admonition type="note"><br-option>--config</br-option>, <br-option>--config-include-path</br-option> and <br-option>--config-path</br-option> are command-line only options.</admonition>
 
             <p><backrest/> can also be configured using environment variables as described in the <link url="command.html">command reference</link>.</p>
