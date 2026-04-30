@@ -504,7 +504,9 @@ testRun(void)
             const unsigned int testPort = hrnServerPortNext();
             const unsigned int testPortAuth = hrnServerPortNext();
 
-            HRN_FORK_CHILD_BEGIN(.prefix = "s3 server", .timeout = 5000)
+            // Increased from 5000 ms to 15000 ms (matching the auth server) so multi-step credential-fetch failure paths can
+            // run on the auth server without the s3 server timing out while waiting for its next instruction.
+            HRN_FORK_CHILD_BEGIN(.prefix = "s3 server", .timeout = 15000)
             {
                 TEST_RESULT_VOID(hrnServerRunP(HRN_FORK_CHILD_READ(), hrnServerProtocolTls, testPort), "s3 server");
             }
@@ -1137,6 +1139,101 @@ testRun(void)
                     storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
                     "AssumeRoleWithWebIdentity failed [400]: InvalidIdentityToken: OpenIDConnect provider's HTTPS certificate"
                     " doesn't match configured thumbprint");
+
+                // -----------------------------------------------------------------------------------------------------------------
+                // Use status codes that don't trigger pgBackRest's automatic retry (5xx / 408 / 429), otherwise the test
+                // harness script gets consumed by the retry attempts before the test can assert.
+                TEST_TITLE("STS non-XML response falls back to generic HTTP error");
+
+                hrnServerScriptAccept(auth);
+
+                testRequestP(auth, NULL, HTTP_VERB_GET, TEST_SERVICE_URI);
+                testResponseP(auth, .code = 400, .content = "service unavailable");
+
+                hrnServerScriptClose(auth);
+
+                TEST_ERROR_FMT(
+                    storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
+                    "HTTP request failed with 400:\n"
+                    "*** Path/Query ***:\n"
+                    "GET %s\n"
+                    "*** Request Headers ***:\n"
+                    "content-length: 0\n"
+                    "host: %s\n"
+                    "*** Response Headers ***:\n"
+                    "content-length: 19\n"
+                    "*** Response Content ***:\n"
+                    "service unavailable",
+                    TEST_SERVICE_URI, strZ(hrnServerHost()));
+
+                // -----------------------------------------------------------------------------------------------------------------
+                TEST_TITLE("STS Error without Code/Message renders 'unknown'");
+
+                hrnServerScriptAccept(auth);
+
+                testRequestP(auth, NULL, HTTP_VERB_GET, TEST_SERVICE_URI);
+                testResponseP(
+                    auth, .code = 400,
+                    .content =
+                        "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n"
+                        "  <Error><Type>Sender</Type></Error>\n"
+                        "</ErrorResponse>");
+
+                hrnServerScriptClose(auth);
+
+                TEST_ERROR(
+                    storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
+                    "AssumeRoleWithWebIdentity failed [400]: unknown");
+
+                // -----------------------------------------------------------------------------------------------------------------
+                TEST_TITLE("STS XML body without Error child falls back to generic HTTP error");
+
+                hrnServerScriptAccept(auth);
+
+                testRequestP(auth, NULL, HTTP_VERB_GET, TEST_SERVICE_URI);
+                testResponseP(
+                    auth, .code = 400,
+                    .content = "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"></ErrorResponse>");
+
+                hrnServerScriptClose(auth);
+
+                TEST_ERROR_FMT(
+                    storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
+                    "HTTP request failed with 400:\n"
+                    "*** Path/Query ***:\n"
+                    "GET %s\n"
+                    "*** Request Headers ***:\n"
+                    "content-length: 0\n"
+                    "host: %s\n"
+                    "*** Response Headers ***:\n"
+                    "content-length: 81\n"
+                    "*** Response Content ***:\n"
+                    "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"></ErrorResponse>",
+                    TEST_SERVICE_URI, strZ(hrnServerHost()));
+
+                // -----------------------------------------------------------------------------------------------------------------
+                TEST_TITLE("STS XML body with non-ErrorResponse root falls back to generic HTTP error");
+
+                hrnServerScriptAccept(auth);
+
+                testRequestP(auth, NULL, HTTP_VERB_GET, TEST_SERVICE_URI);
+                testResponseP(auth, .code = 400, .content = "<UnexpectedRoot/>");
+
+                hrnServerScriptClose(auth);
+
+                TEST_ERROR_FMT(
+                    storageInfoP(s3, STRDEF("BOGUS"), .ignoreMissing = true), ProtocolError,
+                    "HTTP request failed with 400:\n"
+                    "*** Path/Query ***:\n"
+                    "GET %s\n"
+                    "*** Request Headers ***:\n"
+                    "content-length: 0\n"
+                    "host: %s\n"
+                    "*** Response Headers ***:\n"
+                    "content-length: 17\n"
+                    "*** Response Content ***:\n"
+                    "<UnexpectedRoot/>",
+                    TEST_SERVICE_URI, strZ(hrnServerHost()));
 
                 hrnServerScriptAccept(service);
 
