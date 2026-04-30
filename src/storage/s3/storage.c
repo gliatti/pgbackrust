@@ -3,6 +3,7 @@ S3 Storage
 ***********************************************************************************************************************************/
 #include <build.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "common/crypto/hash.h"
@@ -1334,10 +1335,39 @@ storageS3New(
                 ASSERT(accessKey == NULL && secretAccessKey == NULL && securityToken == NULL);
 
                 this->credRole = strDup(credRole);
-                this->credHost = S3_CREDENTIAL_HOST_STR;
                 this->credExpirationTime = time(NULL);
-                this->credHttpClient = httpClientNew(
-                    sckClientNew(this->credHost, S3_CREDENTIAL_PORT, timeout, timeout), timeout);
+
+                // Allow the IMDS endpoint to be overridden via AWS_EC2_METADATA_SERVICE_ENDPOINT for IAM Roles Anywhere
+                // (typically http://localhost:9911) and other non-default IMDS providers
+                const char *const imdsEndpointZ = getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+
+                if (imdsEndpointZ != NULL && imdsEndpointZ[0] != '\0')
+                {
+                    const HttpUrl *const credUrlObj = httpUrlNewParseP(
+                        STR(imdsEndpointZ), .type = httpProtocolTypeAny, .defaultType = httpProtocolTypeHttp);
+                    const HttpProtocolType credProtocolType = httpUrlProtocolType(credUrlObj);
+
+                    this->credHost = httpUrlHost(credUrlObj);
+
+                    IoClient *credIoClient;
+
+                    if (credProtocolType == httpProtocolTypeHttp)
+                        credIoClient = sckClientNew(this->credHost, httpUrlPort(credUrlObj), timeout, timeout);
+                    else
+                    {
+                        credIoClient = tlsClientNewP(
+                            sckClientNew(this->credHost, httpUrlPort(credUrlObj), timeout, timeout), this->credHost, timeout,
+                            timeout, verifyPeer, .caFile = caFile, .caPath = caPath);
+                    }
+
+                    this->credHttpClient = httpClientNew(credIoClient, timeout);
+                }
+                else
+                {
+                    this->credHost = S3_CREDENTIAL_HOST_STR;
+                    this->credHttpClient = httpClientNew(
+                        sckClientNew(this->credHost, S3_CREDENTIAL_PORT, timeout, timeout), timeout);
+                }
 
                 break;
             }
