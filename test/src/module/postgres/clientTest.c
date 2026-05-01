@@ -224,7 +224,7 @@ testRun(void)
 
         TEST_ERROR(
             pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultColumn), DbQueryError,
-            "unable to cancel query '" TEST_QUERY "': " TEST_PQ_ERROR);
+            "unable to cancel query '" TEST_QUERY "' after 500ms: " TEST_PQ_ERROR);
 
         #undef TEST_PQ_ERROR
         #undef TEST_QUERY
@@ -251,7 +251,7 @@ testRun(void)
 
         TEST_ERROR(
             pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultColumn), DbQueryError,
-            "unable to cancel query 'select 1': connection was lost");
+            "unable to cancel query 'select 1' after 500ms: connection was lost");
 
         #undef TEST_QUERY
 #endif
@@ -521,6 +521,33 @@ testRun(void)
         TEST_RESULT_STR_Z(
             hrnPackToStr(pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultColumn)), "1:i32:-2147483647",
             "column result");
+
+        #undef TEST_QUERY
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("drain extra results left on the connection (issue #1233)");
+
+        #define TEST_QUERY                                          "set client_encoding = 'UTF8'"
+
+#ifndef HARNESS_PQ_REAL
+        HRN_PQ_SCRIPT_SET(
+            {.function = HRN_PQ_SENDQUERY, .param = "[\"" TEST_QUERY "\"]", .resultInt = 1},
+            {.function = HRN_PQ_CONSUMEINPUT},
+            {.function = HRN_PQ_ISBUSY},
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_RESULTSTATUS, .resultInt = PGRES_COMMAND_OK},
+            {.function = HRN_PQ_CLEAR},
+            // Two extra results queued (e.g. after a server-side error or dropped connection); both must be cleared so the
+            // connection is left consistent for the next query.
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_CLEAR},
+            {.function = HRN_PQ_GETRESULT},
+            {.function = HRN_PQ_CLEAR},
+            {.function = HRN_PQ_GETRESULT, .resultNull = true});
+#endif
+
+        TEST_RESULT_PTR(
+            pgClientQuery(client, STRDEF(TEST_QUERY), pgClientQueryResultAny), NULL, "extras drained without error");
 
         #undef TEST_QUERY
 

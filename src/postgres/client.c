@@ -206,16 +206,25 @@ pgClientQuery(PgClient *const this, const String *const query, const PgClientQue
         {
             PGcancel *const cancel = PQgetCancel(this->connection);
 
-            // If cancel is NULL then more than likely the server process crashed or disconnected
+            // If cancel is NULL then more than likely the server process crashed or disconnected. Include the timeout in the
+            // message so it is obvious the cancel attempt was triggered by the wait timing out (issue #1234).
             if (cancel == NULL)
-                THROW_FMT(DbQueryError, "unable to cancel query '%s': connection was lost", strZ(query));
+            {
+                THROW_FMT(
+                    DbQueryError, "unable to cancel query '%s' after %" PRIu64 "ms: connection was lost", strZ(query),
+                    pgClientTimeout(this));
+            }
 
             TRY_BEGIN()
             {
                 char error[256];
 
                 if (!PQcancel(cancel, error, sizeof(error)))
-                    THROW_FMT(DbQueryError, "unable to cancel query '%s': %s", strZ(query), strZ(strTrim(strNewZ(error))));
+                {
+                    THROW_FMT(
+                        DbQueryError, "unable to cancel query '%s' after %" PRIu64 "ms: %s", strZ(query),
+                        pgClientTimeout(this), strZ(strTrim(strNewZ(error))));
+                }
             }
             FINALLY()
             {
@@ -347,7 +356,14 @@ pgClientQuery(PgClient *const this, const String *const query, const PgClientQue
             // Free the result
             PQclear(pgResult);
 
-            CHECK(ServiceError, PQgetResult(this->connection) == NULL, "NULL result required to complete request");
+            // Drain any additional results. After a server-side error or a dropped connection libpq can leave extra results
+            // queued; if they are not consumed the connection is left in a state where the next query immediately fails. The
+            // previous version asserted that no extra results existed, which surfaced as a cryptic ServiceError instead of the
+            // real failure. (issue #1233)
+            PGresult *extraResult;
+
+            while ((extraResult = PQgetResult(this->connection)) != NULL)
+                PQclear(extraResult);
         }
         TRY_END();
     }

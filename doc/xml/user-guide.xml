@@ -558,6 +558,8 @@
     <block-define if="'{[package]}' eq 'none'" id="br-install">
         <p>Installing <backrest/> from a package is preferable to building from source. When installing from a package the rest of the instructions in this section are generally not required, but it is possible that a package will skip creating one of the directories or apply incorrect permissions. In that case it may be necessary to manually create directories or update permissions.</p>
 
+        <admonition type="note">If a dedicated <id>pgbackrest</id> user is used (recommended for repository hosts), companion files installed by the package — including <file>/etc/logrotate.d/pgbackrest</file> — may default to a different user (e.g. <id>postgres</id> on PGDG RPMs) and break with <id>error opening /var/log/pgbackrest/*.log: Permission denied</id> after rotation. Adjust the affected files (for example, change <id>su postgres postgres</id> to <id>su pgbackrest pgbackrest</id> in the logrotate config) after the first install; subsequent package upgrades will preserve those edits.</admonition>
+
         <p if="{[os-type-is-debian]}">{[user-guide-os]} packages for <backrest/> are available at <link url="https://www.postgresql.org/download/linux/ubuntu/">apt.postgresql.org</link>.</p>
 
         <p if="{[os-type-is-rhel]}">{[user-guide-os]} packages for <backrest/> are available at <link url="http://yum.postgresql.org">yum.postgresql.org</link>.</p>
@@ -958,7 +960,7 @@
 
             <p>Upgrading from <proper>v2.x</proper> to <proper>v2.y</proper> is straight-forward. The repository format has not changed, so for most installations it is simply a matter of installing binaries for the new version. It is also possible to downgrade if you have not used new features that are unsupported by the older version.</p>
 
-            <admonition type="important">The local and remote <backrest/> versions must match exactly so they should be upgraded together. If there is a mismatch, WAL archiving and backups will not function until the versions match. In such a case, the following error will be reported: <id>[ProtocolError] expected value '2.x' for greeting key 'version' but got '2.y'</id>.</admonition>
+            <admonition type="important">The <backrest/> version installed on the <host>repository</host> host must exactly match the version installed on the <postgres/> host(s), so they should be upgraded together. If there is a mismatch, WAL archiving and backups will not function until the versions match. In such a case, the following error will be reported: <id>[ProtocolError] expected value '2.x' for greeting key 'version' but got '2.y'</id>.</admonition>
         </section>
     </section>
 
@@ -1134,7 +1136,7 @@
                 <backrest-config-option section="global" key="log-timestamp">n</backrest-config-option>
             </backrest-config>
 
-            <p><backrest/> configuration files follow a Windows INI-like convention. Sections are denoted by text in brackets and key/value pairs are contained in each section. Lines beginning with <id>#</id> are ignored and can be used as comments. Quoting is not supported and whitespace is trimmed from keys and values. Sections will be merged if they appear more than once.</p>
+            <p><backrest/> configuration files follow a Windows INI-like convention. Sections are denoted by text in brackets and key/value pairs are contained in each section. Lines beginning with <id>#</id> are ignored and can be used as comments; end-of-line comments after a value are not supported, so a <id>#</id> after a value is treated as part of that value. Quoting is not supported and whitespace is trimmed from keys and values. Sections will be merged if they appear more than once.</p>
 
             <p>There are multiple ways the <backrest/> configuration files can be loaded:</p>
             <list>
@@ -1153,6 +1155,8 @@
                 <list-item>[global:<i>command</i>]</list-item>
                 <list-item>[global]</list-item>
             </list>
+
+            <admonition type="note">Stanza-scoped sections ([<i>stanza</i>] and [<i>stanza</i>:<i>command</i>]) are only consulted when a stanza is selected with the <br-option>--stanza</br-option> option. Commands that can run without a stanza (such as <cmd>info</cmd>) will therefore not see settings placed only in stanza-scoped sections; place repository and other shared settings in [global] (or [global:<i>command</i>]) when you need them to apply across stanzas.</admonition>
 
             <admonition type="note"><br-option>--config</br-option>, <br-option>--config-include-path</br-option> and <br-option>--config-path</br-option> are command-line only options.</admonition>
 
