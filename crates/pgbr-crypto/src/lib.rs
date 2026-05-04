@@ -429,12 +429,7 @@ pub mod cipher {
         /// # Errors
         ///
         /// Propagates the OpenSSL error stack if `EVP_CipherInit_ex` rejects the parameters.
-        pub fn new(
-            cipher: CipherType,
-            mode: Mode,
-            key: &[u8],
-            iv: &[u8],
-        ) -> Result<Self, openssl::error::ErrorStack> {
+        pub fn new(cipher: CipherType, mode: Mode, key: &[u8], iv: &[u8]) -> Result<Self, openssl::error::ErrorStack> {
             let inner = Crypter::new(cipher.openssl(), mode.openssl(), key, Some(iv))?;
             Ok(Self { inner })
         }
@@ -626,11 +621,15 @@ mod cipher_tests {
 
         let mut state: u64 = 0xdead_beef_cafe_babe;
         for _ in 0..10_000 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let len = ((state >> 32) as usize) % 200;
             let mut plaintext = vec![0u8; len];
             for byte in &mut plaintext {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 *byte = (state >> 56) as u8;
             }
 

@@ -110,7 +110,13 @@ testBldShim(const String *const shimC, const StringList *const functionList)
 
     MEM_CONTEXT_TEMP_BEGIN()
     {
-        const StringList *const inList = strLstNewSplitZ(shimC, "\n");
+        // Strip CR before splitting so a CRLF-terminated source file (typical when the repo is checked out on a Windows host and
+        // bind-mounted into the Linux dev container) parses identically to LF-terminated content. Without this, every line ends
+        // with `\r` and the `{` line below never compares equal, so the scan-forward loop falls off the end of the file.
+        // `strDup` returns a fixed-size buffer that `strReplace` cannot resize; build a resizable copy via `strCat` instead.
+        String *const shimNormalized = strCat(strNew(), shimC);
+        strReplace(shimNormalized, STRDEF("\r\n"), STRDEF("\n"));
+        const StringList *const inList = strLstNewSplitZ(shimNormalized, "\n");
         ASSERT(strEmpty(strLstGet(inList, strLstSize(inList) - 1)));
 
         for (unsigned int inIdx = 0; inIdx < strLstSize(inList); inIdx++)
