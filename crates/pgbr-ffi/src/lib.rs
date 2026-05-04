@@ -943,6 +943,44 @@ pub unsafe extern "C" fn pgbr_gz_compress_state_deflate(
     })
 }
 
+// ---------- pgbr-compress lz4 error bridge (Phase 17) ----------
+
+/// Classify an `LZ4F_errorCode_t`.
+///
+/// Returns `0` when `LZ4F_isError(code) == 0` (no throw needed). Returns `1` when the
+/// code represents an error: `msg_out` is filled with the matching human-readable name
+/// (NUL-terminated when `msg_size >= 1`, truncated otherwise) so the C caller can
+/// `THROW_FMT(FormatError, "lz4 error: [<code>] <name>")`.
+///
+/// Mirrors the legacy `lz4Error` body and lets the C wrapper raise the same exception
+/// without including `<lz4frame.h>`.
+///
+/// # Safety
+///
+/// `msg_out` must point to a writable buffer of at least `msg_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_error_classify(code: usize, msg_out: *mut c_char, msg_size: usize) -> i32 {
+    with_panic_guard(|| {
+        if msg_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_lz4_error_classify: null pointer"));
+            return -1;
+        }
+        match pgbr_compress::lz4::error::classify(code) {
+            pgbr_compress::lz4::error::Classification::Ok { .. } => 0,
+            pgbr_compress::lz4::error::Classification::Throw { name, .. } => {
+                if msg_size > 0 {
+                    let copy_len = (msg_size - 1).min(name.len());
+                    // SAFETY: caller upholds the buffer-size contract.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(msg_out.cast::<u8>(), msg_size) };
+                    dst[..copy_len].copy_from_slice(&name[..copy_len]);
+                    dst[copy_len] = 0;
+                }
+                1
+            }
+        }
+    })
+}
+
 // ---------- pgbr-compress gz decompress bridge (Phase 16) ----------
 
 /// Allocate a streaming gzip / zlib-wrapped inflate decompressor.

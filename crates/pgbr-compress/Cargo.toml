@@ -14,6 +14,11 @@ repository.workspace = true
 # does not expose memLevel, so going through `libz-sys` is the only way to keep compressed
 # output byte-identical to the legacy C path.
 libz-sys = "1.1"
+# Direct LZ4-frame bindings — `lz4::error::classify` calls `LZ4F_isError` /
+# `LZ4F_getErrorName` from the system liblz4 so error names match the legacy C path
+# byte-for-byte. The higher-level `lz4_flex` crate replicates LZ4 in pure Rust but does
+# not expose the exact error-name strings the legacy `lz4Error` formatter emits.
+lz4-sys = "1.11"
 
 [lints]
 workspace = true

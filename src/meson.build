@@ -144,14 +144,15 @@ pgbr_ffi_target = custom_target(
 # `sources:` so any C file that #includes "pgbr_ffi.h" forces ninja to regenerate the FFI artefacts
 # first; the archive is linked via link_args plus an explicit dependency on the custom_target so
 # the link step waits for cargo to finish. `lib_openssl` is rolled into the dependency because
-# pgbr-crypto's `common` module pulls in `openssl-sys`, and `lib_z` because pgbr-compress::gz::
-# compress goes through `libz-sys` to call libz directly — the static archive only contains the
-# Rust glue, the actual `libssl` / `libcrypto` / `libz` symbols must be resolved at link time.
+# pgbr-crypto's `common` module pulls in `openssl-sys`; `lib_z` because pgbr-compress::gz goes
+# through `libz-sys`; `lib_lz4` because pgbr-compress::lz4::error goes through `lz4-sys`. The
+# static archive only contains the Rust glue, the actual `libssl` / `libcrypto` / `libz` /
+# `liblz4` symbols must be resolved at link time.
 pgbr_ffi_dep = declare_dependency(
     sources: [pgbr_ffi_target[1]],
     include_directories: include_directories('.'),
     link_args: [pgbr_ffi_target[0].full_path()],
-    dependencies: [lib_openssl, lib_z],
+    dependencies: [lib_openssl, lib_z, lib_lz4],
 )
 
 build_code = executable(
