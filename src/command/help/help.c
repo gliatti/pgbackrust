@@ -17,6 +17,7 @@ Help Command
 #include "common/memContext.h"
 #include "common/project.h"
 #include "common/type/pack.h"
+#include "pgbr_ffi.h"
 #include "config/config.intern.h"
 #include "config/parse.h"
 #include "version.h"
@@ -368,7 +369,7 @@ helpRender(const Buffer *const helpData)
         FUNCTION_TEST_PARAM(BUFFER, helpData);
     FUNCTION_TEST_END();
 
-    String *const result = strCatFmt(strNew(), "%s " PROJECT_VERSION, projectName());
+    String *const result = strCatFmt(strNew(), "%s " PROJECT_VERSION " (rust ffi %s)", projectName(), pgbr_version());
 
     // Display version only
     if (!cfgCommandHelp() &&

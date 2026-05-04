@@ -117,6 +117,45 @@ subdir('command/help')
 subdir('postgres')
 
 ####################################################################################################################################
+# Rust FFI shim — libpgbr_ffi.a + pgbr_ffi.h, regenerated on every build by meson/build-ffi.sh
+####################################################################################################################################
+cargo = find_program('cargo', required: true)
+cbindgen = find_program('cbindgen', required: true)
+
+pgbr_ffi_inputs = files(
+    '../Cargo.toml',
+    '../cbindgen.toml',
+    '../crates/pgbr-ffi/Cargo.toml',
+    '../crates/pgbr-ffi/src/lib.rs',
+)
+
+pgbr_ffi_target = custom_target(
+    'pgbr-ffi',
+    input: pgbr_ffi_inputs,
+    output: ['libpgbr_ffi.a', 'pgbr_ffi.h'],
+    command: [
+        meson.project_source_root() / 'meson' / 'build-ffi.sh',
+        meson.project_source_root(),
+        meson.project_build_root(),
+        '@OUTPUT0@',
+        '@OUTPUT1@',
+    ],
+    build_by_default: true,
+    install: false,
+    console: true,
+)
+
+# Expose the static archive + generated header to downstream targets. The header is wired through
+# `sources:` so any C file that #includes "pgbr_ffi.h" forces ninja to regenerate the FFI artefacts
+# first; the archive is linked via link_args plus an explicit dependency on the custom_target so
+# the link step waits for cargo to finish.
+pgbr_ffi_dep = declare_dependency(
+    sources: [pgbr_ffi_target[1]],
+    include_directories: include_directories('.'),
+    link_args: [pgbr_ffi_target[0].full_path()],
+)
+
+####################################################################################################################################
 # pgBackRest target
 ####################################################################################################################################
 src_pgbackrest = [
@@ -288,6 +327,7 @@ main_exe = executable(
         lib_xml,
         lib_z,
         lib_zstd,
+        pgbr_ffi_dep,
     ],
     install: true,
 )
