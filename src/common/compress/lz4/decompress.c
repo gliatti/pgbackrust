@@ -1,9 +1,13 @@
 /***********************************************************************************************************************************
 LZ4 Decompress
+
+Thin C wrapper over the Rust streaming decompressor in `crates/pgbr-compress::lz4::decompress`. The IoFilter object, the
+input-cursor state, and the `frameDone` / `done` flags stay on the C side because they plug into pgBackRust's IoFilter
+framework. The libliblz4 calls (`LZ4F_createDecompressionContext`, `LZ4F_decompress`, `LZ4F_freeDecompressionContext`) are
+replaced by FFI calls into libpgbr_ffi.a.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <lz4frame.h>
 #include <stdio.h>
 
 #include "common/compress/common.h"
@@ -13,13 +17,14 @@ LZ4 Decompress
 #include "common/io/filter/filter.h"
 #include "common/log.h"
 #include "common/type/object.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct Lz4Decompress
 {
-    LZ4F_decompressionContext_t context;                            // LZ4 decompression context
+    void *state;                                                    // Opaque pgbr_compress::lz4::decompress::Decompress*
     IoFilter *filter;                                               // Filter interface
 
     bool inputSame;                                                 // Is the same input required on the next process call?
@@ -58,7 +63,8 @@ lz4DecompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    LZ4F_freeDecompressionContext(this->context);
+    pgbr_lz4_decompress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -78,7 +84,7 @@ lz4DecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const de
     FUNCTION_LOG_END();
 
     ASSERT(this != NULL);
-    ASSERT(this->context != NULL);
+    ASSERT(this->state != NULL);
     ASSERT(decompressed != NULL);
 
     // When there is no more input then decompression is done
@@ -93,20 +99,23 @@ lz4DecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const de
     else
     {
         // Decompress as much data as possible
-        size_t srcSize = bufUsed(compressed) - this->inputOffset;
-        size_t dstSize = bufRemains(decompressed);
+        const size_t srcAvail = bufUsed(compressed) - this->inputOffset;
+        size_t written = 0;
+        size_t consumed = 0;
+        const size_t hint = pgbr_lz4_decompress_state_decompress(
+            this->state, bufPtrConst(compressed) + this->inputOffset, srcAvail, bufRemainsPtr(decompressed),
+            bufRemains(decompressed), &written, &consumed);
 
-        this->frameDone = lz4Error(
-            LZ4F_decompress(
-                this->context, bufRemainsPtr(decompressed), &dstSize, bufPtrConst(compressed) + this->inputOffset, &srcSize,
-                NULL)) == 0;
+        // Surface liblz4 errors via the legacy classifier so we get the same `[code] message` exception text the C path used to
+        // throw. `lz4Error` is a no-op on the byte-count return values; only `LZ4F_isError`-flagged hints fire it.
+        this->frameDone = lz4Error(hint) == 0;
 
-        bufUsedInc(decompressed, dstSize);
+        bufUsedInc(decompressed, written);
 
         // If the compressed data was not fully processed then update the offset and set inputSame
-        if (srcSize < bufUsed(compressed) - this->inputOffset)
+        if (consumed < srcAvail)
         {
-            this->inputOffset += srcSize;
+            this->inputOffset += consumed;
             this->inputSame = true;
         }
         // Else all compressed data was processed
@@ -159,15 +168,23 @@ FN_EXTERN IoFilter *
 lz4DecompressNew(const bool raw)
 {
     FUNCTION_LOG_BEGIN(logLevelTrace);
-        (void)raw;                                                  // Not required for decompress
+        (void)raw;                                                  // Not required for decompress; liblz4 detects the variant
+                                                                    // from the frame header.
     FUNCTION_LOG_END();
 
     OBJ_NEW_BEGIN(Lz4Decompress, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
         *this = (Lz4Decompress){0};
 
-        // Create lz4 context
-        lz4Error(LZ4F_createDecompressionContext(&this->context, LZ4F_VERSION));
+        // Create the Rust streaming decompressor. The FFI returns the raw LZ4F error code via `errCode` on failure.
+        size_t errCode = 0;
+        this->state = pgbr_lz4_decompress_state_new(&errCode);
+
+        if (this->state == NULL)
+        {
+            pgbr_last_error_clear();
+            lz4Error(errCode);
+        }
 
         // Set callback to ensure lz4 context is freed
         memContextCallbackSet(objMemContext(this), lz4DecompressFreeResource, this);

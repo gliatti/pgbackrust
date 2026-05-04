@@ -90,6 +90,32 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
     return output;
 }
 
+// `legacy_lz4Decompress` mirrors the pre-Phase-19 body of `lz4DecompressNew` / `lz4DecompressProcess` — direct LZ4F calls with
+// no special prefs (the decoder detects them from the frame header). One-shot decompression; both the new IoFilter path and
+// this helper recover the original plaintext byte-for-byte because liblz4's frame decoder is fully deterministic.
+static Buffer *
+legacy_lz4Decompress(const Buffer *const input)
+{
+    LZ4F_decompressionContext_t ctx;
+    size_t ret = LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION);
+    ASSERT(!LZ4F_isError(ret));
+
+    Buffer *const output = bufNew(bufUsed(input) * 64 + 4096);
+
+    size_t srcSize = bufUsed(input);
+    size_t dstSize = bufRemains(output);
+
+    ret = LZ4F_decompress(ctx, bufRemainsPtr(output), &dstSize, bufPtrConst(input), &srcSize, NULL);
+    ASSERT(!LZ4F_isError(ret));
+    ASSERT(ret == 0);                                                   // Frame fully consumed in one tick
+
+    bufUsedInc(output, dstSize);
+
+    LZ4F_freeDecompressionContext(ctx);
+
+    return output;
+}
+
 // `legacy_lz4Compress` mirrors the pre-Phase-18 body of `lz4CompressNew` / `lz4CompressProcess` — direct LZ4F calls with the same
 // preferences (compressionLevel, contentChecksumFlag toggled by `raw`). One-shot compression; both the new IoFilter path and
 // this helper output byte-identical frames because liblz4 is deterministic given fixed prefs and a fixed `LZ4F_VERSION`.
@@ -658,6 +684,57 @@ testRun(void)
         }
 
         TEST_RESULT_UINT(lz4Comparisons, 10000, "10k differential lz4Compress inputs all byte-identical");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("lz4Decompress differential vs direct liblz4 (10000+ inputs)");
+
+        // 10 000 random plaintexts. Compress each through the (already-validated) Phase 18 path then decompress through both the
+        // new FFI path and `legacy_lz4Decompress` (direct LZ4F calls with the same prefs). Both paths must recover the original
+        // plaintext byte-for-byte AND agree with each other.
+        uint64_t lz4DcLcg = UINT64_C(0xBADC0FFEE0FF1CE5);
+        unsigned int lz4DcComparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            lz4DcLcg = lz4DcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t lz4DcLen = (size_t)((lz4DcLcg >> 32) & 0x3FF) + 1;
+            const int lz4DcLevel = (int)(((lz4DcLcg >> 24) & 0xFF) % 18) - 5;
+            const bool lz4DcRaw = ((lz4DcLcg >> 16) & 1) == 0;
+
+            Buffer *const lz4DcPlaintext = bufNew(lz4DcLen);
+            for (size_t i = 0; i < lz4DcLen; i++)
+            {
+                lz4DcLcg = lz4DcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(lz4DcPlaintext)[i] = (uint8_t)(lz4DcLcg >> 56);
+            }
+            bufUsedSet(lz4DcPlaintext, lz4DcLen);
+
+            Buffer *const lz4DcCompressed = testCompress(
+                compressFilterP(compressTypeLz4, lz4DcLevel, .raw = lz4DcRaw), lz4DcPlaintext, lz4DcLen, lz4DcLen * 2 + 256);
+
+            Buffer *const lz4DcNewOut = testDecompress(
+                decompressFilterP(compressTypeLz4, .raw = lz4DcRaw), lz4DcCompressed, lz4DcLen, lz4DcLen + 1);
+            Buffer *const lz4DcLegacyOut = legacy_lz4Decompress(lz4DcCompressed);
+
+            if (!bufEq(lz4DcNewOut, lz4DcPlaintext) || !bufEq(lz4DcLegacyOut, lz4DcPlaintext) || !bufEq(lz4DcNewOut, lz4DcLegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "lz4Decompress(level=%d, raw=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu plaintextSize=%zu", lz4DcLevel,
+                    (int)lz4DcRaw, lz4DcLen, iter, bufUsed(lz4DcNewOut), bufUsed(lz4DcLegacyOut), bufUsed(lz4DcPlaintext));
+            }
+
+            bufFree(lz4DcPlaintext);
+            bufFree(lz4DcCompressed);
+            bufFree(lz4DcNewOut);
+            bufFree(lz4DcLegacyOut);
+
+            lz4DcComparisons++;
+        }
+
+        TEST_RESULT_UINT(lz4DcComparisons, 10000, "10k differential lz4Decompress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************

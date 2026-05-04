@@ -6,6 +6,7 @@
 //! `pgbr_compress::lz4::classify(...)` directly.
 
 pub mod compress;
+pub mod decompress;
 pub mod error;
 
 pub use error::{Classification, classify};
