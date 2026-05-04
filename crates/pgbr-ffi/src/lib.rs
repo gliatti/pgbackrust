@@ -60,6 +60,12 @@ impl FfiPanicReturn for u64 {
     }
 }
 
+impl FfiPanicReturn for isize {
+    fn ffi_panic_return() -> Self {
+        -1
+    }
+}
+
 impl<T> FfiPanicReturn for *const T {
     fn ffi_panic_return() -> Self {
         core::ptr::null()
@@ -681,6 +687,240 @@ pub unsafe extern "C" fn pgbr_crypto_random_bytes(buf: *mut u8, size: usize) {
         let dst = unsafe { core::slice::from_raw_parts_mut(buf, size) };
         let _ = pgbr_crypto::common::random_bytes(dst);
     });
+}
+
+// ---------- pgbr-crypto hash bridge (Phase 11) ----------
+
+/// Allocate a fresh streaming hash state for `type_code` (0 = MD5, 1 = SHA1, 2 = SHA256).
+///
+/// Returns null on bad type or initialization failure; inspect the thread-local last error
+/// for the cause.
+///
+/// The returned pointer must be released exactly once via [`pgbr_crypto_hash_state_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_hash_state_new(type_code: i32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        let Some(ty) = pgbr_crypto::hash::HashType::from_code(type_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_hash_state_new: unknown type code {type_code}"),
+            ));
+            return core::ptr::null_mut();
+        };
+        match pgbr_crypto::hash::State::new(ty) {
+            Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                core::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Drop a hash state previously returned by [`pgbr_crypto_hash_state_new`]. No-op on null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_crypto_hash_state_new`] that has
+/// not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_hash_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_crypto::hash::State>()) };
+    });
+}
+
+/// Feed `size` bytes from `data` into the streaming state. Returns `0` on success, `-1` on
+/// error (the thread-local last error is populated).
+///
+/// # Safety
+///
+/// - `state` must be a non-null pointer from [`pgbr_crypto_hash_state_new`].
+/// - `data` must point to at least `size` readable bytes (or be null when `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_hash_state_update(state: *mut core::ffi::c_void, data: *const u8, size: usize) -> i32 {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hash_state_update: state is null"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is alive and unaliased.
+        let state = unsafe { &mut *state.cast::<pgbr_crypto::hash::State>() };
+        let slice: &[u8] = if size == 0 {
+            &[]
+        } else if data.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hash_state_update: data is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `data` is readable for `size` bytes.
+            unsafe { core::slice::from_raw_parts(data, size) }
+        };
+        match state.update(slice) {
+            Ok(()) => 0,
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Finalize the streaming state and write up to `dst_size` digest bytes into `dst`. Returns
+/// the number of bytes written on success or `-1` on error (thread-local last error set).
+///
+/// Idempotent: calling multiple times returns the same digest from the wrapper's cache, the
+/// same way the legacy `cryptoHash()` getter cached its result.
+///
+/// # Safety
+///
+/// - `state` must be a non-null pointer from [`pgbr_crypto_hash_state_new`].
+/// - `dst` must point to at least `dst_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_hash_state_finalize_into(
+    state: *mut core::ffi::c_void,
+    dst: *mut u8,
+    dst_size: usize,
+) -> isize {
+    with_panic_guard(|| {
+        if state.is_null() || dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_crypto_hash_state_finalize_into: null argument",
+            ));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is alive and unaliased.
+        let state = unsafe { &mut *state.cast::<pgbr_crypto::hash::State>() };
+        // SAFETY: caller guarantees `dst` is writable for `dst_size` bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        match state.finalize_into(dst_slice) {
+            Ok(n) => isize::try_from(n).unwrap_or(-1),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Single-shot hash.
+///
+/// Computes the digest of `msg_size` bytes at `msg` using the algorithm identified by
+/// `type_code` and writes up to `dst_size` digest bytes into `dst`. Returns the number of
+/// bytes written on success or `-1` on error (thread-local last error set).
+///
+/// # Safety
+///
+/// - `msg` must point to at least `msg_size` readable bytes (or be null when `msg_size == 0`).
+/// - `dst` must point to at least `dst_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_hash_one_into(
+    type_code: i32,
+    msg: *const u8,
+    msg_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+) -> isize {
+    with_panic_guard(|| {
+        let Some(ty) = pgbr_crypto::hash::HashType::from_code(type_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_hash_one_into: unknown type code {type_code}"),
+            ));
+            return -1;
+        };
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hash_one_into: dst is null"));
+            return -1;
+        }
+        let msg_slice: &[u8] = if msg_size == 0 {
+            &[]
+        } else if msg.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hash_one_into: msg is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `msg` is readable for `msg_size` bytes.
+            unsafe { core::slice::from_raw_parts(msg, msg_size) }
+        };
+        // SAFETY: caller guarantees `dst` is writable for `dst_size` bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        match pgbr_crypto::hash::one_shot(ty, msg_slice, dst_slice) {
+            Ok(n) => isize::try_from(n).unwrap_or(-1),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Single-shot HMAC. Returns the number of bytes written, or `-1` on error.
+///
+/// # Safety
+///
+/// - `key` must point to at least `key_size` readable bytes (or be null when `key_size == 0`).
+/// - `msg` must point to at least `msg_size` readable bytes (or be null when `msg_size == 0`).
+/// - `dst` must point to at least `dst_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_hmac_one_into(
+    type_code: i32,
+    key: *const u8,
+    key_size: usize,
+    msg: *const u8,
+    msg_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+) -> isize {
+    with_panic_guard(|| {
+        let Some(ty) = pgbr_crypto::hash::HashType::from_code(type_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_hmac_one_into: unknown type code {type_code}"),
+            ));
+            return -1;
+        };
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hmac_one_into: dst is null"));
+            return -1;
+        }
+        let key_slice: &[u8] = if key_size == 0 {
+            &[]
+        } else if key.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hmac_one_into: key is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `key` is readable for `key_size` bytes.
+            unsafe { core::slice::from_raw_parts(key, key_size) }
+        };
+        let msg_slice: &[u8] = if msg_size == 0 {
+            &[]
+        } else if msg.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_hmac_one_into: msg is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `msg` is readable for `msg_size` bytes.
+            unsafe { core::slice::from_raw_parts(msg, msg_size) }
+        };
+        // SAFETY: caller guarantees `dst` is writable for `dst_size` bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        match pgbr_crypto::hash::hmac_one(ty, key_slice, msg_slice, dst_slice) {
+            Ok(n) => isize::try_from(n).unwrap_or(-1),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Digest size in bytes for `type_code`, or `0` for an unknown code.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_hash_size(type_code: i32) -> usize {
+    with_panic_guard(|| pgbr_crypto::hash::HashType::from_code(type_code).map_or(0, pgbr_crypto::hash::HashType::size))
 }
 
 // ---------- pgbr-regex bridge (Phase 9) ----------

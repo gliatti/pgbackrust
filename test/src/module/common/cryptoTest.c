@@ -2,6 +2,7 @@
 Test Block Cipher
 ***********************************************************************************************************************************/
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <string.h>
 
 #include "common/io/bufferRead.h"
@@ -34,6 +35,30 @@ legacy_cryptoErrorReasonInto(unsigned long code, char *const dst, const size_t d
     const size_t copyLen = strlen(source) < dstSize - 1 ? strlen(source) : dstSize - 1;
     memcpy(dst, source, copyLen);
     dst[copyLen] = '\0';
+}
+
+/***********************************************************************************************************************************
+Differential helper — computes a digest for `type` over `msg` by going straight through libcrypto's EVP API, exactly as the legacy
+`cryptoHashOne` body did before the Phase 11 migration. Used to compare against the Rust-backed `cryptoHashOne` shim over
+thousands of random inputs.
+***********************************************************************************************************************************/
+static void
+legacy_cryptoHashOne(const HashType type, const uint8_t *const msg, const size_t msgSize, uint8_t *const dst, const size_t dstSize)
+{
+    char typeZ[STRID_MAX + 1];
+    strIdToZ(type, typeZ);
+
+    const EVP_MD *const md = EVP_get_digestbyname(typeZ);
+    ASSERT(md != NULL);
+    ASSERT(dstSize >= (size_t)EVP_MD_size(md));
+
+    EVP_MD_CTX *const ctx = EVP_MD_CTX_create();
+    ASSERT(EVP_DigestInit_ex(ctx, md, NULL) == 1);
+    ASSERT(EVP_DigestUpdate(ctx, msg, msgSize) == 1);
+    unsigned int written = 0;
+    ASSERT(EVP_DigestFinal_ex(ctx, dst, &written) == 1);
+    ASSERT((size_t)written == (size_t)EVP_MD_size(md));
+    EVP_MD_CTX_destroy(ctx);
 }
 
 /***********************************************************************************************************************************
@@ -420,19 +445,9 @@ testRun(void)
             strNewEncode(encodingHex, pckReadBinP(pckReadNew(ioFilterResult(hash)))), "3318600bc9c1d379e91e4bae90721243",
             "check hash");
 
-        // Full coverage of local MD5 requires processing > 511MB of data but that makes the test run too long. Instead we'll cheat
-        // a bit and initialize the context at 511MB to start. This does not produce a valid MD5 hash but does provide coverage of
-        // that one condition cheaply.
-        // -------------------------------------------------------------------------------------------------------------------------
-        TEST_TITLE("md5 hash - > 0x1fffffff bytes");
-
-        TEST_ASSIGN(hash, cryptoHashNew(hashTypeMd5), "create md5 hash");
-        ((CryptoHash *)ioFilterDriver(hash))->md5Context.lo = 0x1fffffff;
-
-        TEST_RESULT_VOID(ioFilterProcessIn(hash, BUFSTRZ("1")), "add 1");
-        TEST_RESULT_STR_Z(
-            strNewEncode(encodingHex, pckReadBinP(pckReadNew(ioFilterResult(hash)))), "5c99876f9cafa7f485eac9c7a8a2764c",
-            "check hash");
+        // The legacy `md5 hash - > 0x1fffffff bytes` coverage trick directly mutated the bundled MD5 context's `.lo` field,
+        // which no longer exists after Phase 11 routes hashing through the Rust `md-5` crate. The Rust backend has its own
+        // upstream test suite covering the > 4 GiB code path; the C side just needs to verify normal-sized inputs.
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_ASSIGN(hash, cryptoHashNew(hashTypeSha256), "create sha256 hash");
@@ -456,6 +471,52 @@ testRun(void)
                     BUFSTRDEF("20170412"))),
             "8b05c497afe9e1f42c8ada4cb88392e118649db1e5c98f0f0fb0a158bdd2dd76",
             "    check hmac");
+
+        // Differential C/Rust parity on cryptoHashOne over MD5 / SHA1 / SHA256
+        // -------------------------------------------------------------------------------------------------------------------------
+        // 12 000 deterministic random inputs (4 000 per algorithm) hashed via the new Rust path and via a `legacy_*` helper that
+        // calls libcrypto's EVP API directly (the same code the legacy `cryptoHashOne` body executed before the Phase 11
+        // migration). Both paths must produce byte-identical digests.
+        {
+            const HashType types[] = {hashTypeMd5, hashTypeSha1, hashTypeSha256};
+            uint64_t hashState = UINT64_C(0xDEADC0DE12345678);
+            uint8_t input[256];
+            uint8_t legacyDigest[64];
+            unsigned int comparisons = 0;
+
+            for (unsigned int iter = 0; iter < 4000; iter++)
+            {
+                hashState = hashState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                const size_t len = (size_t)((hashState >> 32) % sizeof(input));
+
+                for (size_t b = 0; b < len; b++)
+                {
+                    hashState = hashState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                    input[b] = (uint8_t)(hashState >> 56);
+                }
+
+                for (unsigned int t = 0; t < LENGTH_OF(types); t++)
+                {
+                    Buffer *const inputBuf = bufNewC(input, len);
+                    const Buffer *const rustDigest = cryptoHashOne(types[t], inputBuf);
+
+                    legacy_cryptoHashOne(types[t], input, len, legacyDigest, sizeof(legacyDigest));
+
+                    if (memcmp(bufPtrConst(rustDigest), legacyDigest, bufUsed(rustDigest)) != 0)
+                    {
+                        TEST_ERROR_FMT(
+                            THROW_FMT(AssertError, "differential mismatch"),
+                            AssertError,
+                            "type=%u len=%zu", t, len);
+                    }
+
+                    bufFree(inputBuf);
+                    comparisons++;
+                }
+            }
+
+            TEST_RESULT_UINT(comparisons, 4000 * LENGTH_OF(types), "all C/Rust differential digest comparisons agreed");
+        }
     }
 
     // *****************************************************************************************************************************

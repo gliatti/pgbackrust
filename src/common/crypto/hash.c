@@ -1,13 +1,12 @@
 /***********************************************************************************************************************************
 Cryptographic Hash
+
+Thin C wrappers over the Rust implementation in `crates/pgbr-crypto::hash`. The actual MD5 / SHA1 / SHA256 / HMAC routines live in
+libpgbr_ffi.a; this file keeps the public API in `src/common/crypto/hash.h` byte-identical to the legacy version, including the
+streaming `IoFilter` integration. The opaque Rust hash state stands in for the legacy `EVP_MD_CTX` + bundled MD5 union — the C
+struct only needs to remember the algorithm (for size lookup and re-finalize idempotency) and cache the binary digest.
 ***********************************************************************************************************************************/
 #include <build.h>
-
-#include <string.h>
-
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 
 #include "common/crypto/common.h"
 #include "common/crypto/hash.h"
@@ -16,6 +15,7 @@ Cryptographic Hash
 #include "common/log.h"
 #include "common/type/object.h"
 #include "common/type/pack.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Hashes for zero-length files (i.e., seed value)
@@ -28,19 +28,13 @@ BUFFER_EXTERN(
     0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55);
 
 /***********************************************************************************************************************************
-Include local MD5 code
-***********************************************************************************************************************************/
-#include "common/crypto/md5.vendor.c.inc"
-
-/***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct CryptoHash
 {
-    const EVP_MD *hashType;                                         // Hash type (sha1, md5, etc.)
-    EVP_MD_CTX *hashContext;                                        // Message hash context
-    MD5_CTX md5Context;                                             // MD5 context (used to bypass FIPS restrictions)
-    Buffer *hash;                                                   // Hash in binary form
+    int32_t typeCode;                                               // Numeric pgbr_crypto::hash::HashType discriminant
+    void *state;                                                    // Opaque Rust handle from pgbr_crypto_hash_state_new
+    Buffer *hash;                                                   // Cached binary digest after first finalize
 } CryptoHash;
 
 /***********************************************************************************************************************************
@@ -50,6 +44,32 @@ Macros for function logging
     CryptoHash *
 #define FUNCTION_LOG_CRYPTO_HASH_FORMAT(value, buffer, bufferSize)                                                                 \
     objNameToLog(value, "CryptoHash", buffer, bufferSize)
+
+/***********************************************************************************************************************************
+Map a HashType StringId to the numeric code understood by the FFI layer.
+***********************************************************************************************************************************/
+static int32_t
+cryptoHashTypeCode(const HashType type)
+{
+    switch (type)
+    {
+        case hashTypeMd5:
+            return 0;
+
+        case hashTypeSha1:
+            return 1;
+
+        case hashTypeSha256:
+            return 2;
+
+        default:
+        {
+            char typeZ[STRID_MAX + 1];
+            strIdToZ(type, typeZ);
+            THROW_FMT(AssertError, "unable to load hash '%s'", typeZ);
+        }
+    }
+}
 
 /***********************************************************************************************************************************
 Free hash context
@@ -65,7 +85,8 @@ cryptoHashFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    EVP_MD_CTX_destroy(this->hashContext);
+    pgbr_crypto_hash_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -87,14 +108,8 @@ cryptoHashProcess(THIS_VOID, const Buffer *const message)
     ASSERT(this->hash == NULL);
     ASSERT(message != NULL);
 
-    // Standard OpenSSL implementation
-    if (this->hashContext != NULL)
-    {
-        cryptoError(!EVP_DigestUpdate(this->hashContext, bufPtrConst(message), bufUsed(message)), "unable to process message hash");
-    }
-    // Else local MD5 implementation
-    else
-        MD5_Update(&this->md5Context, bufPtrConst(message), bufUsed(message));
+    if (pgbr_crypto_hash_state_update(this->state, bufPtrConst(message), bufUsed(message)) != 0)
+        THROW_FMT(CryptoError, "unable to process message hash: %s", pgbr_last_error_msg());
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -115,20 +130,17 @@ cryptoHash(CryptoHash *const this)
     {
         MEM_CONTEXT_OBJ_BEGIN(this)
         {
-            // Standard OpenSSL implementation
-            if (this->hashContext != NULL)
-            {
-                this->hash = bufNew((size_t)EVP_MD_size(this->hashType));
-                cryptoError(!EVP_DigestFinal_ex(this->hashContext, bufPtr(this->hash), NULL), "unable to finalize message hash");
-            }
-            // Else local MD5 implementation
-            else
-            {
-                this->hash = bufNew(HASH_TYPE_M5_SIZE);
-                MD5_Final(bufPtr(this->hash), &this->md5Context);
-            }
+            const size_t hashSize = pgbr_crypto_hash_size(this->typeCode);
+            ASSERT(hashSize > 0);
 
-            bufUsedSet(this->hash, bufSize(this->hash));
+            this->hash = bufNew(hashSize);
+
+            const intptr_t written = pgbr_crypto_hash_state_finalize_into(this->state, bufPtr(this->hash), hashSize);
+
+            if (written < 0 || (size_t)written != hashSize)
+                THROW_FMT(CryptoError, "unable to finalize message hash: %s", pgbr_last_error_msg());
+
+            bufUsedSet(this->hash, hashSize);
         }
         MEM_CONTEXT_OBJ_END();
     }
@@ -179,36 +191,21 @@ cryptoHashNew(const HashType type)
     // Init crypto subsystem
     cryptoInit();
 
+    // Resolve the algorithm code up-front so an unsupported `type` throws AssertError before any allocation happens, matching the
+    // legacy "unable to load hash 'xxx'" behaviour.
+    const int32_t typeCode = cryptoHashTypeCode(type);
+
     OBJ_NEW_BEGIN(CryptoHash, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (CryptoHash){0};
+        *this = (CryptoHash){.typeCode = typeCode};
 
-        // Use local MD5 implementation since FIPS-enabled systems do not allow MD5. This is a bit misguided since there are valid
-        // cases for using MD5 which do not involve, for example, password hashes. Since popular object stores, e.g. S3, require
-        // MD5 for verifying payload integrity we are simply forced to provide MD5 functionality.
-        if (type == hashTypeMd5)
-        {
-            MD5_Init(&this->md5Context);
-        }
-        // Else use the standard OpenSSL implementation
-        else
-        {
-            // Lookup digest
-            char typeZ[STRID_MAX + 1];
-            strIdToZ(type, typeZ);
+        this->state = pgbr_crypto_hash_state_new(typeCode);
 
-            if ((this->hashType = EVP_get_digestbyname(typeZ)) == NULL)
-                THROW_FMT(AssertError, "unable to load hash '%s'", typeZ);
+        if (this->state == NULL)
+            THROW_FMT(CryptoError, "unable to create hash context: %s", pgbr_last_error_msg());
 
-            // Create context
-            cryptoError((this->hashContext = EVP_MD_CTX_create()) == NULL, "unable to create hash context");
-
-            // Set free callback to ensure hash context is freed
-            memContextCallbackSet(objMemContext(this), cryptoHashFreeResource, this);
-
-            // Initialize context
-            cryptoError(!EVP_DigestInit_ex(this->hashContext, this->hashType, NULL), "unable to initialize hash context");
-        }
+        // Set free callback to ensure hash state is freed
+        memContextCallbackSet(objMemContext(this), cryptoHashFreeResource, this);
     }
     OBJ_NEW_END();
 
@@ -260,24 +257,20 @@ cryptoHashOne(const HashType type, const Buffer *const message)
     ASSERT(type != 0);
     ASSERT(message != NULL);
 
-    Buffer *result = NULL;
+    cryptoInit();
 
-    MEM_CONTEXT_TEMP_BEGIN()
-    {
-        IoFilter *const hash = cryptoHashNew(type);
+    const int32_t typeCode = cryptoHashTypeCode(type);
+    const size_t hashSize = pgbr_crypto_hash_size(typeCode);
+    ASSERT(hashSize > 0);
 
-        if (!bufEmpty(message))
-            ioFilterProcessIn(hash, message);
+    Buffer *const result = bufNew(hashSize);
 
-        const Buffer *const buffer = cryptoHash((CryptoHash *)ioFilterDriver(hash));
+    const intptr_t written = pgbr_crypto_hash_one_into(typeCode, bufPtrConst(message), bufUsed(message), bufPtr(result), hashSize);
 
-        MEM_CONTEXT_PRIOR_BEGIN()
-        {
-            result = bufDup(buffer);
-        }
-        MEM_CONTEXT_PRIOR_END();
-    }
-    MEM_CONTEXT_TEMP_END();
+    if (written < 0 || (size_t)written != hashSize)
+        THROW_FMT(CryptoError, "unable to compute hash: %s", pgbr_last_error_msg());
+
+    bufUsedSet(result, hashSize);
 
     FUNCTION_LOG_RETURN(BUFFER, result);
 }
@@ -296,22 +289,21 @@ cryptoHmacOne(const HashType type, const Buffer *const key, const Buffer *const 
     ASSERT(key != NULL);
     ASSERT(message != NULL);
 
-    // Init crypto subsystem
     cryptoInit();
 
-    // Lookup digest
-    char typeZ[STRID_MAX + 1];
-    strIdToZ(type, typeZ);
+    const int32_t typeCode = cryptoHashTypeCode(type);
+    const size_t hashSize = pgbr_crypto_hash_size(typeCode);
+    ASSERT(hashSize > 0);
 
-    const EVP_MD *const hashType = EVP_get_digestbyname(typeZ);
-    ASSERT(hashType != NULL);
+    Buffer *const result = bufNew(hashSize);
 
-    // Allocate a buffer to hold the hmac
-    Buffer *const result = bufNew((size_t)EVP_MD_size(hashType));
-    bufUsedSet(result, bufSize(result));
+    const intptr_t written = pgbr_crypto_hmac_one_into(
+        typeCode, bufPtrConst(key), bufUsed(key), bufPtrConst(message), bufUsed(message), bufPtr(result), hashSize);
 
-    // Calculate the HMAC
-    HMAC(hashType, bufPtrConst(key), (int)bufUsed(key), bufPtrConst(message), bufUsed(message), bufPtr(result), NULL);
+    if (written < 0 || (size_t)written != hashSize)
+        THROW_FMT(CryptoError, "unable to compute hmac: %s", pgbr_last_error_msg());
+
+    bufUsedSet(result, hashSize);
 
     FUNCTION_LOG_RETURN(BUFFER, result);
 }
