@@ -12,7 +12,44 @@ Test Compression
 Differential helpers — rebuild the compress / decompress parameter Pack via direct `pckWrite*` calls (the legacy
 `compressParamList` / `decompressParamList` body before Phase 13 routed serialization through Rust). Used to compare against the
 new Rust-backed shim over thousands of `(level, raw)` combinations.
+
+`legacy_gzCompress` mirrors the pre-Phase-15 body of `gzCompressNew` / `gzCompressProcess` — direct libz calls with the same
+`deflateInit2` parameters (`memLevel = 9`, `Z_DEFAULT_STRATEGY`, `windowBits = 15` for raw / `31` for gzip). Used by the gz
+differential to assert that the new FFI path produces byte-identical output. zlib's encoder is deterministic given fixed
+parameters, so a one-shot `Z_FINISH` deflate produces the same bytes as the streaming `Z_NO_FLUSH` + `Z_FINISH` chain the
+IoFilter wrapper drives — `Z_NO_FLUSH` does not introduce block boundaries, only `Z_FINISH` (called once at the end) does.
 ***********************************************************************************************************************************/
+static Buffer *
+legacy_gzCompress(const int level, const bool raw, const Buffer *const input)
+{
+    // Output sizing: `deflateBound` would be tighter but it requires a live `z_stream`; budget generously to avoid Z_BUF_ERROR
+    // — for raw deflate the worst-case overhead per 16 KiB block is small, so `2 * input + 256` is more than enough for any
+    // input size we drive in the differential.
+    Buffer *const output = bufNew(bufUsed(input) * 2 + 256);
+
+    z_stream stream = {.zalloc = NULL, .zfree = NULL, .opaque = NULL};
+
+    int ret = deflateInit2(&stream, level, Z_DEFLATED, (raw ? 0 : WANT_GZ) | WINDOW_BITS, 9, Z_DEFAULT_STRATEGY);
+    ASSERT(ret == Z_OK);
+
+    // bufPtrConst returns `const uint8_t *`; libz declares `next_in` as non-const but only reads from it (the legacy `gzCompress`
+    // module includes the same disclaimer in a comment). Cast through `uintptr_t` so `-Wcast-qual` does not flag the deliberate
+    // const-strip.
+    stream.avail_in = (uInt)bufUsed(input);
+    stream.next_in = (Bytef *)(uintptr_t)bufPtrConst(input);
+    stream.avail_out = (uInt)bufSize(output);
+    stream.next_out = bufPtr(output);
+
+    ret = deflate(&stream, Z_FINISH);
+    ASSERT(ret == Z_STREAM_END);
+
+    bufUsedSet(output, bufSize(output) - stream.avail_out);
+
+    deflateEnd(&stream);
+
+    return output;
+}
+
 static Pack *
 legacy_compressParamList(const int level, const bool raw)
 {
@@ -293,6 +330,71 @@ testRun(void)
 
         TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(decompress, gzDecompressToLog, buffer, sizeof(buffer)), "gzDecompressToLog");
         TEST_RESULT_Z(buffer, "{inputSame: true, done: true, availIn: 0}", "check log");
+
+        GzCompress *compress = (GzCompress *)ioFilterDriver(gzCompressNew(1, false));
+
+        TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(compress, gzCompressToLog, buffer, sizeof(buffer)), "gzCompressToLog");
+        TEST_RESULT_Z(buffer, "{inputSame: false, done: false, flushing: false, availIn: 0}", "check log");
+
+        compress->inputSame = true;
+        compress->flushing = true;
+        compress->done = true;
+        compress->inputAvail = 7;
+
+        TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(compress, gzCompressToLog, buffer, sizeof(buffer)), "gzCompressToLog");
+        TEST_RESULT_Z(buffer, "{inputSame: true, done: true, flushing: true, availIn: 7}", "check log");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("gzCompress differential vs direct zlib (10000+ inputs)");
+
+        // Generate 10 000 random `(level, raw, input)` triples with a deterministic LCG so the test is reproducible. For each
+        // triple, compress through the new FFI path (`compressFilterP(compressTypeGz, level, .raw = raw)`) and through
+        // `legacy_gzCompress` (direct libz with the same parameters). Both paths must produce byte-identical output — zlib's
+        // encoder is deterministic, and the legacy path is byte-for-byte what the pre-Phase-15 C code did.
+        uint64_t lcgState = UINT64_C(0xDEADBEEFCAFEBEEF);
+        unsigned int comparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            lcgState = lcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            // Random length in [1, 1024]. The zero-byte case is covered separately by `pgbr-compress`'s
+            // `roundtrip_zero_byte_input` Rust test; including it here would be confounded by `testCompress` reading from the
+            // input buffer's allocated size (not its `used` count), so a 0-byte input ends up streaming a single uninitialized
+            // byte through the filter and producing a non-comparable output.
+            const size_t len = (size_t)((lcgState >> 32) & 0x3FF) + 1;      // 1..1024 bytes
+            const int level = (int)(((lcgState >> 24) & 0xFF) % 11) - 1;    // -1..9
+            const bool raw = ((lcgState >> 16) & 1) == 0;
+
+            Buffer *const input = bufNew(len);
+            for (size_t i = 0; i < len; i++)
+            {
+                lcgState = lcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(input)[i] = (uint8_t)(lcgState >> 56);
+            }
+            bufUsedSet(input, len);
+
+            Buffer *const newOut = testCompress(
+                compressFilterP(compressTypeGz, level, .raw = raw), input, len, len * 2 + 256);
+            Buffer *const legacyOut = legacy_gzCompress(level, raw, input);
+
+            if (!bufEq(newOut, legacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "gzCompress(level=%d, raw=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu", level, (int)raw, len, iter,
+                    bufUsed(newOut), bufUsed(legacyOut));
+            }
+
+            bufFree(input);
+            bufFree(newOut);
+            bufFree(legacyOut);
+
+            comparisons++;
+        }
+
+        TEST_RESULT_UINT(comparisons, 10000, "10k differential gzCompress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************

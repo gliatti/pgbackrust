@@ -8,5 +8,12 @@ repository.workspace = true
 
 [lib]
 
+[dependencies]
+# Direct libz bindings — needed by `gz::compress` to call `deflateInit2_` / `deflate` /
+# `deflateEnd` with the legacy parameters (memLevel=9, default strategy) byte-for-byte. flate2
+# does not expose memLevel, so going through `libz-sys` is the only way to keep compressed
+# output byte-identical to the legacy C path.
+libz-sys = "1.1"
+
 [lints]
 workspace = true
