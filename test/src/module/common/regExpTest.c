@@ -35,8 +35,12 @@ testRun(void)
     {
         // The Rust implementation reports parse errors with the `regex` crate's diagnostic prefix; the legacy libc messages
         // (glibc / macOS / musl variants) are gone with the regcomp dependency.
-        TEST_ERROR_FMT(regExpNew(STRDEF("[[[")), FormatError, "%s", "regex parse error: %s");
-        TEST_ERROR(regExpNew(STRDEF("(unclosed")), FormatError, "regex parse error:\n    (unclosed\n    ^\nerror: unclosed group");
+        TEST_ERROR(
+            regExpNew(STRDEF("[[[")), FormatError,
+            "regex parse error:\n    [[[\n      ^\nerror: unclosed character class");
+        TEST_ERROR(
+            regExpNew(STRDEF("(unclosed")), FormatError,
+            "regex parse error:\n    (unclosed\n    ^\nerror: unclosed group");
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("new regexp");

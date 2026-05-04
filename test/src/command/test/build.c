@@ -419,6 +419,65 @@ testBldUnit(TestBuild *const this)
             "add_global_arguments('-DVR_EXTERN_DEFINE=', language : 'c')\n"
             "add_global_arguments('-DERROR_MESSAGE_BUFFER_SIZE=131072', language : 'c')\n");
 
+        // Wire the Rust FFI shim into the unit-test build. The project's `subdir('src')` was just
+        // commented out, so `pgbr_ffi_dep` (defined inside src/meson.build) is no longer in scope.
+        // Recreate it here using the absolute repo path so `meson.build/files()` can locate the
+        // crate sources, and so any `#include "pgbr_ffi.h"` from a migrated C wrapper compiled by
+        // the unit-test target can find both the generated header and the static archive.
+        strCatFmt(
+            mesonBuild,
+            "\n"
+            MESON_COMMENT_BLOCK "\n"
+            "# Rust FFI shim — libpgbr_ffi.a + pgbr_ffi.h\n"
+            MESON_COMMENT_BLOCK "\n"
+            "cargo = find_program('cargo', required: true)\n"
+            "cbindgen = find_program('cbindgen', required: true)\n"
+            "\n"
+            "pgbr_ffi_inputs = files(\n"
+            "    '%s/Cargo.toml',\n"
+            "    '%s/cbindgen.toml',\n"
+            "    '%s/crates/pgbr-ffi/Cargo.toml',\n"
+            "    '%s/crates/pgbr-ffi/src/lib.rs',\n"
+            "    '%s/crates/pgbr-encode/Cargo.toml',\n"
+            "    '%s/crates/pgbr-encode/src/lib.rs',\n"
+            "    '%s/crates/pgbr-error/Cargo.toml',\n"
+            "    '%s/crates/pgbr-error/src/lib.rs',\n"
+            "    '%s/crates/pgbr-error/build.rs',\n"
+            "    '%s/crates/pgbr-postgres/Cargo.toml',\n"
+            "    '%s/crates/pgbr-postgres/src/lib.rs',\n"
+            "    '%s/crates/pgbr-crypto/Cargo.toml',\n"
+            "    '%s/crates/pgbr-crypto/src/lib.rs',\n"
+            "    '%s/crates/pgbr-regex/Cargo.toml',\n"
+            "    '%s/crates/pgbr-regex/src/lib.rs',\n"
+            "    '%s/src/build/error/error.yaml',\n"
+            ")\n"
+            "\n"
+            "pgbr_ffi_target = custom_target(\n"
+            "    'pgbr-ffi',\n"
+            "    input: pgbr_ffi_inputs,\n"
+            "    output: ['libpgbr_ffi.a', 'pgbr_ffi.h'],\n"
+            "    command: [\n"
+            "        meson.project_source_root() / '%s/meson/build-ffi.sh',\n"
+            "        meson.project_source_root() / '%s',\n"
+            "        meson.project_build_root(),\n"
+            "        '@OUTPUT0@',\n"
+            "        '@OUTPUT1@',\n"
+            "    ],\n"
+            "    build_by_default: true,\n"
+            "    install: false,\n"
+            "    console: true,\n"
+            ")\n"
+            "\n"
+            "pgbr_ffi_dep = declare_dependency(\n"
+            "    sources: [pgbr_ffi_target[1]],\n"
+            "    include_directories: include_directories('.'),\n"
+            "    link_args: [pgbr_ffi_target[0].full_path()],\n"
+            ")\n",
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel));
+
         // Configure features
         if (module->feature != NULL)
             strCatFmt(mesonBuild, "add_global_arguments('-DHRN_INTEST_%s', language : 'c')\n", strZ(module->feature));
@@ -582,6 +641,7 @@ testBldUnit(TestBuild *const this)
             "        lib_yaml,\n"
             "        lib_z,\n"
             "        lib_zstd,\n"
+            "        pgbr_ffi_dep,\n"
             "    ],\n"
             ")\n");
 
