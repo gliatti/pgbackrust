@@ -1,12 +1,18 @@
 /***********************************************************************************************************************************
 Gz Decompress
 
-Based on the documentation at https://github.com/madler/zlib/blob/master/zlib.h
+Thin C wrapper over the Rust streaming decompressor in `crates/pgbr-compress::gz::decompress`. The IoFilter object, debug
+logging helpers, and `inputSame` state machine stay on the C side; the libz `inflateInit2_` / `inflate` / `inflateEnd` calls
+are replaced by FFI calls into libpgbr_ffi.a (same `windowBits = 15` raw / `31` gzip parameters as the legacy code).
+
+The legacy code held a `z_stream` directly in the GzDecompress struct. This shim replaces it with an opaque `void *state`
+pointer to the Rust `Decompress`, plus an `(inputPtr, inputAvail)` cursor that tracks how many bytes of the current input
+buffer remain unconsumed. The struct still exposes `inputSame` and `done` as public fields because the test suite asserts
+log output against them (see `compressTest.c::"gz"` `gzDecompressToLog` block).
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #include <stdio.h>
-#include <zlib.h>
 
 #include "common/compress/common.h"
 #include "common/compress/gz/common.h"
@@ -16,15 +22,17 @@ Based on the documentation at https://github.com/madler/zlib/blob/master/zlib.h
 #include "common/log.h"
 #include "common/macro.h"
 #include "common/type/object.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct GzDecompress
 {
-    z_stream stream;                                                // Decompression stream state
+    void *state;                                                    // Opaque pgbr_compress::gz::decompress::Decompress*
+    size_t inputAvail;                                              // Bytes still unconsumed from the current input buffer
+    const unsigned char *inputPtr;                                  // Pointer to the unconsumed slice; valid while inputSame=true
 
-    int result;                                                     // Result of last operation
     bool inputSame;                                                 // Is the same input required on the next process call?
     bool done;                                                      // Is decompression done?
 } GzDecompress;
@@ -36,8 +44,8 @@ static void
 gzDecompressToLog(const GzDecompress *const this, StringStatic *const debugLog)
 {
     strStcFmt(
-        debugLog, "{inputSame: %s, done: %s, availIn: %u}", cvtBoolToConstZ(this->inputSame), cvtBoolToConstZ(this->done),
-        this->stream.avail_in);
+        debugLog, "{inputSame: %s, done: %s, availIn: %zu}", cvtBoolToConstZ(this->inputSame), cvtBoolToConstZ(this->done),
+        this->inputAvail);
 }
 
 #define FUNCTION_LOG_GZ_DECOMPRESS_TYPE                                                                                            \
@@ -59,7 +67,8 @@ gzDecompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    inflateEnd(&this->stream);
+    pgbr_gz_decompress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -88,25 +97,34 @@ gzDecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const unc
 
     if (!this->inputSame)
     {
-        this->stream.avail_in = (unsigned int)bufUsed(compressed);
-
-        // Not all versions of zlib (and none by default) will accept const input buffers
-        this->stream.next_in = bufPtrConst(compressed);
+        this->inputAvail = bufUsed(compressed);
+        this->inputPtr = bufPtrConst(compressed);
     }
 
-    this->stream.avail_out = (unsigned int)bufRemains(uncompressed);
-    this->stream.next_out = bufPtr(uncompressed) + bufUsed(uncompressed);
+    // Run one inflate tick. The Rust state owns the libz `z_stream`; this call translates
+    // to a single `inflate(stream, Z_NO_FLUSH)` invocation.
+    size_t written = 0;
+    size_t consumed = 0;
+    const int result = pgbr_gz_decompress_state_inflate(
+        this->state, this->inputPtr, this->inputAvail, bufRemainsPtr(uncompressed), bufRemains(uncompressed), &written,
+        &consumed);
 
-    this->result = gzError(inflate(&this->stream, Z_NO_FLUSH));
+    // Surface zlib errors via the legacy classifier so we get the same `[code] message`
+    // exception text the C path used to throw.
+    gzError(result);
 
     // Set buffer used space
-    bufUsedSet(uncompressed, bufSize(uncompressed) - (size_t)this->stream.avail_out);
+    bufUsedInc(uncompressed, written);
 
-    // Is decompression done?
-    this->done = this->result == Z_STREAM_END;
+    // Advance the unconsumed-input cursor
+    this->inputAvail -= consumed;
+    this->inputPtr += consumed;
+
+    // Is decompression done? `result == 1` is the FFI's mirror of `Z_STREAM_END`.
+    this->done = result == 1;
 
     // Is the same input expected on the next call?
-    this->inputSame = this->done ? false : this->stream.avail_in != 0;
+    this->inputSame = this->done ? false : this->inputAvail != 0;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -155,15 +173,21 @@ gzDecompressNew(const bool raw)
 
     OBJ_NEW_BEGIN(GzDecompress, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (GzDecompress)
+        *this = (GzDecompress){.state = NULL};
+
+        // Create the Rust streaming decompressor. The FFI returns the raw zlib code via
+        // `errCode` on failure; route it through `gzError` so we get the same exception
+        // type / message text the legacy `gzError(inflateInit2(...))` would have raised.
+        int32_t errCode = 0;
+        this->state = pgbr_gz_decompress_state_new(raw, &errCode);
+
+        if (this->state == NULL)
         {
-            .stream = {.zalloc = NULL},
-        };
+            pgbr_last_error_clear();
+            gzError(errCode);
+        }
 
-        // Create gz stream
-        gzError(this->result = inflateInit2(&this->stream, (raw ? 0 : WANT_GZ) | WINDOW_BITS));
-
-        // Set free callback to ensure gz context is freed
+        // Set free callback to ensure inflateEnd is called on context destruction
         memContextCallbackSet(objMemContext(this), gzDecompressFreeResource, this);
     }
     OBJ_NEW_END();

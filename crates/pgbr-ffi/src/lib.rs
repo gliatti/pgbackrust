@@ -943,6 +943,158 @@ pub unsafe extern "C" fn pgbr_gz_compress_state_deflate(
     })
 }
 
+// ---------- pgbr-compress gz decompress bridge (Phase 16) ----------
+
+/// Allocate a streaming gzip / zlib-wrapped inflate decompressor.
+///
+/// `raw=false` expects gzip-wrapped input; `raw=true` expects zlib-wrapped input
+/// (matching the legacy `gzDecompressNew` flag — see the comment on
+/// [`pgbr_compress::gz::decompress::Decompress::new`]).
+///
+/// On success, returns a non-null pointer the caller must release exactly once via
+/// [`pgbr_gz_decompress_state_free`]. On failure, returns null and writes the raw zlib
+/// return code to `*err_out` (so the C caller can hand it to `gzError`).
+///
+/// # Safety
+///
+/// `err_out` must be either null or point to a writable `i32`. The returned pointer (when
+/// non-null) is owned by the caller and must be released with
+/// [`pgbr_gz_decompress_state_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_gz_decompress_state_new(raw: bool, err_out: *mut i32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| match pgbr_compress::gz::decompress::Decompress::new(raw) {
+        Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+        Err(code) => {
+            if !err_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { err_out.write(code) };
+            }
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_gz_decompress_state_new: inflateInit2_ returned {code}"),
+            ));
+            core::ptr::null_mut()
+        }
+    })
+}
+
+/// Drop a gzDecompress state previously returned by [`pgbr_gz_decompress_state_new`].
+///
+/// No-op on null. Calling on a non-null pointer that did not come from `state_new` (or
+/// that has already been freed) is undefined behaviour.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_gz_decompress_state_new`] that
+/// has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_gz_decompress_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_compress::gz::decompress::Decompress>()) };
+    });
+}
+
+/// Run one `inflate(Z_NO_FLUSH)` tick on the streaming decompressor.
+///
+/// On success returns the raw zlib return code (`0` for `Z_OK`, `1` for `Z_STREAM_END`),
+/// writes the bytes-written count to `*written_out` and the bytes-consumed count to
+/// `*consumed_out`. On a libz-level error returns the raw zlib code (negative) so the C
+/// caller can hand it to `gzError`; both out-params are set to 0 in that case. On a
+/// Rust-side invariant violation (null state pointer, etc.) returns `-100` and writes
+/// 0 to the out-params; the matching message is set on the thread-local last-error slot.
+///
+/// `src` / `src_size` describe the input slice (may be empty when draining libz's
+/// internal pending buffer); `dst` / `dst_size` describe the output slice (must always
+/// have remaining capacity).
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_gz_decompress_state_new`]. `src` (if
+/// `src_size > 0`) and `dst` (if `dst_size > 0`) must point to valid buffers of the
+/// documented sizes. `written_out` and `consumed_out` must point to writable `usize`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_gz_decompress_state_inflate(
+    state: *mut core::ffi::c_void,
+    src: *const u8,
+    src_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+    written_out: *mut usize,
+    consumed_out: *mut usize,
+) -> i32 {
+    with_panic_guard(|| {
+        let zero_outs = || {
+            if !written_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { written_out.write(0) };
+            }
+            if !consumed_out.is_null() {
+                // SAFETY: same.
+                unsafe { consumed_out.write(0) };
+            }
+        };
+
+        if state.is_null() || written_out.is_null() || consumed_out.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_gz_decompress_state_inflate: null pointer",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_gz_decompress_state_inflate: dst is null but dst_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if src_size > 0 && src.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_gz_decompress_state_inflate: src is null but src_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::gz::decompress::Decompress>() };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: same.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+
+        match state.inflate_tick(src_slice, dst_slice) {
+            Ok(tick) => {
+                // SAFETY: null-checked above.
+                unsafe {
+                    written_out.write(tick.written);
+                    consumed_out.write(tick.consumed);
+                }
+                i32::from(tick.stream_end)
+            }
+            Err(code) => {
+                zero_outs();
+                code
+            }
+        }
+    })
+}
+
 // ---------- pgbr-crypto cipher bridge (Phase 12) ----------
 
 /// Cipher block size in bytes for `cipher_code`, or `0` for unknown codes.

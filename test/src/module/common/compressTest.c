@@ -1,6 +1,12 @@
 /***********************************************************************************************************************************
 Test Compression
 ***********************************************************************************************************************************/
+#include <zlib.h>                                                       // For Z_OK, Z_STREAM_END, gzError-test constants and the
+                                                                        // legacy_gz* differential helpers — gz/compress.c and
+                                                                        // gz/decompress.c no longer #include <zlib.h> after the
+                                                                        // Phase 15 / 16 migration, so the test file pulls it
+                                                                        // directly.
+
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
 #include "common/io/filter/group.h"
@@ -46,6 +52,37 @@ legacy_gzCompress(const int level, const bool raw, const Buffer *const input)
     bufUsedSet(output, bufSize(output) - stream.avail_out);
 
     deflateEnd(&stream);
+
+    return output;
+}
+
+// `legacy_gzDecompress` mirrors the pre-Phase-16 body of `gzDecompressNew` / `gzDecompressProcess` — direct libz calls with the
+// same `inflateInit2` parameters (`windowBits = 15` for raw / `31` for gzip). Used by the gz decompress differential to assert
+// that the new FFI path produces byte-identical output.
+static Buffer *
+legacy_gzDecompress(const bool raw, const Buffer *const input)
+{
+    // Output sizing: gzip's typical compression ratio is at most ~1024x for highly redundant input, but realistic inputs the
+    // differential test feeds are random-ish bytes that don't compress well, so a small constant multiplier is plenty. The
+    // ASSERT below catches the rare overflow case immediately.
+    Buffer *const output = bufNew(bufUsed(input) * 64 + 4096);
+
+    z_stream stream = {.zalloc = NULL, .zfree = NULL, .opaque = NULL};
+
+    int ret = inflateInit2(&stream, (raw ? 0 : WANT_GZ) | WINDOW_BITS);
+    ASSERT(ret == Z_OK);
+
+    stream.avail_in = (uInt)bufUsed(input);
+    stream.next_in = (Bytef *)(uintptr_t)bufPtrConst(input);
+    stream.avail_out = (uInt)bufSize(output);
+    stream.next_out = bufPtr(output);
+
+    ret = inflate(&stream, Z_NO_FLUSH);
+    ASSERT(ret == Z_STREAM_END);
+
+    bufUsedSet(output, bufSize(output) - stream.avail_out);
+
+    inflateEnd(&stream);
 
     return output;
 }
@@ -395,6 +432,58 @@ testRun(void)
         }
 
         TEST_RESULT_UINT(comparisons, 10000, "10k differential gzCompress inputs all byte-identical");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("gzDecompress differential vs direct zlib (10000+ inputs)");
+
+        // Generate 10 000 random `(raw, plaintext)` pairs, compress each through `compressFilterP(compressTypeGz, ...)` (so we
+        // know the compressed bytes are valid) and decompress through both the new FFI path (`decompressFilterP`) and a
+        // `legacy_gzDecompress` helper (direct libz with the same parameters). The decompressed output must round-trip the
+        // original plaintext byte-for-byte AND the two paths must agree.
+        lcgState = UINT64_C(0xDECAFC0FFEEFACED);
+        unsigned int decompComparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            lcgState = lcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t len = (size_t)((lcgState >> 32) & 0x3FF) + 1;      // 1..1024 bytes
+            const bool raw = ((lcgState >> 16) & 1) == 0;
+
+            Buffer *const plaintext = bufNew(len);
+            for (size_t i = 0; i < len; i++)
+            {
+                lcgState = lcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(plaintext)[i] = (uint8_t)(lcgState >> 56);
+            }
+            bufUsedSet(plaintext, len);
+
+            // Use the (already-validated) Phase 15 compressor to produce the input stream — this exercises both phases with
+            // the same dataset, and whatever compressed bytes come out are necessarily decodable by both decompressors.
+            Buffer *const compressedStream = testCompress(
+                compressFilterP(compressTypeGz, 6, .raw = raw), plaintext, len, len * 2 + 256);
+
+            Buffer *const newOut = testDecompress(decompressFilterP(compressTypeGz, .raw = raw), compressedStream, len, len + 1);
+            Buffer *const legacyOut = legacy_gzDecompress(raw, compressedStream);
+
+            if (!bufEq(newOut, plaintext) || !bufEq(legacyOut, plaintext) || !bufEq(newOut, legacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "gzDecompress(raw=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu plaintextSize=%zu", (int)raw, len, iter,
+                    bufUsed(newOut), bufUsed(legacyOut), bufUsed(plaintext));
+            }
+
+            bufFree(plaintext);
+            bufFree(compressedStream);
+            bufFree(newOut);
+            bufFree(legacyOut);
+
+            decompComparisons++;
+        }
+
+        TEST_RESULT_UINT(decompComparisons, 10000, "10k differential gzDecompress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************
