@@ -2,11 +2,11 @@
 # pgBackRest Project
 ####################################################################################################################################
 project(
-    'pgbackrest',
+    'pgbackrust',
     ['c'],
     version: '2.59.0dev',
     license: 'MIT',
-    meson_version: '>=0.47',
+    meson_version: '>=0.61',
     default_options: [
         # Core options
         'buildtype=release',

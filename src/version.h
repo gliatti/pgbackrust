@@ -5,14 +5,17 @@ Version Numbers and Names
 #define VERSION_H
 
 /***********************************************************************************************************************************
-Official name of the project
+Official name of the project. PROJECT_NAME_COMPAT is the original upstream name kept for backward compatibility (config search paths,
+log identifiers, etc.) until the migration is complete (Phase 212).
 ***********************************************************************************************************************************/
-#define PROJECT_NAME                                                "pgBackRest"
+#define PROJECT_NAME                                                "pgBackRust"
+#define PROJECT_NAME_COMPAT                                         "pgBackRest"
 
 /***********************************************************************************************************************************
-Standard binary name
+Standard binary name. PROJECT_BIN_COMPAT is the legacy binary name installed as a symlink alias.
 ***********************************************************************************************************************************/
-#define PROJECT_BIN                                                 "pgbackrest"
+#define PROJECT_BIN                                                 "pgbackrust"
+#define PROJECT_BIN_COMPAT                                          "pgbackrest"
 
 /***********************************************************************************************************************************
 Config file name. The path will vary based on configuration.

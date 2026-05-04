@@ -43,6 +43,7 @@ src_common = files(
     'common/io/write.c',
     'common/log.c',
     'common/memContext.c',
+    'common/project.c',
     'common/stackTrace.c',
     'common/time.c',
     'common/type/blob.c',
@@ -271,8 +272,8 @@ src_pgbackrest = [
     'main.c',
 ]
 
-executable(
-    'pgbackrest',
+main_exe = executable(
+    'pgbackrust',
     src_common,
     src_pgbackrest,
     help_auto_c_inc,
@@ -289,4 +290,12 @@ executable(
         lib_zstd,
     ],
     install: true,
+)
+
+# Backward-compatible alias: existing deployments still call `pgbackrest`. The symlink lives next to the binary in bindir until
+# the C code is fully retired (Phase 212).
+install_symlink(
+    'pgbackrest',
+    pointing_to: 'pgbackrust',
+    install_dir: get_option('bindir'),
 )

@@ -15,6 +15,7 @@ Help Command
 #include "common/io/fdWrite.h"
 #include "common/io/io.h"
 #include "common/memContext.h"
+#include "common/project.h"
 #include "common/type/pack.h"
 #include "config/config.intern.h"
 #include "config/parse.h"
@@ -367,7 +368,7 @@ helpRender(const Buffer *const helpData)
         FUNCTION_TEST_PARAM(BUFFER, helpData);
     FUNCTION_TEST_END();
 
-    String *const result = strCatZ(strNew(), PROJECT_NAME " " PROJECT_VERSION);
+    String *const result = strCatFmt(strNew(), "%s " PROJECT_VERSION, projectName());
 
     // Display version only
     if (!cfgCommandHelp() &&
@@ -418,14 +419,15 @@ helpRender(const Buffer *const helpData)
         // Display general help
         if (!cfgCommandHelp())
         {
-            strCatZ(
+            strCatFmt(
                 result,
                 " - General help\n"
                 "\n"
                 "Usage:\n"
-                "    " PROJECT_BIN " [options] [command]\n"
+                "    %s [options] [command]\n"
                 "\n"
-                "Commands:\n");
+                "Commands:\n",
+                projectBin());
 
             // Find size of longest command name
             size_t commandSizeMax = 0;
@@ -724,7 +726,7 @@ helpRender(const Buffer *const helpData)
 
         // If there is more help available output a message to let the user know
         if (more != NULL)
-            strCatFmt(result, "\nUse '" PROJECT_BIN " help %s' for more information.\n", strZ(more));
+            strCatFmt(result, "\nUse '%s help %s' for more information.\n", projectBin(), strZ(more));
     }
     MEM_CONTEXT_TEMP_END();
 

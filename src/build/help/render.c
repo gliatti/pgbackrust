@@ -58,7 +58,7 @@ bldHlpRenderXmlNode(const xmlNodePtr xml)
                 strCatZ(result, "\n\n");
             }
             else if (strEq(name, STRDEF("backrest")))
-                strCatZ(result, "pgBackRest");
+                strCatZ(result, "pgBackRust");
             else if (strEq(name, STRDEF("list")))
             {
                 strCat(result, bldHlpRenderXmlNode(currentNode));
