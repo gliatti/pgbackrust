@@ -472,6 +472,7 @@ testBldUnit(TestBuild *const this)
             "    sources: [pgbr_ffi_target[1]],\n"
             "    include_directories: include_directories('.'),\n"
             "    link_args: [pgbr_ffi_target[0].full_path()],\n"
+            "    dependencies: [lib_openssl],\n"
             ")\n",
             strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
             strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),

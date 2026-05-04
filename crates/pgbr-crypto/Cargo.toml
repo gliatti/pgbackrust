@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+openssl = "0.10"
+openssl-sys = "0.9"
 
 [lints]
 workspace = true

@@ -54,6 +54,12 @@ impl FfiPanicReturn for u32 {
     }
 }
 
+impl FfiPanicReturn for u64 {
+    fn ffi_panic_return() -> Self {
+        0
+    }
+}
+
 impl<T> FfiPanicReturn for *const T {
     fn ffi_panic_return() -> Self {
         core::ptr::null()
@@ -610,6 +616,71 @@ pub unsafe extern "C" fn pgbr_decode_to_bin_size(encoding_code: i32, src: *const
             }
         }
     })
+}
+
+// ---------- pgbr-crypto common bridge (Phase 10) ----------
+
+/// Initialize OpenSSL once for the process (idempotent).
+///
+/// Mirrors the legacy `cryptoInit` body — combines `openssl::init` with
+/// `OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL)` so per-platform OpenSSL config files keep
+/// applying.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_init() {
+    with_panic_guard(pgbr_crypto::common::init);
+}
+
+/// Drain one error from the calling thread's OpenSSL queue and return its code, or `0`.
+///
+/// Direct equivalent of `ERR_get_error()` — used by `cryptoError` to feed `cryptoErrorCode`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_last_error_get() -> u64 {
+    with_panic_guard(pgbr_crypto::common::last_error_get)
+}
+
+/// Write the OpenSSL reason string for `code` (or "no details available") into `buf`.
+///
+/// Always NUL-terminates `buf` provided `buf_size >= 1`. Truncates silently when the reason is
+/// longer than `buf_size - 1`. No-op when `buf` is null or `buf_size` is `0`.
+///
+/// # Safety
+///
+/// `buf` must point to a writable buffer of at least `buf_size` bytes (or be null when
+/// `buf_size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_error_reason_into(code: u64, buf: *mut c_char, buf_size: usize) {
+    with_panic_guard(|| {
+        if buf.is_null() || buf_size == 0 {
+            return;
+        }
+        // SAFETY: caller upholds the buffer-size contract above.
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), buf_size) };
+        pgbr_crypto::common::error_reason_into(code, dst);
+    });
+}
+
+/// Fill `buf` with `size` cryptographically strong random bytes via `RAND_bytes`.
+///
+/// No-op when `size == 0`. Mirrors the legacy `cryptoRandomBytes` (which itself ignored the
+/// `RAND_bytes` return value).
+///
+/// # Safety
+///
+/// `buf` must point to a writable buffer of at least `size` bytes (or be null when `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_random_bytes(buf: *mut u8, size: usize) {
+    with_panic_guard(|| {
+        if size == 0 {
+            return;
+        }
+        if buf.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_random_bytes: buf is null"));
+            return;
+        }
+        // SAFETY: caller upholds the buffer-size + non-null contract above.
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf, size) };
+        let _ = pgbr_crypto::common::random_bytes(dst);
+    });
 }
 
 // ---------- pgbr-regex bridge (Phase 9) ----------

@@ -1,10 +1,14 @@
 /***********************************************************************************************************************************
 Test Block Cipher
 ***********************************************************************************************************************************/
+#include <openssl/err.h>
+#include <string.h>
+
 #include "common/io/bufferRead.h"
 #include "common/io/filter/filter.h"
 #include "common/io/io.h"
 #include "common/type/json.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Data for testing
@@ -13,6 +17,24 @@ Data for testing
 #define TEST_PASS                                                   "areallybadpassphrase"
 #define TEST_PLAINTEXT                                              "plaintext"
 #define TEST_BUFFER_SIZE                                            256
+
+/***********************************************************************************************************************************
+Differential helper — fills `dst` with the OpenSSL reason string for `code` (or "no details available") via a direct
+`ERR_reason_error_string` call, exactly as the legacy `cryptoErrorCode` did before the Rust migration. Used to compare against
+the Rust-backed `pgbr_crypto_error_reason_into` over thousands of error codes.
+***********************************************************************************************************************************/
+static void
+legacy_cryptoErrorReasonInto(unsigned long code, char *const dst, const size_t dstSize)
+{
+    if (dstSize == 0)
+        return;
+
+    const char *const reason = ERR_reason_error_string(code);
+    const char *const source = reason == NULL ? "no details available" : reason;
+    const size_t copyLen = strlen(source) < dstSize - 1 ? strlen(source) : dstSize - 1;
+    memcpy(dst, source, copyLen);
+    dst[copyLen] = '\0';
+}
 
 /***********************************************************************************************************************************
 Test Run
@@ -67,6 +89,37 @@ testRun(void)
                 nonZeroTotal++;
 
         TEST_RESULT_INT_NE(nonZeroTotal, 0, "check that there are non-zero values in the buffer");
+
+        // Differential C/Rust parity on cryptoErrorCode reason lookup
+        // -------------------------------------------------------------------------------------------------------------------------
+        // 12 000 deterministic codes spanning the OpenSSL error namespace (sub-library + reason packs). Both paths feed
+        // `ERR_reason_error_string` underneath, so the Rust shim must produce byte-identical output to the legacy direct call.
+        // The seed is fixed so a divergence reproduces on every run.
+        uint64_t state = UINT64_C(0xC0FFEE00BADBADCA);
+        char rustBuf[256];
+        char legacyBuf[256];
+        unsigned int comparisons = 0;
+
+        for (unsigned int iter = 0; iter < 12000; iter++)
+        {
+            state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+            const unsigned long code = (unsigned long)(state >> 32);
+
+            pgbr_crypto_error_reason_into(code, rustBuf, sizeof(rustBuf));
+            legacy_cryptoErrorReasonInto(code, legacyBuf, sizeof(legacyBuf));
+
+            if (strcmp(rustBuf, legacyBuf) != 0)
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "code=%lu rust=%s legacy=%s", code, rustBuf, legacyBuf);
+            }
+
+            comparisons++;
+        }
+
+        TEST_RESULT_UINT(comparisons, 12000, "all C/Rust differential reason lookups agreed");
     }
 
     // *****************************************************************************************************************************

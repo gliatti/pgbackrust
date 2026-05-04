@@ -1,16 +1,95 @@
 //! Cryptographic helpers used throughout the pgBackRust workspace.
 //!
-//! Currently exposes a single algorithm: XXH3-128 (`xxHash`) used to identify backup blocks
-//! during incremental backups. The 128-bit canonical representation matches the upstream xxHash
-//! `XXH128_canonicalFromHash` byte order: high 64 bits first, low 64 bits next, both
-//! big-endian.
+//! Two submodules:
 //!
-//! The XXH3 maths come from the maintained `xxhash-rust` crate (a Rust port of the reference
-//! implementation). This module wraps it to return the canonical byte representation expected
-//! by the C side and hides the streaming state behind an opaque type so the FFI layer can pass
-//! it as a raw pointer.
+//! - [`xxhash3`] — XXH3-128 (`xxHash`) hashing used to identify backup blocks during incremental
+//!   backups. The 128-bit canonical representation matches the upstream xxHash
+//!   `XXH128_canonicalFromHash` byte order: high 64 bits first, low 64 bits next, both
+//!   big-endian.
+//! - [`common`] — OpenSSL initialization, error-stack inspection, and RNG helpers ported from
+//!   `src/common/crypto/common.c`. Routes through the `openssl` and `openssl-sys` crates so that
+//!   error codes and RNG output are byte-identical to the legacy direct libcrypto calls.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
+pub mod common {
+    //! OpenSSL initialization, error-stack draining, RNG helpers — ported from
+    //! `src/common/crypto/common.c`.
+
+    use core::ffi::CStr;
+
+    /// Initialize the OpenSSL crypto and SSL stacks once for the process. Idempotent.
+    ///
+    /// Mirrors `cryptoInit` in the legacy C code: loads the default config in addition to the
+    /// crypto algorithms / strings registered by `openssl::init`. Calling this multiple times is
+    /// a no-op after the first invocation, matching the `cryptoInitDone` guard in the C wrapper.
+    /// Bit mask for `OPENSSL_init_ssl` — load the default OpenSSL config file. The constant is
+    /// defined in `openssl/crypto.h` but `openssl-sys` 0.9 does not re-export it under this name,
+    /// so hard-code the documented value.
+    const OPENSSL_INIT_LOAD_CONFIG: u64 = 0x0000_0040;
+
+    pub fn init() {
+        // The high-level safe init covers `OPENSSL_init_crypto` + `OPENSSL_init_ssl`.
+        openssl::init();
+        // Match the legacy `OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL)` so per-platform
+        // OpenSSL config overrides keep applying. Idempotent — OpenSSL serializes init internally.
+        // SAFETY: `OPENSSL_init_ssl` is documented as thread-safe and idempotent, accepts a null
+        // settings pointer, and returns 1 on success / 0 on failure (which we ignore to mirror
+        // the C wrapper's fire-and-forget behaviour).
+        unsafe {
+            openssl_sys::OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, core::ptr::null());
+        }
+    }
+
+    /// Drain one error from the calling thread's OpenSSL error queue and return its numeric
+    /// code. Returns `0` if the queue is empty.
+    ///
+    /// Direct equivalent of `ERR_get_error()` — the same call the legacy `cryptoError` made.
+    #[must_use]
+    pub fn last_error_get() -> u64 {
+        // SAFETY: `ERR_get_error` is thread-safe, takes no arguments, and returns the numeric
+        // error code (0 when the queue is empty). It is the same call the C wrapper made.
+        unsafe { openssl_sys::ERR_get_error() }
+    }
+
+    /// Fill `dst` with the OpenSSL reason string for `code`. Writes "no details available" when
+    /// `ERR_reason_error_string` returns null (which is what the C wrapper substitutes).
+    ///
+    /// Returns the number of bytes written excluding the trailing NUL. The output is always
+    /// NUL-terminated provided `dst.len() >= 1`. If `dst` is empty, returns 0.
+    pub fn error_reason_into(code: u64, dst: &mut [u8]) -> usize {
+        if dst.is_empty() {
+            return 0;
+        }
+        // SAFETY: `ERR_reason_error_string` is thread-safe and returns either null or a pointer
+        // to a static, NUL-terminated string with lifetime equal to the process.
+        let reason_ptr = unsafe { openssl_sys::ERR_reason_error_string(code) };
+        let reason: &[u8] = if reason_ptr.is_null() {
+            b"no details available"
+        } else {
+            // SAFETY: documented as a NUL-terminated static string when non-null.
+            unsafe { CStr::from_ptr(reason_ptr) }.to_bytes()
+        };
+        let copy_len = (dst.len() - 1).min(reason.len());
+        dst[..copy_len].copy_from_slice(&reason[..copy_len]);
+        dst[copy_len] = 0;
+        copy_len
+    }
+
+    /// Fill `dst` with cryptographically strong random bytes.
+    ///
+    /// Mirrors `cryptoRandomBytes` (`RAND_bytes`). Returns `Ok(())` on success and propagates
+    /// the OpenSSL error stack on failure so the FFI shim can re-emit it as `CryptoError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the captured [`openssl::error::ErrorStack`] when `RAND_bytes` fails — typically
+    /// only when the kernel RNG is unavailable on a hardened platform.
+    pub fn random_bytes(dst: &mut [u8]) -> Result<(), openssl::error::ErrorStack> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        openssl::rand::rand_bytes(dst)
+    }
+}
 
 pub mod xxhash3 {
     //! 128-bit XXH3 hashing (single-shot and incremental).
@@ -57,6 +136,73 @@ pub mod xxhash3 {
         fn default() -> Self {
             Self::new()
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod common_tests {
+    use super::common::*;
+
+    #[test]
+    fn init_is_idempotent() {
+        init();
+        init();
+        init();
+    }
+
+    #[test]
+    fn random_bytes_fills_buffer_and_zero_size_is_noop() {
+        init();
+        let mut buf = [0u8; 64];
+        random_bytes(&mut buf).expect("rand_bytes must succeed on a healthy system");
+        // Statistically, at least one of 64 random bytes should be non-zero.
+        assert!(buf.iter().any(|&b| b != 0), "random_bytes produced an all-zero buffer");
+
+        // Zero-sized requests must short-circuit and not invoke OpenSSL.
+        let mut empty: [u8; 0] = [];
+        random_bytes(&mut empty).expect("zero-length random must succeed without calling OpenSSL");
+    }
+
+    #[test]
+    fn random_bytes_two_calls_differ() {
+        init();
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        random_bytes(&mut a).unwrap();
+        random_bytes(&mut b).unwrap();
+        assert_ne!(a, b, "two consecutive random buffers should not collide");
+    }
+
+    #[test]
+    fn last_error_get_returns_zero_on_clean_queue() {
+        init();
+        // Drain anything residual from earlier tests sharing the thread.
+        while last_error_get() != 0 {}
+        assert_eq!(last_error_get(), 0);
+    }
+
+    #[test]
+    fn error_reason_into_writes_no_details_for_zero_code() {
+        let mut buf = [0u8; 64];
+        let len = error_reason_into(0, &mut buf);
+        assert_eq!(&buf[..len], b"no details available");
+        assert_eq!(buf[len], 0, "must be NUL-terminated");
+    }
+
+    #[test]
+    fn error_reason_into_truncates_to_buffer() {
+        let mut buf = [0u8; 8];
+        let len = error_reason_into(0, &mut buf);
+        assert_eq!(len, 7, "must leave room for NUL");
+        assert_eq!(&buf[..len], b"no deta");
+        assert_eq!(buf[len], 0);
+    }
+
+    #[test]
+    fn error_reason_into_empty_buffer_is_noop() {
+        let mut empty: [u8; 0] = [];
+        assert_eq!(error_reason_into(123, &mut empty), 0);
     }
 }
 
