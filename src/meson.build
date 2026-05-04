@@ -115,6 +115,8 @@ pgbr_ffi_inputs = files(
     '../crates/pgbr-error/build.rs',
     '../crates/pgbr-postgres/Cargo.toml',
     '../crates/pgbr-postgres/src/lib.rs',
+    '../crates/pgbr-crypto/Cargo.toml',
+    '../crates/pgbr-crypto/src/lib.rs',
     '../src/build/error/error.yaml',
 )
 

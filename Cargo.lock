@@ -25,6 +25,9 @@ version = "0.1.0"
 [[package]]
 name = "pgbr-crypto"
 version = "0.1.0"
+dependencies = [
+ "xxhash-rust",
+]
 
 [[package]]
 name = "pgbr-db"
@@ -42,6 +45,7 @@ version = "0.1.0"
 name = "pgbr-ffi"
 version = "0.1.0"
 dependencies = [
+ "pgbr-crypto",
  "pgbr-encode",
  "pgbr-error",
  "pgbr-postgres",
@@ -74,3 +78,9 @@ version = "0.1.0"
 [[package]]
 name = "pgbr-storage"
 version = "0.1.0"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"

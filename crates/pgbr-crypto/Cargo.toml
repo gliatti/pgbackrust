@@ -8,5 +8,8 @@ repository.workspace = true
 
 [lib]
 
+[dependencies]
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
 [lints]
 workspace = true

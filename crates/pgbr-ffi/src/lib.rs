@@ -250,6 +250,141 @@ pub enum LogLevel {
     Trace = 8,
 }
 
+// ---------- pgbr-crypto xxhash bridge (Phase 8) ----------
+
+use pgbr_crypto::xxhash3 as crypto_xxhash3;
+
+/// Allocate a new XXH3-128 streaming state on the Rust heap and return an opaque pointer to it.
+///
+/// The returned pointer must eventually be passed to [`pgbr_xxhash3_state_free`]; otherwise the
+/// state leaks. Returns null on allocation failure (only if the OOM hook panics, in which case
+/// the panic is caught and translated to `ErrorType::Unknown`).
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_xxhash3_state_new() -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        let boxed: Box<crypto_xxhash3::State> = Box::new(crypto_xxhash3::State::new());
+        Box::into_raw(boxed).cast::<core::ffi::c_void>()
+    })
+}
+
+/// Drop the streaming state allocated by [`pgbr_xxhash3_state_new`]. No-op on null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_xxhash3_state_new`] that has not yet
+/// been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_xxhash3_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the ownership invariant — the pointer came from
+        // `pgbr_xxhash3_state_new` and has not been freed. Dropping the Box runs the
+        // xxhash-rust state destructor.
+        let _ = unsafe { Box::from_raw(state.cast::<crypto_xxhash3::State>()) };
+    });
+}
+
+/// Feed `size` bytes from `data` into the streaming state.
+///
+/// Returns 0 on success, -1 if `state` is null. On -1 the thread-local last error is set.
+///
+/// # Safety
+///
+/// - `state` must be a non-null pointer from [`pgbr_xxhash3_state_new`].
+/// - `data` must point to at least `size` readable bytes (or be null when `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_xxhash3_state_update(state: *mut core::ffi::c_void, data: *const u8, size: usize) -> i32 {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_xxhash3_state_update: state is null"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is valid and unique.
+        let state = unsafe { &mut *state.cast::<crypto_xxhash3::State>() };
+        let slice: &[u8] = if size == 0 {
+            &[]
+        } else if data.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_xxhash3_state_update: data is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `data` is readable for `size` bytes.
+            unsafe { core::slice::from_raw_parts(data, size) }
+        };
+        state.update(slice);
+        0
+    })
+}
+
+/// Finalize the hash and write up to `dst_size` canonical bytes (high 64 first, low 64 next,
+/// big-endian) to `dst`. `dst_size` must be in `1..=16`.
+///
+/// Returns 0 on success, -1 on invalid arguments. On -1 the thread-local last error is set.
+///
+/// # Safety
+///
+/// - `state` must be a non-null pointer from [`pgbr_xxhash3_state_new`].
+/// - `dst` must point to at least `dst_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_xxhash3_state_digest(state: *const core::ffi::c_void, dst: *mut u8, dst_size: usize) -> i32 {
+    with_panic_guard(|| {
+        if state.is_null() || dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_xxhash3_state_digest: null pointer"));
+            return -1;
+        }
+        if !(1..=crypto_xxhash3::HASH_SIZE_MAX).contains(&dst_size) {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_xxhash3_state_digest: dst_size {dst_size} out of range 1..=16"),
+            ));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is valid.
+        let state = unsafe { &*state.cast::<crypto_xxhash3::State>() };
+        // SAFETY: caller guarantees `dst` is writable for `dst_size` bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        state.digest_into(dst_slice);
+        0
+    })
+}
+
+/// Single-shot XXH3-128 hash. Writes up to `dst_size` canonical bytes (`1..=16`) into `dst`.
+///
+/// # Safety
+///
+/// - `data` must point to at least `data_size` readable bytes (or be null when `data_size==0`).
+/// - `dst` must point to at least `dst_size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_xxhash3_one(data: *const u8, data_size: usize, dst: *mut u8, dst_size: usize) -> i32 {
+    with_panic_guard(|| {
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_xxhash3_one: dst is null"));
+            return -1;
+        }
+        if !(1..=crypto_xxhash3::HASH_SIZE_MAX).contains(&dst_size) {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_xxhash3_one: dst_size {dst_size} out of range 1..=16"),
+            ));
+            return -1;
+        }
+        let data_slice: &[u8] = if data_size == 0 {
+            &[]
+        } else if data.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_xxhash3_one: data is null"));
+            return -1;
+        } else {
+            // SAFETY: caller guarantees `data` is readable for `data_size` bytes.
+            unsafe { core::slice::from_raw_parts(data, data_size) }
+        };
+        // SAFETY: caller guarantees `dst` is writable for `dst_size` bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        crypto_xxhash3::one_128(data_slice, dst_slice);
+        0
+    })
+}
+
 // ---------- pgbr-postgres bridge (Phase 7) ----------
 
 /// CRC-32C (Castagnoli) checksum of `size` bytes at `data`. Mirrors the legacy `crc32cOne`.

@@ -14,6 +14,7 @@ crate-type = ["staticlib", "rlib"]
 pgbr-error = { path = "../pgbr-error" }
 pgbr-encode = { path = "../pgbr-encode" }
 pgbr-postgres = { path = "../pgbr-postgres" }
+pgbr-crypto = { path = "../pgbr-crypto" }
 
 [lints]
 workspace = true

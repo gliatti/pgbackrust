@@ -1,5 +1,9 @@
 /***********************************************************************************************************************************
 xxHash Interface
+
+The xxHash maths now live in the Rust `pgbr-crypto` crate, exposed through the FFI shim in libpgbr_ffi.a. This file keeps the
+public C API in src/common/crypto/xxhash.h byte-identical and continues to integrate with pgbackrest's IoFilter framework; the
+streaming state behind the IoFilter is an opaque pointer owned by Rust.
 ***********************************************************************************************************************************/
 #include <build.h>
 
@@ -8,13 +12,7 @@ xxHash Interface
 #include "common/io/filter/filter.h"
 #include "common/log.h"
 #include "common/type/object.h"
-
-/***********************************************************************************************************************************
-Include local xxHash code
-***********************************************************************************************************************************/
-#define XXH_INLINE_ALL
-
-#include "common/crypto/xxhash.vendor.c.inc"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Object type
@@ -22,7 +20,7 @@ Object type
 typedef struct XxHash
 {
     size_t size;                                                    // Size of hash to return
-    XXH3_state_t *state;                                            // xxHash state
+    void *state;                                                    // Opaque pointer to a Rust-owned XXH3 state
 } XxHash;
 
 /***********************************************************************************************************************************
@@ -47,7 +45,7 @@ xxHashFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    XXH3_freeState(this->state);
+    pgbr_xxhash3_state_free(this->state);
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -68,7 +66,8 @@ xxHashProcess(THIS_VOID, const Buffer *const message)
     ASSERT(this != NULL);
     ASSERT(message != NULL);
 
-    XXH3_128bits_update(this->state, bufPtrConst(message), bufUsed(message));
+    if (pgbr_xxhash3_state_update(this->state, bufPtrConst(message), bufUsed(message)) != 0)
+        THROW_FMT(AssertError, "%s", pgbr_last_error_msg());
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -93,10 +92,11 @@ xxHashResult(THIS_VOID)
     {
         PackWrite *const packWrite = pckWriteNewP();
 
-        XXH128_canonical_t canonical;
-        XXH128_canonicalFromHash(&canonical, XXH3_128bits_digest(this->state));
+        uint8_t digest[XX_HASH_SIZE_MAX];
+        if (pgbr_xxhash3_state_digest(this->state, digest, this->size) != 0)
+            THROW_FMT(AssertError, "%s", pgbr_last_error_msg());
 
-        pckWriteBinP(packWrite, BUF(canonical.digest, this->size));
+        pckWriteBinP(packWrite, BUF(digest, this->size));
         pckWriteEndP(packWrite);
 
         result = pckMove(pckWriteResult(packWrite), memContextPrior());
@@ -120,8 +120,10 @@ xxHashNew(const size_t size)
     {
         *this = (XxHash){.size = size};
 
-        this->state = XXH3_createState();
-        XXH3_128bits_reset(this->state);
+        this->state = pgbr_xxhash3_state_new();
+
+        if (this->state == NULL)
+            THROW_FMT(AssertError, "%s", pgbr_last_error_msg());
 
         // Set free callback to ensure hash context is freed
         memContextCallbackSet(objMemContext(this), xxHashFreeResource, this);
@@ -145,10 +147,9 @@ xxHashOne(const size_t size, const Buffer *const message)
 
     Buffer *const result = bufNew(size);
 
-    XXH128_canonical_t canonical;
-    XXH128_canonicalFromHash(&canonical, XXH3_128bits(bufPtrConst(message), bufUsed(message)));
+    if (pgbr_xxhash3_one(bufPtrConst(message), bufUsed(message), bufPtr(result), size) != 0)
+        THROW_FMT(AssertError, "%s", pgbr_last_error_msg());
 
-    memcpy(bufPtr(result), canonical.digest, size);
     bufUsedSet(result, size);
 
     FUNCTION_LOG_RETURN(BUFFER, result);

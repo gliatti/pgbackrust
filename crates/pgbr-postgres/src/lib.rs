@@ -19,7 +19,11 @@ const CRC32C_TABLE: [u32; 256] = {
         let mut c = byte;
         let mut i = 0;
         while i < 8 {
-            c = if c & 1 == 1 { (c >> 1) ^ CRC32C_POLY_REFLECTED } else { c >> 1 };
+            c = if c & 1 == 1 {
+                (c >> 1) ^ CRC32C_POLY_REFLECTED
+            } else {
+                c >> 1
+            };
             i += 1;
         }
         table[byte as usize] = c;
@@ -105,11 +109,15 @@ mod tests {
         let mut state: u64 = 0xc0ff_eeba_bea1_b0b0;
         let mut buf = Vec::with_capacity(257);
         for iter in 0..10_000 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let len = if iter < 257 { iter } else { ((state >> 32) as usize) % 257 };
             buf.clear();
             for _ in 0..len {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 buf.push((state >> 56) as u8);
             }
             let table_based = crc32c_one(&buf);
