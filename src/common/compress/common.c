@@ -1,10 +1,18 @@
 /***********************************************************************************************************************************
 Compression Common
+
+Thin C wrappers over the Rust implementation in `crates/pgbr-compress::params`. The Pack-encoded byte representation of the
+parameter lists is produced in Rust (port of `pckWriteI32P` + `pckWriteBoolP` + `pckWriteEndP` for the legacy `compressParamList`,
+and `pckWriteBoolP` + `pckWriteEndP` for `decompressParamList`); the C side just allocates a `Buffer` from the Rust bytes and
+casts it to `Pack *` — `Pack` is structurally a `Buffer`, so the cast is the same zero-copy promotion `pckFromBuf` performs.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #include "common/compress/common.h"
 #include "common/debug.h"
+#include "common/type/buffer.h"
+#include "common/type/object.h"
+#include "pgbr_ffi.h"
 
 /**********************************************************************************************************************************/
 FN_EXTERN Pack *
@@ -19,13 +27,13 @@ compressParamList(const int level, const bool raw)
 
     MEM_CONTEXT_TEMP_BEGIN()
     {
-        PackWrite *const packWrite = pckWriteNewP();
+        const size_t size = pgbr_compress_param_list_size((int32_t)level, raw);
+        Buffer *const buffer = OBJ_NAME(bufNew(size), Pack::Buffer);
+        const size_t written = pgbr_compress_param_list_into((int32_t)level, raw, bufPtr(buffer), size);
+        ASSERT(written == size);
+        bufUsedSet(buffer, written);
 
-        pckWriteI32P(packWrite, level);
-        pckWriteBoolP(packWrite, raw);
-        pckWriteEndP(packWrite);
-
-        result = pckMove(pckWriteResult(packWrite), memContextPrior());
+        result = (Pack *)bufMove(buffer, memContextPrior());
     }
     MEM_CONTEXT_TEMP_END();
 
@@ -44,12 +52,13 @@ decompressParamList(const bool raw)
 
     MEM_CONTEXT_TEMP_BEGIN()
     {
-        PackWrite *const packWrite = pckWriteNewP();
+        const size_t size = pgbr_decompress_param_list_size(raw);
+        Buffer *const buffer = OBJ_NAME(bufNew(size), Pack::Buffer);
+        const size_t written = pgbr_decompress_param_list_into(raw, bufPtr(buffer), size);
+        ASSERT(written == size);
+        bufUsedSet(buffer, written);
 
-        pckWriteBoolP(packWrite, raw);
-        pckWriteEndP(packWrite);
-
-        result = pckMove(pckWriteResult(packWrite), memContextPrior());
+        result = (Pack *)bufMove(buffer, memContextPrior());
     }
     MEM_CONTEXT_TEMP_END();
 

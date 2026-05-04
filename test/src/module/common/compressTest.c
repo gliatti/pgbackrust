@@ -5,7 +5,52 @@ Test Compression
 #include "common/io/bufferWrite.h"
 #include "common/io/filter/group.h"
 #include "common/io/io.h"
+#include "common/type/pack.h"
 #include "storage/posix/storage.h"
+
+/***********************************************************************************************************************************
+Differential helpers — rebuild the compress / decompress parameter Pack via direct `pckWrite*` calls (the legacy
+`compressParamList` / `decompressParamList` body before Phase 13 routed serialization through Rust). Used to compare against the
+new Rust-backed shim over thousands of `(level, raw)` combinations.
+***********************************************************************************************************************************/
+static Pack *
+legacy_compressParamList(const int level, const bool raw)
+{
+    Pack *result;
+
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        PackWrite *const packWrite = pckWriteNewP();
+
+        pckWriteI32P(packWrite, level);
+        pckWriteBoolP(packWrite, raw);
+        pckWriteEndP(packWrite);
+
+        result = pckMove(pckWriteResult(packWrite), memContextPrior());
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    return result;
+}
+
+static Pack *
+legacy_decompressParamList(const bool raw)
+{
+    Pack *result;
+
+    MEM_CONTEXT_TEMP_BEGIN()
+    {
+        PackWrite *const packWrite = pckWriteNewP();
+
+        pckWriteBoolP(packWrite, raw);
+        pckWriteEndP(packWrite);
+
+        result = pckMove(pckWriteResult(packWrite), memContextPrior());
+    }
+    MEM_CONTEXT_TEMP_END();
+
+    return result;
+}
 
 /***********************************************************************************************************************************
 Compress data
@@ -369,6 +414,61 @@ testRun(void)
 #else
         TEST_ERROR(compressTypePresent(compressTypeZst), OptionInvalidValueError, "pgBackRust not built with zst support");
 #endif // HAVE_LIBZST
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("compressParamList() / decompressParamList() differential"))
+    {
+        // 12 000 deterministic (level, raw) combinations: 1 000 inputs × 12 (level ∈ {-3..9, 0 included}, raw ∈ {false,true}).
+        // For each, build the Pack via the new Rust path (`compressParamList`) and via a `legacy_*` helper that calls the C
+        // `pckWrite*` chain directly. The byte buffers must match exactly — Pack is a `Buffer *` cast, so a bytewise compare on
+        // `pckToBuf` is the strict differential.
+        unsigned int comparisons = 0;
+        uint64_t state = UINT64_C(0xFEEDF00DBEEFCAFE);
+
+        for (unsigned int iter = 0; iter < 1000; iter++)
+        {
+            for (int level = -3; level <= 9; level++)
+            {
+                for (unsigned int rawIdx = 0; rawIdx < 2; rawIdx++)
+                {
+                    state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                    const bool raw = (rawIdx == 0);
+
+                    Pack *const rustPack = compressParamList(level, raw);
+                    Pack *const legacyPack = legacy_compressParamList(level, raw);
+
+                    if (!bufEq(pckToBuf(rustPack), pckToBuf(legacyPack)))
+                    {
+                        TEST_ERROR_FMT(
+                            THROW_FMT(AssertError, "differential mismatch"),
+                            AssertError,
+                            "compressParamList(level=%d, raw=%d) iter=%u", level, (int)raw, iter);
+                    }
+
+                    comparisons++;
+                }
+            }
+        }
+
+        for (unsigned int rawIdx = 0; rawIdx < 2; rawIdx++)
+        {
+            const bool raw = (rawIdx == 0);
+            Pack *const rustPack = decompressParamList(raw);
+            Pack *const legacyPack = legacy_decompressParamList(raw);
+
+            if (!bufEq(pckToBuf(rustPack), pckToBuf(legacyPack)))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "decompressParamList(raw=%d)", (int)raw);
+            }
+
+            comparisons++;
+        }
+
+        TEST_RESULT_UINT(comparisons, 1000 * 13 * 2 + 2, "all C/Rust differential comparisons agreed");
     }
 
     // Test everything in the helper that is not tested in the individual compression type tests

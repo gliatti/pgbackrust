@@ -689,6 +689,64 @@ pub unsafe extern "C" fn pgbr_crypto_random_bytes(buf: *mut u8, size: usize) {
     });
 }
 
+// ---------- pgbr-compress params bridge (Phase 13) ----------
+
+/// Number of bytes [`pgbr_compress_param_list_into`] would write for `(level, raw)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_compress_param_list_size(level: i32, raw: bool) -> usize {
+    with_panic_guard(|| pgbr_compress::params::compress_param_list_bytes(level, raw).len())
+}
+
+/// Write the Pack-encoded byte representation of `compressParamList(level, raw)` into `dst`.
+/// Returns the number of bytes written; never exceeds `dst_size`.
+///
+/// # Safety
+///
+/// `dst` must point to a writable buffer of at least `dst_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_compress_param_list_into(level: i32, raw: bool, dst: *mut u8, dst_size: usize) -> usize {
+    with_panic_guard(|| {
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_compress_param_list_into: dst is null"));
+            return 0;
+        }
+        let bytes = pgbr_compress::params::compress_param_list_bytes(level, raw);
+        let n = bytes.len().min(dst_size);
+        // SAFETY: caller upholds the buffer-size + non-null contract.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        dst_slice[..n].copy_from_slice(&bytes[..n]);
+        n
+    })
+}
+
+/// Number of bytes [`pgbr_decompress_param_list_into`] would write for `raw`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_decompress_param_list_size(raw: bool) -> usize {
+    with_panic_guard(|| pgbr_compress::params::decompress_param_list_bytes(raw).len())
+}
+
+/// Write the Pack-encoded byte representation of `decompressParamList(raw)` into `dst`.
+/// Returns the number of bytes written; never exceeds `dst_size`.
+///
+/// # Safety
+///
+/// `dst` must point to a writable buffer of at least `dst_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_decompress_param_list_into(raw: bool, dst: *mut u8, dst_size: usize) -> usize {
+    with_panic_guard(|| {
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_decompress_param_list_into: dst is null"));
+            return 0;
+        }
+        let bytes = pgbr_compress::params::decompress_param_list_bytes(raw);
+        let n = bytes.len().min(dst_size);
+        // SAFETY: caller upholds the buffer-size + non-null contract.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        dst_slice[..n].copy_from_slice(&bytes[..n]);
+        n
+    })
+}
+
 // ---------- pgbr-compress gz error bridge (Phase 14) ----------
 
 /// Classify a zlib return code.
