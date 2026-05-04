@@ -5,13 +5,14 @@
 
 use core::ffi::{CStr, c_char};
 
+use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
+
 /// Version string of the embedded Rust FFI shim, tracking `Cargo.toml`'s workspace version.
 ///
 /// Baked into the static archive and returned to C as a NUL-terminated UTF-8 string.
 // SAFETY: `CARGO_PKG_VERSION` is provided by Cargo and is guaranteed not to contain interior
 // NULs; appending a single `\0` produces a well-formed C string.
-const PGBR_FFI_VERSION: &CStr =
-    unsafe { CStr::from_bytes_with_nul_unchecked(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) };
+const PGBR_FFI_VERSION: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) };
 
 /// Returns a pointer to a static, NUL-terminated UTF-8 string identifying the Rust FFI shim
 /// version. The pointer is valid for the lifetime of the process and must not be freed.
@@ -20,18 +21,122 @@ pub const extern "C" fn pgbr_version() -> *const c_char {
     PGBR_FFI_VERSION.as_ptr()
 }
 
+/// Numeric code of the calling thread's last error, or `0` if no error is set.
+///
+/// Mirrors the C `errorTypeCode` numbering. Reads the same thread-local slot populated by Rust
+/// shims via [`pgbr_error::set_last_error`] and by the C-side helpers below.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_last_code() -> i32 {
+    last_error_code()
+}
+
+/// Pointer to a NUL-terminated UTF-8 message of the calling thread's last error, or `null` if no
+/// error is set.
+///
+/// The returned pointer is valid until the next call into `pgbr_error_*` on the same thread (any
+/// of `pgbr_error_set`, `pgbr_error_clear`, `pgbr_error_take_code`). The caller must not free it.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_last_message() -> *const c_char {
+    last_error_message()
+}
+
+/// Sets the calling thread's last error to the given typed `code` and `message_utf8` C string.
+///
+/// Returns `0` on success, `-1` if `code` is not part of the shared error table or `message_utf8`
+/// is null or not valid UTF-8. On `-1`, the existing thread-local error is left untouched.
+///
+/// # Safety
+///
+/// `message_utf8` must point to a NUL-terminated, valid UTF-8 byte sequence readable for the
+/// duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_set(code: i32, message_utf8: *const c_char) -> i32 {
+    let Some(error_type) = ErrorType::from_code(code) else {
+        return -1;
+    };
+    if message_utf8.is_null() {
+        return -1;
+    }
+
+    // SAFETY: caller guarantees `message_utf8` is NUL-terminated and readable.
+    let cstr = unsafe { CStr::from_ptr(message_utf8) };
+    let Ok(message) = cstr.to_str() else {
+        return -1;
+    };
+
+    set_last_error(Error::new(error_type, message));
+    0
+}
+
+/// Removes the calling thread's last error and returns its numeric code.
+///
+/// Returns `0` if no error was set. The associated message becomes invalid as soon as this
+/// function returns.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_take_code() -> i32 {
+    pgbr_error::take_last_error().map_or(0, |e| e.code())
+}
+
+/// Clears the calling thread's last error.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_clear() {
+    clear_last_error();
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn cstr(s: &str) -> std::ffi::CString {
+        std::ffi::CString::new(s).unwrap()
+    }
 
     #[test]
     fn version_is_non_empty_and_matches_cargo() {
         let ptr = pgbr_version();
         assert!(!ptr.is_null());
         // SAFETY: pgbr_version() returns a pointer to PGBR_FFI_VERSION, a 'static CStr.
-        let cstr = unsafe { CStr::from_ptr(ptr) };
-        let rust_str = cstr.to_str().expect("ffi version is utf-8");
+        let result = unsafe { CStr::from_ptr(ptr) };
+        let rust_str = result.to_str().expect("ffi version is utf-8");
         assert_eq!(rust_str, env!("CARGO_PKG_VERSION"));
         assert!(!rust_str.is_empty());
+    }
+
+    #[test]
+    fn error_set_and_read_round_trip() {
+        pgbr_error_clear();
+        let msg = cstr("disk full while writing manifest");
+        // SAFETY: msg owns a valid NUL-terminated UTF-8 buffer for the duration of the call.
+        let rc = unsafe { pgbr_error_set(94, msg.as_ptr()) };
+        assert_eq!(rc, 0);
+        assert_eq!(pgbr_error_last_code(), 94);
+
+        let msg_ptr = pgbr_error_last_message();
+        assert!(!msg_ptr.is_null());
+        // SAFETY: msg_ptr is the cached CString in the thread-local slot; valid until next mutation.
+        let read = unsafe { CStr::from_ptr(msg_ptr) }.to_str().unwrap();
+        assert_eq!(read, "disk full while writing manifest");
+
+        let taken = pgbr_error_take_code();
+        assert_eq!(taken, 94);
+        assert_eq!(pgbr_error_last_code(), 0);
+        assert!(pgbr_error_last_message().is_null());
+    }
+
+    #[test]
+    fn error_set_rejects_unknown_code_and_null_message() {
+        pgbr_error_clear();
+        let msg = cstr("ignored");
+
+        // SAFETY: msg is a valid NUL-terminated buffer.
+        let rc = unsafe { pgbr_error_set(7777, msg.as_ptr()) };
+        assert_eq!(rc, -1);
+        assert_eq!(pgbr_error_last_code(), 0);
+
+        // SAFETY: explicit null pointer is allowed by the function's documented contract.
+        let rc_null = unsafe { pgbr_error_set(94, std::ptr::null()) };
+        assert_eq!(rc_null, -1);
+        assert_eq!(pgbr_error_last_code(), 0);
     }
 }

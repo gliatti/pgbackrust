@@ -10,5 +10,8 @@ repository.workspace = true
 name = "pgbr_ffi"
 crate-type = ["staticlib", "rlib"]
 
+[dependencies]
+pgbr-error = { path = "../pgbr-error" }
+
 [lints]
 workspace = true

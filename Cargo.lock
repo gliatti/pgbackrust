@@ -41,6 +41,9 @@ version = "0.1.0"
 [[package]]
 name = "pgbr-ffi"
 version = "0.1.0"
+dependencies = [
+ "pgbr-error",
+]
 
 [[package]]
 name = "pgbr-info"
