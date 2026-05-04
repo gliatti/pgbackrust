@@ -140,7 +140,10 @@ pub mod hash {
             }
         }
 
-        fn openssl_md(self) -> MessageDigest {
+        /// `MessageDigest` value the openssl crate expects. Public so the [`super::cipher`]
+        /// module can pass it to `EVP_BytesToKey`.
+        #[must_use]
+        pub fn openssl_md(self) -> MessageDigest {
             match self {
                 Self::Md5 => MessageDigest::md5(),
                 Self::Sha1 => MessageDigest::sha1(),
@@ -277,6 +280,187 @@ pub mod hash {
     }
 }
 
+pub mod cipher {
+    //! AES-256-CBC streaming cipher + `EVP_BytesToKey` key derivation.
+    //!
+    //! Ported from `src/common/crypto/cipherBlock.c`. The header / salt / `Salted__` magic
+    //! state machine stays on the C side (it intermixes with the `IoFilter` wrapper, which is
+    //! not migrated yet); this module just exposes the primitive crypto operations the legacy
+    //! code reached straight into libcrypto for.
+    //!
+    //! Both encryption and decryption go through `openssl::symm::Crypter`, so the algorithm
+    //! choice and PKCS#7 padding behaviour are byte-identical to the legacy `EVP_Cipher*` calls.
+    //! Key + IV derivation uses `openssl::pkcs5::bytes_to_key`, which wraps `EVP_BytesToKey` in
+    //! the same way the C code did.
+
+    use openssl::symm::{Cipher, Crypter, Mode as CrypterMode};
+
+    use super::hash::HashType;
+
+    /// PKCS5 salt size in bytes — the same constant the legacy code took from `openssl/evp.h`.
+    pub const PKCS5_SALT_LEN: usize = 8;
+
+    /// Upper bound on the cipher block size across every supported algorithm.
+    ///
+    /// Mirrors `EVP_MAX_BLOCK_LENGTH` (the libcrypto constant the C code carved buffer growth
+    /// against). Tightened to 32 because every cipher we ship is AES.
+    pub const MAX_BLOCK_LENGTH: usize = 32;
+
+    /// Cipher selector. Discriminants match the FFI shim's `cipher_code` argument so the C side
+    /// can pass an `i32` mapped from the legacy `CipherType` `StringId`.
+    #[repr(i32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum CipherType {
+        /// AES-256-CBC — the only block cipher pgBackRust currently uses on disk.
+        Aes256Cbc = 0,
+    }
+
+    impl CipherType {
+        /// Variant whose discriminant equals `code`, or `None`.
+        #[must_use]
+        pub const fn from_code(code: i32) -> Option<Self> {
+            match code {
+                0 => Some(Self::Aes256Cbc),
+                _ => None,
+            }
+        }
+
+        fn openssl(self) -> Cipher {
+            match self {
+                Self::Aes256Cbc => Cipher::aes_256_cbc(),
+            }
+        }
+
+        /// Required key size in bytes.
+        #[must_use]
+        pub fn key_len(self) -> usize {
+            self.openssl().key_len()
+        }
+
+        /// Required IV size in bytes (always non-zero for the ciphers we support).
+        #[must_use]
+        pub fn iv_len(self) -> usize {
+            self.openssl().iv_len().unwrap_or(0)
+        }
+
+        /// Block size in bytes.
+        #[must_use]
+        pub fn block_size(self) -> usize {
+            self.openssl().block_size()
+        }
+    }
+
+    /// Encrypt vs decrypt selector. Discriminants are stable across the FFI boundary.
+    #[repr(i32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Mode {
+        /// Encrypt direction — the legacy `cipherModeEncrypt`.
+        Encrypt = 0,
+        /// Decrypt direction — the legacy `cipherModeDecrypt`.
+        Decrypt = 1,
+    }
+
+    impl Mode {
+        /// Variant whose discriminant equals `code`, or `None`.
+        #[must_use]
+        pub const fn from_code(code: i32) -> Option<Self> {
+            match code {
+                0 => Some(Self::Encrypt),
+                1 => Some(Self::Decrypt),
+                _ => None,
+            }
+        }
+
+        const fn openssl(self) -> CrypterMode {
+            match self {
+                Self::Encrypt => CrypterMode::Encrypt,
+                Self::Decrypt => CrypterMode::Decrypt,
+            }
+        }
+    }
+
+    /// Derive key + IV from `pass` + `salt` using `EVP_BytesToKey` (count = 1, matching the
+    /// legacy `cipherBlockProcessBlock` call). Writes the key into `key_out` and the IV into
+    /// `iv_out`.
+    ///
+    /// Returns `(key_size, iv_size)` on success.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the OpenSSL error stack if the derivation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key_out` is shorter than `cipher.key_len()` or `iv_out` is shorter than
+    /// `cipher.iv_len()`.
+    pub fn derive_key_iv(
+        cipher: CipherType,
+        digest: HashType,
+        salt: &[u8],
+        pass: &[u8],
+        key_out: &mut [u8],
+        iv_out: &mut [u8],
+    ) -> Result<(usize, usize), openssl::error::ErrorStack> {
+        let kiv = openssl::pkcs5::bytes_to_key(
+            cipher.openssl(),
+            super::hash::HashType::openssl_md(digest),
+            pass,
+            Some(salt),
+            1,
+        )?;
+        let key = &kiv.key;
+        let iv = kiv.iv.as_deref().unwrap_or(&[]);
+        assert!(key_out.len() >= key.len(), "key buffer too small");
+        assert!(iv_out.len() >= iv.len(), "iv buffer too small");
+        key_out[..key.len()].copy_from_slice(key);
+        iv_out[..iv.len()].copy_from_slice(iv);
+        Ok((key.len(), iv.len()))
+    }
+
+    /// Streaming cipher state. Wraps `openssl::symm::Crypter` (which itself wraps
+    /// `EVP_CIPHER_CTX`).
+    pub struct State {
+        inner: Crypter,
+    }
+
+    impl State {
+        /// Initialize a new cipher state with the given algorithm, mode, key and IV.
+        ///
+        /// # Errors
+        ///
+        /// Propagates the OpenSSL error stack if `EVP_CipherInit_ex` rejects the parameters.
+        pub fn new(
+            cipher: CipherType,
+            mode: Mode,
+            key: &[u8],
+            iv: &[u8],
+        ) -> Result<Self, openssl::error::ErrorStack> {
+            let inner = Crypter::new(cipher.openssl(), mode.openssl(), key, Some(iv))?;
+            Ok(Self { inner })
+        }
+
+        /// Process a chunk of input bytes. `dst` must have at least `src.len() + block_size`
+        /// bytes of capacity. Returns the number of bytes written into `dst`.
+        ///
+        /// # Errors
+        ///
+        /// Propagates the OpenSSL error stack on `EVP_CipherUpdate` failure.
+        pub fn update(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, openssl::error::ErrorStack> {
+            self.inner.update(src, dst)
+        }
+
+        /// Finalize the cipher and write any remaining bytes (including the PKCS#7 padding /
+        /// final block) into `dst`. Returns the number of bytes written.
+        ///
+        /// # Errors
+        ///
+        /// Propagates the OpenSSL error stack on `EVP_CipherFinal_ex` failure.
+        pub fn finalize(&mut self, dst: &mut [u8]) -> Result<usize, openssl::error::ErrorStack> {
+            self.inner.finalize(dst)
+        }
+    }
+}
+
 pub mod xxhash3 {
     //! 128-bit XXH3 hashing (single-shot and incremental).
 
@@ -389,6 +573,103 @@ mod common_tests {
     fn error_reason_into_empty_buffer_is_noop() {
         let mut empty: [u8; 0] = [];
         assert_eq!(error_reason_into(123, &mut empty), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod cipher_tests {
+    use super::cipher::*;
+    use super::common as crypto_common;
+    use super::hash::HashType;
+
+    #[test]
+    fn aes_256_cbc_round_trip_known_inputs() {
+        crypto_common::init();
+        let pass = b"areallybadpassphrase";
+        let salt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
+        let mut key = [0u8; 64];
+        let mut iv = [0u8; 64];
+        let (key_len, iv_len) = derive_key_iv(CipherType::Aes256Cbc, HashType::Sha1, &salt, pass, &mut key, &mut iv).unwrap();
+        assert_eq!(key_len, CipherType::Aes256Cbc.key_len());
+        assert_eq!(iv_len, CipherType::Aes256Cbc.iv_len());
+
+        for plaintext in [b"plaintext".to_vec(), vec![], b"a".to_vec(), vec![0u8; 256]] {
+            let mut enc = State::new(CipherType::Aes256Cbc, Mode::Encrypt, &key[..key_len], &iv[..iv_len]).unwrap();
+            let mut ciphertext = vec![0u8; plaintext.len() + MAX_BLOCK_LENGTH * 2];
+            let mut total = 0;
+            total += enc.update(&plaintext, &mut ciphertext[total..]).unwrap();
+            total += enc.finalize(&mut ciphertext[total..]).unwrap();
+            ciphertext.truncate(total);
+
+            let mut dec = State::new(CipherType::Aes256Cbc, Mode::Decrypt, &key[..key_len], &iv[..iv_len]).unwrap();
+            let mut decrypted = vec![0u8; ciphertext.len() + MAX_BLOCK_LENGTH * 2];
+            let mut total = 0;
+            total += dec.update(&ciphertext, &mut decrypted[total..]).unwrap();
+            total += dec.finalize(&mut decrypted[total..]).unwrap();
+            decrypted.truncate(total);
+
+            assert_eq!(decrypted, plaintext, "round-trip failed for {} bytes", plaintext.len());
+        }
+    }
+
+    #[test]
+    fn aes_256_cbc_round_trip_random() {
+        crypto_common::init();
+        let pass = b"another bad pass";
+        let salt = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
+
+        let mut key = [0u8; 64];
+        let mut iv = [0u8; 64];
+        let (key_len, iv_len) = derive_key_iv(CipherType::Aes256Cbc, HashType::Sha1, &salt, pass, &mut key, &mut iv).unwrap();
+
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        for _ in 0..10_000 {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let len = ((state >> 32) as usize) % 200;
+            let mut plaintext = vec![0u8; len];
+            for byte in &mut plaintext {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                *byte = (state >> 56) as u8;
+            }
+
+            let mut enc = State::new(CipherType::Aes256Cbc, Mode::Encrypt, &key[..key_len], &iv[..iv_len]).unwrap();
+            let mut ciphertext = vec![0u8; len + MAX_BLOCK_LENGTH * 2];
+            let mut total = 0;
+            total += enc.update(&plaintext, &mut ciphertext[total..]).unwrap();
+            total += enc.finalize(&mut ciphertext[total..]).unwrap();
+            ciphertext.truncate(total);
+
+            let mut dec = State::new(CipherType::Aes256Cbc, Mode::Decrypt, &key[..key_len], &iv[..iv_len]).unwrap();
+            let mut decrypted = vec![0u8; ciphertext.len() + MAX_BLOCK_LENGTH * 2];
+            let mut total = 0;
+            total += dec.update(&ciphertext, &mut decrypted[total..]).unwrap();
+            total += dec.finalize(&mut decrypted[total..]).unwrap();
+            decrypted.truncate(total);
+
+            assert_eq!(decrypted, plaintext);
+        }
+    }
+
+    #[test]
+    fn cipher_type_from_code_round_trip() {
+        assert_eq!(CipherType::from_code(0), Some(CipherType::Aes256Cbc));
+        assert_eq!(CipherType::from_code(1), None);
+    }
+
+    #[test]
+    fn mode_from_code_round_trip() {
+        assert_eq!(Mode::from_code(0), Some(Mode::Encrypt));
+        assert_eq!(Mode::from_code(1), Some(Mode::Decrypt));
+        assert_eq!(Mode::from_code(2), None);
+    }
+
+    #[test]
+    fn block_and_key_sizes_are_aes_256_cbc() {
+        assert_eq!(CipherType::Aes256Cbc.key_len(), 32);
+        assert_eq!(CipherType::Aes256Cbc.iv_len(), 16);
+        assert_eq!(CipherType::Aes256Cbc.block_size(), 16);
     }
 }
 

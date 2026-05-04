@@ -1,12 +1,15 @@
 /***********************************************************************************************************************************
 Block Cipher
+
+The IoFilter integration, header / salt / `Salted__` magic state machine, and buffer management stay on the C side because they
+are tightly coupled to the IoFilter wrapper, which is not migrated yet (separate phase). The libcrypto-direct calls
+(EVP_get_cipherbyname, EVP_get_digestbyname, EVP_BytesToKey, EVP_CipherInit_ex, EVP_CipherUpdate, EVP_CipherFinal) are replaced by
+thin wrappers over the Rust pgbr-crypto::cipher exports — the algorithm name -> code mapping, key derivation, streaming update,
+and final flush all flow through libpgbr_ffi.a.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #include <string.h>
-
-#include <openssl/err.h>
-#include <openssl/evp.h>
 
 #include "common/crypto/cipherBlock.h"
 #include "common/crypto/common.h"
@@ -14,6 +17,7 @@ Block Cipher
 #include "common/io/filter/filter.h"
 #include "common/log.h"
 #include "common/type/object.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Header constants and sizes
@@ -23,8 +27,24 @@ Header constants and sizes
 #define CIPHER_BLOCK_MAGIC                                          "Salted__"
 #define CIPHER_BLOCK_MAGIC_SIZE                                     (sizeof(CIPHER_BLOCK_MAGIC) - 1)
 
+// PKCS5 salt size — replicated from the legacy `openssl/evp.h` constant so the cipherBlock module no longer needs to include
+// libcrypto headers.
+#define PKCS5_SALT_LEN                                              8
+
+// Upper bound on cipher block size — replicated from `openssl/evp.h` (EVP_MAX_BLOCK_LENGTH = 32). Used for buffer pre-sizing so
+// the legacy `cipherBlockProcessSize` upper bound stays unchanged. Tighter per-cipher sizes are still queried via FFI when the
+// caller knows which cipher is in play.
+#define CIPHER_BLOCK_MAX_BLOCK_LENGTH                               32
+
 // Total length of cipher header
 #define CIPHER_BLOCK_HEADER_SIZE                                    (CIPHER_BLOCK_MAGIC_SIZE + PKCS5_SALT_LEN)
+
+// Numeric pgbr_crypto::cipher::CipherType discriminant — zero is the only supported value (AES-256-CBC).
+#define CIPHER_BLOCK_CIPHER_AES256CBC                               0
+
+// Numeric pgbr_crypto::cipher::Mode discriminants matching the `Mode` enum.
+#define CIPHER_BLOCK_MODE_ENCRYPT                                   0
+#define CIPHER_BLOCK_MODE_DECRYPT                                   1
 
 /***********************************************************************************************************************************
 Object type
@@ -38,9 +58,9 @@ typedef struct CipherBlock
     const Buffer *pass;                                             // Passphrase used to generate encryption key
     size_t headerSize;                                              // Size of header read during decrypt
     uint8_t header[CIPHER_BLOCK_HEADER_SIZE];                       // Buffer to hold partial header during decrypt
-    const EVP_CIPHER *cipher;                                       // Cipher object
-    const EVP_MD *digest;                                           // Message digest object
-    EVP_CIPHER_CTX *cipherContext;                                  // Encrypt/decrypt context
+    int32_t cipherCode;                                             // pgbr_crypto::cipher::CipherType discriminant
+    int32_t digestCode;                                             // pgbr_crypto::hash::HashType discriminant for key derivation
+    void *cipherState;                                              // Opaque pgbr_crypto::cipher::State* (set after derive)
 
     Buffer *buffer;                                                 // Internal buffer in case destination buffer isn't large enough
     bool inputSame;                                                 // Is the same input required on next process call?
@@ -62,7 +82,48 @@ cipherBlockToLog(const CipherBlock *const this, StringStatic *const debugLog)
     FUNCTION_LOG_OBJECT_FORMAT(value, cipherBlockToLog, buffer, bufferSize)
 
 /***********************************************************************************************************************************
-Free cipher context
+Map a CipherType StringId to the numeric code understood by the FFI layer. cipherTypeNone is rejected here because the public
+header (`cipherBlockFilterGroupAdd`) handles "no encryption" before reaching this module.
+***********************************************************************************************************************************/
+static int32_t
+cipherBlockCipherCode(const CipherType type)
+{
+    switch (type)
+    {
+        case cipherTypeAes256Cbc:
+            return CIPHER_BLOCK_CIPHER_AES256CBC;
+
+        default:
+        {
+            char *const typeZ = zNewStrId(type);
+            String *const message = strNewFmt("unable to load cipher '%s'", typeZ);
+            zFree(typeZ);
+            THROW(AssertError, strZ(message));
+        }
+    }
+}
+
+/***********************************************************************************************************************************
+Map a digest name (from CipherBlockNewParam.digest) to the numeric HashType code. Defaults to SHA1 when unset, matching the
+legacy code's `EVP_sha1()` fallback.
+***********************************************************************************************************************************/
+static int32_t
+cipherBlockDigestCode(const String *const digest)
+{
+    if (digest == NULL || strEqZ(digest, "sha1"))
+        return 1;
+
+    if (strEqZ(digest, "sha256"))
+        return 2;
+
+    if (strEqZ(digest, "md5"))
+        return 0;
+
+    THROW_FMT(AssertError, "unable to load digest '%s'", strZ(digest));
+}
+
+/***********************************************************************************************************************************
+Free cipher state
 ***********************************************************************************************************************************/
 static void
 cipherBlockFreeResource(THIS_VOID)
@@ -75,7 +136,8 @@ cipherBlockFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    EVP_CIPHER_CTX_free(this->cipherContext);
+    pgbr_crypto_cipher_state_free(this->cipherState);
+    this->cipherState = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -93,8 +155,9 @@ cipherBlockProcessSize(const CipherBlock *const this, const size_t sourceSize)
 
     ASSERT(this != NULL);
 
-    // Destination size is source size plus one extra block
-    size_t destinationSize = sourceSize + EVP_MAX_BLOCK_LENGTH;
+    // Destination size is source size plus one extra block (use the legacy EVP_MAX_BLOCK_LENGTH upper bound to keep the public
+    // sizing contract identical across the migration).
+    size_t destinationSize = sourceSize + CIPHER_BLOCK_MAX_BLOCK_LENGTH;
 
     // On encrypt the header size must be included before the first block
     if (this->mode == cipherModeEncrypt && !this->saltDone)
@@ -177,25 +240,33 @@ cipherBlockProcessBlock(CipherBlock *const this, const uint8_t *source, size_t s
             }
         }
 
-        // If salt generation/read is done
+        // If salt generation/read is done, derive the key + IV and create the cipher state.
         if (salt)
         {
-            // Generate key and initialization vector
-            uint8_t key[EVP_MAX_KEY_LENGTH];
-            uint8_t initVector[EVP_MAX_IV_LENGTH];
+            const size_t keyLen = pgbr_crypto_cipher_key_len(this->cipherCode);
+            const size_t ivLen = pgbr_crypto_cipher_iv_len(this->cipherCode);
+            uint8_t key[64];
+            uint8_t initVector[64];
 
-            EVP_BytesToKey(this->cipher, this->digest, salt, bufPtrConst(this->pass), (int)bufSize(this->pass), 1, key, initVector);
+            ASSERT(keyLen > 0 && keyLen <= sizeof(key));
+            ASSERT(ivLen > 0 && ivLen <= sizeof(initVector));
 
-            // Create context to track cipher
-            cryptoError(!(this->cipherContext = EVP_CIPHER_CTX_new()), "unable to create context");
+            if (pgbr_crypto_cipher_derive_key_iv(
+                    this->cipherCode, this->digestCode, salt, PKCS5_SALT_LEN, bufPtrConst(this->pass), bufSize(this->pass),
+                    key, sizeof(key), initVector, sizeof(initVector)) != 0)
+            {
+                THROW_FMT(CryptoError, "unable to derive cipher key: %s", pgbr_last_error_msg());
+            }
 
-            // Set free callback to ensure cipher context is freed
+            this->cipherState = pgbr_crypto_cipher_state_new(
+                this->cipherCode, this->mode == cipherModeEncrypt ? CIPHER_BLOCK_MODE_ENCRYPT : CIPHER_BLOCK_MODE_DECRYPT,
+                key, keyLen, initVector, ivLen);
+
+            if (this->cipherState == NULL)
+                THROW_FMT(CryptoError, "unable to initialize cipher: %s", pgbr_last_error_msg());
+
+            // Set free callback to ensure cipher state is freed
             memContextCallbackSet(objMemContext(this), cipherBlockFreeResource, this);
-
-            // Initialize cipher
-            cryptoError(
-                !EVP_CipherInit_ex(this->cipherContext, this->cipher, NULL, key, initVector, this->mode == cipherModeEncrypt),
-                "unable to initialize cipher");
 
             this->saltDone = true;
         }
@@ -204,14 +275,16 @@ cipherBlockProcessBlock(CipherBlock *const this, const uint8_t *source, size_t s
     // Recheck that source size > 0 as the bytes may have been consumed reading the header
     if (sourceSize > 0)
     {
-        // Process the data
-        int destinationUpdateSize = 0;
+        const intptr_t written = pgbr_crypto_cipher_state_update(
+            this->cipherState, source, sourceSize, destination, sourceSize + CIPHER_BLOCK_MAX_BLOCK_LENGTH);
 
-        cryptoError(
-            !EVP_CipherUpdate(this->cipherContext, destination, &destinationUpdateSize, source, (int)sourceSize),
-            "unable to process cipher");
+        if (written < 0)
+        {
+            pgbr_last_error_clear();
+            THROW(CryptoError, "unable to process cipher");
+        }
 
-        destinationSize += (size_t)destinationUpdateSize;
+        destinationSize += (size_t)written;
 
         // Note that data has been processed so flush is valid
         this->processDone = true;
@@ -235,19 +308,22 @@ cipherBlockFlush(CipherBlock *const this, Buffer *const destination)
     ASSERT(this != NULL);
     ASSERT(destination != NULL);
 
-    // Actual destination size
-    int destinationSize = 0;
-
     // If no header was processed then error
     if (!this->saltDone)
         THROW(CryptoError, "cipher header missing");
 
     // Only flush remaining data if some data was processed
-    if (!EVP_CipherFinal(this->cipherContext, bufRemainsPtr(destination), &destinationSize))
+    const intptr_t written = pgbr_crypto_cipher_state_finalize(
+        this->cipherState, bufRemainsPtr(destination), bufRemains(destination));
+
+    if (written < 0)
+    {
+        pgbr_last_error_clear();
         THROW(CryptoError, "unable to flush");
+    }
 
     // Return actual destination size
-    FUNCTION_LOG_RETURN(SIZE, (size_t)destinationSize);
+    FUNCTION_LOG_RETURN(SIZE, (size_t)written);
 }
 
 /***********************************************************************************************************************************
@@ -400,26 +476,10 @@ cipherBlockNew(const CipherMode mode, const CipherType cipherType, const Buffer 
     // Init crypto subsystem
     cryptoInit();
 
-    // Lookup cipher by name. This means the ciphers passed in must exactly match a name expected by OpenSSL. This is a good thing
-    // since the name required by the openssl command-line tool will match what is used by pgBackRest.
-    char *const cipherTypeZ = zNewStrId(cipherType);
-    const EVP_CIPHER *cipher = EVP_get_cipherbyname(cipherTypeZ);
-
-    if (!cipher)
-        THROW_FMT(AssertError, "unable to load cipher '%s'", cipherTypeZ);
-
-    zFree(cipherTypeZ);
-
-    // Lookup digest. If not defined it will be set to sha1.
-    const EVP_MD *digest = NULL;
-
-    if (param.digest)
-        digest = EVP_get_digestbyname(strZ(param.digest));
-    else
-        digest = EVP_sha1();
-
-    if (!digest)
-        THROW_FMT(AssertError, "unable to load digest '%s'", strZ(param.digest));
+    // Resolve cipher and digest codes up-front so an unsupported request raises AssertError before any allocation happens, just
+    // like the legacy `EVP_get_*byname` lookups did.
+    const int32_t cipherCode = cipherBlockCipherCode(cipherType);
+    const int32_t digestCode = cipherBlockDigestCode(param.digest);
 
     OBJ_NEW_BEGIN(CipherBlock, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
@@ -427,8 +487,8 @@ cipherBlockNew(const CipherMode mode, const CipherType cipherType, const Buffer 
         {
             .mode = mode,
             .raw = param.raw,
-            .cipher = cipher,
-            .digest = digest,
+            .cipherCode = cipherCode,
+            .digestCode = digestCode,
             .pass = bufDup(pass),
         };
     }

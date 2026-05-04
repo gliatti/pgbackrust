@@ -168,9 +168,12 @@ testRun(void)
         TEST_RESULT_BOOL(cipherBlock->saltDone, false, "salt done is false");
         TEST_RESULT_BOOL(cipherBlock->processDone, false, "process done is false");
         TEST_RESULT_UINT(cipherBlock->headerSize, 0, "header size is 0");
-        TEST_RESULT_PTR_NE(cipherBlock->cipher, NULL, "cipher is set");
-        TEST_RESULT_PTR_NE(cipherBlock->digest, NULL, "digest is set");
-        TEST_RESULT_PTR(cipherBlock->cipherContext, NULL, "cipher context is not set");
+        // The legacy `cipher` / `digest` (EVP_CIPHER* / EVP_MD*) and `cipherContext` (EVP_CIPHER_CTX*) fields are gone after the
+        // Phase 12 migration: pgbr_crypto::cipher resolves the algorithm + digest from numeric codes and hides the OpenSSL
+        // context behind an opaque `cipherState` pointer that is null until salt processing creates it.
+        TEST_RESULT_INT(cipherBlock->cipherCode, 0, "cipher code is AES-256-CBC");
+        TEST_RESULT_INT(cipherBlock->digestCode, 1, "digest code defaults to SHA1");
+        TEST_RESULT_PTR(cipherBlock->cipherState, NULL, "cipher state is not set");
 
         // Encrypt
         // -------------------------------------------------------------------------------------------------------------------------
@@ -203,21 +206,21 @@ testRun(void)
             strlen(TEST_PLAINTEXT) + EVP_MAX_BLOCK_LENGTH, "check process size");
 
         bufLimitSet(
-            encryptBuffer, CIPHER_BLOCK_MAGIC_SIZE + PKCS5_SALT_LEN + (size_t)EVP_CIPHER_block_size(blockEncrypt->cipher) / 2);
+            encryptBuffer, CIPHER_BLOCK_MAGIC_SIZE + PKCS5_SALT_LEN + (size_t)pgbr_crypto_cipher_block_size(blockEncrypt->cipherCode) / 2);
         ioFilterProcessInOut(blockEncryptFilter, testPlainText, encryptBuffer);
         bufLimitSet(
-            encryptBuffer, CIPHER_BLOCK_MAGIC_SIZE + PKCS5_SALT_LEN + (size_t)EVP_CIPHER_block_size(blockEncrypt->cipher));
+            encryptBuffer, CIPHER_BLOCK_MAGIC_SIZE + PKCS5_SALT_LEN + (size_t)pgbr_crypto_cipher_block_size(blockEncrypt->cipherCode));
         ioFilterProcessInOut(blockEncryptFilter, testPlainText, encryptBuffer);
         bufLimitClear(encryptBuffer);
 
         TEST_RESULT_UINT(
-            bufUsed(encryptBuffer), CIPHER_BLOCK_HEADER_SIZE + (size_t)EVP_CIPHER_block_size(blockEncrypt->cipher),
+            bufUsed(encryptBuffer), CIPHER_BLOCK_HEADER_SIZE + (size_t)pgbr_crypto_cipher_block_size(blockEncrypt->cipherCode),
             "cipher size increases by one block");
         TEST_RESULT_BOOL(ioFilterDone(blockEncryptFilter), false, "filter is not done");
 
         ioFilterProcessInOut(blockEncryptFilter, NULL, encryptBuffer);
         TEST_RESULT_UINT(
-            bufUsed(encryptBuffer), CIPHER_BLOCK_HEADER_SIZE + (size_t)(EVP_CIPHER_block_size(blockEncrypt->cipher) * 2),
+            bufUsed(encryptBuffer), CIPHER_BLOCK_HEADER_SIZE + (size_t)(pgbr_crypto_cipher_block_size(blockEncrypt->cipherCode) * 2),
             "cipher size increases by one block on flush");
         TEST_RESULT_BOOL(ioFilterDone(blockEncryptFilter), true, "filter is done");
 
@@ -236,7 +239,7 @@ testRun(void)
             "check process size");
 
         ioFilterProcessInOut(blockDecryptFilter, encryptBuffer, decryptBuffer);
-        TEST_RESULT_UINT_INT(bufUsed(decryptBuffer), EVP_CIPHER_block_size(blockDecrypt->cipher), "decrypt size is one block");
+        TEST_RESULT_UINT(bufUsed(decryptBuffer), pgbr_crypto_cipher_block_size(blockDecrypt->cipherCode), "decrypt size is one block");
 
         ioFilterProcessInOut(blockDecryptFilter, NULL, decryptBuffer);
         TEST_RESULT_UINT(bufUsed(decryptBuffer), strlen(TEST_PLAINTEXT) * 2, "check final decrypt size");
@@ -276,7 +279,7 @@ testRun(void)
             blockDecryptFilter,
             bufNewC(bufPtr(encryptBuffer) + CIPHER_BLOCK_HEADER_SIZE, bufUsed(encryptBuffer) - CIPHER_BLOCK_HEADER_SIZE),
             decryptBuffer);
-        TEST_RESULT_UINT_INT(bufUsed(decryptBuffer), EVP_CIPHER_block_size(blockDecrypt->cipher), "decrypt size is one block");
+        TEST_RESULT_UINT(bufUsed(decryptBuffer), pgbr_crypto_cipher_block_size(blockDecrypt->cipherCode), "decrypt size is one block");
 
         ioFilterProcessInOut(blockDecryptFilter, NULL, decryptBuffer);
         TEST_RESULT_UINT(bufUsed(decryptBuffer), strlen(TEST_PLAINTEXT) * 2, "check final decrypt size");

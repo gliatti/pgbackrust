@@ -689,6 +689,230 @@ pub unsafe extern "C" fn pgbr_crypto_random_bytes(buf: *mut u8, size: usize) {
     });
 }
 
+// ---------- pgbr-crypto cipher bridge (Phase 12) ----------
+
+/// Cipher block size in bytes for `cipher_code`, or `0` for unknown codes.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_cipher_block_size(cipher_code: i32) -> usize {
+    with_panic_guard(|| pgbr_crypto::cipher::CipherType::from_code(cipher_code).map_or(0, pgbr_crypto::cipher::CipherType::block_size))
+}
+
+/// Required key size in bytes for `cipher_code`, or `0` for unknown codes.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_cipher_key_len(cipher_code: i32) -> usize {
+    with_panic_guard(|| pgbr_crypto::cipher::CipherType::from_code(cipher_code).map_or(0, pgbr_crypto::cipher::CipherType::key_len))
+}
+
+/// Required IV size in bytes for `cipher_code`, or `0` for unknown codes.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_crypto_cipher_iv_len(cipher_code: i32) -> usize {
+    with_panic_guard(|| pgbr_crypto::cipher::CipherType::from_code(cipher_code).map_or(0, pgbr_crypto::cipher::CipherType::iv_len))
+}
+
+/// Derive key + IV from `pass` and `salt` using `EVP_BytesToKey` (count = 1).
+///
+/// Writes the key into `key_out` and the IV into `iv_out`. `key_out_size` / `iv_out_size`
+/// must be at least the cipher's required key / IV size — call
+/// [`pgbr_crypto_cipher_key_len`] and [`pgbr_crypto_cipher_iv_len`] to size the buffers.
+///
+/// Returns `0` on success, `-1` on error (thread-local last error set).
+///
+/// # Safety
+///
+/// All pointers must be non-null and point to buffers of the documented sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_cipher_derive_key_iv(
+    cipher_code: i32,
+    digest_code: i32,
+    salt: *const u8,
+    salt_size: usize,
+    pass: *const u8,
+    pass_size: usize,
+    key_out: *mut u8,
+    key_out_size: usize,
+    iv_out: *mut u8,
+    iv_out_size: usize,
+) -> i32 {
+    with_panic_guard(|| {
+        let Some(cipher) = pgbr_crypto::cipher::CipherType::from_code(cipher_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_cipher_derive_key_iv: unknown cipher code {cipher_code}"),
+            ));
+            return -1;
+        };
+        let Some(digest) = pgbr_crypto::hash::HashType::from_code(digest_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_cipher_derive_key_iv: unknown digest code {digest_code}"),
+            ));
+            return -1;
+        };
+        if salt.is_null() || pass.is_null() || key_out.is_null() || iv_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_cipher_derive_key_iv: null pointer"));
+            return -1;
+        }
+        // SAFETY: caller upholds the size + non-null contracts above.
+        let salt_slice = unsafe { core::slice::from_raw_parts(salt, salt_size) };
+        // SAFETY: same.
+        let pass_slice = unsafe { core::slice::from_raw_parts(pass, pass_size) };
+        // SAFETY: same.
+        let key_slice = unsafe { core::slice::from_raw_parts_mut(key_out, key_out_size) };
+        // SAFETY: same.
+        let iv_slice = unsafe { core::slice::from_raw_parts_mut(iv_out, iv_out_size) };
+        match pgbr_crypto::cipher::derive_key_iv(cipher, digest, salt_slice, pass_slice, key_slice, iv_slice) {
+            Ok(_) => 0,
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Allocate a streaming cipher state with the given algorithm, mode, key and IV.
+///
+/// Returns null on error; inspect the thread-local last error for the cause.
+///
+/// # Safety
+///
+/// `key` / `iv` must point to readable buffers of the documented sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_cipher_state_new(
+    cipher_code: i32,
+    mode_code: i32,
+    key: *const u8,
+    key_size: usize,
+    iv: *const u8,
+    iv_size: usize,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        let Some(cipher) = pgbr_crypto::cipher::CipherType::from_code(cipher_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_cipher_state_new: unknown cipher code {cipher_code}"),
+            ));
+            return core::ptr::null_mut();
+        };
+        let Some(mode) = pgbr_crypto::cipher::Mode::from_code(mode_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_crypto_cipher_state_new: unknown mode code {mode_code}"),
+            ));
+            return core::ptr::null_mut();
+        };
+        if key.is_null() || iv.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_cipher_state_new: null pointer"));
+            return core::ptr::null_mut();
+        }
+        // SAFETY: caller upholds the size + non-null contracts.
+        let key_slice = unsafe { core::slice::from_raw_parts(key, key_size) };
+        // SAFETY: same.
+        let iv_slice = unsafe { core::slice::from_raw_parts(iv, iv_size) };
+        match pgbr_crypto::cipher::State::new(cipher, mode, key_slice, iv_slice) {
+            Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                core::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Drop a cipher state. No-op on null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_crypto_cipher_state_new`] that
+/// has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_cipher_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_crypto::cipher::State>()) };
+    });
+}
+
+/// Stream `src_size` bytes from `src` through the cipher state, writing up to `dst_size`
+/// bytes to `dst`. Returns the number of bytes written (`>= 0`) on success or `-1` on error.
+///
+/// `dst` must have at least `src_size + cipher.block_size()` bytes of capacity.
+///
+/// # Safety
+///
+/// All pointers must be non-null and point to buffers of the documented sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_cipher_state_update(
+    state: *mut core::ffi::c_void,
+    src: *const u8,
+    src_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+) -> isize {
+    with_panic_guard(|| {
+        if state.is_null() || dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_cipher_state_update: null pointer"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is alive.
+        let state = unsafe { &mut *state.cast::<pgbr_crypto::cipher::State>() };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else if src.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_cipher_state_update: src is null"));
+            return -1;
+        } else {
+            // SAFETY: caller upholds the size contract.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+        // SAFETY: same.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        match state.update(src_slice, dst_slice) {
+            Ok(n) => isize::try_from(n).unwrap_or(-1),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
+/// Finalize the cipher state and write any remaining bytes (including PKCS#7 padding for
+/// CBC) to `dst`. Returns the number of bytes written (`>= 0`) on success or `-1` on error.
+///
+/// `dst` must have at least `cipher.block_size()` bytes of capacity.
+///
+/// # Safety
+///
+/// All pointers must be non-null and point to buffers of the documented sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crypto_cipher_state_finalize(
+    state: *mut core::ffi::c_void,
+    dst: *mut u8,
+    dst_size: usize,
+) -> isize {
+    with_panic_guard(|| {
+        if state.is_null() || dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crypto_cipher_state_finalize: null pointer"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the state pointer is alive.
+        let state = unsafe { &mut *state.cast::<pgbr_crypto::cipher::State>() };
+        // SAFETY: caller upholds the size + non-null contract.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, dst_size) };
+        match state.finalize(dst_slice) {
+            Ok(n) => isize::try_from(n).unwrap_or(-1),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Crypto, err.to_string()));
+                -1
+            }
+        }
+    })
+}
+
 // ---------- pgbr-crypto hash bridge (Phase 11) ----------
 
 /// Allocate a fresh streaming hash state for `type_code` (0 = MD5, 1 = SHA1, 2 = SHA256).
