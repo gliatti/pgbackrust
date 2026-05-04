@@ -943,6 +943,216 @@ pub unsafe extern "C" fn pgbr_gz_compress_state_deflate(
     })
 }
 
+// ---------- pgbr-compress lz4 compress bridge (Phase 18) ----------
+
+/// Allocate a streaming LZ4-frame compressor.
+///
+/// `level` matches the legacy `lz4CompressNew` parameter (`-5..=12`). `raw=false`
+/// enables LZ4's frame content checksum; `raw=true` disables it (matching the legacy
+/// flag).
+///
+/// On success returns a non-null pointer the caller must release exactly once via
+/// [`pgbr_lz4_compress_state_free`]. On failure returns null and writes the raw
+/// `LZ4F_errorCode_t` to `*err_out` (so the C caller can hand it to `lz4Error`).
+///
+/// # Safety
+///
+/// `err_out` must be either null or point to a writable `usize`. The returned pointer
+/// (when non-null) is owned by the caller and must be released with
+/// [`pgbr_lz4_compress_state_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_new(level: i32, raw: bool, err_out: *mut usize) -> *mut core::ffi::c_void {
+    with_panic_guard(|| match pgbr_compress::lz4::compress::Compress::new(level, raw) {
+        Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+        Err(code) => {
+            if !err_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { err_out.write(code) };
+            }
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_lz4_compress_state_new: LZ4F_createCompressionContext returned {code}"),
+            ));
+            core::ptr::null_mut()
+        }
+    })
+}
+
+/// Drop an LZ4 compress state previously returned by [`pgbr_lz4_compress_state_new`].
+///
+/// No-op on null. Calling on a non-null pointer that did not come from `state_new` (or
+/// that has already been freed) is undefined behaviour.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_lz4_compress_state_new`] that
+/// has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_compress::lz4::compress::Compress>()) };
+    });
+}
+
+/// `LZ4F_compressBound(src_size, &prefs)` for the state's preferences.
+///
+/// Used by the C side to size its destination buffer before calling
+/// [`pgbr_lz4_compress_state_update`] / [`pgbr_lz4_compress_state_end`]. Returns the
+/// raw `LZ4F_errorCode_t`-flagged `usize` (the C caller routes it through `lz4Error`).
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_lz4_compress_state_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_bound(state: *mut core::ffi::c_void, src_size: usize) -> usize {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_lz4_compress_state_bound: null pointer"));
+            return 0;
+        }
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &*state.cast::<pgbr_compress::lz4::compress::Compress>() };
+        state.compress_bound(src_size)
+    })
+}
+
+/// Run `LZ4F_compressBegin`: write the frame header into `dst`.
+///
+/// Returns the raw `LZ4F_errorCode_t` (`LZ4F_isError`-flagged on failure, byte count on
+/// success) so the C caller can hand it to `lz4Error`. Returns `usize::MAX` on Rust-side
+/// invariant violation (null state pointer, etc.); the matching message is set on the
+/// thread-local last-error slot.
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_lz4_compress_state_new`]. `dst` (if
+/// `dst_size > 0`) must point to a writable buffer of `dst_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_begin(state: *mut core::ffi::c_void, dst: *mut u8, dst_size: usize) -> usize {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_lz4_compress_state_begin: null pointer"));
+            return usize::MAX;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_lz4_compress_state_begin: dst is null but dst_size > 0",
+            ));
+            return usize::MAX;
+        }
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::lz4::compress::Compress>() };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+        match state.compress_begin(dst_slice) {
+            Ok(n) | Err(n) => n,
+        }
+    })
+}
+
+/// Run `LZ4F_compressUpdate`: compress `src` into `dst`.
+///
+/// Returns the raw `LZ4F_errorCode_t` (`LZ4F_isError`-flagged on failure, byte count on
+/// success). Returns `usize::MAX` on Rust-side invariant violation.
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_lz4_compress_state_new`]. `src` (if
+/// `src_size > 0`) and `dst` (if `dst_size > 0`) must point to readable / writable
+/// buffers of the documented sizes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_update(
+    state: *mut core::ffi::c_void,
+    src: *const u8,
+    src_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+) -> usize {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_lz4_compress_state_update: null pointer"));
+            return usize::MAX;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_lz4_compress_state_update: dst is null but dst_size > 0",
+            ));
+            return usize::MAX;
+        }
+        if src_size > 0 && src.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_lz4_compress_state_update: src is null but src_size > 0",
+            ));
+            return usize::MAX;
+        }
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::lz4::compress::Compress>() };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: same.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+        match state.compress_update(src_slice, dst_slice) {
+            Ok(n) | Err(n) => n,
+        }
+    })
+}
+
+/// Run `LZ4F_compressEnd`: write the frame trailer into `dst`.
+///
+/// Returns the raw `LZ4F_errorCode_t` (`LZ4F_isError`-flagged on failure, byte count on
+/// success). Returns `usize::MAX` on Rust-side invariant violation.
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_lz4_compress_state_new`]. `dst` (if
+/// `dst_size > 0`) must point to a writable buffer of `dst_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_lz4_compress_state_end(state: *mut core::ffi::c_void, dst: *mut u8, dst_size: usize) -> usize {
+    with_panic_guard(|| {
+        if state.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_lz4_compress_state_end: null pointer"));
+            return usize::MAX;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_lz4_compress_state_end: dst is null but dst_size > 0",
+            ));
+            return usize::MAX;
+        }
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::lz4::compress::Compress>() };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+        match state.compress_end(dst_slice) {
+            Ok(n) | Err(n) => n,
+        }
+    })
+}
+
 // ---------- pgbr-compress lz4 error bridge (Phase 17) ----------
 
 /// Classify an `LZ4F_errorCode_t`.

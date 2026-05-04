@@ -6,6 +6,9 @@ Test Compression
                                                                         // gz/decompress.c no longer #include <zlib.h> after the
                                                                         // Phase 15 / 16 migration, so the test file pulls it
                                                                         // directly.
+#include <lz4frame.h>                                                   // For the legacy_lz4Compress differential helper —
+                                                                        // lz4/compress.c (Phase 18) no longer includes
+                                                                        // lz4frame.h.
 
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
@@ -83,6 +86,48 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
     bufUsedSet(output, bufSize(output) - stream.avail_out);
 
     inflateEnd(&stream);
+
+    return output;
+}
+
+// `legacy_lz4Compress` mirrors the pre-Phase-18 body of `lz4CompressNew` / `lz4CompressProcess` — direct LZ4F calls with the same
+// preferences (compressionLevel, contentChecksumFlag toggled by `raw`). One-shot compression; both the new IoFilter path and
+// this helper output byte-identical frames because liblz4 is deterministic given fixed prefs and a fixed `LZ4F_VERSION`.
+static Buffer *
+legacy_lz4Compress(const int level, const bool raw, const Buffer *const input)
+{
+    LZ4F_preferences_t prefs =
+    {
+        .compressionLevel = level,
+        .frameInfo = {.contentChecksumFlag = raw ? LZ4F_noContentChecksum : LZ4F_contentChecksumEnabled},
+    };
+
+    LZ4F_compressionContext_t ctx;
+    size_t ret = LZ4F_createCompressionContext(&ctx, LZ4F_VERSION);
+    ASSERT(!LZ4F_isError(ret));
+
+    const size_t bound = LZ4F_compressBound(bufUsed(input), &prefs);
+    ASSERT(!LZ4F_isError(bound));
+
+    Buffer *const output = bufNew(bound + 32);
+
+    size_t written = LZ4F_compressBegin(ctx, bufRemainsPtr(output), bufRemains(output), &prefs);
+    ASSERT(!LZ4F_isError(written));
+    bufUsedInc(output, written);
+
+    if (bufUsed(input) > 0)
+    {
+        written = LZ4F_compressUpdate(
+            ctx, bufRemainsPtr(output), bufRemains(output), bufPtrConst(input), bufUsed(input), NULL);
+        ASSERT(!LZ4F_isError(written));
+        bufUsedInc(output, written);
+    }
+
+    written = LZ4F_compressEnd(ctx, bufRemainsPtr(output), bufRemains(output), NULL);
+    ASSERT(!LZ4F_isError(written));
+    bufUsedInc(output, written);
+
+    LZ4F_freeCompressionContext(ctx);
 
     return output;
 }
@@ -565,6 +610,54 @@ testRun(void)
 
         TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(decompress, lz4DecompressToLog, buffer, sizeof(buffer)), "lz4DecompressToLog");
         TEST_RESULT_Z(buffer, "{inputSame: true, inputOffset: 999, frameDone false, done: true}", "check log");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("lz4Compress differential vs direct liblz4 (10000+ inputs)");
+
+        // 10 000 random `(level, raw, input)` triples. liblz4's frame-format encoder is deterministic given fixed prefs +
+        // LZ4F_VERSION, so the new FFI path and `legacy_lz4Compress` (direct LZ4F calls with the same prefs) must produce
+        // byte-identical frames.
+        uint64_t lz4LcgState = UINT64_C(0xACE0FFEEDEADBEEF);
+        unsigned int lz4Comparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            lz4LcgState = lz4LcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t lz4Len = (size_t)((lz4LcgState >> 32) & 0x3FF) + 1;            // 1..1024 bytes
+            // Range matches LZ4_COMPRESS_LEVEL_MIN..MAX (-5..12) → 18 distinct values.
+            const int lz4Level = (int)(((lz4LcgState >> 24) & 0xFF) % 18) - 5;
+            const bool lz4Raw = ((lz4LcgState >> 16) & 1) == 0;
+
+            Buffer *const lz4Input = bufNew(lz4Len);
+            for (size_t i = 0; i < lz4Len; i++)
+            {
+                lz4LcgState = lz4LcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(lz4Input)[i] = (uint8_t)(lz4LcgState >> 56);
+            }
+            bufUsedSet(lz4Input, lz4Len);
+
+            Buffer *const lz4NewOut = testCompress(
+                compressFilterP(compressTypeLz4, lz4Level, .raw = lz4Raw), lz4Input, lz4Len, lz4Len * 2 + 256);
+            Buffer *const lz4LegacyOut = legacy_lz4Compress(lz4Level, lz4Raw, lz4Input);
+
+            if (!bufEq(lz4NewOut, lz4LegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "lz4Compress(level=%d, raw=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu", lz4Level, (int)lz4Raw, lz4Len,
+                    iter, bufUsed(lz4NewOut), bufUsed(lz4LegacyOut));
+            }
+
+            bufFree(lz4Input);
+            bufFree(lz4NewOut);
+            bufFree(lz4LegacyOut);
+
+            lz4Comparisons++;
+        }
+
+        TEST_RESULT_UINT(lz4Comparisons, 10000, "10k differential lz4Compress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************

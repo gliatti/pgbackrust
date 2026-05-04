@@ -1,11 +1,14 @@
 /***********************************************************************************************************************************
 LZ4 Compress
 
-Developed against version r131 using the documentation in https://github.com/lz4/lz4/blob/r131/lib/lz4frame.h.
+Thin C wrapper over the Rust streaming compressor in `crates/pgbr-compress::lz4::compress`. The IoFilter object, the internal
+overflow `Buffer*`, and the `first` / `inputSame` / `flushing` state machine stay on the C side because they plug into
+pgBackRust's IoFilter framework. The libliblz4 calls (`LZ4F_createCompressionContext`, `LZ4F_compressBegin`,
+`LZ4F_compressBound`, `LZ4F_compressUpdate`, `LZ4F_compressEnd`, `LZ4F_freeCompressionContext`) are replaced by FFI calls into
+libpgbr_ffi.a, which owns the LZ4F context and the `LZ4F_preferences_t` struct.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <lz4frame.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -17,21 +20,21 @@ Developed against version r131 using the documentation in https://github.com/lz4
 #include "common/log.h"
 #include "common/type/object.h"
 #include "common/type/pack.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
-Older versions of lz4 do not define the max header size. This seems to be the max for any version.
+Older versions of lz4 do not define the max header size. This seems to be the max for any version. Replicated here so the C side
+no longer needs `<lz4frame.h>`.
 ***********************************************************************************************************************************/
-#ifndef LZ4F_HEADER_SIZE_MAX
 #define LZ4F_HEADER_SIZE_MAX                                        19
-#endif
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct Lz4Compress
 {
-    LZ4F_compressionContext_t context;                              // LZ4 compression context
-    LZ4F_preferences_t prefs;                                       // Preferences -- just compress level set
+    void *state;                                                    // Opaque pgbr_compress::lz4::compress::Compress*
+    int level;                                                      // Compression level, mirrored on the C side for `*ToLog`
     IoFilter *filter;                                               // Filter interface
 
     Buffer *buffer;                                                 // For when the output buffer can't accept all compressed data
@@ -47,8 +50,8 @@ static void
 lz4CompressToLog(const Lz4Compress *const this, StringStatic *const debugLog)
 {
     strStcFmt(
-        debugLog, "{level: %d, first: %s, inputSame: %s, flushing: %s}", this->prefs.compressionLevel,
-        cvtBoolToConstZ(this->first), cvtBoolToConstZ(this->inputSame), cvtBoolToConstZ(this->flushing));
+        debugLog, "{level: %d, first: %s, inputSame: %s, flushing: %s}", this->level, cvtBoolToConstZ(this->first),
+        cvtBoolToConstZ(this->inputSame), cvtBoolToConstZ(this->flushing));
 }
 
 #define FUNCTION_LOG_LZ4_COMPRESS_TYPE                                                                                             \
@@ -70,7 +73,8 @@ lz4CompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    LZ4F_freeCompressionContext(this->context);
+    pgbr_lz4_compress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -151,7 +155,7 @@ lz4CompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
 
     ASSERT(this != NULL);
     ASSERT(!(this->flushing && !this->inputSame));
-    ASSERT(this->context != NULL);
+    ASSERT(this->state != NULL);
     ASSERT(compressed != NULL);
     ASSERT(!this->flushing || uncompressed == NULL);
 
@@ -168,8 +172,8 @@ lz4CompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
         if (this->first)
         {
             output = lz4CompressBuffer(this, LZ4F_HEADER_SIZE_MAX, compressed);
-            bufUsedInc(
-                output, lz4Error(LZ4F_compressBegin(this->context, bufRemainsPtr(output), bufRemains(output), &this->prefs)));
+            const size_t headerSize = pgbr_lz4_compress_state_begin(this->state, bufRemainsPtr(output), bufRemains(output));
+            bufUsedInc(output, lz4Error(headerSize));
 
             this->first = false;
         }
@@ -177,14 +181,12 @@ lz4CompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
         // Normal processing call
         if (uncompressed != NULL)
         {
-            output = lz4CompressBuffer(this, lz4Error(LZ4F_compressBound(bufUsed(uncompressed), &this->prefs)), compressed);
+            const size_t bound = lz4Error(pgbr_lz4_compress_state_bound(this->state, bufUsed(uncompressed)));
+            output = lz4CompressBuffer(this, bound, compressed);
 
-            bufUsedInc(
-                output,
-                lz4Error(
-                    LZ4F_compressUpdate(
-                        this->context, bufRemainsPtr(output), bufRemains(output), bufPtrConst(uncompressed), bufUsed(uncompressed),
-                        NULL)));
+            const size_t written = pgbr_lz4_compress_state_update(
+                this->state, bufPtrConst(uncompressed), bufUsed(uncompressed), bufRemainsPtr(output), bufRemains(output));
+            bufUsedInc(output, lz4Error(written));
         }
         // Else flush remaining output
         else
@@ -192,8 +194,11 @@ lz4CompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
             // Pass 1 as src size to help allocate enough space for the final flush. This is required for some versions that don't
             // allocate enough memory unless autoFlush is enabled. Other versions fail if autoFlush is only enabled before the final
             // flush. This will hopefully work across all versions even if it does allocate a larger buffer than needed.
-            output = lz4CompressBuffer(this, lz4Error(LZ4F_compressBound(1, &this->prefs)), compressed);
-            bufUsedInc(output, lz4Error(LZ4F_compressEnd(this->context, bufRemainsPtr(output), bufRemains(output), NULL)));
+            const size_t bound = lz4Error(pgbr_lz4_compress_state_bound(this->state, 1));
+            output = lz4CompressBuffer(this, bound, compressed);
+
+            const size_t trailerSize = pgbr_lz4_compress_state_end(this->state, bufRemainsPtr(output), bufRemains(output));
+            bufUsedInc(output, lz4Error(trailerSize));
 
             this->flushing = true;
         }
@@ -255,17 +260,22 @@ lz4CompressNew(const int level, const bool raw)
     {
         *this = (Lz4Compress)
         {
-            .prefs =
-            {
-                .compressionLevel = level,
-                .frameInfo = {.contentChecksumFlag = raw ? LZ4F_noContentChecksum : LZ4F_contentChecksumEnabled},
-            },
+            .level = level,
             .first = true,
             .buffer = bufNew(0),
         };
 
-        // Create lz4 context
-        lz4Error(LZ4F_createCompressionContext(&this->context, LZ4F_VERSION));
+        // Create the Rust streaming compressor. The FFI returns the raw LZ4F error code via
+        // `errCode` on failure; route it through `lz4Error` so we get the same exception
+        // type / message text the legacy `lz4Error(LZ4F_createCompressionContext(...))` would have raised.
+        size_t errCode = 0;
+        this->state = pgbr_lz4_compress_state_new(level, raw, &errCode);
+
+        if (this->state == NULL)
+        {
+            pgbr_last_error_clear();
+            lz4Error(errCode);
+        }
 
         // Set callback to ensure lz4 context is freed
         memContextCallbackSet(objMemContext(this), lz4CompressFreeResource, this);
