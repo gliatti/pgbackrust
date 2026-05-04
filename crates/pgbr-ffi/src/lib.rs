@@ -48,6 +48,12 @@ impl FfiPanicReturn for usize {
     }
 }
 
+impl FfiPanicReturn for u32 {
+    fn ffi_panic_return() -> Self {
+        0
+    }
+}
+
 impl<T> FfiPanicReturn for *const T {
     fn ffi_panic_return() -> Self {
         core::ptr::null()
@@ -242,6 +248,29 @@ pub enum LogLevel {
     Debug = 7,
     /// Trace-level diagnostic.
     Trace = 8,
+}
+
+// ---------- pgbr-postgres bridge (Phase 7) ----------
+
+/// CRC-32C (Castagnoli) checksum of `size` bytes at `data`. Mirrors the legacy `crc32cOne`.
+///
+/// # Safety
+///
+/// `data` must point to at least `size` readable bytes (or be null when `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_crc32c_one(data: *const u8, size: usize) -> u32 {
+    with_panic_guard(|| {
+        if size == 0 {
+            return pgbr_postgres::crc32c_one(&[]);
+        }
+        if data.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_crc32c_one: data is null"));
+            return 0;
+        }
+        // SAFETY: caller upholds the read-of-size precondition above.
+        let slice = unsafe { core::slice::from_raw_parts(data, size) };
+        pgbr_postgres::crc32c_one(slice)
+    })
 }
 
 // ---------- pgbr-encode bridge (Phase 6) ----------
