@@ -358,8 +358,7 @@ System call harness
         if (TEST_SYSTEM_FMT_result != 0)                                                                                           \
         {                                                                                                                          \
             THROW_FMT(                                                                                                             \
-                AssertError, "SYSTEM COMMAND: %s\n\nFAILED WITH CODE %d\n\nTHROWN AT:\n%s", command, TEST_SYSTEM_FMT_result,       \
-                errorStackTrace());                                                                                                \
+                AssertError, "SYSTEM COMMAND: %s\n\nFAILED WITH CODE %d", command, TEST_SYSTEM_FMT_result);                        \
         }                                                                                                                          \
     } while (0)
 

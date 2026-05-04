@@ -12,15 +12,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG RUST_VERSION=1.95.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git rsync pkg-config build-essential \
+        ca-certificates curl git rsync pkg-config build-essential cmake \
         libssl-dev libpq-dev libxml2-dev liblz4-dev libyaml-dev libbz2-dev zlib1g-dev \
         libssh2-1-dev libzstd-dev \
-        meson ninja-build uncrustify \
+        gzip bzip2 lz4 zstd \
+        meson ninja-build \
         python3 python3-pip \
         perl libperl-dev libdbd-pg-perl libdbi-perl \
         libxml-checker-perl libxml-libxml-perl libjson-pp-perl libyaml-libyaml-perl \
         clang lld \
     && rm -rf /var/lib/apt/lists/*
+
+# Build uncrustify 0.72.0 from source — Debian 13 ships 0.78.1 which interprets several legacy
+# `true`/`false` options as numbers and silently changes formatting decisions, breaking
+# `test.pl --code-format-check`. The project's `test/uncrustify.cfg` header is pinned to
+# `Uncrustify-0.72.0_f`; honour that pin so format checks stay deterministic.
+RUN curl -fsSL https://github.com/uncrustify/uncrustify/archive/refs/tags/uncrustify-0.72.0.tar.gz \
+        | tar -xzC /tmp \
+    && cmake -S /tmp/uncrustify-uncrustify-0.72.0 -B /tmp/uncrustify-uncrustify-0.72.0/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/uncrustify-uncrustify-0.72.0/build --parallel $(nproc) \
+    && cmake --install /tmp/uncrustify-uncrustify-0.72.0/build \
+    && rm -rf /tmp/uncrustify-uncrustify-0.72.0 \
+    && uncrustify --version
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \

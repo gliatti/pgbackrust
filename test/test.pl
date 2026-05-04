@@ -569,6 +569,7 @@ eval
                 $strFile eq 'doc/release.pl' ||
                 $strFile eq 'test/ci.pl' ||
                 $strFile eq 'test/test.pl' ||
+                $strFile eq 'meson/build-ffi.sh' ||
                 $hManifest->{$strFile}{type} eq 'd')
             {
                 $strExpectedMode = sprintf('%04o', oct($hManifest->{$strFile}{mode}) & 0777);

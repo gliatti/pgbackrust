@@ -6,8 +6,8 @@ file keeps `src/postgres/interface/crc32.h` byte-identical to the legacy version
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include "postgres/interface/crc32.h"
 #include "pgbr_ffi.h"
+#include "postgres/interface/crc32.h"
 
 /**********************************************************************************************************************************/
 FN_EXTERN uint32_t

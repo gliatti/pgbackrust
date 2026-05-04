@@ -17,9 +17,9 @@ Help Command
 #include "common/memContext.h"
 #include "common/project.h"
 #include "common/type/pack.h"
-#include "pgbr_ffi.h"
 #include "config/config.intern.h"
 #include "config/parse.h"
+#include "pgbr_ffi.h"
 #include "version.h"
 
 /***********************************************************************************************************************************
