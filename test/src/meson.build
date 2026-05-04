@@ -67,6 +67,7 @@ executable(
         lib_backtrace,
         lib_bz2,
         lib_yaml,
+        pgbr_ffi_dep,
     ],
     build_by_default: false,
 )

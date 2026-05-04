@@ -1,20 +1,23 @@
 /***********************************************************************************************************************************
 Regular Expression Handler
+
+Thin C wrappers over the Rust implementation in `crates/pgbr-regex`. The actual matching engine lives in libpgbr_ffi.a; this file
+keeps the public API in `src/common/regExp.h` byte-identical to the legacy version, translating between the C calling convention
+and the Rust thread-local last-error machinery.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <regex.h>
-#include <sys/types.h>
-
 #include "common/debug.h"
 #include "common/regExp.h"
+#include "common/type/string.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
-Contains information about the regular expression handler
+Regular expression handle. Holds the opaque pointer returned by the Rust shim plus a memory-context callback that releases it.
 ***********************************************************************************************************************************/
 struct RegExp
 {
-    regex_t regExp;
+    void *handle;
 };
 
 /***********************************************************************************************************************************
@@ -31,31 +34,8 @@ regExpFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    regfree(&this->regExp);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/***********************************************************************************************************************************
-Handle errors
-***********************************************************************************************************************************/
-static void
-regExpError(const int error)
-{
-    char buffer[4096];
-    regerror(error, NULL, buffer, sizeof(buffer));
-    THROW(FormatError, buffer);
-}
-
-static void
-regExpErrorCheck(const int error)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(INT, error);
-    FUNCTION_TEST_END();
-
-    if (error != 0 && error != REG_NOMATCH)
-        regExpError(error);
+    pgbr_regex_free(this->handle);
+    this->handle = NULL;
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -72,15 +52,16 @@ regExpNew(const String *const expression)
 
     OBJ_NEW_BEGIN(RegExp, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (RegExp){{0}};                                      // Extra braces are required for older gcc versions
+        *this = (RegExp){.handle = NULL};
 
-        // Compile the regexp and process errors
-        int result = 0;
+        // Compile the regexp through the Rust shim. A NULL return populates the thread-local last error, which we re-throw as a
+        // FormatError to preserve the legacy throw site.
+        this->handle = pgbr_regex_new(strZ(expression));
 
-        if ((result = regcomp(&this->regExp, strZ(expression), REG_EXTENDED)) != 0)
-            regExpError(result);
+        if (this->handle == NULL)
+            THROW_FMT(FormatError, "%s", pgbr_last_error_msg());
 
-        // Set free callback to ensure cipher context is freed
+        // Set free callback to release the Rust handle when the memory context is destroyed.
         memContextCallbackSet(objMemContext(this), regExpFreeResource, this);
     }
     OBJ_NEW_END();
@@ -100,14 +81,12 @@ regExpMatch(RegExp *const this, const String *const string)
     ASSERT(this != NULL);
     ASSERT(string != NULL);
 
-    // Test for a match
-    regmatch_t matchPtr;
-    const int result = regexec(&this->regExp, strZ(string), 1, &matchPtr, 0);
+    const int32_t result = pgbr_regex_match(this->handle, strZ(string));
 
-    // Check for an error
-    regExpErrorCheck(result);
+    if (result < 0)
+        THROW_FMT(FormatError, "%s", pgbr_last_error_msg());
 
-    FUNCTION_TEST_RETURN(BOOL, result == 0);
+    FUNCTION_TEST_RETURN(BOOL, result == 1);
 }
 
 /**********************************************************************************************************************************/
@@ -143,44 +122,15 @@ regExpPrefix(const String *const expression)
 
     String *result = NULL;
 
-    // Only generate prefix if expression is defined and has a beginning anchor
-    if (expression != NULL && strZ(expression)[0] == '^')
+    if (expression != NULL)
     {
-        const char *const expressionZ = strZ(expression);
-        const size_t expressionSize = strSize(expression);
-        unsigned int expressionIdx = 1;
+        const size_t prefixLen = pgbr_regex_prefix_len(strZ(expression));
 
-        for (; expressionIdx < expressionSize; expressionIdx++)
-        {
-            char expressionChr = expressionZ[expressionIdx];
+        if (prefixLen == SIZE_MAX)
+            THROW_FMT(FormatError, "%s", pgbr_last_error_msg());
 
-            // Search for characters that will end the prefix
-            if (expressionChr == '.' || expressionChr == '^' || expressionChr == '$' || expressionChr == '*' ||
-                expressionChr == '+' || expressionChr == '-' || expressionChr == '?' || expressionChr == '(' ||
-                expressionChr == '[' || expressionChr == '{' || expressionChr == ' ' || expressionChr == '|' ||
-                expressionChr == '\\')
-            {
-                break;
-            }
-        }
-
-        // Will there be any characters in the prefix?
-        if (expressionIdx > 1)
-        {
-            // Search the rest of the string for another begin anchor
-            unsigned int anchorIdx = expressionIdx;
-
-            for (; anchorIdx < expressionSize; anchorIdx++)
-            {
-                // [^ and \^ are not begin anchors
-                if (expressionZ[anchorIdx] == '^' && expressionZ[anchorIdx - 1] != '[' && expressionZ[anchorIdx - 1] != '\\')
-                    break;
-            }
-
-            // If no other begin anchor was found then the prefix is usable
-            if (anchorIdx == expressionSize)
-                result = strSubN(expression, 1, expressionIdx - 1);
-        }
+        if (prefixLen > 0)
+            result = strSubN(expression, 1, prefixLen);
     }
 
     FUNCTION_TEST_RETURN(STRING, result);

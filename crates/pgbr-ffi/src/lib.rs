@@ -612,6 +612,148 @@ pub unsafe extern "C" fn pgbr_decode_to_bin_size(encoding_code: i32, src: *const
     })
 }
 
+// ---------- pgbr-regex bridge (Phase 9) ----------
+
+/// Compile the NUL-terminated UTF-8 regular expression at `pattern` as a POSIX ERE.
+///
+/// Returns a non-null opaque handle on success that the caller must release via
+/// [`pgbr_regex_free`]. Returns null on failure and sets the thread-local last error to
+/// `FormatError` with the engine's diagnostic message — matching the legacy `regExpNew`'s
+/// `THROW(FormatError, ...)` behaviour. The wrapper in `src/common/regExp.c` forwards that
+/// message verbatim to the C exception machinery.
+///
+/// # Safety
+///
+/// `pattern` must be a non-null pointer to a NUL-terminated, readable byte sequence.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_regex_new(pattern: *const c_char) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        if pattern.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_regex_new: pattern is null"));
+            return core::ptr::null_mut();
+        }
+        // SAFETY: caller guarantees `pattern` is NUL-terminated and readable.
+        let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
+        match pgbr_regex::Regex::new(bytes) {
+            Ok(regex) => Box::into_raw(Box::new(regex)).cast::<core::ffi::c_void>(),
+            Err(err) => {
+                set_last_error(Error::new(ErrorType::Format, err.to_string()));
+                core::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Drop a regex handle previously returned by [`pgbr_regex_new`]. No-op on null.
+///
+/// # Safety
+///
+/// `handle` must be a pointer previously returned by [`pgbr_regex_new`] that has not yet been
+/// freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_regex_free(handle: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if handle.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the ownership invariant — the pointer came from
+        // `pgbr_regex_new` and has not been freed.
+        let _ = unsafe { Box::from_raw(handle.cast::<pgbr_regex::Regex>()) };
+    });
+}
+
+/// Test whether `haystack` is matched by the regex at `handle`.
+///
+/// Returns `1` for a match, `0` for no match, `-1` on error (null arguments). On `-1` the
+/// thread-local last error is set.
+///
+/// # Safety
+///
+/// - `handle` must be a non-null pointer from [`pgbr_regex_new`] that has not yet been freed.
+/// - `haystack` must be a non-null pointer to a NUL-terminated, readable byte sequence.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_regex_match(handle: *const core::ffi::c_void, haystack: *const c_char) -> i32 {
+    with_panic_guard(|| {
+        if handle.is_null() || haystack.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_regex_match: null argument"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the handle is alive and unaliased.
+        let regex = unsafe { &*handle.cast::<pgbr_regex::Regex>() };
+        // SAFETY: caller guarantees `haystack` is NUL-terminated and readable.
+        let bytes = unsafe { CStr::from_ptr(haystack) }.to_bytes();
+        i32::from(regex.is_match(bytes))
+    })
+}
+
+/// Locate the first match and write its byte offsets to `*start_out` / `*end_out`.
+///
+/// Returns `1` on match, `0` on no match, `-1` on error (null arguments). The output cells are
+/// not written when the function returns `0` or `-1`.
+///
+/// Used by the build-time helper `regExpMatchPtr` / `regExpMatchStr` in
+/// `src/build/common/regExp.c` to recover the same offsets the legacy code took from
+/// `regmatch_t.rm_so` / `rm_eo`.
+///
+/// # Safety
+///
+/// - `handle` must be a non-null pointer from [`pgbr_regex_new`] that has not yet been freed.
+/// - `haystack` must be a non-null pointer to a NUL-terminated, readable byte sequence.
+/// - `start_out` and `end_out` must be non-null pointers to writable `usize` cells.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_regex_match_offsets(
+    handle: *const core::ffi::c_void,
+    haystack: *const c_char,
+    start_out: *mut usize,
+    end_out: *mut usize,
+) -> i32 {
+    with_panic_guard(|| {
+        if handle.is_null() || haystack.is_null() || start_out.is_null() || end_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_regex_match_offsets: null argument"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the handle is alive and unaliased.
+        let regex = unsafe { &*handle.cast::<pgbr_regex::Regex>() };
+        // SAFETY: caller guarantees `haystack` is NUL-terminated and readable.
+        let bytes = unsafe { CStr::from_ptr(haystack) }.to_bytes();
+        match regex.find(bytes) {
+            Some((start, end)) => {
+                // SAFETY: caller guarantees `start_out` / `end_out` are writable.
+                unsafe {
+                    start_out.write(start);
+                    end_out.write(end);
+                }
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Length of the leading fixed-character prefix in `pattern`, or `0` when no usable prefix.
+///
+/// Excludes the leading `^` anchor. Mirrors `regExpPrefix` in `src/common/regExp.c` for the C
+/// wrapper that materialises the result as a `String *`.
+///
+/// Returns `usize::MAX` if `pattern` is null and sets the thread-local last error.
+///
+/// # Safety
+///
+/// `pattern` must be a NUL-terminated, readable byte sequence (or null, which produces an
+/// error return).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_regex_prefix_len(pattern: *const c_char) -> usize {
+    with_panic_guard(|| {
+        if pattern.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_regex_prefix_len: pattern is null"));
+            return usize::MAX;
+        }
+        // SAFETY: caller guarantees `pattern` is NUL-terminated and readable.
+        let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
+        pgbr_regex::prefix_len(bytes)
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -718,5 +860,109 @@ mod tests {
 
         assert_eq!(CALLBACK_HITS.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(LAST_LEVEL.load(std::sync::atomic::Ordering::SeqCst), LogLevel::Info as i32);
+    }
+
+    #[test]
+    fn regex_new_matches_and_frees() {
+        pgbr_last_error_clear();
+        let pattern = cstr("^abc");
+        // SAFETY: pattern is a valid NUL-terminated buffer.
+        let handle = unsafe { pgbr_regex_new(pattern.as_ptr()) };
+        assert!(!handle.is_null());
+        assert_eq!(pgbr_last_error_code(), 0);
+
+        let hay_match = cstr("abcdef");
+        let hay_no = cstr("xyz");
+        // SAFETY: handle is alive, haystack is NUL-terminated.
+        assert_eq!(unsafe { pgbr_regex_match(handle, hay_match.as_ptr()) }, 1);
+        // SAFETY: same.
+        assert_eq!(unsafe { pgbr_regex_match(handle, hay_no.as_ptr()) }, 0);
+
+        let mut start = 0usize;
+        let mut end = 0usize;
+        // SAFETY: handle alive, haystack NUL-terminated, output cells writable.
+        let rc = unsafe { pgbr_regex_match_offsets(handle, hay_match.as_ptr(), &raw mut start, &raw mut end) };
+        assert_eq!(rc, 1);
+        assert_eq!((start, end), (0, 3));
+
+        // SAFETY: handle came from pgbr_regex_new and is freed exactly once.
+        unsafe { pgbr_regex_free(handle) };
+    }
+
+    #[test]
+    fn regex_new_rejects_bad_pattern_and_sets_error() {
+        pgbr_last_error_clear();
+        let pattern = cstr("[[[");
+        // SAFETY: pattern is a valid NUL-terminated buffer.
+        let handle = unsafe { pgbr_regex_new(pattern.as_ptr()) };
+        assert!(handle.is_null());
+        assert_eq!(pgbr_last_error_code(), ErrorType::Format.code());
+
+        let msg_ptr = pgbr_last_error_msg();
+        assert!(!msg_ptr.is_null());
+        // SAFETY: pointer comes from the thread-local slot just populated above.
+        let msg = unsafe { CStr::from_ptr(msg_ptr) }.to_str().unwrap();
+        assert!(msg.contains("regex parse error"), "expected diagnostic, got {msg:?}");
+        pgbr_last_error_clear();
+    }
+
+    #[test]
+    fn regex_match_offsets_no_match_leaves_outputs_unchanged() {
+        let pattern = cstr("zzz");
+        // SAFETY: pattern is NUL-terminated.
+        let handle = unsafe { pgbr_regex_new(pattern.as_ptr()) };
+        assert!(!handle.is_null());
+
+        let hay = cstr("abcdef");
+        let mut start = usize::MAX;
+        let mut end = usize::MAX;
+        // SAFETY: handle alive, haystack NUL-terminated, output cells writable.
+        let rc = unsafe { pgbr_regex_match_offsets(handle, hay.as_ptr(), &raw mut start, &raw mut end) };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            (start, end),
+            (usize::MAX, usize::MAX),
+            "no-match must leave outputs untouched"
+        );
+
+        // SAFETY: handle came from pgbr_regex_new and is freed exactly once.
+        unsafe { pgbr_regex_free(handle) };
+    }
+
+    #[test]
+    fn regex_prefix_len_examples() {
+        let cases: &[(&str, usize)] = &[
+            ("", 0),
+            ("abc", 0),
+            ("^", 0),
+            ("^.", 0),
+            ("^ABC$", 3),
+            ("^ABCDEF", 6),
+            ("^ABC^", 0),
+            ("^ABC[^DEF]", 3),
+            ("^ABC\\^DEF", 3),
+        ];
+        for (pattern, expected) in cases {
+            let c = cstr(pattern);
+            // SAFETY: pattern is a valid NUL-terminated buffer.
+            let len = unsafe { pgbr_regex_prefix_len(c.as_ptr()) };
+            assert_eq!(len, *expected, "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn regex_null_argument_returns_error() {
+        pgbr_last_error_clear();
+        // SAFETY: explicit null pointer is allowed by the function's documented contract.
+        let h = unsafe { pgbr_regex_new(core::ptr::null()) };
+        assert!(h.is_null());
+        assert_ne!(pgbr_last_error_code(), 0);
+        pgbr_last_error_clear();
+
+        // SAFETY: same — null is the contract.
+        let len = unsafe { pgbr_regex_prefix_len(core::ptr::null()) };
+        assert_eq!(len, usize::MAX);
+        assert_ne!(pgbr_last_error_code(), 0);
+        pgbr_last_error_clear();
     }
 }

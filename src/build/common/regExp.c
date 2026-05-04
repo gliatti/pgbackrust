@@ -20,16 +20,17 @@ regExpMatchPtr(RegExp *const this, const String *const string)
     ASSERT(this != NULL);
     ASSERT(string != NULL);
 
-    // Test for a match
-    regmatch_t matchPtr;
-    const int result = regexec(&this->regExp, strZ(string), 1, &matchPtr, 0);
+    // Test for a match through the Rust shim. The shim returns the byte offsets of the first match (POSIX rm_so / rm_eo
+    // equivalent) for the build-time helpers used by uncrustify lints and log harness scrubbing.
+    size_t matchStart = 0;
+    size_t matchEnd = 0;
+    const int32_t result = pgbr_regex_match_offsets(this->handle, strZ(string), &matchStart, &matchEnd);
 
-    // Check for an error
-    regExpErrorCheck(result);
+    if (result < 0)
+        THROW_FMT(FormatError, "%s", pgbr_last_error_msg());
 
-    // Return pointer to match
-    if (result == 0)
-        FUNCTION_TEST_RETURN_CONST(STRINGZ, strZ(string) + matchPtr.rm_so);
+    if (result == 1)
+        FUNCTION_TEST_RETURN_CONST(STRINGZ, strZ(string) + matchStart);
 
     // Return NULL when no match
     FUNCTION_TEST_RETURN_CONST(STRINGZ, NULL);
@@ -46,16 +47,16 @@ regExpMatchStr(RegExp *const this, const String *const string)
     ASSERT(this != NULL);
     ASSERT(string != NULL);
 
-    // Test for a match
-    regmatch_t matchPtr;
-    int result = regexec(&this->regExp, strZ(string), 1, &matchPtr, 0);
+    // Test for a match through the Rust shim and rebuild the matched substring as a `String *` in the caller's memory context.
+    size_t matchStart = 0;
+    size_t matchEnd = 0;
+    const int32_t result = pgbr_regex_match_offsets(this->handle, strZ(string), &matchStart, &matchEnd);
 
-    // Check for an error
-    regExpErrorCheck(result);
+    if (result < 0)
+        THROW_FMT(FormatError, "%s", pgbr_last_error_msg());
 
-    // Return match as string
-    if (result == 0)
-        FUNCTION_TEST_RETURN(STRING, strNewZN(strZ(string) + matchPtr.rm_so, (size_t)(matchPtr.rm_eo - matchPtr.rm_so)));
+    if (result == 1)
+        FUNCTION_TEST_RETURN(STRING, strNewZN(strZ(string) + matchStart, matchEnd - matchStart));
 
     // Return NULL when no match
     FUNCTION_TEST_RETURN(STRING, NULL);

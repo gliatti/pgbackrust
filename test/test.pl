@@ -654,7 +654,7 @@ eval
 
                     # Setup build if it does not exist
                     my $strBuildCommand =
-                        "ninja -C ${strBuildPath}" . ($bBinRequired ? ' src/pgbackrest' : '') .
+                        "ninja -C ${strBuildPath}" . ($bBinRequired ? ' src/pgbackrust' : '') .
                         ($bUnitRequired ? ' test/src/test-pgbackrest' : '') .  ' 2>&1';
 
                     if (!-e $strBuildNinja)

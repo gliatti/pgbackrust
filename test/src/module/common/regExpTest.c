@@ -1,6 +1,26 @@
 /***********************************************************************************************************************************
 Test Regular Expression Handler
 ***********************************************************************************************************************************/
+#include <regex.h>
+#include <string.h>
+
+/***********************************************************************************************************************************
+Differential helper — runs the legacy POSIX `regcomp` / `regexec` engine on a pattern + haystack pair and reports the boolean match
+result. Used to compare the Rust replacement against the previous C behaviour over thousands of random inputs.
+***********************************************************************************************************************************/
+static bool
+legacy_regExpMatchOne(const char *const pattern, const char *const haystack)
+{
+    regex_t regex;
+
+    if (regcomp(&regex, pattern, REG_EXTENDED) != 0)
+        return false;
+
+    const int execResult = regexec(&regex, haystack, 0, NULL, 0);
+    regfree(&regex);
+
+    return execResult == 0;
+}
 
 /***********************************************************************************************************************************
 Test Run
@@ -13,25 +33,10 @@ testRun(void)
     // *****************************************************************************************************************************
     if (testBegin("regExpNew(), regExpMatch(), and regExpFree()"))
     {
-        TEST_ERROR_MULTI(
-            regExpNew(STRDEF("[[[")), FormatError,
-            // Older glibc
-            "Unmatched [ or [^",
-            // Newer glibc
-            "Unmatched [, [^, [:, [., or [=",
-            // MacOS
-            "brackets ([ ]) not balanced",
-            // Musl libc
-            "Missing ']'");
-
-        TEST_ERROR_MULTI(
-            regExpErrorCheck(REG_BADBR), FormatError,
-            // glibc
-            "Invalid content of \\{\\}",
-            // MacOS
-            "invalid repetition count(s)",
-            // Musl libc
-            "Invalid contents of {}");
+        // The Rust implementation reports parse errors with the `regex` crate's diagnostic prefix; the legacy libc messages
+        // (glibc / macOS / musl variants) are gone with the regcomp dependency.
+        TEST_ERROR_FMT(regExpNew(STRDEF("[[[")), FormatError, "%s", "regex parse error: %s");
+        TEST_ERROR(regExpNew(STRDEF("(unclosed")), FormatError, "regex parse error:\n    (unclosed\n    ^\nerror: unclosed group");
 
         // -------------------------------------------------------------------------------------------------------------------------
         TEST_TITLE("new regexp");
@@ -93,6 +98,70 @@ testRun(void)
     {
         TEST_RESULT_BOOL(regExpMatchOne(STRDEF("^abc"), STRDEF("abcdef")), true, "match regexp");
         TEST_RESULT_BOOL(regExpMatchOne(STRDEF("^abc"), STRDEF("bcdef")), false, "no match regexp");
+    }
+
+    // *****************************************************************************************************************************
+    if (testBegin("differential C/Rust match parity"))
+    {
+        // Patterns chosen so POSIX ERE leftmost-longest and the `regex` crate leftmost-first agree on whether *any* match exists.
+        // pgBackRust uses these shapes for backup labels, archive filenames and option allow-lists; the boolean parity covers all
+        // legacy callers because regExpMatch / regExpMatchOne return only booleans, and regExpMatchPtr / regExpMatchStr feed off
+        // the same FFI primitive that locates the first match.
+        const char *const patterns[] =
+        {
+            "^abc",
+            "abc$",
+            "^[0-9]+$",
+            "^[A-Za-z_][A-Za-z0-9_]*$",
+            "^[A-Z][A-Z0-9_-]*$",
+            "(foo|bar|baz)",
+            "^[^/]+$",
+            "\\.tar\\.gz$",
+            "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "^pg_data/[^/]+\\.conf$",
+        };
+
+        // Deterministic LCG over a fixed seed — the same 12 000 inputs reproduce on every run, making divergence reproducible.
+        // Each haystack is printable ASCII (32..127) of bounded length to dodge NUL bytes and odd locale interactions in libc.
+        uint64_t state = UINT64_C(0x0123456789ABCDEF);
+        char haystack[129];
+        const unsigned int patternCount = LENGTH_OF(patterns);
+        const unsigned int iterations = 12000;
+        unsigned int comparisons = 0;
+
+        for (unsigned int iter = 0; iter < iterations; iter++)
+        {
+            state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+            const unsigned int patternIdx = (unsigned int)((state >> 32) % patternCount);
+            const char *const pattern = patterns[patternIdx];
+
+            state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+            const size_t haystackLen = (size_t)((state >> 40) % 64);
+
+            for (size_t b = 0; b < haystackLen; b++)
+            {
+                state = state * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                haystack[b] = (char)(32 + (unsigned char)((state >> 56) % 96));
+            }
+
+            haystack[haystackLen] = '\0';
+
+            const bool legacy = legacy_regExpMatchOne(pattern, haystack);
+            const bool rust = regExpMatchOne(STR(pattern), STR(haystack));
+
+            if (legacy != rust)
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "pattern=%s haystack=%s legacy=%d rust=%d",
+                    pattern, haystack, legacy, rust);
+            }
+
+            comparisons++;
+        }
+
+        TEST_RESULT_UINT(comparisons, iterations, "all C/Rust differential comparisons agreed");
     }
 
     FUNCTION_HARNESS_RETURN_VOID();

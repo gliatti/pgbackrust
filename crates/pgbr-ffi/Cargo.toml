@@ -15,6 +15,7 @@ pgbr-error = { path = "../pgbr-error" }
 pgbr-encode = { path = "../pgbr-encode" }
 pgbr-postgres = { path = "../pgbr-postgres" }
 pgbr-crypto = { path = "../pgbr-crypto" }
+pgbr-regex = { path = "../pgbr-regex" }
 
 [lints]
 workspace = true
