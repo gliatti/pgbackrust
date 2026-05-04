@@ -1,0 +1,31 @@
+# Dev image for the pgbackrust C->Rust migration.
+# Pinned to latest stable as of 2026-05.
+FROM debian:13.4-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    CARGO_HOME=/cargo \
+    RUSTUP_HOME=/rustup
+
+ARG RUST_VERSION=1.95.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git rsync pkg-config build-essential \
+        libssl-dev libpq-dev libxml2-dev liblz4-dev libyaml-dev libbz2-dev zlib1g-dev \
+        libssh2-1-dev libzstd-dev \
+        meson ninja-build uncrustify \
+        python3 python3-pip \
+        perl libperl-dev libdbd-pg-perl libdbi-perl \
+        libxml-checker-perl libxml-libxml-perl libjson-pp-perl libyaml-libyaml-perl \
+        clang lld \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+            -c rustfmt -c clippy \
+    && cargo install --locked --version 0.29.2 cbindgen \
+    && cargo --version && rustc --version && cbindgen --version
+
+WORKDIR /work
