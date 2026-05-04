@@ -16,6 +16,7 @@ pgbr-encode = { path = "../pgbr-encode" }
 pgbr-postgres = { path = "../pgbr-postgres" }
 pgbr-crypto = { path = "../pgbr-crypto" }
 pgbr-regex = { path = "../pgbr-regex" }
+pgbr-compress = { path = "../pgbr-compress" }
 
 [lints]
 workspace = true

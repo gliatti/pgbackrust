@@ -1,66 +1,43 @@
 /***********************************************************************************************************************************
 Gz Common
+
+Thin C wrappers over the Rust implementation in `crates/pgbr-compress::gz`. The zlib error-code → pgBackRust exception-type
+mapping lives in libpgbr_ffi.a; this file keeps the public API in `src/common/compress/gz/common.h` byte-identical to the
+legacy version, plugging the classification result back into pgBackRust's `THROWP_FMT` machinery.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <zlib.h>
-
 #include "common/compress/gz/common.h"
 #include "common/debug.h"
-#include "common/memContext.h"
+#include "pgbr_ffi.h"
 
 /**********************************************************************************************************************************/
 FN_EXTERN int
 gzError(const int error)
 {
-    if (error != Z_OK && error != Z_STREAM_END)
+    int32_t kindCode = 0;
+    char message[64];
+
+    if (pgbr_gz_error_classify(error, &kindCode, message, sizeof(message)) == 1)
     {
-        const char *errorMsg;
-        const ErrorType *errorType = &AssertError;
+        const ErrorType *errorType;
 
-        switch (error)
+        switch (kindCode)
         {
-            // Not exactly an error, but since we are not using custom dictionaries it shouldn't be possible to get this result
-            case Z_NEED_DICT:
-                errorMsg = "need dictionary";
-                break;
-
-            // We should not get this error -- included for completeness
-            case Z_ERRNO:
-                errorMsg = "file error";
-                break;
-
-            case Z_STREAM_ERROR:
-                errorMsg = "stream error";
+            case 1:
                 errorType = &FormatError;
                 break;
 
-            case Z_DATA_ERROR:
-                errorMsg = "data error";
-                errorType = &FormatError;
-                break;
-
-            case Z_MEM_ERROR:
-                errorMsg = "insufficient memory";
+            case 2:
                 errorType = &MemoryError;
                 break;
 
-            // This error indicates an error in the code -- there should always be space in the buffer
-            case Z_BUF_ERROR:
-                errorMsg = "no space in buffer";
-                break;
-
-            case Z_VERSION_ERROR:
-                errorMsg = "incompatible version";
-                errorType = &FormatError;
-                break;
-
             default:
-                errorMsg = "unknown error";
+                errorType = &AssertError;
                 break;
         }
 
-        THROWP_FMT(errorType, "zlib threw error: [%d] %s", error, errorMsg);
+        THROWP_FMT(errorType, "zlib threw error: [%d] %s", error, message);
     }
 
     return error;

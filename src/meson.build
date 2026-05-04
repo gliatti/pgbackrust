@@ -119,6 +119,8 @@ pgbr_ffi_inputs = files(
     '../crates/pgbr-crypto/src/lib.rs',
     '../crates/pgbr-regex/Cargo.toml',
     '../crates/pgbr-regex/src/lib.rs',
+    '../crates/pgbr-compress/Cargo.toml',
+    '../crates/pgbr-compress/src/lib.rs',
     '../src/build/error/error.yaml',
 )
 

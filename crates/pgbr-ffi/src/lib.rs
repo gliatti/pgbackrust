@@ -689,6 +689,54 @@ pub unsafe extern "C" fn pgbr_crypto_random_bytes(buf: *mut u8, size: usize) {
     });
 }
 
+// ---------- pgbr-compress gz error bridge (Phase 14) ----------
+
+/// Classify a zlib return code.
+///
+/// Returns `0` when the code is `Z_OK` / `Z_STREAM_END` (no throw needed; `code_out` is set
+/// to `code`). Returns `1` when the code represents an error: `kind_out` is set to the
+/// pgBackRust error category (0 = Assert, 1 = Format, 2 = Memory) and `msg_out` is filled
+/// with the matching human-readable message (NUL-terminated when `msg_size >= 1`,
+/// truncated otherwise).
+///
+/// Mirrors the legacy `gzError` switch and lets the C wrapper raise the right `ErrorType`
+/// without including `<zlib.h>`.
+///
+/// # Safety
+///
+/// `kind_out` must point to a writable `i32`; `msg_out` must point to a writable buffer of
+/// at least `msg_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_gz_error_classify(
+    code: i32,
+    kind_out: *mut i32,
+    msg_out: *mut c_char,
+    msg_size: usize,
+) -> i32 {
+    with_panic_guard(|| {
+        if kind_out.is_null() || msg_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_gz_error_classify: null pointer"));
+            return -1;
+        }
+        match pgbr_compress::gz::classify(code) {
+            pgbr_compress::gz::Classification::Ok { .. } => 0,
+            pgbr_compress::gz::Classification::Throw { kind, message, .. } => {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { kind_out.write(kind as i32) };
+                if msg_size > 0 {
+                    let bytes = message.as_bytes();
+                    let copy_len = (msg_size - 1).min(bytes.len());
+                    // SAFETY: caller upholds the buffer-size contract.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(msg_out.cast::<u8>(), msg_size) };
+                    dst[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                    dst[copy_len] = 0;
+                }
+                1
+            }
+        }
+    })
+}
+
 // ---------- pgbr-crypto cipher bridge (Phase 12) ----------
 
 /// Cipher block size in bytes for `cipher_code`, or `0` for unknown codes.
