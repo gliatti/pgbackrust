@@ -95,29 +95,10 @@ src_build_code = [
     'common/compress/bz2/compress.c',
 ]
 
-build_code = executable(
-    'build-code',
-    src_common,
-    src_build_code,
-    dependencies: [
-        lib_backtrace,
-        lib_bz2,
-        lib_xml,
-        lib_yaml
-    ],
-    c_args: [
-        arg_unity,
-    ],
-)
-
-# Build help.auto.c.inc
-subdir('command/help')
-
-# Build interface.auto.c.inc
-subdir('postgres')
-
 ####################################################################################################################################
-# Rust FFI shim — libpgbr_ffi.a + pgbr_ffi.h, regenerated on every build by meson/build-ffi.sh
+# Rust FFI shim — libpgbr_ffi.a + pgbr_ffi.h, regenerated on every build by meson/build-ffi.sh.
+# Declared before any executable that uses src_common because src/common/encode.c (and future
+# C wrappers) #include "pgbr_ffi.h" and link against libpgbr_ffi.a.
 ####################################################################################################################################
 cargo = find_program('cargo', required: true)
 cbindgen = find_program('cbindgen', required: true)
@@ -127,6 +108,12 @@ pgbr_ffi_inputs = files(
     '../cbindgen.toml',
     '../crates/pgbr-ffi/Cargo.toml',
     '../crates/pgbr-ffi/src/lib.rs',
+    '../crates/pgbr-encode/Cargo.toml',
+    '../crates/pgbr-encode/src/lib.rs',
+    '../crates/pgbr-error/Cargo.toml',
+    '../crates/pgbr-error/src/lib.rs',
+    '../crates/pgbr-error/build.rs',
+    '../src/build/error/error.yaml',
 )
 
 pgbr_ffi_target = custom_target(
@@ -154,6 +141,28 @@ pgbr_ffi_dep = declare_dependency(
     include_directories: include_directories('.'),
     link_args: [pgbr_ffi_target[0].full_path()],
 )
+
+build_code = executable(
+    'build-code',
+    src_common,
+    src_build_code,
+    dependencies: [
+        lib_backtrace,
+        lib_bz2,
+        lib_xml,
+        lib_yaml,
+        pgbr_ffi_dep,
+    ],
+    c_args: [
+        arg_unity,
+    ],
+)
+
+# Build help.auto.c.inc
+subdir('command/help')
+
+# Build interface.auto.c.inc
+subdir('postgres')
 
 ####################################################################################################################################
 # pgBackRest target

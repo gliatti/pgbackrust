@@ -42,6 +42,7 @@ version = "0.1.0"
 name = "pgbr-ffi"
 version = "0.1.0"
 dependencies = [
+ "pgbr-encode",
  "pgbr-error",
 ]
 

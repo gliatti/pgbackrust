@@ -12,6 +12,7 @@ use core::ffi::{CStr, c_char};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use pgbr_encode::{self as encode, EncodingType};
 use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
 
 /// Version string of the embedded Rust FFI shim, tracking `Cargo.toml`'s workspace version.
@@ -38,6 +39,12 @@ impl FfiPanicReturn for () {
 impl FfiPanicReturn for i32 {
     fn ffi_panic_return() -> Self {
         -1
+    }
+}
+
+impl FfiPanicReturn for usize {
+    fn ffi_panic_return() -> Self {
+        Self::MAX
     }
 }
 
@@ -235,6 +242,210 @@ pub enum LogLevel {
     Debug = 7,
     /// Trace-level diagnostic.
     Trace = 8,
+}
+
+// ---------- pgbr-encode bridge (Phase 6) ----------
+
+/// Format a [`pgbr_encode::DecodeError`] using the legacy C error wording (`base64 size ...`,
+/// `hex invalid character ...`) so the C wrappers in `src/common/encode.c` continue to throw
+/// `FormatError` messages that match the existing test expectations.
+fn format_decode_error(encoding: EncodingType, err: encode::DecodeError) -> String {
+    let prefix = match encoding {
+        EncodingType::Base64 | EncodingType::Base64Url => "base64",
+        EncodingType::Hex => "hex",
+    };
+    match err {
+        encode::DecodeError::InvalidLength { len, group } => {
+            format!("{prefix} size {len} is not evenly divisible by {group}")
+        }
+        encode::DecodeError::InvalidCharacter { position } => {
+            format!("{prefix} invalid character found at position {position}")
+        }
+        encode::DecodeError::PaddingMisplaced => {
+            format!("{prefix} '=' character may only appear in last two positions")
+        }
+        encode::DecodeError::PaddingTrailing => {
+            format!("{prefix} last character must be '=' if second to last is")
+        }
+        encode::DecodeError::Unsupported => format!("{prefix} decoding is not supported"),
+    }
+}
+
+fn record_decode_error(encoding: EncodingType, err: encode::DecodeError) {
+    set_last_error(Error::new(ErrorType::Format, format_decode_error(encoding, err)));
+}
+
+/// Encode `src_size` bytes at `src` into `dst` using the encoding selected by `encoding_code`
+/// (0=Base64, 1=Base64Url, 2=Hex). Mirrors the legacy `encodeToStr` from `src/common/encode.h`.
+///
+/// The function writes `pgbr_encode::encoded_len(encoding, src_size) + 1` bytes (the encoded
+/// form plus a trailing NUL).
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_size` readable bytes (or be null when `src_size == 0`).
+/// - `dst` must point to a writable buffer of at least `encoded_len(encoding, src_size) + 1`
+///   bytes.
+/// - `encoding_code` must be one of 0, 1, 2; any other value sets the thread-local error and
+///   leaves `dst` untouched.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_encode_to_str(encoding_code: i32, src: *const u8, src_size: usize, dst: *mut c_char) {
+    with_panic_guard(|| {
+        let Some(encoding) = EncodingType::from_code(encoding_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("unknown EncodingType code {encoding_code}"),
+            ));
+            return;
+        };
+        if dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_encode_to_str: dst is null"));
+            return;
+        }
+
+        let dst_len = encode::encoded_len(encoding, src_size) + 1;
+        // SAFETY: caller upholds the buffer size + non-null preconditions.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst.cast::<u8>(), dst_len) };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else {
+            // SAFETY: caller guarantees `src` is readable for `src_size` bytes.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+
+        encode::encode(encoding, src_slice, dst_slice);
+    });
+}
+
+/// Returns `pgbr_encode::encoded_len(encoding, src_size)` — the size of the encoded form
+/// excluding the trailing NUL. Mirrors the legacy `encodeToStrSize`.
+///
+/// Returns `usize::MAX` if `encoding_code` is unknown; the C wrapper translates that into a
+/// `FormatError` throw via the thread-local last-error slot.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_encode_to_str_size(encoding_code: i32, src_size: usize) -> usize {
+    with_panic_guard(|| {
+        let Some(encoding) = EncodingType::from_code(encoding_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("unknown EncodingType code {encoding_code}"),
+            ));
+            return usize::MAX;
+        };
+        encode::encoded_len(encoding, src_size)
+    })
+}
+
+/// Decode the NUL-terminated UTF-8 string at `src` into `dst` using the encoding selected by
+/// `encoding_code`. Mirrors the legacy `decodeToBin`.
+///
+/// Returns `0` on success, `-1` if validation failed; on `-1`, the thread-local last error is
+/// populated with a `FormatError`-formatted message that the C wrapper re-throws.
+///
+/// # Safety
+///
+/// - `src` must be a valid NUL-terminated C string.
+/// - `dst` must point to a writable buffer of at least `pgbr_decode_to_bin_size(encoding, src)`
+///   bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_decode_to_bin(encoding_code: i32, src: *const c_char, dst: *mut u8) -> i32 {
+    with_panic_guard(|| {
+        let Some(encoding) = EncodingType::from_code(encoding_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("unknown EncodingType code {encoding_code}"),
+            ));
+            return -1;
+        };
+        if src.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_decode_to_bin: src is null"));
+            return -1;
+        }
+
+        // SAFETY: caller guarantees `src` is NUL-terminated.
+        let cstr = unsafe { CStr::from_ptr(src) };
+        let Ok(text) = cstr.to_str() else {
+            set_last_error(Error::new(ErrorType::Format, "decode source is not valid utf-8"));
+            return -1;
+        };
+
+        let needed = match encode::decoded_len(encoding, text) {
+            Ok(n) => n,
+            Err(err) => {
+                record_decode_error(encoding, err);
+                return -1;
+            }
+        };
+
+        if needed > 0 && dst.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_decode_to_bin: dst is null"));
+            return -1;
+        }
+
+        // SAFETY: caller upholds the dst sizing precondition.
+        let dst_slice = if needed == 0 {
+            &mut [][..]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(dst, needed) }
+        };
+
+        match encode::decode(encoding, text, dst_slice) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_decode_error(encoding, err);
+                -1
+            }
+        }
+    })
+}
+
+/// Computes the decoded byte size for the NUL-terminated string at `src`. Writes the result
+/// through `out_size` and returns `0` on success, `-1` on validation failure.
+///
+/// On `-1`, `out_size` is left untouched and the thread-local last error carries the
+/// `FormatError`-formatted reason.
+///
+/// # Safety
+///
+/// - `src` must be a valid NUL-terminated C string.
+/// - `out_size` must point to a writable `usize` (8 bytes on 64-bit).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_decode_to_bin_size(encoding_code: i32, src: *const c_char, out_size: *mut usize) -> i32 {
+    with_panic_guard(|| {
+        let Some(encoding) = EncodingType::from_code(encoding_code) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("unknown EncodingType code {encoding_code}"),
+            ));
+            return -1;
+        };
+        if src.is_null() || out_size.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_decode_to_bin_size: src or out_size is null",
+            ));
+            return -1;
+        }
+
+        // SAFETY: caller guarantees `src` is NUL-terminated.
+        let cstr = unsafe { CStr::from_ptr(src) };
+        let Ok(text) = cstr.to_str() else {
+            set_last_error(Error::new(ErrorType::Format, "decode source is not valid utf-8"));
+            return -1;
+        };
+
+        match encode::decoded_len(encoding, text) {
+            Ok(n) => {
+                // SAFETY: caller guarantees `out_size` is writable.
+                unsafe { out_size.write(n) };
+                0
+            }
+            Err(err) => {
+                record_decode_error(encoding, err);
+                -1
+            }
+        }
+    })
 }
 
 #[cfg(test)]
