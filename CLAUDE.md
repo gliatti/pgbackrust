@@ -4,7 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-pgBackRest is **no longer being maintained** as of release 2.58.0 (see `README.md`). Forks should select a new project name. Treat this repo as primarily archival; new feature work is unlikely to be accepted.
+pgBackRest is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) is **migrating the codebase from C to Rust** in 215 phased issues — each phase ports one `.c` file to a Rust crate behind an FFI shim, with C-Rust differential tests until Phase 212 removes the C originals. The PR target is `eol`.
+
+## Docker dev environment (REQUIRED — Rust is not installed locally)
+
+All Rust compilation, `cargo` commands, the Meson C build, and `pgbackrest/test/test.pl` runs go through the `pgbackrust-dev` Docker image defined in `Dockerfile.dev` and orchestrated by `docker-compose.yml`. **Do not install Rust on the host.**
+
+Pinned versions (refresh deliberately, not silently):
+
+- Debian 13 trixie (13.4)
+- Rust 1.95.0 stable (rustup, components: rustfmt, clippy)
+- cbindgen 0.29.2
+- Meson 1.11.x (apt) + ninja
+- libpq from Debian (PostgreSQL 18 client)
+
+Common invocations (all from repo root):
+
+```
+docker compose build dev                                     # build the image (first time only)
+docker compose run --rm cargo check --workspace              # quick type-check
+docker compose run --rm cargo test --workspace               # run Rust tests
+docker compose run --rm cargo fmt --check                    # rustfmt verify
+docker compose run --rm cargo clippy --workspace -- -D warnings
+docker compose run --rm cargo run -p pgbr-naming             # run a specific crate binary
+docker compose run --rm meson setup build                    # configure the C build
+docker compose run --rm meson compile -C build               # build the C target
+docker compose run --rm test-pl --gen-check                  # regenerate-check the auto files
+docker compose run --rm test-pl --code-format-check          # uncrustify check
+```
+
+The first build of the image takes a few minutes. Cargo registry, git cache and `target/` live in named volumes (`cargo-registry`, `cargo-git`, `rust-target`) so subsequent `cargo` runs are fast. To wipe them: `docker compose down -v`.
+
+The `dev` service stays up (`sleep infinity`) so you can `docker compose exec dev bash` for an interactive shell.
 
 ## Build
 

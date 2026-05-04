@@ -1,0 +1,20 @@
+[package]
+name = "pgbr-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pgbr_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+pgbr-error = { path = "../pgbr-error" }
+pgbr-encode = { path = "../pgbr-encode" }
+pgbr-postgres = { path = "../pgbr-postgres" }
+pgbr-crypto = { path = "../pgbr-crypto" }
+
+[lints]
+workspace = true

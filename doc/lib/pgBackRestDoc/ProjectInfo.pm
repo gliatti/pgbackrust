@@ -46,11 +46,11 @@ my $strProjectInfo = ${new pgBackRestTest::Common::Storage(
 
 foreach my $strLine (split("\n", $strProjectInfo))
 {
-    if ($strLine =~ /^#define PROJECT_NAME/)
+    if ($strLine =~ /^#define PROJECT_NAME\s/)
     {
         eval("use constant PROJECT_NAME => " . (split(" ", $strLine))[-1]);
     }
-    elsif ($strLine =~ /^#define PROJECT_BIN/)
+    elsif ($strLine =~ /^#define PROJECT_BIN\s/)
     {
         eval("use constant PROJECT_EXE => " . (split(" ", $strLine))[-1]);
     }

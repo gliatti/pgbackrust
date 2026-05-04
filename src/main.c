@@ -37,6 +37,7 @@ Main
 #include "common/debug.h"
 #include "common/io/fdRead.h"
 #include "common/io/fdWrite.h"
+#include "common/project.h"
 #include "common/stat.h"
 #include "config/config.h"
 #include "config/load.h"
@@ -58,6 +59,10 @@ Include automatically generated help data
 int
 main(int argListSize, const char *argList[])
 {
+    // Resolve the invocation name from argv[0] before any user-facing output is produced. Idempotent and side-effect free besides
+    // updating the cached display/bin names returned by projectName() / projectBin().
+    projectInit(argListSize > 0 ? argList[0] : NULL);
+
     // Set stack trace and mem context error cleanup handlers
     static const ErrorHandlerFunction errorHandlerList[] = {stackTraceClean, memContextClean};
     errorHandlerSet(errorHandlerList, LENGTH_OF(errorHandlerList));
