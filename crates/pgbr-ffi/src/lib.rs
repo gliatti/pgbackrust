@@ -1298,6 +1298,53 @@ pub unsafe extern "C" fn pgbr_lz4_compress_state_end(state: *mut core::ffi::c_vo
     })
 }
 
+// ---------- pgbr-compress bz2 error bridge (Phase 20) ----------
+
+/// Classify a libbz2 return code.
+///
+/// Returns `0` when `code >= 0` (no throw needed). Returns `1` when the code represents
+/// an error: `kind_out` is set to the pgBackRust error category (0 = Assert, 1 = Format,
+/// 2 = Memory) and `msg_out` is filled with the matching human-readable message
+/// (NUL-terminated when `msg_size >= 1`, truncated otherwise).
+///
+/// Mirrors the legacy `bz2Error` switch and lets the C wrapper raise the right
+/// `ErrorType` without including `<bzlib.h>`.
+///
+/// # Safety
+///
+/// `kind_out` must point to a writable `i32`; `msg_out` must point to a writable buffer
+/// of at least `msg_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_error_classify(
+    code: i32,
+    kind_out: *mut i32,
+    msg_out: *mut c_char,
+    msg_size: usize,
+) -> i32 {
+    with_panic_guard(|| {
+        if kind_out.is_null() || msg_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_bz2_error_classify: null pointer"));
+            return -1;
+        }
+        match pgbr_compress::bz2::classify(code) {
+            pgbr_compress::bz2::Classification::Ok { .. } => 0,
+            pgbr_compress::bz2::Classification::Throw { kind, message, .. } => {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { kind_out.write(kind as i32) };
+                if msg_size > 0 {
+                    let bytes = message.as_bytes();
+                    let copy_len = (msg_size - 1).min(bytes.len());
+                    // SAFETY: caller upholds the buffer-size contract.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(msg_out.cast::<u8>(), msg_size) };
+                    dst[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                    dst[copy_len] = 0;
+                }
+                1
+            }
+        }
+    })
+}
+
 // ---------- pgbr-compress lz4 error bridge (Phase 17) ----------
 
 /// Classify an `LZ4F_errorCode_t`.

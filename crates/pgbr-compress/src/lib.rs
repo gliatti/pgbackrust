@@ -171,6 +171,7 @@ pub mod params {
     }
 }
 
+pub mod bz2;
 pub mod gz;
 pub mod lz4;
 
