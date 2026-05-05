@@ -1,13 +1,19 @@
 /***********************************************************************************************************************************
 Static String Handler
+
+`strStcCat` / `strStcCatChr` route through `pgbr_string_static_*` so the byte-copy + truncation contract lives in
+`crates/pgbr-core::string_static`. `strStcFmt` keeps its body in C because it is variadic and consumes the format string with
+`vsnprintf`; the C->Rust marshalling bridge for variadic args (`pgbr_error_format_message` from Phase 27 sub-issue B) covers the
+THROW_FMT call sites and is overkill for the small buffer-cursor bookkeeping `strStcFmt` performs after the format runs. Final
+removal of the C originals is at Phase 212.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "common/type/stringStatic.h"
+#include "pgbr_ffi.h"
 
 /**********************************************************************************************************************************/
 FN_EXTERN StringStatic *
@@ -34,28 +40,12 @@ strStcFmt(StringStatic *const debugLog, const char *const format, ...)
 FN_EXTERN void
 strStcCat(StringStatic *const debugLog, const char *const cat)
 {
-    // Proceed if there is space for at least one character
-    const size_t remainsSize = strStcRemainsSize(debugLog);
-
-    if (remainsSize > 1)
-    {
-        const size_t catSize = strlen(cat);
-        const size_t resultSize = catSize > remainsSize - 1 ? remainsSize - 1 : catSize;
-
-        memcpy(strStcRemains(debugLog), cat, resultSize);
-        debugLog->resultSize += resultSize;
-
-        debugLog->buffer[debugLog->resultSize] = '\0';
-    }
+    debugLog->resultSize += pgbr_string_static_cat(strStcRemains(debugLog), strStcRemainsSize(debugLog), cat);
 }
 
 /**********************************************************************************************************************************/
 FN_EXTERN void
 strStcCatChr(StringStatic *const debugLog, const char cat)
 {
-    if (strStcRemainsSize(debugLog) > 1)
-    {
-        debugLog->buffer[debugLog->resultSize] = cat;
-        debugLog->buffer[++debugLog->resultSize] = '\0';
-    }
+    debugLog->resultSize += pgbr_string_static_cat_chr(strStcRemains(debugLog), strStcRemainsSize(debugLog), cat);
 }

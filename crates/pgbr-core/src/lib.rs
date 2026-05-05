@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), forbid(unsafe_op_in_unsafe_fn))]
 
 pub mod debug;
+pub mod string_static;
 
 use core::ffi::{CStr, c_char};
 use core::fmt;

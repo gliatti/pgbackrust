@@ -9,10 +9,40 @@ Test Debug Macros and Routines
 #include "common/macro.h"
 
 /***********************************************************************************************************************************
-Differential helpers — `legacy_*` re-implementations of the pre-Phase-29 `typeToLog` / `objNameToLog` / `ptrToLog` bodies, kept
-verbatim from `src/common/debug.c`. The differential test below feeds identical inputs to both paths and asserts the output bytes
-and the returned size match for a wide grid of buffer sizes and name lengths.
+Differential helpers — `legacy_*` re-implementations of the pre-Phase-29 `typeToLog` / `objNameToLog` / `ptrToLog` bodies and the
+pre-Phase-34 `strStcCat` / `strStcCatChr` bodies, kept verbatim from the pre-migration C sources. The differential tests below
+feed identical inputs to both paths and assert the output bytes and the returned size match for a wide grid of buffer sizes and
+payload shapes.
 ***********************************************************************************************************************************/
+// Pre-Phase-34 strStcCat. Verbatim copy of the legacy body from src/common/type/stringStatic.c.
+static void
+legacy_strStcCat(StringStatic *const debugLog, const char *const cat)
+{
+    const size_t remainsSize = strStcRemainsSize(debugLog);
+
+    if (remainsSize > 1)
+    {
+        const size_t catSize = strlen(cat);
+        const size_t resultSize = catSize > remainsSize - 1 ? remainsSize - 1 : catSize;
+
+        memcpy(strStcRemains(debugLog), cat, resultSize);
+        debugLog->resultSize += resultSize;
+
+        debugLog->buffer[debugLog->resultSize] = '\0';
+    }
+}
+
+// Pre-Phase-34 strStcCatChr. Verbatim copy of the legacy body.
+static void
+legacy_strStcCatChr(StringStatic *const debugLog, const char cat)
+{
+    if (strStcRemainsSize(debugLog) > 1)
+    {
+        debugLog->buffer[debugLog->resultSize] = cat;
+        debugLog->buffer[++debugLog->resultSize] = '\0';
+    }
+}
+
 static size_t
 legacy_typeToLog(const char *const typeName, char *const buffer, const size_t bufferSize)
 {
@@ -150,6 +180,68 @@ testRun(void)
         TEST_RESULT_UINT(strStcRemainsSize(&debugLog), 1, "buffer size");
         TEST_RESULT_PTR(strStcRemains(&debugLog), buffer9 + 1, "buffer remains");
         TEST_RESULT_Z(debugLog.buffer, "Z", "check buffer");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("differential parity vs legacy_* C re-implementation");
+
+        // 7 payload shapes × 7 buffer sizes covers: empty payload, single byte, exact fit, off-by-one
+        // truncation, large overrun, plus a "first cat into populated buffer" sequence. Each cat run is
+        // applied to a freshly initialised StringStatic for both paths; resultSize and buffer bytes are
+        // asserted equal afterwards.
+        const char *const payloads[] = {"", "X", "AB", "ABC", "ABCD", "ABCDE", "ABCDEFGHIJKLMNOP"};
+        const size_t bufferSizes[] = {0, 1, 2, 3, 4, 8, 32};
+
+        for (unsigned int sizeIdx = 0; sizeIdx < LENGTH_OF(bufferSizes); sizeIdx++)
+        {
+            const size_t bufferSize = bufferSizes[sizeIdx];
+
+            for (unsigned int payloadIdx = 0; payloadIdx < LENGTH_OF(payloads); payloadIdx++)
+            {
+                const char *const payload = payloads[payloadIdx];
+
+                char newBuf[64];
+                char legacyBuf[64];
+                memset(newBuf, 0xAA, sizeof(newBuf));
+                memset(legacyBuf, 0xAA, sizeof(legacyBuf));
+
+                StringStatic newLog = strStcInit(newBuf, bufferSize);
+                StringStatic legacyLog = strStcInit(legacyBuf, bufferSize);
+
+                strStcCat(&newLog, payload);
+                legacy_strStcCat(&legacyLog, payload);
+
+                TEST_RESULT_UINT(
+                    newLog.resultSize, legacyLog.resultSize,
+                    zNewFmt("strStcCat: size=%zu payload=%u — resultSize matches", bufferSize, payloadIdx));
+
+                if (bufferSize > 0)
+                {
+                    TEST_RESULT_INT(
+                        memcmp(newBuf, legacyBuf, bufferSize), 0,
+                        zNewFmt("strStcCat: size=%zu payload=%u — bytes match", bufferSize, payloadIdx));
+                }
+
+                // strStcCatChr — single-byte append, also driven from a clean state.
+                memset(newBuf, 0xAA, sizeof(newBuf));
+                memset(legacyBuf, 0xAA, sizeof(legacyBuf));
+
+                StringStatic newChrLog = strStcInit(newBuf, bufferSize);
+                StringStatic legacyChrLog = strStcInit(legacyBuf, bufferSize);
+
+                strStcCatChr(&newChrLog, 'Z');
+                legacy_strStcCatChr(&legacyChrLog, 'Z');
+
+                TEST_RESULT_UINT(
+                    newChrLog.resultSize, legacyChrLog.resultSize,
+                    zNewFmt("strStcCatChr: size=%zu — resultSize matches", bufferSize));
+
+                if (bufferSize > 0)
+                {
+                    TEST_RESULT_INT(
+                        memcmp(newBuf, legacyBuf, bufferSize), 0, zNewFmt("strStcCatChr: size=%zu — bytes match", bufferSize));
+                }
+            }
+        }
     }
 
     // *****************************************************************************************************************************

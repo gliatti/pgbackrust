@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgbr_core::debug as core_debug;
+use pgbr_core::string_static as core_string_static;
 use pgbr_encode::{self as encode, EncodingType};
 use pgbr_error::retry::RetryState;
 use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
@@ -699,6 +700,60 @@ pub unsafe extern "C" fn pgbr_debug_ptr_to_log(
         // SAFETY: caller guarantees `buffer` points to at least `buffer_size` writable bytes.
         let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), buffer_size) };
         core_debug::ptr_to_log(present, name, buf)
+    })
+}
+
+/// Append `cat_utf8` (NUL-terminated UTF-8) to a `StringStatic`-style buffer.
+///
+/// `tail` points to `tail_size` writable bytes — typically the C side computes `tail =
+/// debugLog->buffer + debugLog->resultSize` and `tail_size = debugLog->bufferSize -
+/// debugLog->resultSize`. Returns the number of payload bytes written (excluding the
+/// trailing NUL); `0` on bad input or when `tail_size <= 1`.
+///
+/// # Safety
+///
+/// - `cat_utf8` must be a NUL-terminated, readable C string.
+/// - `tail` must point to at least `tail_size` writable bytes, or be null when
+///   `tail_size == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_static_cat(tail: *mut c_char, tail_size: usize, cat_utf8: *const c_char) -> usize {
+    with_panic_guard(|| {
+        if tail_size == 0 || cat_utf8.is_null() {
+            return 0;
+        }
+        if tail.is_null() {
+            return 0;
+        }
+        // SAFETY: caller guarantees `cat_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(cat_utf8) };
+        let Ok(payload) = cstr.to_str() else {
+            return 0;
+        };
+        // SAFETY: caller guarantees `tail` points to at least `tail_size` writable bytes.
+        let buf = unsafe { core::slice::from_raw_parts_mut(tail.cast::<u8>(), tail_size) };
+        core_string_static::cat(buf, payload)
+    })
+}
+
+/// Append a single byte `byte` to a `StringStatic`-style buffer. Returns `1` on success,
+/// `0` when the buffer is too small.
+///
+/// # Safety
+///
+/// `tail` must point to at least `tail_size` writable bytes, or be null when
+/// `tail_size == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_static_cat_chr(tail: *mut c_char, tail_size: usize, byte: c_char) -> usize {
+    with_panic_guard(|| {
+        if tail_size == 0 || tail.is_null() {
+            return 0;
+        }
+        // SAFETY: caller guarantees `tail` points to at least `tail_size` writable bytes.
+        let buf = unsafe { core::slice::from_raw_parts_mut(tail.cast::<u8>(), tail_size) };
+        // The C `char` may be signed or unsigned depending on the platform; cast through
+        // the byte representation rather than relying on the implicit conversion.
+        let byte_u8 = byte.cast_unsigned();
+        core_string_static::cat_chr(buf, byte_u8)
     })
 }
 
