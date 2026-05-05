@@ -324,6 +324,44 @@ errorTryDepth(void)
 }
 
 /**********************************************************************************************************************************/
+FN_EXTERN void
+pgbr_error_throw_from_last(const char *const fileName, const char *const functionName, const int fileLine)
+{
+    const int code = pgbr_last_error_code();
+
+    // Caller must populate the slot first via pgbr_last_error_set or set_last_error in Rust. Surfacing this as an AssertError
+    // (rather than silently returning) makes the misuse visible and reuses the existing exception machinery.
+    if (code == 0)
+    {
+        errorInternalThrowFmt(
+            &AssertError, fileName, functionName, fileLine,
+            "pgbr_error_throw_from_last called with no last error set");
+    }
+
+    const ErrorType *const type = errorTypeFromCode(code);
+    const char *const message = pgbr_last_error_msg();
+
+    // Snapshot the message into a temp buffer before clearing the Rust-side slot. The buffer the message points into is owned
+    // by Rust's thread-local; clearing the slot invalidates it, and `errorInternalThrowFmt` itself writes through
+    // `messageBufferTemp` which could in principle alias.
+    char messageCopy[ERROR_MESSAGE_BUFFER_SIZE];
+
+    if (message == NULL)
+    {
+        messageCopy[0] = '\0';
+    }
+    else
+    {
+        strncpy(messageCopy, message, sizeof(messageCopy));
+        messageCopy[sizeof(messageCopy) - 1] = '\0';
+    }
+
+    pgbr_last_error_clear();
+
+    errorInternalThrowFmt(type, fileName, functionName, fileLine, "%s", messageCopy);
+}
+
+/**********************************************************************************************************************************/
 FN_EXTERN bool
 errorTypeExtends(const ErrorType *const child, const ErrorType *const parent)
 {

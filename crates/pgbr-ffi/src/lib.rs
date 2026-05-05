@@ -1025,6 +1025,32 @@ pub unsafe extern "C" fn pgbr_decompress_param_list_into(raw: bool, dst: *mut u8
 /// with the matching human-readable message (NUL-terminated when `msg_size >= 1`,
 /// truncated otherwise).
 ///
+/// Classify a zlib return code, format the THROWP_FMT-equivalent message, and populate
+/// the thread-local last-error slot for [`pgbr_error_throw_from_last`].
+///
+/// Returns `1` if the code represents an error (and the slot has been populated);
+/// returns `0` if the code is `Z_OK` / `Z_STREAM_END` (and the slot is left untouched).
+///
+/// This is the typical way new Rust shims should signal a throw to the C side: classify
+/// plus format plus populate happen in Rust, and the C caller just invokes
+/// `pgbr_error_throw_from_last` if the return is non-zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_gz_error_classify_throw(code: i32) -> i32 {
+    with_panic_guard(|| match pgbr_compress::gz::classify(code) {
+        pgbr_compress::gz::Classification::Ok { .. } => 0,
+        pgbr_compress::gz::Classification::Throw { kind, message, .. } => {
+            let error_type = match kind {
+                pgbr_compress::gz::ErrorKind::Format => ErrorType::Format,
+                pgbr_compress::gz::ErrorKind::Memory => ErrorType::Memory,
+                pgbr_compress::gz::ErrorKind::Assert => ErrorType::Assert,
+            };
+            let formatted = format!("zlib threw error: [{code}] {message}");
+            set_last_error(Error::new(error_type, formatted));
+            1
+        }
+    })
+}
+
 /// Mirrors the legacy `gzError` switch and lets the C wrapper raise the right `ErrorType`
 /// without including `<zlib.h>`.
 ///

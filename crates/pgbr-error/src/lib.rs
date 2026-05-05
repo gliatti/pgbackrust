@@ -59,6 +59,34 @@ impl Error {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Sets `self` as the thread's last error and longjmps into the nearest C `TRY_BEGIN`.
+    ///
+    /// Typed equivalent of "set the slot, return a sentinel, let the C caller invoke
+    /// `pgbr_error_throw_from_last`" — useful when a Rust function deeper in the call stack
+    /// already has an `Error` in hand and wants to surface it to a C caller in one step.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be inside a C `TRY` / `CATCH` frame: the bridge longjmps via
+    /// `errorInternalThrowFmt` and skips Rust destructors on the call stack between this
+    /// call and the matching `TRY`. Resources holding `Drop` impls in those frames will leak
+    /// — this matches the existing C `THROW` semantics.
+    #[cfg(not(test))]
+    pub fn throw_into_c(self, file: &core::ffi::CStr, function: &core::ffi::CStr, line: i32) -> ! {
+        set_last_error(self);
+        // SAFETY: the C-side shim is provided by `pgbr_error_throw_from_last` in
+        // src/common/error/error.c. It never returns (longjmps via `errorInternalThrowFmt`).
+        unsafe {
+            pgbr_error_throw_from_last(file.as_ptr(), function.as_ptr(), line);
+        }
+        unreachable!("pgbr_error_throw_from_last returned");
+    }
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    fn pgbr_error_throw_from_last(file: *const core::ffi::c_char, function: *const core::ffi::c_char, line: i32);
 }
 
 impl fmt::Display for Error {

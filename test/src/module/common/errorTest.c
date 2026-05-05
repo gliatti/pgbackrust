@@ -174,6 +174,44 @@ testRun(void)
     }
 
     // *****************************************************************************************************************************
+    if (testBegin("pgbr_error_throw_from_last() bridge"))
+    {
+        TEST_TITLE("Rust-populated last-error throws via the C TRY/CATCH machinery");
+
+        // Populate the slot directly via the FFI helper (the same path Rust shims use).
+        assert(pgbr_last_error_set(FormatError.code, "test message from rust") == 0);
+
+        TRY_BEGIN()
+        {
+            pgbr_error_throw_from_last("file42", "function43", 44);
+        }
+        CATCH_ANY()
+        {
+            assert(errorType() == &FormatError);
+            assert(strcmp(errorMessage(), "test message from rust") == 0);
+            assert(errorFileLine() == 44);
+            assert(strcmp(errorFileName(), "file42") == 0);
+            assert(strcmp(errorFunctionName(), "function43") == 0);
+
+            // The bridge clears the slot once it has consumed the message.
+            assert(pgbr_last_error_code() == 0);
+        }
+        TRY_END();
+
+        // Empty slot trips the assert path inside the bridge — AssertError is fatal, so use CATCH_FATAL.
+        TRY_BEGIN()
+        {
+            pgbr_error_throw_from_last("f", "g", 1);
+        }
+        CATCH_FATAL()
+        {
+            assert(errorType() == &AssertError);
+            assert(strcmp(errorMessage(), "pgbr_error_throw_from_last called with no last error set") == 0);
+        }
+        TRY_END();
+    }
+
+    // *****************************************************************************************************************************
     if (testBegin("errorInternalThrowFmt() formatting via Rust"))
     {
         // After sub-issue #223, the format-string work in errorInternalThrowFmt /

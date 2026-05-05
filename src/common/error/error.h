@@ -83,6 +83,15 @@ FN_EXTERN const ErrorType *errorTypeParent(const ErrorType *errorType);
 FN_EXTERN bool errorTypeExtends(const ErrorType *child, const ErrorType *parent);
 
 /***********************************************************************************************************************************
+Bridge for Rust shims that need to longjmp into the nearest C TRY block
+
+A Rust shim populates the thread-local last-error slot via `pgbr_last_error_set` (or via the higher-level
+`pgbr_error::Error::throw_into_c` helper which calls this function) and then invokes this shim. It reads the slot, resolves the
+code into an ErrorType, clears the slot, and longjmps via `errorInternalThrowFmt`. Asserts if no last error is set.
+***********************************************************************************************************************************/
+FN_EXTERN void pgbr_error_throw_from_last(const char *fileName, const char *functionName, int fileLine);
+
+/***********************************************************************************************************************************
 Functions to get information about the current error within a CATCH() block. Invalid outside a CATCH() block.
 ***********************************************************************************************************************************/
 // Error type
