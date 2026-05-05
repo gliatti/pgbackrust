@@ -11,6 +11,7 @@
 pub mod debug;
 pub mod log;
 pub mod mem_context;
+pub mod object;
 pub mod stack_trace;
 pub mod string_static;
 

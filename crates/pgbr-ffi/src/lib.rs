@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use pgbr_core::debug as core_debug;
 use pgbr_core::log as core_log;
 use pgbr_core::mem_context as core_mem_context;
+use pgbr_core::object as core_object;
 use pgbr_core::stack_trace as core_stack_trace;
 use pgbr_core::string_static as core_string_static;
 use pgbr_encode::{self as encode, EncodingType};
@@ -4692,6 +4693,61 @@ pub unsafe extern "C" fn pgbr_regex_prefix_len(pattern: *const c_char) -> usize 
         let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
         pgbr_regex::prefix_len(bytes)
     })
+}
+
+// ─── pgbr_obj ──────────────────────────────────────────────────────────────────────────────────
+
+/// `objMove(thisVoid, parentNew)`. Returns `this_void` unchanged.
+///
+/// # Safety
+///
+/// `this_void`, when non-null, must point at the `allocExtra` slot of an object
+/// allocated via `OBJ_NEW_*`; `parent_new` must be a valid `MemContext` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_obj_move(
+    this_void: *mut core::ffi::c_void,
+    parent_new: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the live-allocation contract.
+        unsafe { core_object::move_obj(this_void, parent_new) }
+    })
+}
+
+/// `objMoveToInterface(thisVoid, interfaceVoid, current)`. Returns `this_void` (or the
+/// moved object pointer, identical to the C contract).
+///
+/// # Safety
+///
+/// `this_void` and `interface_void` must satisfy the same `OBJ_NEW_*` contract as
+/// [`pgbr_obj_move`]. `current` is a borrowed `MemContext` pointer the caller obtained
+/// from `mem_context_current`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_obj_move_to_interface(
+    this_void: *mut core::ffi::c_void,
+    interface_void: *mut core::ffi::c_void,
+    current: *const core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the live-allocation contract.
+        unsafe { core_object::move_to_interface(this_void, interface_void, current) }
+    })
+}
+
+/// `objFree(thisVoid)`. Forwards the resolved `MemContext` to `free_callback`
+/// (typically the C-side `memContextFree`).
+///
+/// # Safety
+///
+/// `this_void`, when non-null, must point at the `allocExtra` slot of an object
+/// allocated via `OBJ_NEW_*`. `free_callback` must be safe to invoke on the resulting
+/// `MemContext` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_obj_free(this_void: *mut core::ffi::c_void, free_callback: PgbrFreeCallback) {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the contract for both arguments.
+        unsafe { core_object::free_obj(this_void, free_callback) };
+    });
 }
 
 // ─── pgbr_log ──────────────────────────────────────────────────────────────────────────────────
