@@ -1287,6 +1287,373 @@ pub unsafe extern "C" fn pgbr_mem_context_init_top(top: *mut core::ffi::c_void) 
     with_panic_guard(|| unsafe { core_mem_context::init_top(top) });
 }
 
+// ─── Field accessors required by the 32D test rewrite ──────────────────────────────────────────
+
+/// Read the `child_initialized` bit. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_child_initialized(this: *const core::ffi::c_void) -> bool {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe { (*this.cast::<core_mem_context::MemContext>()).child_initialized() })
+}
+
+/// Read the `alloc_initialized` bit. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_alloc_initialized(this: *const core::ffi::c_void) -> bool {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe { (*this.cast::<core_mem_context::MemContext>()).alloc_initialized() })
+}
+
+/// Read the `callback_qty` 2-bit field. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_callback_qty(this: *const core::ffi::c_void) -> u8 {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe { (*this.cast::<core_mem_context::MemContext>()).callback_qty() })
+}
+
+/// Read the `callback_initialized` bit. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_callback_initialized(this: *const core::ffi::c_void) -> bool {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe { (*this.cast::<core_mem_context::MemContext>()).callback_initialized() })
+}
+
+/// Read the DEBUG-only `sequence_new` field; returns 0 in non-DEBUG builds.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_sequence_new(this: *const core::ffi::c_void) -> u64 {
+    with_panic_guard(|| {
+        #[cfg(c_debug)]
+        {
+            // SAFETY: caller upholds pointer-validity.
+            unsafe { (*this.cast::<core_mem_context::MemContext>()).sequence_new }
+        }
+        #[cfg(not(c_debug))]
+        {
+            let _ = this;
+            0
+        }
+    })
+}
+
+/// Read `context_parent`. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_context_parent(this: *const core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe {
+        (*this.cast::<core_mem_context::MemContext>())
+            .context_parent
+            .cast::<core::ffi::c_void>()
+    })
+}
+
+/// Read `context_parent_idx`. # Safety: `this` must be a valid `MemContext *`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_context_parent_idx(this: *const core::ffi::c_void) -> u32 {
+    // SAFETY: caller upholds pointer-validity.
+    with_panic_guard(|| unsafe { (*this.cast::<core_mem_context::MemContext>()).context_parent_idx })
+}
+
+// ─── Optional-region accessors used by the 32D test rewrite ────────────────────────────────────
+
+/// Returns `(MemContextChildOne *)this->child_offset`'s `context` field.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `child_qty == MEM_QTY_ONE`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_one_context(this: *const core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let one = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildOne>();
+        (*one).context.cast::<core::ffi::c_void>()
+    })
+}
+
+/// Returns the `i`-th entry of the child-many list. # Safety: `this` must be valid; `idx` in
+/// range `[0, list_size)`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_many_list_at(this: *const core::ffi::c_void, idx: u32) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildMany>();
+        (*(*many).list.add(idx as usize)).cast::<core::ffi::c_void>()
+    })
+}
+
+/// Sets the `i`-th entry of the child-many list. The test uses this to null out and restore a
+/// child entry to exercise `memContextMove`'s list-validity assertion.
+///
+/// # Safety
+///
+/// `this` must be valid; `idx` in range `[0, list_size)`. `value` must be a valid `MemContext *`
+/// or null.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_many_list_set(
+    this: *mut core::ffi::c_void,
+    idx: u32,
+    value: *mut core::ffi::c_void,
+) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>();
+        let many = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildMany>();
+        *(*many).list.add(idx as usize) = value.cast::<core_mem_context::MemContext>();
+    });
+}
+
+/// Returns the `list_size` of the child-many region. # Safety: `this` must be a valid
+/// `MemContext *` whose `child_qty == MEM_QTY_MANY`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_many_list_size(this: *const core::ffi::c_void) -> u32 {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildMany>();
+        (*many).list_size
+    })
+}
+
+/// Returns the `free_idx` of the child-many region.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_many_free_idx(this: *const core::ffi::c_void) -> u32 {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildMany>();
+        (*many).free_idx
+    })
+}
+
+/// Returns the raw pointer to the child-many list. The test uses this for null-checking.
+///
+/// # Safety
+///
+/// `this` must be valid.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_child_many_list(this: *const core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::child_offset_ptr_pub(mc).cast::<core_mem_context::MemContextChildMany>();
+        (*many).list.cast::<core::ffi::c_void>()
+    })
+}
+
+/// Returns the alloc-one `alloc` pointer.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `alloc_qty == MEM_QTY_ONE`.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_one_alloc(this: *const core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let one = core_mem_context::alloc_offset_ptr_pub(mc).cast::<core_mem_context::MemContextAllocOne>();
+        (*one).alloc.cast::<core::ffi::c_void>()
+    })
+}
+
+/// Returns the `i`-th entry of the alloc-many list (a `MemContextAlloc *` cast to `void *`).
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_many_list_at(this: *const core::ffi::c_void, idx: u32) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::alloc_offset_ptr_pub(mc).cast::<core_mem_context::MemContextAllocMany>();
+        (*(*many).list.add(idx as usize)).cast::<core::ffi::c_void>()
+    })
+}
+
+/// Returns the `list_size` of the alloc-many region.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_many_list_size(this: *const core::ffi::c_void) -> u32 {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::alloc_offset_ptr_pub(mc).cast::<core_mem_context::MemContextAllocMany>();
+        (*many).list_size
+    })
+}
+
+/// Returns the `free_idx` of the alloc-many region.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_many_free_idx(this: *const core::ffi::c_void) -> u32 {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let mc = this.cast::<core_mem_context::MemContext>().cast_mut();
+        let many = core_mem_context::alloc_offset_ptr_pub(mc).cast::<core_mem_context::MemContextAllocMany>();
+        (*many).free_idx
+    })
+}
+
+// ─── MemContextAlloc helpers (replace MEM_CONTEXT_ALLOC_BUFFER / _HEADER macros) ───────────────
+
+/// Returns `(MemContextAlloc *)alloc + 1` cast to `void *` — the user-visible buffer pointer.
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_buffer(alloc: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        alloc
+            .cast::<core_mem_context::MemContextAlloc>()
+            .add(1)
+            .cast::<core::ffi::c_void>()
+    })
+}
+
+/// Returns `(MemContextAlloc *)buffer - 1` cast to `void *` — the alloc header pointer. Returns
+/// the `(uintptr_t)-sizeof(MemContextAlloc)` sentinel when `buffer` is null (matches the legacy
+/// `MEM_CONTEXT_ALLOC_HEADER` macro behaviour the test pins).
+#[allow(
+    clippy::missing_safety_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_long_first_doc_paragraph
+)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_header(buffer: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        buffer
+            .cast::<core_mem_context::MemContextAlloc>()
+            .sub(1)
+            .cast::<core::ffi::c_void>()
+    })
+}
+
+/// Compile-time `sizeof(MemContextAlloc)`. Used by the test which previously referenced the C
+/// `sizeof(MemContextAlloc)` constant.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_alloc_size_of() -> usize {
+    with_panic_guard(core::mem::size_of::<core_mem_context::MemContextAlloc>)
+}
+
+/// Compile-time `sizeof(MemContextChildMany)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_child_many_size_of() -> usize {
+    with_panic_guard(core::mem::size_of::<core_mem_context::MemContextChildMany>)
+}
+
+/// Compile-time `sizeof(MemContextAllocMany)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_alloc_many_size_of() -> usize {
+    with_panic_guard(core::mem::size_of::<core_mem_context::MemContextAllocMany>)
+}
+
+/// Compile-time `sizeof(MemContextCallbackOne)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_callback_one_size_of() -> usize {
+    with_panic_guard(core::mem::size_of::<core_mem_context::MemContextCallbackOne>)
+}
+
+/// Initialise the Rust-owned top context and prime `memContextStack[0]` with its address.
+/// Called once from the C `__attribute__((constructor))` in `src/common/memContext.c`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_top_setup() {
+    with_panic_guard(core_mem_context::top_setup);
+}
+
+/// Returns the address of the Rust-owned top context. Replaces `&contextTop` from the legacy
+/// C side.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_top() -> *mut core::ffi::c_void {
+    with_panic_guard(|| (&raw mut core_mem_context::TOP_CONTEXT).cast::<core::ffi::c_void>())
+}
+
 // ─── Tree algorithms (32B-3) ───────────────────────────────────────────────────────────────────
 //
 // `pgbr_mem_context_new` is the FFI surface for `memContextNewP`; the C wrapper retains the

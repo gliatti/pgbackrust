@@ -21,6 +21,13 @@ Memory context object
 ***********************************************************************************************************************************/
 typedef struct MemContext MemContext;
 
+// Mirror of the Rust `MEM_QTY_*` constants (`pgbr-core::mem_context`). Phase 32D dropped the
+// C-side `MemQty` enum together with the `struct MemContext` body, so the constants live here
+// for the FFI shims and the test rewrite. Values must match `pgbr-core::mem_context`.
+#define MEM_QTY_NONE                                                0
+#define MEM_QTY_ONE                                                 1
+#define MEM_QTY_MANY                                                2
+
 #include "common/type/param.h"
 
 /***********************************************************************************************************************************

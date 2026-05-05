@@ -517,6 +517,26 @@ unsafe fn child_offset_ptr(this: *mut MemContext) -> *mut u8 {
     }
 }
 
+/// Public re-export of [`child_offset_ptr`] for the FFI accessor crate.
+///
+/// # Safety
+///
+/// Same as [`child_offset_ptr`].
+pub unsafe fn child_offset_ptr_pub(this: *mut MemContext) -> *mut u8 {
+    // SAFETY: caller upholds `this` validity.
+    unsafe { child_offset_ptr(this) }
+}
+
+/// Public re-export of [`alloc_offset_ptr`] for the FFI accessor crate.
+///
+/// # Safety
+///
+/// Same as [`alloc_offset_ptr`].
+pub unsafe fn alloc_offset_ptr_pub(this: *mut MemContext) -> *mut u8 {
+    // SAFETY: caller upholds `this` validity.
+    unsafe { alloc_offset_ptr(this) }
+}
+
 /// Pointer to the optional alloc region; sits after the child region.
 unsafe fn alloc_offset_ptr(this: *mut MemContext) -> *mut u8 {
     // SAFETY: caller upholds `this` validity.
@@ -980,6 +1000,87 @@ pub unsafe fn mem_context_size(this: *const MemContext) -> usize {
 pub fn top_context() -> *mut c_void {
     // SAFETY: see module-level note. Slot 0 is initialised before `main` runs.
     unsafe { entry_at(0).mem_context }
+}
+
+// ─── 32D: top context owned by Rust ────────────────────────────────────────────────────────────
+//
+// Before 32D the top context lived in C as `static struct MemContextTop contextTop`. 32D drops
+// the C struct definitions, so the top context moves here and the C side reaches it via
+// `pgbr_mem_context_top()`. Rust's const-init cannot set bitfield bits via the
+// non-const `MemContext::set_*` methods, so the bits get initialised once at process start by
+// `top_setup()` (called from the C `__attribute__((constructor))` below).
+
+/// Same layout as the legacy C `struct MemContextTop`.
+///
+/// A `MemContext` followed by a `MemContextChildMany` and a `MemContextAllocMany`. Lives as a
+/// process-wide `static mut` so `&TOP_CONTEXT` is the same pointer for every caller.
+#[repr(C)]
+pub struct MemContextTop {
+    pub mem_context: MemContext,
+    pub child_many: MemContextChildMany,
+    pub alloc_many: MemContextAllocMany,
+}
+
+/// Default-construct an all-zero `MemContextTop`. The bitfields live inside `mem_context.flags`
+/// as a single `u32` and the `set_*` accessors are not `const`, so the bits get filled in by
+/// [`top_setup`] before the first allocation.
+const fn make_top() -> MemContextTop {
+    MemContextTop {
+        mem_context: MemContext {
+            #[cfg(c_debug)]
+            name: TOP_NAME.as_ptr(),
+            #[cfg(c_debug)]
+            sequence_new: 0,
+            flags: 0,
+            context_parent_idx: 0,
+            context_parent: core::ptr::null_mut(),
+        },
+        child_many: MemContextChildMany {
+            list: core::ptr::null_mut(),
+            list_size: 0,
+            free_idx: 0,
+        },
+        alloc_many: MemContextAllocMany {
+            list: core::ptr::null_mut(),
+            list_size: 0,
+            free_idx: 0,
+        },
+    }
+}
+
+#[cfg(c_debug)]
+static TOP_NAME: [c_char; 4] = [b'T' as c_char, b'O' as c_char, b'P' as c_char, 0];
+
+/// Process-wide top context. Equivalent to the legacy C `static struct MemContextTop contextTop`.
+#[unsafe(no_mangle)]
+pub static mut TOP_CONTEXT: MemContextTop = make_top();
+
+/// Initialise the bitfields on `TOP_CONTEXT` and prime `memContextStack[0]` with its address.
+///
+/// Called once from the C `__attribute__((constructor))` in `memContext.c`. The setters are not
+/// `const`, so we apply them to a stack-local `MemContext` and then copy the resulting `flags`
+/// word into the static via `core::ptr::write` (avoiding `&mut` to a `static mut`).
+pub fn top_setup() {
+    // SAFETY: process-singleton. Single-threaded init guaranteed by the constructor attribute.
+    unsafe {
+        let mut tmp = MemContext {
+            #[cfg(c_debug)]
+            name: TOP_NAME.as_ptr(),
+            #[cfg(c_debug)]
+            sequence_new: 0,
+            flags: 0,
+            context_parent_idx: 0,
+            context_parent: core::ptr::null_mut(),
+        };
+        tmp.set_active(true);
+        tmp.set_child_qty(MEM_QTY_MANY);
+        tmp.set_alloc_qty(MEM_QTY_MANY);
+
+        let flags_ptr = &raw mut TOP_CONTEXT.mem_context.flags;
+        core::ptr::write(flags_ptr, tmp.flags);
+
+        init_top((&raw mut TOP_CONTEXT).cast::<c_void>());
+    }
 }
 
 // ─── Allocations (32C) ────────────────────────────────────────────────────────────────────────

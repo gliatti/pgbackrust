@@ -1,9 +1,15 @@
 /***********************************************************************************************************************************
 Memory Context Manager
+
+Phase 32D: the C `struct MemContext` body is gone — the byte-for-byte mirror in
+`pgbr-core::mem_context` is the single source of truth. Every public function in this file is now
+a thin FFI shim. The `memAllocInternal` / `memReAllocInternal` / `memFreeInternal` static helpers
+stay because the first `testBegin` block of `memContextTest.c` exercises them directly with pinned
+`MemoryError` diagnostics; everything else (`struct MemContext`, the optional-region typedefs, the
+size-table, the static accessor helpers and the `contextTop` static) was deleted.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,304 +18,486 @@ Memory Context Manager
 #include "common/memContext.h"
 #include "pgbr_ffi.h"
 
-/***********************************************************************************************************************************
-Contains information about a memory allocation. This header is placed at the beginning of every memory allocation returned to the
-user by memNew(), etc. The advantage is that when an allocation is passed back by the user we know the location of the allocation
-header by doing some pointer arithmetic. This is much faster than searching through a list.
-***********************************************************************************************************************************/
-typedef struct MemContextAlloc
-{
-    unsigned int allocIdx : 32;                                     // Index in the allocation list
-    unsigned int size : 32;                                         // Allocation size (4GB max)
-} MemContextAlloc;
-
-// Get the allocation buffer pointer given the allocation header pointer
-#define MEM_CONTEXT_ALLOC_BUFFER(header)                            ((MemContextAlloc *)header + 1)
-
-// Get the allocation header pointer given the allocation buffer pointer
-#define MEM_CONTEXT_ALLOC_HEADER(buffer)                            ((MemContextAlloc *)buffer - 1)
-
-// Make sure the allocation is valid for the current memory context. The actual validity check
-// lives in `pgbr_mem_alloc_valid` (`pgbr-core::mem_context::mem_alloc_valid`); the macro just
-// stringifies for the legacy `assertion '%s' failed` diagnostic.
+// Make sure the allocation is valid for the current memory context. The validity check lives in
+// `pgbr-core::mem_context::mem_alloc_valid`; the macro just stringifies for the legacy
+// `assertion '%s' failed` diagnostic.
 #define ASSERT_ALLOC_MANY_VALID(alloc)                                                                                             \
     ASSERT(pgbr_mem_alloc_valid(alloc))
 
 /***********************************************************************************************************************************
-Contains information about the memory context
+Constructor: prime the Rust-owned `TOP_CONTEXT` static and slot 0 of `memContextStack`. Runs once
+per process at load time; `__attribute__((constructor))` is supported by GCC and Clang on every
+platform pgBackRest builds against.
 ***********************************************************************************************************************************/
-// Quantity of child contexts, allocations, or callbacks
-typedef enum
-{
-    memQtyNone = 0,                                                 // None for this type
-    memQtyOne = 1,                                                  // One for this type
-    memQtyMany = 2,                                                 // Many for this type
-} MemQty;
-
-// Main structure required by every mem context
-struct MemContext
-{
-#ifdef DEBUG
-    const char *name;                                               // Indicates what the context is being used for
-    uint64_t sequenceNew;                                           // Sequence when this context was created (used for audit)
-    bool active : 1;                                                // Is the context currently active?
-#endif
-    MemQty childQty : 2;                                            // How many child contexts can this context have?
-    bool childInitialized : 1;                                      // Has the child context list been initialized?
-    MemQty allocQty : 2;                                            // How many allocations can this context have?
-    bool allocInitialized : 1;                                      // Has the allocation list been initialized?
-    MemQty callbackQty : 2;                                         // How many callbacks can this context have?
-    bool callbackInitialized : 1;                                   // Has the callback been initialized?
-    size_t allocExtra : 16;                                         // Size of extra allocation (1kB max)
-
-    unsigned int contextParentIdx;                                  // Index in the parent context list
-    MemContext *contextParent;                                      // All contexts have a parent except top
-};
-
-// Mem context with one allocation
-typedef struct MemContextAllocOne
-{
-    MemContextAlloc *alloc;                                         // Memory allocation created in this context
-} MemContextAllocOne;
-
-// Mem context with many allocations
-typedef struct MemContextAllocMany
-{
-    MemContextAlloc **list;                                         // List of memory allocations created in this context
-    unsigned int listSize;                                          // Size of alloc list (not the actual count of allocations)
-    unsigned int freeIdx;                                           // Index of first free space in the alloc list
-} MemContextAllocMany;
-
-// Mem context with one child context
-typedef struct MemContextChildOne
-{
-    MemContext *context;                                            // Context created in this context
-} MemContextChildOne;
-
-// Mem context with many child contexts
-typedef struct MemContextChildMany
-{
-    MemContext **list;                                              // List of contexts created in this context
-    unsigned int listSize;                                          // Size of child context list (not the actual count of contexts)
-    unsigned int freeIdx;                                           // Index of first free space in the context list
-} MemContextChildMany;
-
-// Mem context with one callback
-typedef struct MemContextCallbackOne
-{
-    void (*function)(void *);                                       // Function to call before the context is freed
-    void *argument;                                                 // Argument to pass to callback function
-} MemContextCallbackOne;
-
-/***********************************************************************************************************************************
-Layout-drift guard: the Rust mirror in `crates/pgbr-core/src/mem_context.rs` is byte-identical to these C structs and is gated by
-the `c-debug` cargo feature (toggled via `PGBR_C_DEBUG=1` from the meson custom_target when `get_option('debug')` is true). Any
-size drift here would corrupt malloc'd allocations the Rust algorithms in 32B-2 (#236) operate on; catch it at build time.
-***********************************************************************************************************************************/
-#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
-#ifdef DEBUG
-_Static_assert(sizeof(MemContext) == 32, "Rust mirror expects sizeof(MemContext) == 32 on 64-bit DEBUG");
-#else
-_Static_assert(sizeof(MemContext) == 16, "Rust mirror expects sizeof(MemContext) == 16 on 64-bit release");
-#endif
-_Static_assert(sizeof(MemContextChildMany) == 16, "Rust mirror expects sizeof(MemContextChildMany) == 16 on 64-bit");
-_Static_assert(sizeof(MemContextAllocMany) == 16, "Rust mirror expects sizeof(MemContextAllocMany) == 16 on 64-bit");
-_Static_assert(sizeof(MemContextCallbackOne) == 16, "Rust mirror expects sizeof(MemContextCallbackOne) == 16 on 64-bit");
-_Static_assert(sizeof(MemContextAlloc) == 8, "Rust mirror expects sizeof(MemContextAlloc) == 8");
-#endif
-
-/***********************************************************************************************************************************
-Possible sizes for the manifest based on options
-***********************************************************************************************************************************/
-// {uncrustify_off - formatting compressed to save space}
-static const uint8_t memContextSizePossible[memQtyMany + 1][memQtyMany + 1][memQtyOne + 1] =
-{
-    // child none
-    {// alloc none
-     {/* callback none */ 0, /* callback one */ sizeof(MemContextCallbackOne)},
-     // alloc one
-     {/* callback none */ sizeof(MemContextAllocOne),
-      /* callback one */ sizeof(MemContextAllocOne) + sizeof(MemContextCallbackOne)},
-     // alloc many
-     {/* callback none */ sizeof(MemContextAllocMany),
-      /* callback one */ sizeof(MemContextAllocMany) + sizeof(MemContextCallbackOne)}},
-    // child one
-    {// alloc none
-     {/* callback none */ sizeof(MemContextChildOne),
-      /* callback one */ sizeof(MemContextChildOne) + sizeof(MemContextCallbackOne)},
-     // alloc one
-     {/* callback none */ sizeof(MemContextChildOne) + sizeof(MemContextAllocOne),
-      /* callback one */ sizeof(MemContextChildOne) + sizeof(MemContextAllocOne) + sizeof(MemContextCallbackOne)},
-     // alloc many
-     {/* callback none */ sizeof(MemContextChildOne) + sizeof(MemContextAllocMany),
-      /* callback one */ sizeof(MemContextChildOne) + sizeof(MemContextAllocMany) + sizeof(MemContextCallbackOne)}},
-    // child many
-    {// alloc none
-     {/* callback none */ sizeof(MemContextChildMany),
-      /* callback one */ sizeof(MemContextChildMany) + sizeof(MemContextCallbackOne)},
-     // alloc one
-     {/* callback none */ sizeof(MemContextChildMany) + sizeof(MemContextAllocOne),
-      /* callback one */ sizeof(MemContextChildMany) + sizeof(MemContextAllocOne) + sizeof(MemContextCallbackOne)},
-     // alloc many
-     {/* callback none */ sizeof(MemContextChildMany) + sizeof(MemContextAllocMany),
-      /* callback one */ sizeof(MemContextChildMany) + sizeof(MemContextAllocMany) + sizeof(MemContextCallbackOne)}},
-};
-// {uncrustify_on}
-
-/***********************************************************************************************************************************
-Get pointers to optional parts of the manifest
-***********************************************************************************************************************************/
-// Get pointer to child part
-#define MEM_CONTEXT_CHILD_OFFSET(memContext)                        ((uint8_t *)(memContext + 1) + memContext->allocExtra)
-
-// Used only by DEBUG-gated code (`memContextAuditBegin`, `memContextAuditEnd`, `memContextMove`'s
-// asserts). In NDEBUG every caller compiles out, so tag the helpers `unused` to keep
-// `-Werror=unused-function` happy. They stay declared because the test (`#include`s this `.c`
-// directly) uses them.
-__attribute__((unused)) static MemContextChildOne *
-memContextChildOne(MemContext *const memContext)
-{
-    return (MemContextChildOne *)MEM_CONTEXT_CHILD_OFFSET(memContext);
-}
-
-__attribute__((unused)) static MemContextChildMany *
-memContextChildMany(MemContext *const memContext)
-{
-    return (MemContextChildMany *)MEM_CONTEXT_CHILD_OFFSET(memContext);
-}
-
-// Get pointer to allocation part
-#define MEM_CONTEXT_ALLOC_OFFSET(memContext)                                                                                       \
-    ((uint8_t *)(memContext + 1) + memContextSizePossible[memContext->childQty][0][0] + memContext->allocExtra)
-
-static MemContextAllocOne *
-memContextAllocOne(MemContext *const memContext)
-{
-    return (MemContextAllocOne *)MEM_CONTEXT_ALLOC_OFFSET(memContext);
-}
-
-// `memContextAllocMany` is only used by the test (`#include`s this file) and by `ASSERT_ALLOC_MANY_VALID`
-// in DEBUG builds before the 32C macro rewrite. After 32C the macro delegates to
-// `pgbr_mem_alloc_valid` so the helper has no production C caller. Mark it `unused` so
-// `-Werror=unused-function` does not fire; the symbol stays compilable for the test.
-__attribute__((unused)) static MemContextAllocMany *
-memContextAllocMany(MemContext *const memContext)
-{
-    return (MemContextAllocMany *)MEM_CONTEXT_ALLOC_OFFSET(memContext);
-}
-
-// Get pointer to callback part. The callers moved to Rust in 32B-3 (mem_context_callback_set /
-// _clear / _callback_recurse), and the test does not yet reach into the callback region by hand,
-// so this helper is unused on the C side. Tag it `unused` to keep `-Wunused-function` happy
-// while preserving the symbol for the 32D rewrite which is expected to surface accessor parity.
-__attribute__((unused)) static MemContextCallbackOne *
-memContextCallbackOne(MemContext *const memContext)
-{
-    return
-        (MemContextCallbackOne *)
-        ((uint8_t *)(memContext + 1) +
-         memContextSizePossible[memContext->childQty][memContext->allocQty][0] + memContext->allocExtra);
-}
-
-/***********************************************************************************************************************************
-Top context
-
-The top context always exists and can never be freed. All other contexts are children of the top context. The top context is
-generally used to allocate memory that exists for the life of the program.
-***********************************************************************************************************************************/
-static struct MemContextTop
-{
-    MemContext memContext;
-    MemContextChildMany memContextChildMany;
-    MemContextAllocMany memContextAllocMany;
-} contextTop =
-{
-    .memContext =
-    {
-#ifdef DEBUG
-        .name = "TOP",
-        .active = true,
-#endif
-        .childQty = memQtyMany,
-        .allocQty = memQtyMany,
-    },
-};
-
-/***********************************************************************************************************************************
-Memory context stack types
-***********************************************************************************************************************************/
-typedef enum
-{
-    memContextStackTypeSwitch = 0,                                  // Context can be switched to allocate mem for new variables
-    memContextStackTypeNew,                                         // Context to be tracked for error handling - cannot switch to
-} MemContextStackType;
-
-/***********************************************************************************************************************************
-Mem context stack used to pop mem contexts and cleanup after an error
-
-Phase 32 sub-issue A moves the storage for `memContextStack`, `memContextCurrentStackIdx`, `memContextMaxStackIdx` and
-`memContextSequence` into Rust (see `crates/pgbr-core/src/mem_context.rs`) so `libpgbr_ffi.a` is self-contained: every test
-binary that links the FFI archive resolves the `pgbr_mem_context_*` symbols without needing this `.c` file in its compile
-list. The error / error-retry tests, which only need `pgbr_stack_trace_*` from the FFI archive, would otherwise fail at link
-with `undefined reference to memContextStack`.
-
-The C-side declarations below are `extern` aliases that point at the Rust-owned storage. The test (`test/src/test.c`
-`#include`s this file directly) keeps reading `memContextStack[memContextCurrentStackIdx]` unchanged, and the
-`ASSERT_ALLOC_MANY_VALID` macro stringification stays byte-identical.
-
-Slot zero of `memContextStack` must hold `&contextTop`. Rust cannot static-init that pointer (it is a C symbol), so the
-`pgbr_mem_context_init_top` hook is invoked from a `__attribute__((constructor))` below before `main` runs.
-***********************************************************************************************************************************/
-#define MEM_CONTEXT_STACK_MAX                                       128
-
-struct MemContextStack
-{
-    MemContext *memContext;
-    MemContextStackType type;
-    unsigned int tryDepth;
-};
-
-extern struct MemContextStack memContextStack[MEM_CONTEXT_STACK_MAX];
-extern unsigned int memContextCurrentStackIdx;
-extern unsigned int memContextMaxStackIdx;
-extern uint64_t memContextSequence;
-
-// Constructor that primes `memContextStack[0].memContext` with `&contextTop` before `main`. Runs once per process at load
-// time; `__attribute__((constructor))` is supported by GCC and Clang on every platform pgBackRest builds against.
-//
-// Phase 32B-3 sentinel: also assert that `pgbr_mem_context_struct_size()` (returned by the Rust
-// mirror) matches `sizeof(struct MemContext)` on this side. The two must agree byte-for-byte; a
-// disagreement means the Rust crate was built with the wrong `c-debug` cfg (the bug 32B-2
-// surfaced when `test.pl` produced a libpgbr_ffi.a without `c-debug` even though the C side
-// compiled with `-DDEBUG`). Aborting here is loud and obvious; silently mis-indexing bitfields is
-// not.
 __attribute__((constructor))
 static void
 pgbr_mem_context_init_top_ctor(void)
 {
-    if (pgbr_mem_context_struct_size() != sizeof(struct MemContext))
-    {
-        fprintf(
-            stderr,
-            "[pgbr] FATAL: Rust MemContext mirror size (%zu) != C sizeof(struct MemContext) (%zu).\n"
-            "[pgbr] The libpgbr_ffi.a archive was built with the wrong `c-debug` cfg. Check that\n"
-            "[pgbr] the meson custom_target invoking build-ffi.sh forwards `get_option('debug')`\n"
-            "[pgbr] as the 5th argument; see test/src/command/test/build.c and src/meson.build.\n",
-            pgbr_mem_context_struct_size(), sizeof(struct MemContext));
-        abort();
-    }
-
-    pgbr_mem_context_init_top((MemContext *)&contextTop);
+    pgbr_mem_context_top_setup();
 }
 
 /***********************************************************************************************************************************
+Wrapper around malloc() with error handling
 ***********************************************************************************************************************************/
+static void *
+memAllocInternal(const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
+
+    void *const buffer = malloc(size);
+
+    if (buffer == NULL)
+        THROW_FMT(MemoryError, "unable to allocate %zu bytes", size);
+
+    FUNCTION_TEST_RETURN_P(VOID, buffer);
+}
+
+/***********************************************************************************************************************************
+Allocate an array of pointers and set all entries to NULL. Phase 32C: not called from C production
+code (the `pgbr-core::mem_context::mem_alloc_ptr_array` helper covers the live path); kept so the
+test #include of this file keeps compiling.
+***********************************************************************************************************************************/
+__attribute__((unused)) static void *
+memAllocPtrArrayInternal(const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
+
+    void **const buffer = memAllocInternal(size * sizeof(void *));
+
+    for (size_t ptrIdx = 0; ptrIdx < size; ptrIdx++)
+        buffer[ptrIdx] = NULL;
+
+    FUNCTION_TEST_RETURN_P(VOID, buffer);
+}
+
+/***********************************************************************************************************************************
+Wrapper around realloc() with error handling
+***********************************************************************************************************************************/
+static void *
+memReAllocInternal(void *const bufferOld, const size_t sizeNew)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, bufferOld);
+        FUNCTION_TEST_PARAM(SIZE, sizeNew);
+    FUNCTION_TEST_END();
+
+    ASSERT(bufferOld != NULL);
+
+    void *const bufferNew = realloc(bufferOld, sizeNew);
+
+    if (bufferNew == NULL)
+        THROW_FMT(MemoryError, "unable to reallocate %zu bytes", sizeNew);
+
+    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
+}
+
+__attribute__((unused)) static void *
+memReAllocPtrArrayInternal(void *const bufferOld, const size_t sizeOld, const size_t sizeNew)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, bufferOld);
+        FUNCTION_TEST_PARAM(SIZE, sizeOld);
+        FUNCTION_TEST_PARAM(SIZE, sizeNew);
+    FUNCTION_TEST_END();
+
+    void **const bufferNew = memReAllocInternal(bufferOld, sizeNew * sizeof(void *));
+
+    for (size_t ptrIdx = sizeOld; ptrIdx < sizeNew; ptrIdx++)
+        bufferNew[ptrIdx] = NULL;
+
+    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
+}
+
+/***********************************************************************************************************************************
+Wrapper around free()
+***********************************************************************************************************************************/
+__attribute__((unused)) static void
+memFreeInternal(void *const buffer)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, buffer);
+    FUNCTION_TEST_END();
+
+    ASSERT(buffer != NULL);
+
+    free(buffer);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN MemContext *
+memContextNew(
+#ifdef DEBUG
+    const char *const name,
+#endif
+    const MemContextNewParam param)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRINGZ, name);
+        FUNCTION_TEST_PARAM(UINT, param.childQty);
+        FUNCTION_TEST_PARAM(UINT, param.allocQty);
+        FUNCTION_TEST_PARAM(UINT, param.callbackQty);
+        FUNCTION_TEST_PARAM(SIZE, param.allocExtra);
+    FUNCTION_TEST_END();
+
+#ifdef DEBUG
+    ASSERT(name != NULL);
+#endif
+    ASSERT(param.childQty <= 1 || param.childQty == UINT8_MAX);
+    ASSERT(param.allocQty <= 1 || param.allocQty == UINT8_MAX);
+    ASSERT(param.callbackQty <= 1);
+#ifdef DEBUG
+    ASSERT(name[0] != '\0');
+#endif
+    ASSERT(pgbr_mem_context_field_child_qty(pgbr_mem_context_current()) != MEM_QTY_NONE);
+
+    const PGBR_PgbrMemContextNewParam pgbrParam =
+    {
+        .dummy = false,
+        .child_qty = (uint8_t)param.childQty,
+        .alloc_qty = (uint8_t)param.allocQty,
+        .callback_qty = (uint8_t)param.callbackQty,
+        .alloc_extra = (uint16_t)param.allocExtra,
+    };
+
+    MemContext *const this = (MemContext *)pgbr_mem_context_new(
+#ifdef DEBUG
+        name,
+#else
+        NULL,
+#endif
+        pgbrParam, errorTryDepth());
+
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, this);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void *
+memContextAllocExtra(MemContext *const this)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+    FUNCTION_TEST_END();
+
+    ASSERT(this != NULL);
+    ASSERT(pgbr_mem_context_field_alloc_extra(this) != 0);
+
+    FUNCTION_TEST_RETURN_P(VOID, pgbr_mem_context_alloc_extra(this));
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN MemContext *
+memContextFromAllocExtra(void *const allocExtra)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, allocExtra);
+    FUNCTION_TEST_END();
+
+    ASSERT(allocExtra != NULL);
+    ASSERT(pgbr_mem_context_field_alloc_extra(pgbr_mem_context_from_alloc_extra(allocExtra)) != 0);
+
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_from_alloc_extra(allocExtra));
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextCallbackSet(MemContext *const this, void (*const callbackFunction)(void *), void *const callbackArgument)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+        FUNCTION_TEST_PARAM(FUNCTIONP, callbackFunction);
+        FUNCTION_TEST_PARAM_P(VOID, callbackArgument);
+    FUNCTION_TEST_END();
+
+    ASSERT(this != NULL);
+    ASSERT(pgbr_mem_context_field_active(this));
+    ASSERT(callbackFunction != NULL);
+    ASSERT(pgbr_mem_context_field_callback_qty(this) != MEM_QTY_NONE);
+
+#ifdef DEBUG
+    if (pgbr_mem_context_field_callback_initialized(this))
+        THROW_FMT(AssertError, "callback is already set for context '%s'", pgbr_mem_context_field_name(this));
+#endif
+
+    pgbr_mem_context_callback_set(this, (PGBR_PgbrFreeCallback)callbackFunction, callbackArgument);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextCallbackClear(MemContext *const this)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+    FUNCTION_TEST_END();
+
+    ASSERT(this != NULL);
+    ASSERT(pgbr_mem_context_field_callback_qty(this) != MEM_QTY_NONE);
+    ASSERT(pgbr_mem_context_field_active(this));
+
+    pgbr_mem_context_callback_clear(this);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void *
+memNew(const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
+
+    ASSERT(pgbr_mem_context_field_alloc_qty(pgbr_mem_context_current()) != MEM_QTY_NONE);
+
+    void *const buffer = pgbr_mem_new(size);
+
+    if (buffer == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+
+    FUNCTION_TEST_RETURN_P(VOID, buffer);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void *
+memNewPtrArray(const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
+
+    ASSERT(pgbr_mem_context_field_alloc_qty(pgbr_mem_context_current()) != MEM_QTY_NONE);
+
+    void *const buffer = pgbr_mem_new_ptr_array(size);
+
+    if (buffer == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+
+    FUNCTION_TEST_RETURN_P(VOID, buffer);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void *
+memResize(void *const buffer, const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, buffer);
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
+
+    ASSERT(buffer != NULL);
+
+    void *const bufferNew = pgbr_mem_resize(buffer, size);
+
+    if (bufferNew == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+
+    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memFree(void *const buffer)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(VOID, buffer);
+    FUNCTION_TEST_END();
+
+    void *const ctx = pgbr_mem_context_current();
+    ASSERT(pgbr_mem_context_field_alloc_qty(ctx) != MEM_QTY_NONE);
+    ASSERT(pgbr_mem_context_field_alloc_initialized(ctx));
+    void *const alloc = pgbr_mem_context_alloc_header(buffer);
+
+    if (pgbr_mem_context_field_alloc_qty(ctx) == MEM_QTY_ONE)
+    {
+        ASSERT(pgbr_mem_context_alloc_one_alloc(ctx) == alloc);
+    }
+    else
+    {
+        ASSERT(pgbr_mem_context_field_alloc_qty(ctx) == MEM_QTY_MANY);
+        ASSERT_ALLOC_MANY_VALID(alloc);
+    }
+
+    pgbr_mem_free(buffer);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextMove(MemContext *const this, MemContext *const parentNew)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, parentNew);
+    FUNCTION_TEST_END();
+
+    ASSERT(parentNew != NULL);
+
+#ifdef DEBUG
+    if (this != NULL && pgbr_mem_context_field_context_parent(this) != parentNew)
+    {
+        void *const oldParent = pgbr_mem_context_field_context_parent(this);
+        ASSERT(pgbr_mem_context_field_active(this));
+        ASSERT(pgbr_mem_context_field_active(oldParent));
+        ASSERT(pgbr_mem_context_field_child_qty(oldParent) != MEM_QTY_NONE);
+        ASSERT(pgbr_mem_context_field_child_initialized(oldParent));
+
+        if (pgbr_mem_context_field_child_qty(oldParent) == MEM_QTY_ONE)
+        {
+            ASSERT(pgbr_mem_context_child_one_context(oldParent) != NULL);
+        }
+        else
+        {
+            ASSERT(pgbr_mem_context_field_child_qty(oldParent) == MEM_QTY_MANY);
+            ASSERT(
+                pgbr_mem_context_child_many_list_at(oldParent, pgbr_mem_context_field_context_parent_idx(this)) == this);
+        }
+
+        ASSERT(pgbr_mem_context_field_active(parentNew));
+        ASSERT(pgbr_mem_context_field_child_qty(parentNew) != MEM_QTY_NONE);
+
+        if (pgbr_mem_context_field_child_qty(parentNew) == MEM_QTY_ONE)
+        {
+            ASSERT(
+                !pgbr_mem_context_field_child_initialized(parentNew) ||
+                pgbr_mem_context_child_one_context(parentNew) == NULL);
+        }
+        else
+        {
+            ASSERT(pgbr_mem_context_field_child_qty(parentNew) == MEM_QTY_MANY);
+        }
+    }
+#endif
+
+    pgbr_mem_context_move(this, parentNew);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextSwitch(MemContext *const this)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+    FUNCTION_TEST_END();
+
+    ASSERT(this != NULL);
+    ASSERT(pgbr_mem_context_field_active(this));
+
+    pgbr_mem_context_switch(this, errorTryDepth());
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextSwitchBack(void)
+{
+    FUNCTION_TEST_VOID();
+
+#ifdef DEBUG
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_switch_back();
+    if (r.kind == 1)
+    {
+        THROW_FMT(
+            AssertError, "current context expected but new context '%s' found",
+            pgbr_mem_context_field_name(r.mem_context));
+    }
+#else
+    pgbr_mem_context_switch_back();
+#endif
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextKeep(void)
+{
+    FUNCTION_TEST_VOID();
+
+#ifdef DEBUG
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_keep();
+    if (r.kind == 2)
+    {
+        THROW_FMT(
+            AssertError, "new context expected but current context '%s' found",
+            pgbr_mem_context_field_name(r.mem_context));
+    }
+#else
+    pgbr_mem_context_keep();
+#endif
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN void
+memContextDiscard(void)
+{
+    FUNCTION_TEST_VOID();
+
+#ifdef DEBUG
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
+    if (r.kind == 2)
+    {
+        THROW_FMT(
+            AssertError, "new context expected but current context '%s' found",
+            pgbr_mem_context_field_name(r.mem_context));
+    }
+#else
+    pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
+#endif
+
+    FUNCTION_TEST_RETURN_VOID();
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN MemContext *
+memContextTop(void)
+{
+    FUNCTION_TEST_VOID();
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_top());
+}
+
+FN_EXTERN MemContext *
+memContextCurrent(void)
+{
+    FUNCTION_TEST_VOID();
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_current());
+}
+
+FN_EXTERN MemContext *
+memContextPrior(void)
+{
+    FUNCTION_TEST_VOID();
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_prior());
+}
+
+/**********************************************************************************************************************************/
 #ifdef DEBUG
 
-// Phase 32C: thin FFI shims. The audit walk lives in `pgbr-core::mem_context`; the C wrapper
-// retains the parameter ASSERTs and translates the `AuditEndResult` from
-// `pgbr_mem_context_audit_end` into the legacy `THROW_FMT(AssertError, "expected return type
-// '%s' ...", ...)` diagnostics that the test pins.
+FN_EXTERN size_t
+memContextSize(const MemContext *const this)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
+    FUNCTION_TEST_END();
+
+    ASSERT(this != NULL);
+    ASSERT(pgbr_mem_context_field_active(this));
+
+    FUNCTION_TEST_RETURN(SIZE, pgbr_mem_context_size(this));
+}
+
 FN_EXTERN void
 memContextAuditBegin(MemContextAuditState *const state)
 {
@@ -319,7 +507,9 @@ memContextAuditBegin(MemContextAuditState *const state)
 
     ASSERT(state != NULL);
     ASSERT(state->memContext != NULL);
-    ASSERT(state->memContext == memContextTop() || state->memContext->sequenceNew != 0);
+    ASSERT(
+        state->memContext == memContextTop() ||
+        pgbr_mem_context_field_sequence_new(state->memContext) != 0);
 
     pgbr_mem_context_audit_begin(state);
 
@@ -363,515 +553,6 @@ memContextAuditAllocExtraName(void *const allocExtra, const char *const name)
 
 #endif
 
-/***********************************************************************************************************************************
-Wrapper around malloc() with error handling
-***********************************************************************************************************************************/
-static void *
-memAllocInternal(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    // Allocate memory
-    void *const buffer = malloc(size);
-
-    // Error when malloc fails
-    if (buffer == NULL)
-        THROW_FMT(MemoryError, "unable to allocate %zu bytes", size);
-
-    // Return the buffer
-    FUNCTION_TEST_RETURN_P(VOID, buffer);
-}
-
-/***********************************************************************************************************************************
-Allocate an array of pointers and set all entries to NULL. Phase 32C: no longer called from C
-production code (the `pgbr-core::mem_context::mem_alloc_ptr_array` helper covers the live path).
-The helper stays so the test #include of this file keeps compiling.
-***********************************************************************************************************************************/
-__attribute__((unused)) static void *
-memAllocPtrArrayInternal(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    // Allocate memory
-    void **const buffer = memAllocInternal(size * sizeof(void *));
-
-    // Set all pointers to NULL
-    for (size_t ptrIdx = 0; ptrIdx < size; ptrIdx++)
-        buffer[ptrIdx] = NULL;
-
-    // Return the buffer
-    FUNCTION_TEST_RETURN_P(VOID, buffer);
-}
-
-/***********************************************************************************************************************************
-Wrapper around realloc() with error handling
-***********************************************************************************************************************************/
-static void *
-memReAllocInternal(void *const bufferOld, const size_t sizeNew)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, bufferOld);
-        FUNCTION_TEST_PARAM(SIZE, sizeNew);
-    FUNCTION_TEST_END();
-
-    ASSERT(bufferOld != NULL);
-
-    // Allocate memory
-    void *const bufferNew = realloc(bufferOld, sizeNew);
-
-    // Error when realloc fails
-    if (bufferNew == NULL)
-        THROW_FMT(MemoryError, "unable to reallocate %zu bytes", sizeNew);
-
-    // Return the buffer
-    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
-}
-
-/***********************************************************************************************************************************
-Wrapper around realloc() with error handling. Phase 32C: no longer called from C production code
-(the `pgbr-core::mem_context::mem_realloc_ptr_array` helper covers the live path).
-***********************************************************************************************************************************/
-__attribute__((unused)) static void *
-memReAllocPtrArrayInternal(void *const bufferOld, const size_t sizeOld, const size_t sizeNew)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, bufferOld);
-        FUNCTION_TEST_PARAM(SIZE, sizeOld);
-        FUNCTION_TEST_PARAM(SIZE, sizeNew);
-    FUNCTION_TEST_END();
-
-    // Allocate memory
-    void **const bufferNew = memReAllocInternal(bufferOld, sizeNew * sizeof(void *));
-
-    // Set all new pointers to NULL
-    for (size_t ptrIdx = sizeOld; ptrIdx < sizeNew; ptrIdx++)
-        bufferNew[ptrIdx] = NULL;
-
-    // Return the buffer
-    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
-}
-
-/***********************************************************************************************************************************
-Wrapper around free(). Phase 32C: no longer called from C production code (the public `memFree`
-delegates straight to `pgbr_mem_free`); the helper stays so the test #include continues to
-exercise its `assertion 'buffer != NULL' failed` path.
-***********************************************************************************************************************************/
-__attribute__((unused)) static void
-memFreeInternal(void *const buffer)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, buffer);
-    FUNCTION_TEST_END();
-
-    ASSERT(buffer != NULL);
-
-    free(buffer);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-// Phase 32B-3: thin FFI shim. The C wrapper retains the parameter ASSERTs (name format, qty
-// ranges) so the test still pins their stringified text. The actual allocation, parent-list
-// registration and stack push happen in `pgbr-core::mem_context::mem_context_new`.
-FN_EXTERN MemContext *
-memContextNew(
-#ifdef DEBUG
-    const char *const name,
-#endif
-    const MemContextNewParam param)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(STRINGZ, name);
-        FUNCTION_TEST_PARAM(UINT, param.childQty);
-        FUNCTION_TEST_PARAM(UINT, param.allocQty);
-        FUNCTION_TEST_PARAM(UINT, param.callbackQty);
-        FUNCTION_TEST_PARAM(SIZE, param.allocExtra);
-    FUNCTION_TEST_END();
-
-#ifdef DEBUG
-    ASSERT(name != NULL);
-#endif
-    ASSERT(param.childQty <= 1 || param.childQty == UINT8_MAX);
-    ASSERT(param.allocQty <= 1 || param.allocQty == UINT8_MAX);
-    ASSERT(param.callbackQty <= 1);
-#ifdef DEBUG
-    ASSERT(name[0] != '\0');
-#endif
-    ASSERT(((MemContext *)pgbr_mem_context_current())->childQty != memQtyNone);
-
-    const PGBR_PgbrMemContextNewParam pgbrParam =
-    {
-        .dummy = false,
-        .child_qty = (uint8_t)param.childQty,
-        .alloc_qty = (uint8_t)param.allocQty,
-        .callback_qty = (uint8_t)param.callbackQty,
-        .alloc_extra = (uint16_t)param.allocExtra,
-    };
-
-    MemContext *const this = (MemContext *)pgbr_mem_context_new(
-#ifdef DEBUG
-        name,
-#else
-        NULL,
-#endif
-        pgbrParam, errorTryDepth());
-
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, this);
-}
-
-/**********************************************************************************************************************************/
-// Phase 32C: thin FFI shim. ASSERTs stay on the C side so the test pins their text.
-FN_EXTERN void *
-memContextAllocExtra(MemContext *const this)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-    FUNCTION_TEST_END();
-
-    ASSERT(this != NULL);
-    ASSERT(this->allocExtra != 0);
-
-    FUNCTION_TEST_RETURN_P(VOID, pgbr_mem_context_alloc_extra(this));
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN MemContext *
-memContextFromAllocExtra(void *const allocExtra)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, allocExtra);
-    FUNCTION_TEST_END();
-
-    ASSERT(allocExtra != NULL);
-    ASSERT(((MemContext *)allocExtra - 1)->allocExtra != 0);
-
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_from_alloc_extra(allocExtra));
-}
-
-/**********************************************************************************************************************************/
-// Phase 32B-3: thin FFI shim. The C wrapper retains the ASSERTs (the test pins their stringified
-// text) and the DEBUG-only "callback is already set" check so the legacy diagnostic format
-// survives. The actual write happens in `pgbr-core::mem_context::mem_context_callback_set`.
-FN_EXTERN void
-memContextCallbackSet(MemContext *const this, void (*const callbackFunction)(void *), void *const callbackArgument)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-        FUNCTION_TEST_PARAM(FUNCTIONP, callbackFunction);
-        FUNCTION_TEST_PARAM_P(VOID, callbackArgument);
-    FUNCTION_TEST_END();
-
-    ASSERT(this != NULL);
-    ASSERT(this->active);
-    ASSERT(callbackFunction != NULL);
-    ASSERT(this->callbackQty != memQtyNone);
-
-#ifdef DEBUG
-    // Error if callback has already been set - there may be valid use cases for this in the future but error until one is found
-    if (this->callbackInitialized)
-        THROW_FMT(AssertError, "callback is already set for context '%s'", this->name);
-#endif
-
-    pgbr_mem_context_callback_set(this, (PGBR_PgbrFreeCallback)callbackFunction, callbackArgument);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-// Phase 32B-3: thin FFI shim. ASSERTs stay on the C side so the test pins their text.
-FN_EXTERN void
-memContextCallbackClear(MemContext *const this)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-    FUNCTION_TEST_END();
-
-    ASSERT(this != NULL);
-    ASSERT(this->callbackQty != memQtyNone);
-    ASSERT(this->active);
-
-    pgbr_mem_context_callback_clear(this);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-// Phase 32C: thin FFI shims. The static `memContextAllocNew` / `memContextAllocResize` helpers
-// moved to `pgbr-core::mem_context`. The C wrapper keeps the assertions and re-throws Rust's
-// MemoryError diagnostic via `pgbr_error_throw_from_last` when libc malloc/realloc fails.
-FN_EXTERN void *
-memNew(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    ASSERT(((MemContext *)pgbr_mem_context_current())->allocQty != memQtyNone);
-
-    void *const buffer = pgbr_mem_new(size);
-
-    if (buffer == NULL)
-        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
-
-    FUNCTION_TEST_RETURN_P(VOID, buffer);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void *
-memNewPtrArray(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    ASSERT(((MemContext *)pgbr_mem_context_current())->allocQty != memQtyNone);
-
-    void *const buffer = pgbr_mem_new_ptr_array(size);
-
-    if (buffer == NULL)
-        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
-
-    FUNCTION_TEST_RETURN_P(VOID, buffer);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void *
-memResize(void *const buffer, const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, buffer);
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    ASSERT(buffer != NULL);
-
-    void *const bufferNew = pgbr_mem_resize(buffer, size);
-
-    if (bufferNew == NULL)
-        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
-
-    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void
-memFree(void *const buffer)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, buffer);
-    FUNCTION_TEST_END();
-
-    MemContext *const contextCurrent = memContextStack[memContextCurrentStackIdx].memContext;
-    ASSERT(contextCurrent->allocQty != memQtyNone);
-    ASSERT(contextCurrent->allocInitialized);
-    MemContextAlloc *const alloc = MEM_CONTEXT_ALLOC_HEADER(buffer);
-
-    if (contextCurrent->allocQty == memQtyOne)
-    {
-        ASSERT(memContextAllocOne(contextCurrent)->alloc == alloc);
-    }
-    else
-    {
-        ASSERT(contextCurrent->allocQty == memQtyMany);
-        ASSERT_ALLOC_MANY_VALID(alloc);
-    }
-
-    pgbr_mem_free(buffer);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-// Phase 32B-3: thin FFI shim. The C wrapper retains the ASSERTs (the test pins their stringified
-// text — see `'memContextChildMany(this->contextParent)->list[this->contextParentIdx] == this'`)
-// and delegates the actual reparenting to `pgbr-core::mem_context::mem_context_move`.
-FN_EXTERN void
-memContextMove(MemContext *const this, MemContext *const parentNew)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, parentNew);
-    FUNCTION_TEST_END();
-
-    ASSERT(parentNew != NULL);
-
-#ifdef DEBUG
-    // Only validate if a valid mem context is provided and the old and new parents are not the same. The asserts capture the
-    // legacy diagnostic stringification that the test still pins (`'this->active' failed`,
-    // `'memContextChildMany(this->contextParent)->list[this->contextParentIdx] == this' failed`, etc.). They are DEBUG-only on
-    // the C side because in NDEBUG every `ASSERT` expands to nothing — leaving empty if/else bodies that `-Werror=empty-body`
-    // refuses to compile.
-    if (this != NULL && this->contextParent != parentNew)
-    {
-        ASSERT(this->active);
-        ASSERT(this->contextParent->active);
-        ASSERT(this->contextParent->childQty != memQtyNone);
-        ASSERT(this->contextParent->childInitialized);
-
-        if (this->contextParent->childQty == memQtyOne)
-        {
-            ASSERT(memContextChildOne(this->contextParent)->context != NULL);
-        }
-        else
-        {
-            ASSERT(this->contextParent->childQty == memQtyMany);
-            ASSERT(memContextChildMany(this->contextParent)->list[this->contextParentIdx] == this);
-        }
-
-        ASSERT(parentNew->active);
-        ASSERT(parentNew->childQty != memQtyNone);
-
-        if (parentNew->childQty == memQtyOne)
-        {
-            ASSERT(!parentNew->childInitialized || memContextChildOne(parentNew)->context == NULL);
-        }
-        else
-        {
-            ASSERT(parentNew->childQty == memQtyMany);
-        }
-    }
-#endif
-
-    pgbr_mem_context_move(this, parentNew);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void
-memContextSwitch(MemContext *const this)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-    FUNCTION_TEST_END();
-
-    ASSERT(this != NULL);
-    ASSERT(this->active);
-
-    // Phase 32A: stack mutation lives in Rust now. The Rust side asserts on overflow.
-    pgbr_mem_context_switch(this, errorTryDepth());
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void
-memContextSwitchBack(void)
-{
-    FUNCTION_TEST_VOID();
-
-    // Phase 32A: stack mutation lives in Rust now. On a type mismatch the Rust side returns the
-    // offending top entry without popping (so the legacy "throw before pop" semantics survive in
-    // DEBUG builds).
-#ifdef DEBUG
-    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_switch_back();
-    if (r.kind == 1)
-    {
-        THROW_FMT(
-            AssertError, "current context expected but new context '%s' found",
-            ((MemContext *)r.mem_context)->name);
-    }
-#else
-    pgbr_mem_context_switch_back();
-#endif
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void
-memContextKeep(void)
-{
-    FUNCTION_TEST_VOID();
-
-#ifdef DEBUG
-    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_keep();
-    if (r.kind == 2)
-    {
-        THROW_FMT(
-            AssertError, "new context expected but current context '%s' found",
-            ((MemContext *)r.mem_context)->name);
-    }
-#else
-    pgbr_mem_context_keep();
-#endif
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN void
-memContextDiscard(void)
-{
-    FUNCTION_TEST_VOID();
-
-    // Phase 32A: stack mutation in Rust. On type-mismatch (kind == 2) the Rust side returns the
-    // offending top entry without freeing or popping; the legacy DEBUG diagnostic is preserved.
-    // On success Rust invokes `memContextFree` (passed by pointer) and pops.
-#ifdef DEBUG
-    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
-    if (r.kind == 2)
-    {
-        THROW_FMT(
-            AssertError, "new context expected but current context '%s' found",
-            ((MemContext *)r.mem_context)->name);
-    }
-#else
-    pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
-#endif
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN MemContext *
-memContextTop(void)
-{
-    FUNCTION_TEST_VOID();
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)&contextTop);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN MemContext *
-memContextCurrent(void)
-{
-    FUNCTION_TEST_VOID();
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_current());
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN MemContext *
-memContextPrior(void)
-{
-    FUNCTION_TEST_VOID();
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_prior());
-}
-
-/**********************************************************************************************************************************/
-#ifdef DEBUG
-
-// Phase 32B-3: thin FFI shim. The recursive size accounting moved to
-// `pgbr-core::mem_context::mem_context_size`.
-FN_EXTERN size_t
-memContextSize(const MemContext *const this)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(MEM_CONTEXT, this);
-    FUNCTION_TEST_END();
-
-    ASSERT(this != NULL);
-    ASSERT(this->active);
-
-    FUNCTION_TEST_RETURN(SIZE, pgbr_mem_context_size(this));
-}
-
-#endif // DEBUG
-
 /**********************************************************************************************************************************/
 FN_EXTERN void
 memContextClean(const unsigned int tryDepth, const bool fatal)
@@ -881,21 +562,12 @@ memContextClean(const unsigned int tryDepth, const bool fatal)
         FUNCTION_TEST_PARAM(BOOL, false);
     FUNCTION_TEST_END();
 
-    // Phase 32A: stack unwinding lives in Rust now. The Rust side invokes `memContextFree`
-    // (passed by pointer) for non-fatal frees so the link-time dependency stays in this file.
     pgbr_mem_context_clean(tryDepth, fatal, (PGBR_PgbrFreeCallback)memContextFree);
 
     FUNCTION_TEST_RETURN_VOID();
 }
 
 /**********************************************************************************************************************************/
-// Phase 32B-3: thin FFI shim. The two halves of the legacy `memContextFree` —
-// `memContextCallbackRecurse` and `memContextFreeRecurse` — moved into
-// `pgbr-core::mem_context::mem_context_callback_recurse` and `_free_release_recurse`. The
-// `TRY_BEGIN`/`FINALLY`/`TRY_END` wrapper stays on the C side because callbacks may longjmp via
-// the C error machinery, and setjmp/longjmp through Rust frames is undefined behaviour. The
-// release-half returns the offending context pointer when the DEBUG-only "cannot free current
-// context" invariant is violated; the C wrapper rethrows with the legacy diagnostic.
 FN_EXTERN void
 memContextFree(MemContext *const this)
 {
@@ -904,7 +576,7 @@ memContextFree(MemContext *const this)
     FUNCTION_TEST_END();
 
     ASSERT(this != NULL);
-    ASSERT(this->active);
+    ASSERT(pgbr_mem_context_field_active(this));
 
     TRY_BEGIN()
     {
@@ -916,7 +588,7 @@ memContextFree(MemContext *const this)
 
 #ifdef DEBUG
         if (err != NULL)
-            THROW_FMT(AssertError, "cannot free current context '%s'", err->name);
+            THROW_FMT(AssertError, "cannot free current context '%s'", pgbr_mem_context_field_name(err));
 #else
         (void)err;
 #endif
