@@ -1,9 +1,12 @@
 /***********************************************************************************************************************************
 BZ2 Decompress
+
+Thin C wrapper over the Rust streaming decompressor in `crates/pgbr-compress::bz2::decompress`. The IoFilter object, debug
+logging helpers, and the inputSame / done state machine stay on the C side; the libbz2 calls (`BZ2_bzDecompressInit`,
+`BZ2_bzDecompress`, `BZ2_bzDecompressEnd`) are replaced by FFI calls into libpgbr_ffi.a.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <bzlib.h>
 #include <stdio.h>
 
 #include "common/compress/bz2/common.h"
@@ -14,15 +17,25 @@ BZ2 Decompress
 #include "common/log.h"
 #include "common/macro.h"
 #include "common/type/object.h"
+#include "pgbr_ffi.h"
+
+// Mirror of libbz2's `BZ_STREAM_END` constant.
+#define BZ_DECOMPRESS_STREAM_END                                    4
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct Bz2Decompress
 {
-    bz_stream stream;                                               // Decompression stream state
+    void *state;                                                    // Opaque pgbr_compress::bz2::decompress::Decompress*
+    size_t inputAvail;                                              // Bytes still unconsumed from the current input buffer
+    const unsigned char *inputPtr;                                  // Pointer to the unconsumed slice (into caller's Buffer)
 
-    int result;                                                     // Result of last operation
+    // Public substruct for `bz2DecompressToLog` testing — only `avail_in` is read/written.
+    struct {
+        unsigned int avail_in;
+    } stream;
+
     bool inputSame;                                                 // Is the same input required on the next process call?
     bool done;                                                      // Is decompression done?
 } Bz2Decompress;
@@ -44,7 +57,7 @@ bz2DecompressToLog(const Bz2Decompress *const this, StringStatic *const debugLog
     FUNCTION_LOG_OBJECT_FORMAT(value, bz2DecompressToLog, buffer, bufferSize)
 
 /***********************************************************************************************************************************
-Free inflate stream
+Free decompression stream
 ***********************************************************************************************************************************/
 static void
 bz2DecompressFreeResource(THIS_VOID)
@@ -57,7 +70,8 @@ bz2DecompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    BZ2_bzDecompressEnd(&this->stream);
+    pgbr_bz2_decompress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -79,35 +93,33 @@ bz2DecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const un
     ASSERT(this != NULL);
     ASSERT(uncompressed != NULL);
 
-    // There should never be a flush because in a valid compressed stream the end of data can be determined and done will be set.
-    // If a flush is received it means the compressed stream terminated early, e.g. a zero-length or truncated file.
     if (compressed == NULL)
         THROW(FormatError, "unexpected eof in compressed data");
 
     if (!this->inputSame)
     {
-        this->stream.avail_in = (unsigned int)bufUsed(compressed);
-
-        // bzip2 does not accept const input buffers
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-qual"
-        this->stream.next_in = (char *)UNCONSTIFY(uint8_t *, bufPtrConst(compressed));
-#pragma GCC diagnostic pop
+        this->inputAvail = bufUsed(compressed);
+        this->inputPtr = bufPtrConst(compressed);
     }
 
-    this->stream.avail_out = (unsigned int)bufRemains(uncompressed);
-    this->stream.next_out = (char *)bufPtr(uncompressed) + bufUsed(uncompressed);
+    // Run one bz2 decompress tick
+    size_t written = 0;
+    size_t consumed = 0;
+    const int result = pgbr_bz2_decompress_state_decompress(
+        this->state, this->inputPtr, this->inputAvail, bufRemainsPtr(uncompressed), bufRemains(uncompressed), &written, &consumed);
 
-    this->result = bz2Error(BZ2_bzDecompress(&this->stream));
+    bz2Error(result);
 
-    // Set buffer used space
-    bufUsedSet(uncompressed, bufSize(uncompressed) - (size_t)this->stream.avail_out);
+    bufUsedInc(uncompressed, written);
 
-    // Is decompression done?
-    this->done = this->result == BZ_STREAM_END;
+    this->inputAvail -= consumed;
+    this->inputPtr += consumed;
 
-    // Is the same input expected on the next call?
-    this->inputSame = this->done ? false : this->stream.avail_in != 0;
+    // Mirror availIn for the public substruct
+    this->stream.avail_in = (unsigned int)this->inputAvail;
+
+    this->done = result == BZ_DECOMPRESS_STREAM_END;
+    this->inputSame = this->done ? false : this->inputAvail != 0;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -156,13 +168,17 @@ bz2DecompressNew(const bool raw)
 
     OBJ_NEW_BEGIN(Bz2Decompress, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (Bz2Decompress)
-        {
-            .stream = {.bzalloc = NULL},
-        };
+        *this = (Bz2Decompress){.state = NULL};
 
-        // Create bz2 stream
-        bz2Error(this->result = BZ2_bzDecompressInit(&this->stream, 0, 0));
+        // Create the Rust streaming decompressor
+        int32_t errCode = 0;
+        this->state = pgbr_bz2_decompress_state_new(&errCode);
+
+        if (this->state == NULL)
+        {
+            pgbr_last_error_clear();
+            bz2Error(errCode);
+        }
 
         // Set free callback to ensure bz2 context is freed
         memContextCallbackSet(objMemContext(this), bz2DecompressFreeResource, this);

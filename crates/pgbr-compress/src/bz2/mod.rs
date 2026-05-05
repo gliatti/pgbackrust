@@ -4,6 +4,7 @@
 //! Classify helpers live in [`error`]; the compressor lives in [`compress`].
 
 pub mod compress;
+pub mod decompress;
 pub mod error;
 
 pub use error::{Classification, ErrorKind, classify};

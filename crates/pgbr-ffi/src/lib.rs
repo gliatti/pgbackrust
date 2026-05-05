@@ -1298,6 +1298,145 @@ pub unsafe extern "C" fn pgbr_lz4_compress_state_end(state: *mut core::ffi::c_vo
     })
 }
 
+// ---------- pgbr-compress bz2 decompress bridge (Phase 22) ----------
+
+/// Allocate a streaming bzip2 decompressor.
+///
+/// On success returns a non-null pointer the caller must release exactly once via
+/// [`pgbr_bz2_decompress_state_free`]. On failure returns null and writes the raw
+/// libbz2 return code to `*err_out`.
+///
+/// # Safety
+///
+/// `err_out` must be either null or point to a writable `i32`. The returned pointer
+/// (when non-null) is owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_decompress_state_new(err_out: *mut i32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| match pgbr_compress::bz2::decompress::Decompress::new() {
+        Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+        Err(code) => {
+            if !err_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { err_out.write(code) };
+            }
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_bz2_decompress_state_new: BZ2_bzDecompressInit returned {code}"),
+            ));
+            core::ptr::null_mut()
+        }
+    })
+}
+
+/// Drop a bz2 decompress state previously returned by
+/// [`pgbr_bz2_decompress_state_new`].
+///
+/// No-op on null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_bz2_decompress_state_new`]
+/// that has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_decompress_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_compress::bz2::decompress::Decompress>()) };
+    });
+}
+
+/// Run one `BZ2_bzDecompress` call.
+///
+/// On success returns `0` (`BZ_OK`) or `4` (`BZ_STREAM_END`). On a libbz2 error returns
+/// the raw negative code. Returns `-100` on Rust-side invariant violation.
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_bz2_decompress_state_new`]. `src`
+/// (if `src_size > 0`) and `dst` (if `dst_size > 0`) must point to valid buffers.
+/// `written_out` and `consumed_out` must point to writable `usize`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_decompress_state_decompress(
+    state: *mut core::ffi::c_void,
+    src: *const u8,
+    src_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+    written_out: *mut usize,
+    consumed_out: *mut usize,
+) -> i32 {
+    with_panic_guard(|| {
+        let zero_outs = || {
+            if !written_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { written_out.write(0) };
+            }
+            if !consumed_out.is_null() {
+                // SAFETY: same.
+                unsafe { consumed_out.write(0) };
+            }
+        };
+
+        if state.is_null() || written_out.is_null() || consumed_out.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_decompress_state_decompress: null pointer",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_decompress_state_decompress: dst is null but dst_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if src_size > 0 && src.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_decompress_state_decompress: src is null but src_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::bz2::decompress::Decompress>() };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: same.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+
+        match state.decompress_tick(src_slice, dst_slice) {
+            Ok(tick) => {
+                // SAFETY: null-checked above.
+                unsafe {
+                    written_out.write(tick.written);
+                    consumed_out.write(tick.consumed);
+                }
+                if tick.stream_end { 4 } else { 0 }
+            }
+            Err(code) => {
+                zero_outs();
+                code
+            }
+        }
+    })
+}
+
 // ---------- pgbr-compress bz2 compress bridge (Phase 21) ----------
 
 /// Allocate a streaming bzip2 compressor.

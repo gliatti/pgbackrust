@@ -93,6 +93,34 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
     return output;
 }
 
+// `legacy_bz2Decompress` mirrors the pre-Phase-22 body of `bz2DecompressNew` / `bz2DecompressProcess` — direct libbz2 calls.
+// One-shot decompression; both the new IoFilter path and this helper recover the original plaintext byte-for-byte because
+// libbz2's frame decoder is fully deterministic.
+static Buffer *
+legacy_bz2Decompress(const Buffer *const input)
+{
+    bz_stream stream = {.bzalloc = NULL, .bzfree = NULL, .opaque = NULL};
+
+    int ret = BZ2_bzDecompressInit(&stream, 0, 0);
+    ASSERT(ret == BZ_OK);
+
+    Buffer *const output = bufNew(bufUsed(input) * 64 + 4096);
+
+    stream.avail_in = (unsigned int)bufUsed(input);
+    stream.next_in = (char *)(uintptr_t)bufPtrConst(input);
+    stream.avail_out = (unsigned int)bufSize(output);
+    stream.next_out = (char *)bufPtr(output);
+
+    ret = BZ2_bzDecompress(&stream);
+    ASSERT(ret == BZ_STREAM_END);
+
+    bufUsedSet(output, bufSize(output) - stream.avail_out);
+
+    BZ2_bzDecompressEnd(&stream);
+
+    return output;
+}
+
 // `legacy_bz2Compress` mirrors the pre-Phase-21 body of `bz2CompressNew` / `bz2CompressProcess` — direct libbz2 calls with the
 // same parameters (level, workFactor=0, verbosity=0). One-shot compression; libbz2 is deterministic given fixed parameters.
 static Buffer *
@@ -677,6 +705,56 @@ testRun(void)
         }
 
         TEST_RESULT_UINT(bz2Comparisons, 10000, "10k differential bz2Compress inputs all byte-identical");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("bz2Decompress differential vs direct libbz2 (10000+ inputs)");
+
+        // 10 000 random plaintexts. Compress through Phase 21 then decompress through both the new FFI path and
+        // `legacy_bz2Decompress`; both must recover the original plaintext byte-for-byte.
+        uint64_t bz2DcLcg = UINT64_C(0x88BB22DD44CC66AA);
+        unsigned int bz2DcComparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            bz2DcLcg = bz2DcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t bz2DcLen = (size_t)((bz2DcLcg >> 32) & 0x3FF) + 1;
+            const int bz2DcLevel = (int)(((bz2DcLcg >> 24) & 0xFF) % 9) + 1;
+
+            Buffer *const bz2DcPlaintext = bufNew(bz2DcLen);
+            for (size_t i = 0; i < bz2DcLen; i++)
+            {
+                bz2DcLcg = bz2DcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(bz2DcPlaintext)[i] = (uint8_t)(bz2DcLcg >> 56);
+            }
+            bufUsedSet(bz2DcPlaintext, bz2DcLen);
+
+            Buffer *const bz2DcCompressed = testCompress(
+                compressFilterP(compressTypeBz2, bz2DcLevel), bz2DcPlaintext, bz2DcLen, bz2DcLen * 2 + 4096);
+
+            Buffer *const bz2DcNewOut = testDecompress(
+                decompressFilterP(compressTypeBz2), bz2DcCompressed, bz2DcLen, bz2DcLen + 1);
+            Buffer *const bz2DcLegacyOut = legacy_bz2Decompress(bz2DcCompressed);
+
+            if (!bufEq(bz2DcNewOut, bz2DcPlaintext) || !bufEq(bz2DcLegacyOut, bz2DcPlaintext) ||
+                !bufEq(bz2DcNewOut, bz2DcLegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "bz2Decompress(level=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu plaintextSize=%zu", bz2DcLevel, bz2DcLen,
+                    iter, bufUsed(bz2DcNewOut), bufUsed(bz2DcLegacyOut), bufUsed(bz2DcPlaintext));
+            }
+
+            bufFree(bz2DcPlaintext);
+            bufFree(bz2DcCompressed);
+            bufFree(bz2DcNewOut);
+            bufFree(bz2DcLegacyOut);
+
+            bz2DcComparisons++;
+        }
+
+        TEST_RESULT_UINT(bz2DcComparisons, 10000, "10k differential bz2Decompress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************
