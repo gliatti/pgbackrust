@@ -4,7 +4,7 @@
 //! conversion specifiers used by pgBackRust's `THROW_FMT` / `errorInternalThrowFmt` call
 //! sites (verified by grep across `src/`):
 //!
-//! - `%s`, `%c`, `%d` / `%i`, `%u`, `%X`, `%%`
+//! - `%s`, `%c`, `%d` / `%i`, `%u`, `%x`, `%X`, `%%`
 //! - length modifiers `z` (`size_t` / `ssize_t`) and `l` (`long` / `unsigned long`)
 //! - flags `0` and width digits — `%02d`, `%03u`, `%04d`, `%02X`
 //! - precision on strings — `%.3s`, `%.16s`
@@ -105,11 +105,15 @@ pub fn format_message(template: &str, args: &[Arg<'_>]) -> String {
                 next_arg += 1;
             }
             b'u' => {
-                emit_unsigned(&mut out, args.get(next_arg).copied(), spec, false);
+                emit_unsigned(&mut out, args.get(next_arg).copied(), spec, Radix::Decimal);
+                next_arg += 1;
+            }
+            b'x' => {
+                emit_unsigned(&mut out, args.get(next_arg).copied(), spec, Radix::HexLower);
                 next_arg += 1;
             }
             b'X' => {
-                emit_unsigned(&mut out, args.get(next_arg).copied(), spec, true);
+                emit_unsigned(&mut out, args.get(next_arg).copied(), spec, Radix::HexUpper);
                 next_arg += 1;
             }
             other => {
@@ -209,7 +213,14 @@ fn emit_signed(out: &mut String, arg: Option<Arg<'_>>, spec: Spec) {
     pad_into(out, &body, spec.zero_pad, spec.width, v < 0);
 }
 
-fn emit_unsigned(out: &mut String, arg: Option<Arg<'_>>, spec: Spec, hex_upper: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Radix {
+    Decimal,
+    HexLower,
+    HexUpper,
+}
+
+fn emit_unsigned(out: &mut String, arg: Option<Arg<'_>>, spec: Spec, radix: Radix) {
     let v: u64 = match (arg, spec.length) {
         (Some(Arg::U32(v)), LenMod::None) => u64::from(v),
         (Some(Arg::Usize(v)), LenMod::Z) => v as u64,
@@ -218,7 +229,11 @@ fn emit_unsigned(out: &mut String, arg: Option<Arg<'_>>, spec: Spec, hex_upper: 
         (Some(Arg::I32(v)), LenMod::None) => u64::from(v.cast_unsigned()),
         _ => 0,
     };
-    let body = if hex_upper { format!("{v:X}") } else { v.to_string() };
+    let body = match radix {
+        Radix::Decimal => v.to_string(),
+        Radix::HexLower => format!("{v:x}"),
+        Radix::HexUpper => format!("{v:X}"),
+    };
     pad_into(out, &body, spec.zero_pad, spec.width, false);
 }
 
@@ -317,6 +332,19 @@ mod tests {
         assert_eq!(format_message("%02X", &[Arg::U32(0x0F)]), "0F");
         assert_eq!(format_message("%02X", &[Arg::U32(0xFF)]), "FF");
         assert_eq!(format_message("%02X", &[Arg::U32(0x123)]), "123");
+    }
+
+    #[test]
+    fn percent_x_lowercase_hex() {
+        assert_eq!(format_message("%x", &[Arg::U32(0xABC)]), "abc");
+        assert_eq!(format_message("%02x", &[Arg::U32(0x0F)]), "0f");
+        // ChecksumError-style template: two %x followed by %s — the va_arg slots must
+        // align between the C marshaller and the Rust formatter.
+        let args = [Arg::U32(0x1234_5678), Arg::U32(0xABCD_EF00), Arg::Str("HINT: ...\n")];
+        assert_eq!(
+            format_message("calculated 0x%x but expected 0x%x\n%s", &args),
+            "calculated 0x12345678 but expected 0xabcdef00\nHINT: ...\n",
+        );
     }
 
     #[test]
