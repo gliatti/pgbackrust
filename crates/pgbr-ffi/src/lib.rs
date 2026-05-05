@@ -1912,6 +1912,60 @@ pub unsafe extern "C" fn pgbr_zst_compress_state_end(
     })
 }
 
+// ---------- pgbr-compress helper bridge (Phase 26) ----------
+
+/// Map a `StringId`-encoded compress type name to the matching `CompressType` enum
+/// value (`0` = None, `1` = Bz2, `2` = Gz, `3` = Lz4, `4` = Zst, `5` = Xz).
+///
+/// Returns `1` on success and writes the enum value to `*out`. Returns `0` when the
+/// type id is not recognized; `*out` is not touched.
+///
+/// # Safety
+///
+/// `out` must point to a writable `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_compress_type_enum(type_id: u64, out: *mut i32) -> i32 {
+    with_panic_guard(|| {
+        if out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_compress_type_enum: null pointer"));
+            return -1;
+        }
+        pgbr_compress::helper::type_enum(type_id).map_or(0, |ty| {
+            // SAFETY: caller upholds the writable-pointer contract.
+            unsafe { out.write(ty as i32) };
+            1
+        })
+    })
+}
+
+/// Map a filename to its compress-type enum by extension (`0` = None / no recognized
+/// extension). Mirrors the legacy `compressTypeFromName`.
+///
+/// # Safety
+///
+/// `name_utf8` must point to `name_len` valid UTF-8 bytes (or be null when
+/// `name_len == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_compress_type_from_name(name_utf8: *const u8, name_len: usize) -> i32 {
+    with_panic_guard(|| {
+        if name_utf8.is_null() && name_len > 0 {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_compress_type_from_name: null pointer"));
+            return 0;
+        }
+        let bytes = if name_len == 0 {
+            b"".as_slice()
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts(name_utf8, name_len) }
+        };
+        // Invalid UTF-8 → treat as "no recognized extension" (returning None).
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            return 0;
+        };
+        pgbr_compress::helper::type_from_name(name) as i32
+    })
+}
+
 // ---------- pgbr-compress zst error bridge (Phase 23) ----------
 
 /// Classify a libzstd return code.

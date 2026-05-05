@@ -20,6 +20,7 @@ Compression Helper
 #include "common/compress/zst/decompress.h"
 #include "common/debug.h"
 #include "common/log.h"
+#include "pgbr_ffi.h"
 #include "version.h"
 
 /***********************************************************************************************************************************
@@ -110,18 +111,13 @@ compressTypeEnum(const StringId type)
 
     ASSERT(type != 0);
 
-    CompressType result = compressTypeNone;
+    // Look up the compression type via the Rust pgbr-compress::helper table.
+    int32_t enumValue = 0;
 
-    for (; result < LENGTH_OF(compressHelperLocal); result++)
-    {
-        if (type == compressHelperLocal[result].typeId)
-            break;
-    }
-
-    if (result == LENGTH_OF(compressHelperLocal))
+    if (pgbr_compress_type_enum((uint64_t)type, &enumValue) != 1)
         THROW_FMT(AssertError, "invalid compression type '%s'", zNewStrId(type));
 
-    FUNCTION_TEST_RETURN(ENUM, result);
+    FUNCTION_TEST_RETURN(ENUM, (CompressType)enumValue);
 }
 
 /**********************************************************************************************************************************/
@@ -161,16 +157,10 @@ compressTypeFromName(const String *const name)
         FUNCTION_TEST_PARAM(STRING, name);
     FUNCTION_TEST_END();
 
-    CompressType result = compressTypeNone + 1;
-
-    for (; result < LENGTH_OF(compressHelperLocal); result++)
-    {
-        if (strEndsWith(name, compressHelperLocal[result].ext))
-            break;
-    }
-
-    if (result == LENGTH_OF(compressHelperLocal))
-        result = compressTypeNone;
+    // Defer to the Rust pgbr-compress::helper extension table. pgBackRust `String` stores its bytes contiguously and exposes
+    // them via `bufPtrConst`/`strSize`; pass that slice straight through to the FFI.
+    const CompressType result =
+        (CompressType)pgbr_compress_type_from_name((const uint8_t *)strZ(name), (size_t)strSize(name));
 
     FUNCTION_TEST_RETURN(ENUM, result);
 }
