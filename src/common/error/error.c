@@ -1,5 +1,27 @@
 /***********************************************************************************************************************************
 Error Handler
+
+Phase 27 of the C->Rust migration is split across three sub-issues — see #222, #223, #224 — because the full body of this file
+cannot be replaced with thin Rust FFI shims while the C `setjmp`/`longjmp` state machine and the frozen `const ErrorType *` ABI
+are in place. What lives where after the split:
+
+  pgbr-error (Rust crate, called via pgbr-ffi)
+    - ErrorType enum + lookups (parent / extends / from_code / from_name / is_fatal). Sub-issue #222.
+    - Printf-style message formatting (`pgbr_error::format::format_message`), reached from the Throw_Fmt
+      family below via `pgbr_error_format_message` and the args-blob marshalling in `errorMarshalArgs`. Sub-issue #223.
+    - `Error::throw_into_c` helper for Rust callers that already have an `Error` in hand. Sub-issue #224.
+
+  This file (C — stays here for the foreseeable future)
+    - The TRY / CATCH / FINALLY state machine (`errorInternalTryBegin`, `errorInternalCatch`,
+      `errorInternalPropagate`, `errorInternalTryEnd`) and the `jumpList` of `jmp_buf` slots.
+    - The Throw_Fmt family that callers reach through THROW_FMT macros — bodies retained because they accept
+      C varargs and longjmp out of the call site, neither of which Rust can do safely.
+    - `pgbr_error_throw_from_last`, the canonical exit point for Rust shims that need to longjmp into the
+      nearest TRY block via the same machinery as `THROW_FMT`.
+
+The C source above will be removed in bulk at Phase 212 alongside the rest of the legacy C tree, at which point the public
+ErrorType API is replaced by a Rust-native equivalent. Until then this file is a thin set of wrappers around the Rust formatter
+plus the C-only TRY state machine.
 ***********************************************************************************************************************************/
 #include <build.h>
 
