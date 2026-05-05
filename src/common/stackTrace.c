@@ -1,5 +1,13 @@
 /***********************************************************************************************************************************
 Stack Trace Handler
+
+Thin C wrappers over the Rust accumulator in `crates/pgbr-core::stack_trace`. The frame stack, parameter buffer, test flag and the
+"force-no-backtrace" override all live in Rust; the public API in `src/common/stackTrace.h` is preserved byte-for-byte.
+
+The libbacktrace integration stays here because `backtrace_full` takes a C function-pointer callback and reads platform-specific
+debug data (`backtrace_create_state`). The callback resolves frames the linker enumerated and matches them against the Rust state
+through the `pgbr_stack_trace_*` FFI getters; the fallback formatter (when libbacktrace returns no frames) walks the same Rust
+state directly.
 ***********************************************************************************************************************************/
 #include <build.h>
 
@@ -14,73 +22,39 @@ Stack Trace Handler
 #include "common/assert.h"
 #include "common/macro.h"
 #include "common/stackTrace.h"
-
-/***********************************************************************************************************************************
-Max call stack depth
-***********************************************************************************************************************************/
-#define STACK_TRACE_MAX                                             128
-
-/***********************************************************************************************************************************
-Local variables
-***********************************************************************************************************************************/
-// Stack trace function data
-typedef struct StackTraceData
-{
-    const char *fileName;
-    const char *functionName;
-    unsigned int fileLine;
-    LogLevel functionLogLevel;
-    unsigned int tryDepth;
-
-    bool paramOverflow;
-    bool paramLog;
-    char *param;
-    size_t paramSize;
-} StackTraceData;
-
-static struct StackTraceLocal
-{
-    int stackSize;                                                  // Stack size
-    StackTraceData stack[STACK_TRACE_MAX];                          // Stack data
-    char functionParamBuffer[32 * 1024];                            // Buffer to hold function parameters
+#include "pgbr_ffi.h"
 
 #ifdef HAVE_LIBBACKTRACE
-    struct backtrace_state *backTraceState;                         // Backtrace state struct
+// libbacktrace state — single-instance, lazily created on first use. Stays on the C side because the libbacktrace API talks in C
+// pointers and is platform-specific.
+static struct backtrace_state *backTraceState;
 #endif
-} stackTraceLocal;
 
 /**********************************************************************************************************************************/
 #ifdef DEBUG
 
-static struct StackTraceTestLocal
-{
-    bool testFlag;                                        // Don't log in parameter logging functions to avoid recursion
-} stackTraceTestLocal = {.testFlag = true};
-
 FN_EXTERN void
 stackTraceTestStart(void)
 {
-    stackTraceTestLocal.testFlag = true;
+    pgbr_stack_trace_test_start();
 }
 
 FN_EXTERN void
 stackTraceTestStop(void)
 {
-    stackTraceTestLocal.testFlag = false;
+    pgbr_stack_trace_test_stop();
 }
 
 FN_EXTERN bool
 stackTraceTest(void)
 {
-    return stackTraceTestLocal.testFlag;
+    return pgbr_stack_trace_test_flag();
 }
 
 FN_EXTERN void
 stackTraceTestFileLineSet(unsigned int fileLine)
 {
-    ASSERT(stackTraceLocal.stackSize > 0);
-
-    stackTraceLocal.stack[stackTraceLocal.stackSize - 1].fileLine = fileLine;
+    pgbr_stack_trace_test_file_line_set((uint32_t)fileLine);
 }
 
 #endif
@@ -89,132 +63,40 @@ stackTraceTestFileLineSet(unsigned int fileLine)
 FN_EXTERN LogLevel
 stackTracePush(const char *const fileName, const char *const functionName, const LogLevel functionLogLevel)
 {
-    ASSERT(stackTraceLocal.stackSize < STACK_TRACE_MAX - 1);
+    // The Rust side asserts on overflow with `panic!`, which crosses the FFI boundary as an `Unknown` error. Mirror the legacy
+    // C `ASSERT(stackTraceLocal.stackSize < STACK_TRACE_MAX - 1)` here so the throw shows up as an AssertError with the same
+    // diagnostic shape the existing test expects.
+    ASSERT(pgbr_stack_trace_size() < 127);
 
-    // Set function info
-    StackTraceData *const data = &stackTraceLocal.stack[stackTraceLocal.stackSize];
-
-    *data = (StackTraceData)
-    {
-        .fileName = fileName,
-        .functionName = functionName,
-        .tryDepth = errorTryDepth(),
-    };
-
-    // Set param pointer
-    if (stackTraceLocal.stackSize == 0)
-    {
-        data->param = stackTraceLocal.functionParamBuffer;
-        data->functionLogLevel = functionLogLevel;
-    }
-    else
-    {
-        StackTraceData *const dataPrior = &stackTraceLocal.stack[stackTraceLocal.stackSize - 1];
-
-        data->param = dataPrior->param + dataPrior->paramSize + 1;
-
-        // Log level cannot be lower than the prior function
-        if (functionLogLevel < dataPrior->functionLogLevel)
-            data->functionLogLevel = dataPrior->functionLogLevel;
-        else
-            data->functionLogLevel = functionLogLevel;
-    }
-
-    stackTraceLocal.stackSize++;
-
-    return data->functionLogLevel;
+    return (LogLevel)pgbr_stack_trace_push(fileName, functionName, (int32_t)functionLogLevel, errorTryDepth());
 }
 
 /**********************************************************************************************************************************/
-static const char *
-stackTraceParamIdx(const int stackIdx)
-{
-    ASSERT(stackTraceLocal.stackSize > 0);
-    ASSERT(stackIdx < stackTraceLocal.stackSize);
-
-    StackTraceData *const data = &stackTraceLocal.stack[stackIdx];
-
-    if (data->paramLog)
-    {
-        if (data->paramOverflow)
-            return "buffer full - parameters not available";
-
-        if (data->paramSize == 0)
-            return "void";
-
-        return data->param;
-    }
-
-    // If no parameters return the log level required to get them
-    #define LOG_LEVEL_REQUIRED " log level required for parameters"
-    return data->functionLogLevel == logLevelTrace ? "trace" LOG_LEVEL_REQUIRED : "debug" LOG_LEVEL_REQUIRED;
-}
-
 FN_EXTERN const char *
 stackTraceParam(void)
 {
-    return stackTraceParamIdx(stackTraceLocal.stackSize - 1);
+    return pgbr_stack_trace_param_top();
 }
 
 /**********************************************************************************************************************************/
 FN_EXTERN char *
 stackTraceParamBuffer(const char *const paramName)
 {
-    ASSERT(stackTraceLocal.stackSize > 0);
-
-    StackTraceData *const data = &stackTraceLocal.stack[stackTraceLocal.stackSize - 1];
-    const size_t paramNameSize = strlen(paramName);
-
-    // Make sure that adding this parameter will not overflow the buffer
-    if ((size_t)(data->param - stackTraceLocal.functionParamBuffer) + data->paramSize + paramNameSize + 4 >
-        sizeof(stackTraceLocal.functionParamBuffer) - (STACK_TRACE_PARAM_MAX * 2))
-    {
-        // Set overflow to true
-        data->paramOverflow = true;
-
-        // There's no way to stop the parameter from being formatted so we reserve a space at the end where the format can safely
-        // take place and not disturb the rest of the buffer. Hopefully overflows just won't happen but we need to be prepared in
-        // case of runaway recursion or some other issue that fills the buffer because we don't want a segfault.
-        return stackTraceLocal.functionParamBuffer + sizeof(stackTraceLocal.functionParamBuffer) - STACK_TRACE_PARAM_MAX;
-    }
-
-    // Add a comma if a parameter is already in the list
-    if (data->paramSize != 0)
-    {
-        data->param[data->paramSize++] = ',';
-        data->param[data->paramSize++] = ' ';
-    }
-
-    // Add the parameter name
-    strcpy(data->param + data->paramSize, paramName);
-    data->paramSize += paramNameSize;
-
-    // Add param/value separator
-    data->param[data->paramSize++] = ':';
-    data->param[data->paramSize++] = ' ';
-
-    return data->param + data->paramSize;
+    return pgbr_stack_trace_param_buffer(paramName);
 }
 
 /**********************************************************************************************************************************/
 FN_EXTERN void
 stackTraceParamAdd(const size_t bufferSize)
 {
-    ASSERT(stackTraceLocal.stackSize > 0);
-
-    StackTraceData *data = &stackTraceLocal.stack[stackTraceLocal.stackSize - 1];
-
-    if (!data->paramOverflow)
-        data->paramSize += bufferSize;
+    pgbr_stack_trace_param_add(bufferSize);
 }
 
 /**********************************************************************************************************************************/
 FN_EXTERN void
 stackTraceParamLog(void)
 {
-    ASSERT(stackTraceLocal.stackSize > 0);
-
-    stackTraceLocal.stack[stackTraceLocal.stackSize - 1].paramLog = true;
+    pgbr_stack_trace_param_log();
 }
 
 /**********************************************************************************************************************************/
@@ -223,16 +105,14 @@ stackTraceParamLog(void)
 FN_EXTERN void
 stackTracePop(const char *const fileName, const char *const functionName, const bool test)
 {
-    ASSERT(stackTraceLocal.stackSize > 0);
+    // Mirror the legacy `ASSERT(stackTraceLocal.stackSize > 0)` so underflow throws AssertError before reaching Rust.
+    ASSERT(pgbr_stack_trace_size() > 0);
 
-    if (!test || stackTraceTest())
+    if (pgbr_stack_trace_pop_debug(fileName, functionName, test) != 0)
     {
-        stackTraceLocal.stackSize--;
-
-        StackTraceData *data = &stackTraceLocal.stack[stackTraceLocal.stackSize];
-
-        if (strcmp(data->fileName, fileName) != 0 || strcmp(data->functionName, functionName) != 0)
-            THROW_FMT(AssertError, "popping %s:%s but expected %s:%s", fileName, functionName, data->fileName, data->functionName);
+        // The Rust side records the diagnostic message in the thread-local last-error slot; re-throw via the standard bridge so
+        // the caller sees an AssertError with the correct file/function/line.
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
     }
 }
 
@@ -241,13 +121,15 @@ stackTracePop(const char *const fileName, const char *const functionName, const 
 FN_EXTERN void
 stackTracePop(void)
 {
-    stackTraceLocal.stackSize--;
+    ASSERT(pgbr_stack_trace_size() > 0);
+    pgbr_stack_trace_pop_release();
 }
 
 #endif
 
 /***********************************************************************************************************************************
-Stack trace format
+Stack trace format helper. Kept on the C side because it consumes a variadic format string via `vsnprintf`; the legacy test
+exercises it directly and keeping it here avoids marshalling the variadic args across the FFI boundary.
 ***********************************************************************************************************************************/
 static FN_PRINTF(4, 5) size_t
 stackTraceFmt(char *const buffer, const size_t bufferSize, const size_t bufferUsed, const char *const format, ...)
@@ -262,7 +144,8 @@ stackTraceFmt(char *const buffer, const size_t bufferSize, const size_t bufferUs
 }
 
 /***********************************************************************************************************************************
-Helper to trim off extra path before the src path
+Helper to trim off extra path before the src path. Mirrors `pgbr_core::stack_trace::trim_src` byte-for-byte; kept here so the
+libbacktrace callback does not have to allocate to call into Rust.
 ***********************************************************************************************************************************/
 static const char *
 stackTraceTrimSrc(const char *const fileName)
@@ -308,20 +191,25 @@ stackTraceBackCallback(
     data->firstCall = false;
 
     // If the function name matches combine backtrace data with stack data
-    if (data->stackIdx >= 0 && strcmp(functionName, stackTraceLocal.stack[data->stackIdx].functionName) == 0)
+    PGBR_PgbrStackFrame frame;
+    bool matched = false;
+
+    if (data->stackIdx >= 0 && pgbr_stack_trace_frame_at((size_t)data->stackIdx, &frame) == 0 &&
+        strcmp(functionName, frame.function_name) == 0)
     {
         data->result += stackTraceFmt(
             data->buffer, data->bufferSize, data->result, "%s%s:%s:%d:(%s)", data->firstLine ? "" : "\n",
-            stackTraceTrimSrc(stackTraceLocal.stack[data->stackIdx].fileName), functionName, fileLine,
-            stackTraceParamIdx(data->stackIdx));
+            stackTraceTrimSrc(frame.file_name), functionName, fileLine, pgbr_stack_trace_param_idx((size_t)data->stackIdx));
 
         data->stackIdx--;
+        matched = true;
     }
-    // Else just use stack data. Skip any functions in the error module since they are not useful for the user
-    else
+
+    if (!matched)
     {
         fileName = stackTraceTrimSrc(fileName);
 
+        // Else just use stack data. Skip any functions in the error module since they are not useful for the user
         if (strcmp(fileName, "common/error/error.c") == 0)
             return false;
 
@@ -354,37 +242,43 @@ stackTraceToZ(
     const unsigned int fileLine)
 {
 #ifdef HAVE_LIBBACKTRACE
-    // Attempt to use backtrace data
-    StackTraceBackData data =
+    if (!pgbr_stack_trace_force_no_backtrace_get())
     {
-        .firstCall = true,
-        .firstLine = true,
-        .stackIdx = stackTraceLocal.stackSize - 1,
-        .result = 0,
-        .buffer = buffer,
-        .bufferSize = bufferSize,
-    };
+        StackTraceBackData data =
+        {
+            .firstCall = true,
+            .firstLine = true,
+            .stackIdx = (int)pgbr_stack_trace_size() - 1,
+            .result = 0,
+            .buffer = buffer,
+            .bufferSize = bufferSize,
+        };
 
-    if (stackTraceLocal.backTraceState == NULL)
-        stackTraceLocal.backTraceState = backtrace_create_state(NULL, false, NULL, NULL);
+        if (backTraceState == NULL)
+            backTraceState = backtrace_create_state(NULL, false, NULL, NULL);
 
-    backtrace_full(stackTraceLocal.backTraceState, 2, stackTraceBackCallback, stackTraceBackErrorCallback, &data);
+        backtrace_full(backTraceState, 2, stackTraceBackCallback, stackTraceBackErrorCallback, &data);
 
-    if (data.result != 0)
-        return data.result;
+        if (data.result != 0)
+            return data.result;
+    }
 #endif // HAVE_LIBBACKTRACE
 
     size_t result = 0;
     const char *param = "test build required for parameters";
-    int stackIdx = stackTraceLocal.stackSize - 1;
+    const size_t stackSize = pgbr_stack_trace_size();
+    int stackIdx = (int)stackSize - 1;
 
     // If the current function passed in is the same as the top function on the stack then use the parameters for that function
     fileName = stackTraceTrimSrc(fileName);
 
-    if (stackTraceLocal.stackSize > 0 && strcmp(fileName, stackTraceTrimSrc(stackTraceLocal.stack[stackIdx].fileName)) == 0 &&
-        strcmp(functionName, stackTraceLocal.stack[stackIdx].functionName) == 0)
+    PGBR_PgbrStackFrame topFrame;
+
+    if (stackSize > 0 && pgbr_stack_trace_frame_at((size_t)stackIdx, &topFrame) == 0 &&
+        strcmp(fileName, stackTraceTrimSrc(topFrame.file_name)) == 0 &&
+        strcmp(functionName, topFrame.function_name) == 0)
     {
-        param = stackTraceParamIdx(stackTraceLocal.stackSize - 1);
+        param = pgbr_stack_trace_param_idx((size_t)stackIdx);
         stackIdx--;
     }
 
@@ -395,20 +289,22 @@ stackTraceToZ(
     if (stackIdx >= 0)
     {
         // If the function passed in was not at the top of the stack then some functions are missing
-        if (stackIdx == stackTraceLocal.stackSize - 1)
+        if (stackIdx == (int)stackSize - 1)
             result += stackTraceFmt(buffer, bufferSize, result, "\n    ... function(s) omitted ...");
 
         // Output the rest of the stack
         for (; stackIdx >= 0; stackIdx--)
         {
-            const StackTraceData *const data = &stackTraceLocal.stack[stackIdx];
+            PGBR_PgbrStackFrame frame;
+            if (pgbr_stack_trace_frame_at((size_t)stackIdx, &frame) != 0)
+                break;
 
-            result += stackTraceFmt(buffer, bufferSize, result, "\n%s:%s", stackTraceTrimSrc(data->fileName), data->functionName);
+            result += stackTraceFmt(buffer, bufferSize, result, "\n%s:%s", stackTraceTrimSrc(frame.file_name), frame.function_name);
 
-            if (data->fileLine > 0)
-                result += stackTraceFmt(buffer, bufferSize, result, ":%u", data->fileLine);
+            if (frame.file_line > 0)
+                result += stackTraceFmt(buffer, bufferSize, result, ":%u", frame.file_line);
 
-            result += stackTraceFmt(buffer, bufferSize, result, ":(%s)", stackTraceParamIdx(stackIdx));
+            result += stackTraceFmt(buffer, bufferSize, result, ":(%s)", pgbr_stack_trace_param_idx((size_t)stackIdx));
         }
     }
 
@@ -420,7 +316,5 @@ FN_EXTERN void
 stackTraceClean(const unsigned int tryDepth, const bool fatal)
 {
     (void)fatal;                                                    // Cleanup is the same for fatal errors
-
-    while (stackTraceLocal.stackSize > 0 && stackTraceLocal.stack[stackTraceLocal.stackSize - 1].tryDepth >= tryDepth)
-        stackTraceLocal.stackSize--;
+    pgbr_stack_trace_clean((uint32_t)tryDepth);
 }

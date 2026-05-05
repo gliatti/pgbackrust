@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgbr_core::debug as core_debug;
+use pgbr_core::stack_trace as core_stack_trace;
 use pgbr_core::string_static as core_string_static;
 use pgbr_encode::{self as encode, EncodingType};
 use pgbr_error::retry::RetryState;
@@ -754,6 +755,245 @@ pub unsafe extern "C" fn pgbr_string_static_cat_chr(tail: *mut c_char, tail_size
         // the byte representation rather than relying on the implicit conversion.
         let byte_u8 = byte.cast_unsigned();
         core_string_static::cat_chr(buf, byte_u8)
+    })
+}
+
+/// Push a frame onto the call-stack accumulator and return the effective log level.
+///
+/// # Safety
+///
+/// `file_name` and `function_name` must point to NUL-terminated, statically allocated
+/// C strings (the C side hands `__FILE__` / `__func__` literals here).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_stack_trace_push(
+    file_name: *const c_char,
+    function_name: *const c_char,
+    function_log_level: i32,
+    try_depth: u32,
+) -> i32 {
+    with_panic_guard(|| core_stack_trace::push(file_name, function_name, function_log_level, try_depth))
+}
+
+/// DEBUG-build pop. Returns 0 on success, -1 on `(file, function)` mismatch.
+///
+/// On -1 the thread-local last-error slot carries the descriptive `AssertError`
+/// message the C side then re-throws via `pgbr_error_throw_from_last`.
+///
+/// # Safety
+///
+/// `expected_file_name` and `expected_function_name` must be NUL-terminated readable C
+/// strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_stack_trace_pop_debug(
+    expected_file_name: *const c_char,
+    expected_function_name: *const c_char,
+    test: bool,
+) -> i32 {
+    with_panic_guard(|| {
+        // SAFETY: caller guarantees the pointers are NUL-terminated readable C strings.
+        match unsafe { core_stack_trace::pop_debug(expected_file_name, expected_function_name, test) } {
+            Ok(()) => 0,
+            Err(actual) => {
+                // SAFETY: actual_* came from a stored frame, both originally received as
+                // NUL-terminated literals from C call sites.
+                let actual_file_str = unsafe { CStr::from_ptr(actual.file_name) }.to_str().unwrap_or("?");
+                let actual_func_str = unsafe { CStr::from_ptr(actual.function_name) }.to_str().unwrap_or("?");
+                let expected_file_str = unsafe { CStr::from_ptr(expected_file_name) }.to_str().unwrap_or("?");
+                let expected_func_str = unsafe { CStr::from_ptr(expected_function_name) }.to_str().unwrap_or("?");
+                let message =
+                    format!("popping {expected_file_str}:{expected_func_str} but expected {actual_file_str}:{actual_func_str}");
+                set_last_error(Error::new(ErrorType::Assert, message));
+                -1
+            }
+        }
+    })
+}
+
+/// Non-DEBUG-build pop.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_pop_release() {
+    with_panic_guard(core_stack_trace::pop_release);
+}
+
+/// Mark the top frame as having logged its parameters.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_param_log() {
+    with_panic_guard(core_stack_trace::param_log);
+}
+
+/// Reserve a slot for a new parameter and return a pointer the C side formats into.
+///
+/// # Safety
+///
+/// `param_name` must be a NUL-terminated readable C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_stack_trace_param_buffer(param_name: *const c_char) -> *mut c_char {
+    with_panic_guard(|| {
+        if param_name.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: caller guarantees `param_name` is NUL-terminated and readable.
+        unsafe { core_stack_trace::param_buffer(param_name) }
+    })
+}
+
+/// Bump the top frame's recorded parameter size by `size` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_param_add(size: usize) {
+    with_panic_guard(|| core_stack_trace::param_add(size));
+}
+
+/// Drop frames whose `try_depth >= try_depth_floor`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_clean(try_depth_floor: u32) {
+    with_panic_guard(|| core_stack_trace::clean(try_depth_floor));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_start() {
+    with_panic_guard(core_stack_trace::test_start);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_stop() {
+    with_panic_guard(core_stack_trace::test_stop);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_flag() -> bool {
+    with_panic_guard(core_stack_trace::test_flag)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_file_line_set(file_line: u32) {
+    with_panic_guard(|| core_stack_trace::test_file_line_set(file_line));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_force_no_backtrace_set(value: bool) {
+    with_panic_guard(|| core_stack_trace::force_no_backtrace_set(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_force_no_backtrace_get() -> bool {
+    with_panic_guard(core_stack_trace::force_no_backtrace_get)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_size() -> usize {
+    with_panic_guard(core_stack_trace::stack_size)
+}
+
+/// Test-only: bump the stack-size cursor without writing a new frame. Used by
+/// `stackTraceTest.c` to exercise `stackTraceTestFileLineSet`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_size_inc() {
+    with_panic_guard(core_stack_trace::test_size_inc);
+}
+
+/// Test-only: decrement the stack-size cursor.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_size_dec() {
+    with_panic_guard(core_stack_trace::test_size_dec);
+}
+
+/// Test-only: write a single frame field.
+///
+/// `field` is `0` for `file_line`, `1` for `function_log_level`, `2` for `param_size`,
+/// `3` for `param_offset`. Any other value panics — the FFI guard turns the panic into
+/// a typed `Unknown` error.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_test_set_frame_field(idx: usize, field: i32, value: u64) {
+    with_panic_guard(|| core_stack_trace::test_set_frame_field(idx, field, value));
+}
+
+/// FFI mirror of [`core_stack_trace::StackFrame`].
+///
+/// The C-side libbacktrace callback reads frames without owning them. The pointer
+/// fields borrow C-side static storage; the offset/size fields index into the
+/// parameter buffer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PgbrStackFrame {
+    pub file_name: *const c_char,
+    pub function_name: *const c_char,
+    pub file_line: u32,
+    pub function_log_level: i32,
+    pub param_overflow: bool,
+    pub param_log: bool,
+    pub param_offset: usize,
+    pub param_size: usize,
+}
+
+/// Read frame `idx` into `out`. Returns `0` on success, `-1` if `idx` is out of range
+/// or `out` is null.
+///
+/// # Safety
+///
+/// `out` must point to a writable `PgbrStackFrame` cell.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_stack_trace_frame_at(idx: usize, out: *mut PgbrStackFrame) -> i32 {
+    with_panic_guard(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(frame) = core_stack_trace::frame_at(idx) else {
+            return -1;
+        };
+        let value = PgbrStackFrame {
+            file_name: frame.file_name,
+            function_name: frame.function_name,
+            file_line: frame.file_line,
+            function_log_level: frame.function_log_level,
+            param_overflow: frame.param_overflow,
+            param_log: frame.param_log,
+            param_offset: frame.param_offset,
+            param_size: frame.param_size,
+        };
+        // SAFETY: caller guarantees `out` is writable and properly aligned.
+        unsafe { out.write(value) };
+        0
+    })
+}
+
+/// Pointer to the start of the parameter buffer.
+///
+/// Used together with `(param_offset, param_size)` from [`pgbr_stack_trace_frame_at`]
+/// to read a frame's rendered parameters. The pointer is stable for the lifetime of
+/// the process.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_param_buffer_ptr() -> *const c_char {
+    with_panic_guard(|| core_stack_trace::param_buffer_ptr().cast::<c_char>())
+}
+
+/// Render the parameter string for `stack_idx`. See `core_stack_trace::param_idx` for
+/// the full branch table. Returns null if `stack_idx` is out of range.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_param_idx(stack_idx: usize) -> *const c_char {
+    with_panic_guard(|| {
+        if stack_idx >= core_stack_trace::stack_size() {
+            return core::ptr::null();
+        }
+        match core_stack_trace::param_idx(stack_idx) {
+            core_stack_trace::ParamIdx::Static(s) => s.as_ptr(),
+            core_stack_trace::ParamIdx::Buffer { offset } => {
+                let base = core_stack_trace::param_buffer_ptr();
+                // SAFETY: offset is within PARAM_BUFFER_SIZE.
+                unsafe { base.add(offset).cast::<c_char>() }
+            }
+        }
+    })
+}
+
+/// Render the parameter string for the current top frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_stack_trace_param_top() -> *const c_char {
+    with_panic_guard(|| {
+        let size = core_stack_trace::stack_size();
+        if size == 0 {
+            return core::ptr::null();
+        }
+        pgbr_stack_trace_param_idx(size - 1)
     })
 }
 

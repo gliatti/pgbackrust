@@ -67,10 +67,11 @@ unit:
         feature: stackTrace
         harness:
           name: stackTrace
+          # Phase 30 moved the no-backtrace simulation from a SHIM_MODULE function override
+          # to a Rust-side force_no_backtrace flag. No function rename is needed any more —
+          # the harness toggles the Rust flag through the FFI layer.
           shim:
             common/stackTrace:
-              function:
-                - stackTraceBackCallback
 
         coverage:
           - common/stackTrace
