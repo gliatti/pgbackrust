@@ -12,6 +12,11 @@ Test Compression
 #include <bzlib.h>                                                      // For the legacy_bz2Compress differential helper —
                                                                         // bz2/compress.c (Phase 21) no longer includes
                                                                         // bzlib.h.
+#ifdef HAVE_LIBZST
+#include <zstd.h>                                                       // For the legacy_zstCompress differential helper —
+                                                                        // zst/compress.c (Phase 24) no longer includes
+                                                                        // zstd.h.
+#endif
 
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
@@ -92,6 +97,43 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
 
     return output;
 }
+
+// `legacy_zstCompress` mirrors the pre-Phase-24 body of `zstCompressNew` / `zstCompressProcess` — direct libzstd calls with the
+// same level. One-shot compression; libzstd is deterministic given fixed level, so the new IoFilter path and this helper
+// produce byte-identical frames.
+#ifdef HAVE_LIBZST
+static Buffer *
+legacy_zstCompress(const int level, const Buffer *const input)
+{
+    ZSTD_CStream *const ctx = ZSTD_createCStream();
+    ASSERT(ctx != NULL);
+    size_t ret = ZSTD_initCStream(ctx, level);
+    ASSERT(!ZSTD_isError(ret));
+
+    Buffer *const output = bufNew(bufUsed(input) * 2 + 4096);
+
+    ZSTD_inBuffer in = {.src = bufPtrConst(input), .size = bufUsed(input), .pos = 0};
+    ZSTD_outBuffer out = {.dst = bufPtr(output), .size = bufSize(output), .pos = 0};
+
+    ret = ZSTD_compressStream(ctx, &out, &in);
+    ASSERT(!ZSTD_isError(ret));
+    ASSERT(in.pos == in.size);
+
+    // Flush trailer; loop until ZSTD_endStream returns 0.
+    do
+    {
+        ret = ZSTD_endStream(ctx, &out);
+        ASSERT(!ZSTD_isError(ret));
+    }
+    while (ret != 0);
+
+    bufUsedSet(output, out.pos);
+
+    ZSTD_freeCStream(ctx);
+
+    return output;
+}
+#endif
 
 // `legacy_bz2Decompress` mirrors the pre-Phase-22 body of `bz2DecompressNew` / `bz2DecompressProcess` — direct libbz2 calls.
 // One-shot decompression; both the new IoFilter path and this helper recover the original plaintext byte-for-byte because
@@ -926,6 +968,53 @@ testRun(void)
 
         TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(decompress, zstDecompressToLog, buffer, sizeof(buffer)), "zstDecompressToLog");
         TEST_RESULT_Z(buffer, "{inputSame: true, inputOffset: 999, frameDone false, done: true}", "check log");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("zstCompress differential vs direct libzstd (10000+ inputs)");
+
+        // 10 000 random `(level, plaintext)` pairs. libzstd is deterministic given fixed level + ZSTD_initCStream defaults, so
+        // the new FFI path and `legacy_zstCompress` (direct libzstd calls with the same level) must produce byte-identical
+        // frames.
+        uint64_t zstLcgState = UINT64_C(0xC0FFEE0005A5A5A5);
+        unsigned int zstComparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            zstLcgState = zstLcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t zstLen = (size_t)((zstLcgState >> 32) & 0x3FF) + 1;
+            // ZST_COMPRESS_LEVEL_MIN..MAX is -7..22 → 30 values.
+            const int zstLevel = (int)(((zstLcgState >> 24) & 0xFF) % 30) - 7;
+
+            Buffer *const zstInput = bufNew(zstLen);
+            for (size_t i = 0; i < zstLen; i++)
+            {
+                zstLcgState = zstLcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(zstInput)[i] = (uint8_t)(zstLcgState >> 56);
+            }
+            bufUsedSet(zstInput, zstLen);
+
+            Buffer *const zstNewOut = testCompress(
+                compressFilterP(compressTypeZst, zstLevel), zstInput, zstLen, zstLen * 2 + 4096);
+            Buffer *const zstLegacyOut = legacy_zstCompress(zstLevel, zstInput);
+
+            if (!bufEq(zstNewOut, zstLegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "zstCompress(level=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu", zstLevel, zstLen, iter,
+                    bufUsed(zstNewOut), bufUsed(zstLegacyOut));
+            }
+
+            bufFree(zstInput);
+            bufFree(zstNewOut);
+            bufFree(zstLegacyOut);
+
+            zstComparisons++;
+        }
+
+        TEST_RESULT_UINT(zstComparisons, 10000, "10k differential zstCompress inputs all byte-identical");
 #else
         TEST_ERROR(compressTypePresent(compressTypeZst), OptionInvalidValueError, "pgBackRust not built with zst support");
 #endif // HAVE_LIBZST

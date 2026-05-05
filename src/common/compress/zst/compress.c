@@ -1,11 +1,14 @@
 /***********************************************************************************************************************************
 ZST Compress
+
+Thin C wrapper over the Rust streaming compressor in `crates/pgbr-compress::zst::compress`. The IoFilter object, the
+`inputSame` / `flushing` / `inputOffset` state machine, and `zstCompressToLog` stay on the C side; the libzstd calls
+(`ZSTD_createCStream`, `ZSTD_initCStream`, `ZSTD_compressStream`, `ZSTD_endStream`, `ZSTD_freeCStream`) are replaced by FFI
+calls into libpgbr_ffi.a.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #ifdef HAVE_LIBZST
-
-#include <zstd.h>
 
 #include "common/compress/common.h"
 #include "common/compress/zst/common.h"
@@ -15,13 +18,14 @@ ZST Compress
 #include "common/log.h"
 #include "common/type/object.h"
 #include "common/type/pack.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct ZstCompress
 {
-    ZSTD_CStream *context;                                          // Compression context
+    void *state;                                                    // Opaque pgbr_compress::zst::compress::Compress*
     int level;                                                      // Compression level
     IoFilter *filter;                                               // Filter interface
 
@@ -60,7 +64,8 @@ zstCompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    ZSTD_freeCStream(this->context);
+    pgbr_zst_compress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -81,42 +86,39 @@ zstCompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
 
     ASSERT(this != NULL);
     ASSERT(!(this->flushing && !this->inputSame));
-    ASSERT(this->context != NULL);
+    ASSERT(this->state != NULL);
     ASSERT(compressed != NULL);
     ASSERT(!this->flushing || uncompressed == NULL);
 
-    // Initialize output buffer
-    ZSTD_outBuffer out = {.dst = bufRemainsPtr(compressed), .size = bufRemains(compressed)};
+    size_t written = 0;
 
     // If input is NULL then start flushing
     if (uncompressed == NULL)
     {
         this->flushing = true;
-        this->inputSame = zstError(ZSTD_endStream(this->context, &out)) != 0;
+
+        // ZSTD_endStream returns the number of bytes still queued. If non-zero, the C wrapper sets inputSame so the IoFilter
+        // framework calls back to drain the rest of the trailer.
+        const size_t remaining = pgbr_zst_compress_state_end(this->state, bufRemainsPtr(compressed), bufRemains(compressed),
+            &written);
+        zstError(remaining);
+        this->inputSame = remaining != 0;
     }
     // Else still have input data
     else
     {
-        // Initialize input buffer
-        ZSTD_inBuffer in =
-        {
-            .src = bufPtrConst(uncompressed) + this->inputOffset,
-            .size = bufUsed(uncompressed) - this->inputOffset,
-        };
-
-        // Perform compression
-        zstError(ZSTD_compressStream(this->context, &out, &in));
+        size_t consumed = 0;
+        const size_t code = pgbr_zst_compress_state_compress(
+            this->state, bufPtrConst(uncompressed) + this->inputOffset, bufUsed(uncompressed) - this->inputOffset,
+            bufRemainsPtr(compressed), bufRemains(compressed), &written, &consumed);
+        zstError(code);
 
         // If the input buffer was not entirely consumed then set inputSame and store the offset where processing will restart
-        if (in.pos < in.size)
+        if (consumed < bufUsed(uncompressed) - this->inputOffset)
         {
-            // Output buffer should be completely full
-            ASSERT(out.pos == out.size);
-
             this->inputSame = true;
-            this->inputOffset += in.pos;
+            this->inputOffset += consumed;
         }
-        // Else ready for more input
         else
         {
             this->inputSame = false;
@@ -124,7 +126,7 @@ zstCompressProcess(THIS_VOID, const Buffer *const uncompressed, Buffer *const co
         }
     }
 
-    bufUsedInc(compressed, out.pos);
+    bufUsedInc(compressed, written);
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -176,17 +178,20 @@ zstCompressNew(const int level, const bool raw)
 
     OBJ_NEW_BEGIN(ZstCompress, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (ZstCompress)
+        *this = (ZstCompress){.state = NULL, .level = level};
+
+        // Create the Rust streaming compressor
+        size_t errCode = 0;
+        this->state = pgbr_zst_compress_state_new(level, &errCode);
+
+        if (this->state == NULL)
         {
-            .context = ZSTD_createCStream(),
-            .level = level,
-        };
+            pgbr_last_error_clear();
+            zstError(errCode);
+        }
 
         // Set callback to ensure zst context is freed
         memContextCallbackSet(objMemContext(this), zstCompressFreeResource, this);
-
-        // Initialize context
-        zstError(ZSTD_initCStream(this->context, this->level));
     }
     OBJ_NEW_END();
 
