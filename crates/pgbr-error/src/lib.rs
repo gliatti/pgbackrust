@@ -15,6 +15,8 @@ use core::fmt;
 use std::cell::RefCell;
 use std::ffi::CString;
 
+pub mod format;
+
 include!(concat!(env!("OUT_DIR"), "/error_types.rs"));
 
 /// Owned error value. Crosses crate boundaries inside the workspace; does not implement `Copy`.

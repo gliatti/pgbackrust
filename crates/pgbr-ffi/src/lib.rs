@@ -214,6 +214,211 @@ pub extern "C" fn pgbr_error_type_extends_by_code(child: i32, parent: i32) -> bo
     })
 }
 
+/// Discriminant tag for [`PgbrFmtArg`], matching `pgbr_error::format::Arg` variants.
+///
+/// Numeric values are the C-side ABI: do not renumber.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgbrFmtArgKind {
+    /// 32-bit signed integer (C `int`).
+    I32 = 0,
+    /// 32-bit unsigned integer (C `unsigned int`).
+    U32 = 1,
+    /// 64-bit signed integer (C `long` on LP64).
+    I64 = 2,
+    /// 64-bit unsigned integer (C `unsigned long` on LP64).
+    U64 = 3,
+    /// Pointer-width signed integer (C `ssize_t`).
+    Isize = 4,
+    /// Pointer-width unsigned integer (C `size_t`).
+    Usize = 5,
+    /// Single byte interpreted as a character.
+    Char = 6,
+    /// Pointer + length describing a UTF-8 string slice owned by the C caller.
+    Str = 7,
+}
+
+/// Typed printf argument crossing the FFI boundary.
+///
+/// `kind` selects how the payload (`value_a`, `value_b`) is interpreted:
+/// - For numeric kinds (`I32`..=`Char`), `value_a` holds the value's bits (sign-extended
+///   for signed kinds), and `value_b` is unused.
+/// - For [`PgbrFmtArgKind::Str`], `value_a` is a `*const c_char` cast to `u64` and
+///   `value_b` is the byte length of the slice. The pointed-to bytes must be valid UTF-8
+///   for the duration of the [`pgbr_error_format_message`] call; the function does not
+///   take ownership.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PgbrFmtArg {
+    /// Discriminant — see [`PgbrFmtArgKind`].
+    pub kind: i32,
+    /// Reserved for alignment so the struct is 24 bytes and 8-aligned on every target.
+    pub reserved: i32,
+    /// Primary payload — primitive bits or `*const c_char` cast to `u64`.
+    pub value_a: u64,
+    /// Secondary payload — only used for `Str`, where it is the byte length.
+    pub value_b: u64,
+}
+
+/// Renders `template_utf8` into `dst` using the typed args at `args`.
+///
+/// The supported specifier set is documented on [`pgbr_error::format::format_message`]:
+/// `%s %c %d %u %X %zd %zu %lu %% %02d %04d %02u %03u %02X %.3s %.16s` plus their
+/// natural variants. Any other specifier is treated as a programmer error and emitted
+/// as the literal `%c` token.
+///
+/// Returns the number of bytes written to `dst` (excluding the trailing NUL), capped at
+/// `dst_size - 1`. The destination is always NUL-terminated when `dst_size > 0`.
+///
+/// Returns `usize::MAX` on programmer error: null `template_utf8`, null `dst` with
+/// `dst_size > 0`, null `args` with `args_len > 0`, invalid UTF-8 in the template, or
+/// an `Arg::Str` whose `(ptr, len)` does not point at valid UTF-8. The thread-local
+/// last-error slot is populated in those cases so the C caller can surface it.
+///
+/// # Safety
+///
+/// - `template_utf8` must be a NUL-terminated, valid UTF-8 byte sequence readable for the
+///   call.
+/// - `args` must point to `args_len` valid `PgbrFmtArg` values; for any element with
+///   `kind == PgbrFmtArgKind::Str as i32`, `value_a` must point to a UTF-8 byte sequence
+///   of length `value_b`.
+/// - `dst` must point to a writable buffer of at least `dst_size` bytes, or be null when
+///   `dst_size == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_format_message(
+    template_utf8: *const c_char,
+    args: *const PgbrFmtArg,
+    args_len: usize,
+    dst: *mut c_char,
+    dst_size: usize,
+) -> usize {
+    with_panic_guard(|| unsafe { pgbr_error_format_message_impl(template_utf8, args, args_len, dst, dst_size) })
+}
+
+/// SAFETY: the caller upholds the documented contract on `pgbr_error_format_message`.
+// The function unpacks a fixed-size payload from the FFI blob into typed Rust values; the casts
+// are exactly the contract documented on `PgbrFmtArg::value_a`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+unsafe fn pgbr_error_format_message_impl(
+    template_utf8: *const c_char,
+    args: *const PgbrFmtArg,
+    args_len: usize,
+    dst: *mut c_char,
+    dst_size: usize,
+) -> usize {
+    if template_utf8.is_null() {
+        set_last_error(Error::new(ErrorType::Assert, "pgbr_error_format_message: template is null"));
+        return usize::MAX;
+    }
+    if args.is_null() && args_len > 0 {
+        set_last_error(Error::new(
+            ErrorType::Assert,
+            "pgbr_error_format_message: args is null with args_len > 0",
+        ));
+        return usize::MAX;
+    }
+    if dst.is_null() && dst_size > 0 {
+        set_last_error(Error::new(
+            ErrorType::Assert,
+            "pgbr_error_format_message: dst is null with dst_size > 0",
+        ));
+        return usize::MAX;
+    }
+
+    // SAFETY: caller guarantees `template_utf8` is NUL-terminated and readable.
+    let template_cstr = unsafe { CStr::from_ptr(template_utf8) };
+    let Ok(template) = template_cstr.to_str() else {
+        set_last_error(Error::new(
+            ErrorType::Assert,
+            "pgbr_error_format_message: template is not valid UTF-8",
+        ));
+        return usize::MAX;
+    };
+
+    // SAFETY: caller guarantees `args[..args_len]` are readable.
+    let raw_args = if args_len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(args, args_len) }
+    };
+
+    // Convert each FFI arg into the typed Rust representation. String slices borrow
+    // from C-owned memory for the duration of this call.
+    let mut typed_args: Vec<pgbr_error::format::Arg<'_>> = Vec::with_capacity(args_len);
+    for raw in raw_args {
+        let kind = raw.kind;
+        let arg = if kind == PgbrFmtArgKind::I32 as i32 {
+            pgbr_error::format::Arg::I32(raw.value_a as u32 as i32)
+        } else if kind == PgbrFmtArgKind::U32 as i32 {
+            pgbr_error::format::Arg::U32(raw.value_a as u32)
+        } else if kind == PgbrFmtArgKind::I64 as i32 {
+            pgbr_error::format::Arg::I64(raw.value_a as i64)
+        } else if kind == PgbrFmtArgKind::U64 as i32 {
+            pgbr_error::format::Arg::U64(raw.value_a)
+        } else if kind == PgbrFmtArgKind::Isize as i32 {
+            pgbr_error::format::Arg::Isize(raw.value_a as i64 as isize)
+        } else if kind == PgbrFmtArgKind::Usize as i32 {
+            pgbr_error::format::Arg::Usize(raw.value_a as usize)
+        } else if kind == PgbrFmtArgKind::Char as i32 {
+            pgbr_error::format::Arg::Char(raw.value_a as u8)
+        } else if kind == PgbrFmtArgKind::Str as i32 {
+            let len = raw.value_b as usize;
+            let slice = if len == 0 {
+                ""
+            } else {
+                let ptr = raw.value_a as *const u8;
+                if ptr.is_null() {
+                    set_last_error(Error::new(
+                        ErrorType::Assert,
+                        "pgbr_error_format_message: Str arg has null pointer with non-zero length",
+                    ));
+                    return usize::MAX;
+                }
+                // SAFETY: caller guarantees the (ptr, len) describe a readable byte range
+                // of valid UTF-8 for the duration of the call.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+                let Ok(s) = core::str::from_utf8(bytes) else {
+                    set_last_error(Error::new(
+                        ErrorType::Assert,
+                        "pgbr_error_format_message: Str arg is not valid UTF-8",
+                    ));
+                    return usize::MAX;
+                };
+                s
+            };
+            pgbr_error::format::Arg::Str(slice)
+        } else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_error_format_message: unknown arg kind {kind}"),
+            ));
+            return usize::MAX;
+        };
+        typed_args.push(arg);
+    }
+
+    let formatted = pgbr_error::format::format_message(template, &typed_args);
+
+    // Write into dst, truncating to dst_size - 1 and NUL-terminating.
+    if dst_size == 0 {
+        return formatted.len();
+    }
+    let bytes = formatted.as_bytes();
+    let copy_len = (dst_size - 1).min(bytes.len());
+    // SAFETY: dst_size > 0 is checked above, and `dst` is non-null in that case;
+    // copy_len <= dst_size - 1 keeps us inside the buffer including the NUL slot.
+    unsafe {
+        let out = core::slice::from_raw_parts_mut(dst.cast::<u8>(), dst_size);
+        out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        out[copy_len] = 0;
+    }
+    copy_len
+}
+
 /// Numeric code of the error type whose YAML kebab-case name matches `name_utf8`, or `0` if no
 /// such type exists, `name_utf8` is null, or the buffer is not valid UTF-8.
 ///

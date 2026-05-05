@@ -12,6 +12,7 @@ Error Handler
 #include "common/error/error.h"
 #include "common/macro.h"
 #include "common/stackTrace.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Represents an error type
@@ -97,6 +98,162 @@ The temp buffer is required because the error message being passed might be the 
 static char messageBuffer[ERROR_MESSAGE_BUFFER_SIZE];
 static char messageBufferTemp[ERROR_MESSAGE_BUFFER_SIZE];
 static char stackTraceBuffer[ERROR_MESSAGE_BUFFER_SIZE];
+
+/***********************************************************************************************************************************
+Format-string marshalling for the Rust-side message formatter
+
+Walks `format` once, reading each `va_arg` according to the spec, and packs the typed values into `out` in declaration order. The
+spec parser must accept exactly the conversion specifiers the Rust formatter understands (see crates/pgbr-error/src/format.rs):
+%s %c %d %i %u %X %% with optional `0` flag, decimal width, `.precision`, and `z` / `l` / `ll` length modifiers. Any unknown
+specifier is skipped without consuming an arg, and the Rust side will surface it as a programmer error.
+
+Returns the number of args written into `out`. Asserts on overflow rather than silently dropping arguments — every current
+THROW_FMT call site uses well under ERROR_FMT_ARG_MAX entries, so an overflow indicates a bug.
+***********************************************************************************************************************************/
+#define ERROR_FMT_ARG_MAX                                           16
+
+static unsigned int
+errorMarshalArgs(const char *format, va_list args, PGBR_PgbrFmtArg *const out)
+{
+    unsigned int n = 0;
+    const char *p = format;
+
+    while (*p != '\0')
+    {
+        if (*p != '%')
+        {
+            p++;
+            continue;
+        }
+
+        p++;                                                        // consume '%'
+
+        // Flag: only '0' is used by pgBackRust call sites.
+        if (*p == '0')
+            p++;
+
+        // Width digits.
+        while (*p >= '0' && *p <= '9')
+            p++;
+
+        // Precision.
+        if (*p == '.')
+        {
+            p++;
+
+            while (*p >= '0' && *p <= '9')
+                p++;
+        }
+
+        // Length modifier.
+        char lenMod = 0;
+
+        if (*p == 'z')
+        {
+            lenMod = 'z';
+            p++;
+        }
+        else if (*p == 'l')
+        {
+            lenMod = 'l';
+            p++;
+
+            if (*p == 'l')
+            {
+                lenMod = 'L';
+                p++;
+            }
+        }
+
+        // Conversion specifier.
+        const char conv = *p;
+
+        if (conv == '\0')
+            break;
+
+        p++;
+
+        if (conv == '%')
+            continue;                                               // %% does not consume an arg
+
+        assert(n < ERROR_FMT_ARG_MAX);
+        PGBR_PgbrFmtArg *const arg = &out[n];
+
+        // Zero the slot first so unused payload bytes are deterministic on the Rust side.
+        arg->kind = 0;
+        arg->reserved = 0;
+        arg->value_a = 0;
+        arg->value_b = 0;
+
+        switch (conv)
+        {
+            case 's':
+            {
+                const char *const s = va_arg(args, const char *);
+
+                arg->kind = 7;                                      // PgbrFmtArgKind::Str
+                arg->value_a = (uint64_t)(uintptr_t)(s == NULL ? "" : s);
+                arg->value_b = (uint64_t)(s == NULL ? 0 : strlen(s));
+                break;
+            }
+
+            case 'c':
+                arg->kind = 6;                                      // PgbrFmtArgKind::Char
+                arg->value_a = (uint64_t)(unsigned char)va_arg(args, int);
+                break;
+
+            case 'd':
+            case 'i':
+                if (lenMod == 'z')
+                {
+                    arg->kind = 4;                                  // PgbrFmtArgKind::Isize
+                    arg->value_a = (uint64_t)(int64_t)va_arg(args, ssize_t);
+                }
+                else if (lenMod == 'l' || lenMod == 'L')
+                {
+                    arg->kind = 2;                                  // PgbrFmtArgKind::I64
+                    arg->value_a = (uint64_t)(int64_t)va_arg(args, long);
+                }
+                else
+                {
+                    arg->kind = 0;                                  // PgbrFmtArgKind::I32
+                    arg->value_a = (uint64_t)(uint32_t)va_arg(args, int);
+                }
+
+                break;
+
+            case 'u':
+            case 'x':
+            case 'X':
+                if (lenMod == 'z')
+                {
+                    arg->kind = 5;                                  // PgbrFmtArgKind::Usize
+                    arg->value_a = (uint64_t)va_arg(args, size_t);
+                }
+                else if (lenMod == 'l' || lenMod == 'L')
+                {
+                    arg->kind = 3;                                  // PgbrFmtArgKind::U64
+                    arg->value_a = (uint64_t)va_arg(args, unsigned long);
+                }
+                else
+                {
+                    arg->kind = 1;                                  // PgbrFmtArgKind::U32
+                    arg->value_a = (uint64_t)va_arg(args, unsigned int);
+                }
+
+                break;
+
+            default:
+                // Unknown specifier — the Rust side will emit it literally and a debug build
+                // will assert. Don't consume an arg here; leave the slot unused.
+                continue;
+        }
+
+        n++;
+    }
+
+    return n;
+}
 
 /**********************************************************************************************************************************/
 FN_EXTERN void
@@ -410,11 +567,14 @@ errorInternalThrowFmt(
     const ErrorType *const errorType, const char *const fileName, const char *const functionName, const int fileLine,
     const char *const format, ...)
 {
-    // Format message
+    // Marshal varargs into a typed blob and format on the Rust side.
+    PGBR_PgbrFmtArg fmtArgs[ERROR_FMT_ARG_MAX];
     va_list argument;
     va_start(argument, format);
-    vsnprintf(messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE - 1, format, argument);
+    const unsigned int nArgs = errorMarshalArgs(format, argument, fmtArgs);
     va_end(argument);
+
+    pgbr_error_format_message(format, fmtArgs, nArgs, messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE);
 
     errorInternalThrow(errorType, fileName, functionName, fileLine, messageBufferTemp, NULL);
 }
@@ -455,15 +615,22 @@ errorInternalThrowSysFmt(
     const int errNo, const ErrorType *const errorType, const char *const fileName, const char *const functionName,
     const int fileLine, const char *const format, ...)
 {
-    // Format message
+    // Marshal varargs and format the user message on the Rust side.
+    PGBR_PgbrFmtArg fmtArgs[ERROR_FMT_ARG_MAX];
     va_list argument;
     va_start(argument, format);
-    size_t messageSize = (size_t)vsnprintf(messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE - 1, format, argument);
+    const unsigned int nArgs = errorMarshalArgs(format, argument, fmtArgs);
     va_end(argument);
+
+    const size_t messageSize = pgbr_error_format_message(
+        format, fmtArgs, nArgs, messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE);
 
     // Append the system message
     if (errNo != 0)
-        snprintf(messageBufferTemp + messageSize, ERROR_MESSAGE_BUFFER_SIZE - 1 - messageSize, ": [%d] %s", errNo, strerror(errNo));
+    {
+        snprintf(
+            messageBufferTemp + messageSize, ERROR_MESSAGE_BUFFER_SIZE - messageSize, ": [%d] %s", errNo, strerror(errNo));
+    }
 
     errorInternalThrow(errorType, fileName, functionName, fileLine, messageBufferTemp, NULL);
 }
@@ -477,17 +644,21 @@ errorInternalThrowOnSysFmt(
 {
     if (error)
     {
-        // Format message
+        // Marshal varargs and format the user message on the Rust side.
+        PGBR_PgbrFmtArg fmtArgs[ERROR_FMT_ARG_MAX];
         va_list argument;
         va_start(argument, format);
-        size_t messageSize = (size_t)vsnprintf(messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE - 1, format, argument);
+        const unsigned int nArgs = errorMarshalArgs(format, argument, fmtArgs);
         va_end(argument);
+
+        const size_t messageSize = pgbr_error_format_message(
+            format, fmtArgs, nArgs, messageBufferTemp, ERROR_MESSAGE_BUFFER_SIZE);
 
         // Append the system message
         if (errNo != 0)
         {
             snprintf(
-                messageBufferTemp + messageSize, ERROR_MESSAGE_BUFFER_SIZE - 1 - messageSize, ": [%d] %s", errNo, strerror(errNo));
+                messageBufferTemp + messageSize, ERROR_MESSAGE_BUFFER_SIZE - messageSize, ": [%d] %s", errNo, strerror(errNo));
         }
 
         errorInternalThrow(errorType, fileName, functionName, fileLine, messageBufferTemp, NULL);

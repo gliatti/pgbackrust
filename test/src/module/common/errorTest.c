@@ -174,6 +174,103 @@ testRun(void)
     }
 
     // *****************************************************************************************************************************
+    if (testBegin("errorInternalThrowFmt() formatting via Rust"))
+    {
+        // After sub-issue #223, the format-string work in errorInternalThrowFmt /
+        // errorInternalThrowSysFmt is performed by pgbr_error_format_message. Verify each
+        // specifier shape that appears in pgBackRust's THROW_FMT call sites produces the
+        // expected message body end-to-end (varargs marshalling -> Rust format -> Throw).
+
+        // %s (the dominant case)
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "the value is %s here", "foo");
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "the value is foo here") == 0);
+        }
+        TRY_END();
+
+        // %d signed int + %u unsigned int
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "code=%d count=%u", -7, 42U);
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "code=-7 count=42") == 0);
+        }
+        TRY_END();
+
+        // %02X / %04d / %03u zero-pad widths
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "%02X-%02X / %04d / %03u", 0x0AU, 0xFFU, 7, 12U);
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "0A-FF / 0007 / 012") == 0);
+        }
+        TRY_END();
+
+        // %zu and %zd length modifier
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "size=%zu signed=%zd", (size_t)8192, (ssize_t)-1);
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "size=8192 signed=-1") == 0);
+        }
+        TRY_END();
+
+        // %lu length modifier
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "long=%lu", (unsigned long)12345678900UL);
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "long=12345678900") == 0);
+        }
+        TRY_END();
+
+        // %.3s string precision
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "trunc=%.3s rest=%s", "abcdef", "tail");
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "trunc=abc rest=tail") == 0);
+        }
+        TRY_END();
+
+        // %% literal
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "100%% complete: %d/%d", 100, 100);
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "100% complete: 100/100") == 0);
+        }
+        TRY_END();
+
+        // %c byte
+        TRY_BEGIN()
+        {
+            THROW_FMT(FormatError, "marker=[%c]", 'Z');
+        }
+        CATCH_ANY()
+        {
+            assert(strcmp(errorMessage(), "marker=[Z]") == 0);
+        }
+        TRY_END();
+    }
+
+    // *****************************************************************************************************************************
     if (testBegin("TRY with multiple catches"))
     {
         volatile bool tryDone = false;
