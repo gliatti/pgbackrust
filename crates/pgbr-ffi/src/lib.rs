@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgbr_core::debug as core_debug;
+use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::stack_trace as core_stack_trace;
 use pgbr_core::string_static as core_string_static;
 use pgbr_encode::{self as encode, EncodingType};
@@ -995,6 +996,189 @@ pub extern "C" fn pgbr_stack_trace_param_top() -> *const c_char {
         }
         pgbr_stack_trace_param_idx(size - 1)
     })
+}
+
+/// C function pointer the C wrapper passes to `pgbr_mem_context_discard` / `_clean`.
+///
+/// Lets the Rust side avoid referencing `memContextFree` directly. Defined in this crate so
+/// cbindgen can emit the typedef into `pgbr_ffi.h` (cbindgen runs with `parse_deps = false` and
+/// would otherwise see only the alias name from `pgbr_core::mem_context`).
+pub type PgbrFreeCallback = unsafe extern "C" fn(*mut core::ffi::c_void);
+
+// ─── pgbr_mem_context ──────────────────────────────────────────────────────────────────────────
+//
+// Phase 32 sub-issue A. The C `memContextSwitch`, `memContextSwitchBack`, `memContextKeep`,
+// `memContextDiscard`, `memContextCurrent`, `memContextPrior`, `memContextClean` are now thin
+// wrappers around the shims below. The bitfield-mirrored field accessors and the alloc/free
+// algorithms are deferred to 32B/32C.
+//
+// 32A keeps the storage (`memContextStack`, `memContextCurrentStackIdx`, `memContextMaxStackIdx`,
+// `memContextSequence`) defined in `src/common/memContext.c` so the C test (which `#include`s
+// `memContext.c` and dereferences `memContextStack[memContextCurrentStackIdx]` in the
+// `ASSERT_ALLOC_MANY_VALID` macro) keeps compiling unchanged. The Rust side reaches that storage
+// through `unsafe extern "C" { static mut ... }` declarations inside `pgbr_core::mem_context`.
+
+/// Mirror of `core_mem_context::StackTopMismatch` for the C side.
+///
+/// Returned from `pgbr_mem_context_switch_back` / `_keep` / `_discard` so the C wrapper can
+/// re-throw the legacy `AssertError` diagnostic with the offending context's `name` field. The
+/// `name` is read directly from the still-in-C `MemContext` struct since 32A does not yet expose
+/// a Rust accessor for the DEBUG-only bitfield region.
+#[repr(C)]
+pub struct PgbrMemContextStackMismatch {
+    /// `0` = no mismatch (success); `1` = expected switch found new (raised by
+    /// `switch_back`); `2` = expected new found switch (raised by `keep` / `discard`).
+    pub kind: i32,
+    /// The offending context pointer when `kind != 0`. Null when `kind == 0`.
+    pub mem_context: *mut core::ffi::c_void,
+}
+
+impl PgbrMemContextStackMismatch {
+    const OK: Self = Self {
+        kind: 0,
+        mem_context: core::ptr::null_mut(),
+    };
+    const fn from_result(r: core::result::Result<(), core_mem_context::StackTopMismatch>) -> Self {
+        match r {
+            Ok(()) => Self::OK,
+            Err(core_mem_context::StackTopMismatch::ExpectedSwitchFoundNew { mem_context }) => Self { kind: 1, mem_context },
+            Err(core_mem_context::StackTopMismatch::ExpectedNewFoundSwitch { mem_context }) => Self { kind: 2, mem_context },
+        }
+    }
+}
+
+impl FfiPanicReturn for PgbrMemContextStackMismatch {
+    fn ffi_panic_return() -> Self {
+        // Sentinel: kind 99 = panic. The C wrapper treats anything other than 0/1/2 as
+        // "look at pgbr_last_error_msg". 99 is distinct from the legitimate kinds.
+        Self {
+            kind: 99,
+            mem_context: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Switch the current mem context to `mem_context`.
+///
+/// Records the supplied `try_depth` from the C-side `errorTryDepth()`. The C wrapper still
+/// asserts `mem_context != NULL` and `mem_context->active` since 32A does not yet have a Rust
+/// accessor for the active bit.
+///
+/// # Safety
+///
+/// `mem_context` must be a valid `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_switch(mem_context: *mut core::ffi::c_void, try_depth: u32) {
+    // SAFETY: caller asserts the pointer is valid; the algorithm itself only stores it.
+    with_panic_guard(|| unsafe { core_mem_context::switch(mem_context, try_depth) });
+}
+
+/// Switch back to the prior `Switch`-typed context. See `core_mem_context::switch_back` for the
+/// returned mismatch payload.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_switch_back() -> PgbrMemContextStackMismatch {
+    with_panic_guard(|| PgbrMemContextStackMismatch::from_result(core_mem_context::switch_back()))
+}
+
+/// Promote the most-recently `pgbr_mem_context_push_new`'d context so it survives an error
+/// unwind. Returns the mismatch payload; `kind == 0` on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_keep() -> PgbrMemContextStackMismatch {
+    with_panic_guard(|| PgbrMemContextStackMismatch::from_result(core_mem_context::keep()))
+}
+
+/// Discard the most-recently `pgbr_mem_context_push_new`'d context: pop and invoke `free`.
+///
+/// The C wrapper passes `&memContextFree` so the link-time dependency on `memContextFree`
+/// stays local to `src/common/memContext.c` (where `memContextFree` is defined), not Rust-side
+/// — tests like `error` / `error-retry` can pull in `libpgbr_ffi.a` without linking
+/// `memContext.c`.
+///
+/// Returns the mismatch payload; `kind == 0` on success.
+///
+/// # Safety
+///
+/// `free` must be a valid C function pointer that may be invoked with the popped
+/// `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_discard(free: PgbrFreeCallback) -> PgbrMemContextStackMismatch {
+    // SAFETY: caller upholds the function-pointer-validity contract.
+    with_panic_guard(|| PgbrMemContextStackMismatch::from_result(unsafe { core_mem_context::discard(free) }))
+}
+
+/// Returns the current `MemContext *`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_current() -> *mut core::ffi::c_void {
+    with_panic_guard(core_mem_context::current)
+}
+
+/// Returns the `MemContext *` that was current immediately before the last `switch`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_prior() -> *mut core::ffi::c_void {
+    with_panic_guard(core_mem_context::prior)
+}
+
+/// Drop entries from the stack whose `try_depth >= try_depth_floor`.
+///
+/// Invokes `free` on each `New` entry unless `fatal == true`. The C wrapper passes
+/// `&memContextFree`; see [`pgbr_mem_context_discard`] for why the function pointer is threaded
+/// through rather than externed from Rust.
+///
+/// # Safety
+///
+/// `free` must be a valid C function pointer that may be invoked with each popped
+/// `MemContext *` while `fatal == false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_clean(try_depth_floor: u32, fatal: bool, free: PgbrFreeCallback) {
+    // SAFETY: caller upholds the function-pointer-validity contract.
+    with_panic_guard(|| unsafe { core_mem_context::clean(try_depth_floor, fatal, free) });
+}
+
+/// Push a `New`-typed entry onto the stack. Used by the still-in-C `memContextNew` after it
+/// allocates and initialises the new mem context.
+///
+/// # Safety
+///
+/// `mem_context` must be a valid `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_push_new(mem_context: *mut core::ffi::c_void, try_depth: u32) {
+    // SAFETY: caller upholds the pointer-validity contract.
+    with_panic_guard(|| unsafe { core_mem_context::push_new(mem_context, try_depth) });
+}
+
+/// Bump and return `memContextSequence`. Used by the still-in-C `memContextNew` (DEBUG only) to
+/// stamp the new context's audit sequence number.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_next_sequence() -> u64 {
+    with_panic_guard(core_mem_context::next_sequence)
+}
+
+/// Read accessor for the current stack-cursor index. Test-only — production callers should use
+/// `pgbr_mem_context_current` to fetch the actual context pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_current_stack_idx() -> u32 {
+    with_panic_guard(core_mem_context::current_stack_idx)
+}
+
+/// Read accessor for the max stack-cursor index. Test-only.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_mem_context_max_stack_idx() -> u32 {
+    with_panic_guard(core_mem_context::max_stack_idx)
+}
+
+/// Set `memContextStack[0].memContext = top`.
+///
+/// Invoked from a C `__attribute__((constructor))` in `src/common/memContext.c` before `main`
+/// runs so slot 0 of the Rust-owned stack array points at the C-side static `contextTop`. Rust
+/// cannot static-initialise that slot because `&contextTop` is not a Rust constant.
+///
+/// # Safety
+///
+/// `top` must be a valid `MemContext *` whose lifetime is the entire process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_init_top(top: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the pointer-validity contract.
+    with_panic_guard(|| unsafe { core_mem_context::init_top(top) });
 }
 
 /// Logging callback registered by the C side to receive every Rust-originated log line.

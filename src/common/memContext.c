@@ -9,6 +9,7 @@ Memory Context Manager
 #include "common/debug.h"
 #include "common/macro.h"
 #include "common/memContext.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Contains information about a memory allocation. This header is placed at the beginning of every memory allocation returned to the
@@ -218,24 +219,46 @@ typedef enum
 
 /***********************************************************************************************************************************
 Mem context stack used to pop mem contexts and cleanup after an error
+
+Phase 32 sub-issue A moves the storage for `memContextStack`, `memContextCurrentStackIdx`, `memContextMaxStackIdx` and
+`memContextSequence` into Rust (see `crates/pgbr-core/src/mem_context.rs`) so `libpgbr_ffi.a` is self-contained: every test
+binary that links the FFI archive resolves the `pgbr_mem_context_*` symbols without needing this `.c` file in its compile
+list. The error / error-retry tests, which only need `pgbr_stack_trace_*` from the FFI archive, would otherwise fail at link
+with `undefined reference to memContextStack`.
+
+The C-side declarations below are `extern` aliases that point at the Rust-owned storage. The test (`test/src/test.c`
+`#include`s this file directly) keeps reading `memContextStack[memContextCurrentStackIdx]` unchanged, and the
+`ASSERT_ALLOC_MANY_VALID` macro stringification stays byte-identical.
+
+Slot zero of `memContextStack` must hold `&contextTop`. Rust cannot static-init that pointer (it is a C symbol), so the
+`pgbr_mem_context_init_top` hook is invoked from a `__attribute__((constructor))` below before `main` runs.
 ***********************************************************************************************************************************/
 #define MEM_CONTEXT_STACK_MAX                                       128
 
-static struct MemContextStack
+struct MemContextStack
 {
     MemContext *memContext;
     MemContextStackType type;
     unsigned int tryDepth;
-} memContextStack[MEM_CONTEXT_STACK_MAX] = {{.memContext = (MemContext *)&contextTop}};
+};
 
-static unsigned int memContextCurrentStackIdx = 0;
-static unsigned int memContextMaxStackIdx = 0;
+extern struct MemContextStack memContextStack[MEM_CONTEXT_STACK_MAX];
+extern unsigned int memContextCurrentStackIdx;
+extern unsigned int memContextMaxStackIdx;
+extern uint64_t memContextSequence;
+
+// Constructor that primes `memContextStack[0].memContext` with `&contextTop` before `main`. Runs once per process at load
+// time; `__attribute__((constructor))` is supported by GCC and Clang on every platform pgBackRest builds against.
+__attribute__((constructor))
+static void
+pgbr_mem_context_init_top_ctor(void)
+{
+    pgbr_mem_context_init_top((MemContext *)&contextTop);
+}
 
 /***********************************************************************************************************************************
 ***********************************************************************************************************************************/
 #ifdef DEBUG
-
-static uint64_t memContextSequence = 0;
 
 FN_EXTERN void
 memContextAuditBegin(MemContextAuditState *const state)
@@ -578,7 +601,7 @@ memContextNew(
         allocExtra += ALIGN_OFFSET(void *, allocExtra);
 
     // Create the new context
-    MemContext *const contextCurrent = memContextStack[memContextCurrentStackIdx].memContext;
+    MemContext *const contextCurrent = (MemContext *)pgbr_mem_context_current();
     ASSERT(contextCurrent->childQty != memQtyNone);
 
     const MemQty childQty = param.childQty > 1 ? memQtyMany : (MemQty)param.childQty;
@@ -594,8 +617,8 @@ memContextNew(
         // Set the context name
         .name = name,
 
-        // Set audit sequence
-        .sequenceNew = ++memContextSequence,
+        // Set audit sequence (Phase 32A: Rust now owns the increment).
+        .sequenceNew = pgbr_mem_context_next_sequence(),
 
         // Set new context active
         .active = true,
@@ -632,15 +655,9 @@ memContextNew(
         memContextChild->freeIdx++;
     }
 
-    // Add to the mem context stack so it will be automatically freed on error if memContextKeep() has not been called
-    memContextMaxStackIdx++;
-
-    memContextStack[memContextMaxStackIdx] = (struct MemContextStack)
-    {
-        .memContext = this,
-        .type = memContextStackTypeNew,
-        .tryDepth = errorTryDepth(),
-    };
+    // Add to the mem context stack so it will be automatically freed on error if memContextKeep() has not been called.
+    // Phase 32A: stack mutation lives in Rust now; this helper bumps `memContextMaxStackIdx` and writes the new entry.
+    pgbr_mem_context_push_new(this, errorTryDepth());
 
     // Return context
     FUNCTION_TEST_RETURN(MEM_CONTEXT, this);
@@ -990,18 +1007,9 @@ memContextSwitch(MemContext *const this)
 
     ASSERT(this != NULL);
     ASSERT(this->active);
-    ASSERT(memContextCurrentStackIdx < MEM_CONTEXT_STACK_MAX - 1);
 
-    memContextMaxStackIdx++;
-    memContextCurrentStackIdx = memContextMaxStackIdx;
-
-    // Add memContext to the stack as a context that can be used for memory allocation
-    memContextStack[memContextCurrentStackIdx] = (struct MemContextStack)
-    {
-        .memContext = this,
-        .type = memContextStackTypeSwitch,
-        .tryDepth = errorTryDepth(),
-    };
+    // Phase 32A: stack mutation lives in Rust now. The Rust side asserts on overflow.
+    pgbr_mem_context_switch(this, errorTryDepth());
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -1012,27 +1020,20 @@ memContextSwitchBack(void)
 {
     FUNCTION_TEST_VOID();
 
-    ASSERT(memContextCurrentStackIdx > 0);
-
-    // Generate a detailed error to help with debugging
+    // Phase 32A: stack mutation lives in Rust now. On a type mismatch the Rust side returns the
+    // offending top entry without popping (so the legacy "throw before pop" semantics survive in
+    // DEBUG builds).
 #ifdef DEBUG
-    if (memContextStack[memContextMaxStackIdx].type == memContextStackTypeNew)
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_switch_back();
+    if (r.kind == 1)
     {
         THROW_FMT(
             AssertError, "current context expected but new context '%s' found",
-            memContextStack[memContextMaxStackIdx].memContext->name);
+            ((MemContext *)r.mem_context)->name);
     }
+#else
+    pgbr_mem_context_switch_back();
 #endif
-
-    ASSERT(memContextCurrentStackIdx == memContextMaxStackIdx);
-
-    memContextMaxStackIdx--;
-    memContextCurrentStackIdx--;
-
-    // memContext of type New cannot be the current context so keep going until we find a memContext we can switch to as the current
-    // context
-    while (memContextStack[memContextCurrentStackIdx].type == memContextStackTypeNew)
-        memContextCurrentStackIdx--;
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -1043,17 +1044,17 @@ memContextKeep(void)
 {
     FUNCTION_TEST_VOID();
 
-    // Generate a detailed error to help with debugging
 #ifdef DEBUG
-    if (memContextStack[memContextMaxStackIdx].type != memContextStackTypeNew)
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_keep();
+    if (r.kind == 2)
     {
         THROW_FMT(
             AssertError, "new context expected but current context '%s' found",
-            memContextStack[memContextMaxStackIdx].memContext->name);
+            ((MemContext *)r.mem_context)->name);
     }
+#else
+    pgbr_mem_context_keep();
 #endif
-
-    memContextMaxStackIdx--;
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -1064,18 +1065,20 @@ memContextDiscard(void)
 {
     FUNCTION_TEST_VOID();
 
-    // Generate a detailed error to help with debugging
+    // Phase 32A: stack mutation in Rust. On type-mismatch (kind == 2) the Rust side returns the
+    // offending top entry without freeing or popping; the legacy DEBUG diagnostic is preserved.
+    // On success Rust invokes `memContextFree` (passed by pointer) and pops.
 #ifdef DEBUG
-    if (memContextStack[memContextMaxStackIdx].type != memContextStackTypeNew)
+    PGBR_PgbrMemContextStackMismatch r = pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
+    if (r.kind == 2)
     {
         THROW_FMT(
             AssertError, "new context expected but current context '%s' found",
-            memContextStack[memContextMaxStackIdx].memContext->name);
+            ((MemContext *)r.mem_context)->name);
     }
+#else
+    pgbr_mem_context_discard((PGBR_PgbrFreeCallback)memContextFree);
 #endif
-
-    memContextFree(memContextStack[memContextMaxStackIdx].memContext);
-    memContextMaxStackIdx--;
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -1093,7 +1096,7 @@ FN_EXTERN MemContext *
 memContextCurrent(void)
 {
     FUNCTION_TEST_VOID();
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, memContextStack[memContextCurrentStackIdx].memContext);
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_current());
 }
 
 /**********************************************************************************************************************************/
@@ -1101,15 +1104,7 @@ FN_EXTERN MemContext *
 memContextPrior(void)
 {
     FUNCTION_TEST_VOID();
-
-    ASSERT(memContextCurrentStackIdx > 0);
-
-    unsigned int priorIdx = 1;
-
-    while (memContextStack[memContextCurrentStackIdx - priorIdx].type == memContextStackTypeNew)
-        priorIdx++;
-
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, memContextStack[memContextCurrentStackIdx - priorIdx].memContext);
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_prior());
 }
 
 /**********************************************************************************************************************************/
@@ -1209,29 +1204,9 @@ memContextClean(const unsigned int tryDepth, const bool fatal)
         FUNCTION_TEST_PARAM(BOOL, false);
     FUNCTION_TEST_END();
 
-    ASSERT(tryDepth > 0);
-
-    // Iterate through everything pushed to the stack since the last try
-    while (memContextStack[memContextMaxStackIdx].tryDepth >= tryDepth)
-    {
-        // Free memory contexts that were not kept. Skip this for fatal errors to avoid calling destructors that could error and
-        // mask the original error.
-        if (memContextStack[memContextMaxStackIdx].type == memContextStackTypeNew)
-        {
-            if (!fatal)
-                memContextFree(memContextStack[memContextMaxStackIdx].memContext);
-        }
-        // Else find the prior context and make it the current context
-        else
-        {
-            memContextCurrentStackIdx--;
-
-            while (memContextStack[memContextCurrentStackIdx].type == memContextStackTypeNew)
-                memContextCurrentStackIdx--;
-        }
-
-        memContextMaxStackIdx--;
-    }
+    // Phase 32A: stack unwinding lives in Rust now. The Rust side invokes `memContextFree`
+    // (passed by pointer) for non-fatal frees so the link-time dependency stays in this file.
+    pgbr_mem_context_clean(tryDepth, fatal, (PGBR_PgbrFreeCallback)memContextFree);
 
     FUNCTION_TEST_RETURN_VOID();
 }
