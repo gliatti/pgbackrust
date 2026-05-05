@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), forbid(unsafe_op_in_unsafe_fn))]
 
 pub mod debug;
+pub mod log;
 pub mod mem_context;
 pub mod stack_trace;
 pub mod string_static;

@@ -13,6 +13,7 @@ Log Test Harness
 #include "common/log.h"
 #include "common/memContext.h"
 #include "common/type/stringList.h"
+#include "pgbr_ffi.h"
 
 #include "common/harnessDebug.h"
 #include "common/harnessLog.h"
@@ -72,12 +73,12 @@ harnessLogInit(void)
 {
     FUNCTION_HARNESS_VOID();
 
-    logInit(logLevelTestDefault, logLevelOff, logLevelInfo, false, logProcessId, 99, false);
-    logFileBanner = true;
+    logInit(logLevelTestDefault, logLevelOff, logLevelInfo, false, pgbr_log_process_id_get(), 99, false);
+    pgbr_log_file_banner_set(true);
 
     snprintf(logFile, sizeof(logFile), "%s/expect.log", hrnPath());
-    logFdFile = harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640);
-    logAnySet();
+    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
+    pgbr_log_any_set();
 
     FUNCTION_HARNESS_RETURN_VOID();
 }
@@ -90,57 +91,57 @@ harnessLogDryRunSet(bool dryRun)
 {
     logDryRunTest = dryRun;
 
-    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, logProcessId, 99, logDryRunTest);
+    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, pgbr_log_process_id_get(), 99, logDryRunTest);
 }
 
 /**********************************************************************************************************************************/
 unsigned int
 hrnLogLevelFile(void)
 {
-    return logLevelFile;
+    return (unsigned int)pgbr_log_level_file_get();
 }
 
 void
 hrnLogLevelFileSet(unsigned int logLevel)
 {
-    logLevelFile = logLevel;
+    pgbr_log_level_file_set((int)logLevel);
 }
 
 unsigned int
 hrnLogLevelStdOut(void)
 {
-    return logLevelStdOut;
+    return (unsigned int)pgbr_log_level_std_out_get();
 }
 
 void
 hrnLogLevelStdOutSet(unsigned int logLevel)
 {
-    logLevelStdOut = logLevel;
+    pgbr_log_level_std_out_set((int)logLevel);
 }
 
 unsigned int
 hrnLogLevelStdErr(void)
 {
-    return logLevelStdErr;
+    return (unsigned int)pgbr_log_level_std_err_get();
 }
 
 void
 hrnLogLevelStdErrSet(unsigned int logLevel)
 {
-    logLevelStdErr = logLevel;
+    pgbr_log_level_std_err_set((int)logLevel);
 }
 
 /**********************************************************************************************************************************/
 bool
 hrnLogTimestamp(void)
 {
-    return logTimestamp;
+    return pgbr_log_timestamp_get();
 }
 
 void
 hrnLogTimestampSet(bool log)
 {
-    logTimestamp = log;
+    pgbr_log_timestamp_set(log);
 }
 
 /***********************************************************************************************************************************
@@ -153,7 +154,7 @@ harnessLogLevelSet(LogLevel logLevel)
 {
     logLevelTest = logLevel;
 
-    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, logProcessId, 99, logDryRunTest);
+    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, pgbr_log_process_id_get(), 99, logDryRunTest);
 }
 
 /***********************************************************************************************************************************
@@ -166,7 +167,7 @@ harnessLogLevelReset(void)
 {
     logLevelTest = logLevelInfo;
 
-    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, logProcessId, 99, logDryRunTest);
+    logInit(logLevelTestDefault, logLevelOff, logLevelTest, false, pgbr_log_process_id_get(), 99, logDryRunTest);
 }
 
 /***********************************************************************************************************************************
@@ -186,7 +187,7 @@ harnessLogLevelDefaultSet(LogLevel logLevel)
 void
 hrnLogProcessIdSet(unsigned int processId)
 {
-    logProcessId = processId;
+    pgbr_log_process_id_set(processId);
 }
 
 #endif
@@ -445,8 +446,8 @@ harnessLogResult(const char *expected)
             harnessLogBuffer, hrnDiff(expected, harnessLogBuffer));
     }
 
-    close(logFdFile);
-    logFdFile = harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    close(pgbr_log_fd_file_get());
+    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
 
     FUNCTION_HARNESS_RETURN_VOID();
 }
@@ -471,8 +472,8 @@ harnessLogResultEmptyOrContains(const char *const contains)
             contains, harnessLogBuffer);
     }
 
-    close(logFdFile);
-    logFdFile = harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    close(pgbr_log_fd_file_get());
+    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
 
     FUNCTION_HARNESS_RETURN_VOID();
 }
@@ -491,7 +492,7 @@ harnessLogFinal(void)
     hrnLogReplace();
 
     // Close expect log file
-    close(logFdFile);
+    close(pgbr_log_fd_file_get());
 
     if (strcmp(harnessLogBuffer, "") != 0)
         THROW_FMT(AssertError, "\n\nexpected log to be empty but actual log was:\n\n%s\n\n", harnessLogBuffer);

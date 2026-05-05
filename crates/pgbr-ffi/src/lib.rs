@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgbr_core::debug as core_debug;
+use pgbr_core::log as core_log;
 use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::stack_trace as core_stack_trace;
 use pgbr_core::string_static as core_string_static;
@@ -4691,6 +4692,187 @@ pub unsafe extern "C" fn pgbr_regex_prefix_len(pattern: *const c_char) -> usize 
         let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
         pgbr_regex::prefix_len(bytes)
     })
+}
+
+// ─── pgbr_log ──────────────────────────────────────────────────────────────────────────────────
+
+/// Initialise the log state. Mirrors `logInit` in `src/common/log.c`.
+///
+/// Asserts in `pgbr_core::log` enforce the same domain as the C side: levels in
+/// `[0, LOG_LEVEL_MAX]`, ids in `[0, 999]`. Out-of-range values panic and the panic guard
+/// translates that to a typed `Unknown` error visible via `pgbr_last_error_msg`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_init(
+    level_std_out: i32,
+    level_std_err: i32,
+    level_file: i32,
+    timestamp: bool,
+    process_id: u32,
+    process_max: u32,
+    dry_run: bool,
+) {
+    with_panic_guard(|| {
+        core_log::init(
+            level_std_out,
+            level_std_err,
+            level_file,
+            timestamp,
+            process_id,
+            process_max,
+            dry_run,
+        );
+    });
+}
+
+/// Reset the log state to OFF. Used by the C `logClose` shim before it closes the file fd.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_close() {
+    with_panic_guard(core_log::close);
+}
+
+/// Promote `level_any` to the loudest active sink. Mirrors the static `logAnySet` in C.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_any_set() {
+    with_panic_guard(core_log::any_set);
+}
+
+/// `logAny(level)` — true when a message at `level` would reach at least one sink.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_any(level: i32) -> bool {
+    with_panic_guard(|| core_log::any(level))
+}
+
+/// `logLevelEnum(seq)` — convert a stringId sequence number into a `LogLevel`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_enum(seq: u32) -> i32 {
+    with_panic_guard(|| core_log::level_enum(seq))
+}
+
+/// `logLevelStr(level)` — pointer to the static UPPERCASE level name (e.g. `"INFO"`).
+/// The pointer is stable for the process lifetime; the caller must not free it.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_str(level: i32) -> *const c_char {
+    with_panic_guard(|| core_log::level_str(level).as_ptr())
+}
+
+/// Pointer to the start of the 32 KiB log buffer.
+///
+/// Used by the C-side `logPre` / `logPost` / `logInternal*` formatter to render a header
+/// and message before the `write(2)` call. The buffer is process-global; concurrent
+/// writes are unsound — same single-threaded invariant as the rest of the state.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_buffer_ptr() -> *mut c_char {
+    with_panic_guard(core_log::buffer_ptr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_std_out_get() -> i32 {
+    with_panic_guard(core_log::level_std_out)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_std_out_set(value: i32) {
+    with_panic_guard(|| core_log::set_level_std_out(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_std_err_get() -> i32 {
+    with_panic_guard(core_log::level_std_err)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_std_err_set(value: i32) {
+    with_panic_guard(|| core_log::set_level_std_err(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_file_get() -> i32 {
+    with_panic_guard(core_log::level_file)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_file_set(value: i32) {
+    with_panic_guard(|| core_log::set_level_file(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_level_any_get() -> i32 {
+    with_panic_guard(core_log::level_any)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_std_out_get() -> i32 {
+    with_panic_guard(core_log::fd_std_out)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_std_out_set(value: i32) {
+    with_panic_guard(|| core_log::set_fd_std_out(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_std_err_get() -> i32 {
+    with_panic_guard(core_log::fd_std_err)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_std_err_set(value: i32) {
+    with_panic_guard(|| core_log::set_fd_std_err(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_file_get() -> i32 {
+    with_panic_guard(core_log::fd_file)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_fd_file_set(value: i32) {
+    with_panic_guard(|| core_log::set_fd_file(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_file_banner_get() -> bool {
+    with_panic_guard(core_log::file_banner)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_file_banner_set(value: bool) {
+    with_panic_guard(|| core_log::set_file_banner(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_timestamp_get() -> bool {
+    with_panic_guard(core_log::timestamp)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_timestamp_set(value: bool) {
+    with_panic_guard(|| core_log::set_timestamp(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_process_id_get() -> u32 {
+    with_panic_guard(core_log::process_id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_process_id_set(value: u32) {
+    with_panic_guard(|| core_log::set_process_id(value));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_process_size_get() -> i32 {
+    with_panic_guard(core_log::process_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_dry_run_get() -> bool {
+    with_panic_guard(core_log::dry_run)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_dry_run_set(value: bool) {
+    with_panic_guard(|| core_log::set_dry_run(value));
 }
 
 #[cfg(test)]
