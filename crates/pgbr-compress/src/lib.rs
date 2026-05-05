@@ -174,6 +174,7 @@ pub mod params {
 pub mod bz2;
 pub mod gz;
 pub mod lz4;
+pub mod zst;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -1577,6 +1577,44 @@ pub unsafe extern "C" fn pgbr_bz2_compress_state_compress(
     })
 }
 
+// ---------- pgbr-compress zst error bridge (Phase 23) ----------
+
+/// Classify a libzstd return code.
+///
+/// Returns `0` when `ZSTD_isError(code) == 0` (no throw needed). Returns `1` when the
+/// code represents an error: `msg_out` is filled with the matching human-readable name
+/// (NUL-terminated when `msg_size >= 1`, truncated otherwise) so the C caller can
+/// `THROW_FMT(FormatError, "zst error: [<code>] <name>")`.
+///
+/// Mirrors the legacy `zstError` body and lets the C wrapper raise the same exception
+/// without including `<zstd.h>`.
+///
+/// # Safety
+///
+/// `msg_out` must point to a writable buffer of at least `msg_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_zst_error_classify(code: usize, msg_out: *mut c_char, msg_size: usize) -> i32 {
+    with_panic_guard(|| {
+        if msg_out.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_zst_error_classify: null pointer"));
+            return -1;
+        }
+        match pgbr_compress::zst::classify(code) {
+            pgbr_compress::zst::Classification::Ok { .. } => 0,
+            pgbr_compress::zst::Classification::Throw { name, .. } => {
+                if msg_size > 0 {
+                    let copy_len = (msg_size - 1).min(name.len());
+                    // SAFETY: caller upholds the buffer-size contract.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(msg_out.cast::<u8>(), msg_size) };
+                    dst[..copy_len].copy_from_slice(&name[..copy_len]);
+                    dst[copy_len] = 0;
+                }
+                1
+            }
+        }
+    })
+}
+
 // ---------- pgbr-compress bz2 error bridge (Phase 20) ----------
 
 /// Classify a libbz2 return code.

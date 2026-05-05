@@ -152,7 +152,7 @@ pgbr_ffi_dep = declare_dependency(
     sources: [pgbr_ffi_target[1]],
     include_directories: include_directories('.'),
     link_args: [pgbr_ffi_target[0].full_path()],
-    dependencies: [lib_openssl, lib_z, lib_lz4, lib_bz2],
+    dependencies: [lib_openssl, lib_z, lib_lz4, lib_bz2, lib_zstd],
 )
 
 build_code = executable(

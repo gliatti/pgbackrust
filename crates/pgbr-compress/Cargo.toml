@@ -24,6 +24,11 @@ lz4-sys = "1.11"
 # `BZ2_bzDecompressEnd` so the streaming behaviour and byte output match the legacy C
 # path exactly (libbz2 is deterministic given fixed level + workFactor).
 bzip2-sys = "0.1"
+# Direct libzstd bindings — `zst::error::classify` calls `ZSTD_isError` /
+# `ZSTD_getErrorName` from the system libzstd so error names match the legacy C path
+# byte-for-byte. The streaming compress / decompress wrappers in `zst::compress` /
+# `zst::decompress` call `ZSTD_compressStream2` / `ZSTD_decompressStream`.
+zstd-sys = "2"
 
 [lints]
 workspace = true
