@@ -18,6 +18,7 @@ use pgbr_core::log as core_log;
 use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::object as core_object;
 use pgbr_core::stack_trace as core_stack_trace;
+use pgbr_core::string as core_string;
 use pgbr_core::string_static as core_string_static;
 use pgbr_core::string_z as core_string_z;
 use pgbr_encode::{self as encode, EncodingType};
@@ -4727,6 +4728,238 @@ pub unsafe extern "C" fn pgbr_blob_add(
 ) -> *const core::ffi::c_void {
     // SAFETY: caller upholds the contract.
     with_panic_guard(|| unsafe { core_blob::add(this.cast::<core_blob::Blob>(), data, size, try_depth) })
+}
+
+// ─── pgbr_string ───────────────────────────────────────────────────────────────────────────────
+//
+// All these helpers operate on `*mut StringPub` directly so the C side keeps using its
+// existing `struct String { StringPub pub; }` layout. The C wrapper passes the
+// `EMPTY_STR->pub.buffer` literal as `empty_buffer` whenever it's needed (the Rust side
+// can't reach for the static `EMPTY_STR` constant — it lives in the C `.rodata`).
+
+/// `strNew()` — empty growable string. `empty_buffer` is `EMPTY_STR->pub.buffer`.
+///
+/// # Safety
+///
+/// Single-threaded mem-context invariant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_new(empty_buffer: *const c_char, try_depth: u32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::new(empty_buffer, try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `strNewFixed(size)` — fixed-size buffer. The C side uses this for everything that
+/// pre-knows the size. `size <= STRING_SIZE_MAX`.
+///
+/// # Safety
+///
+/// Single-threaded mem-context invariant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_new_fixed(size: usize, try_depth: u32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::new_fixed(size, try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `strNewZ(z)`.
+///
+/// # Safety
+///
+/// `z` is NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_new_z(z: *const c_char, try_depth: u32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::new_z(z, try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `strNewZN(z, size)`.
+///
+/// # Safety
+///
+/// `z` readable for `size` bytes (when `size > 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_new_zn(z: *const c_char, size: usize, try_depth: u32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::new_zn(z, size, try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `strDup(this)`. Null-tolerant.
+///
+/// # Safety
+///
+/// `this` may be null; otherwise live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_dup(this: *const core::ffi::c_void, try_depth: u32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::dup(this.cast::<core_string::StringPub>(), try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `strResize(this, requested)`. The C wrapper still runs the `STR_IS_FIXED_BUFFER`
+/// assertion before calling.
+///
+/// # Safety
+///
+/// `this` is a live growable `String *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_resize(
+    this: *mut core::ffi::c_void,
+    requested: usize,
+    try_depth: u32,
+    empty_buffer: *const c_char,
+) {
+    with_panic_guard(|| unsafe {
+        core_string::resize(this.cast::<core_string::StringPub>(), requested, try_depth, empty_buffer);
+    });
+}
+
+/// `strCatZN(this, cat, size)`.
+///
+/// # Safety
+///
+/// `this` is a live growable `String *`. `cat` readable for `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_cat_zn(
+    this: *mut core::ffi::c_void,
+    cat: *const c_char,
+    size: usize,
+    try_depth: u32,
+    empty_buffer: *const c_char,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe {
+        core_string::cat_zn(this.cast::<core_string::StringPub>(), cat, size, try_depth, empty_buffer).cast::<core::ffi::c_void>()
+    })
+}
+
+/// `strCatZ(this, cat)`.
+///
+/// # Safety
+///
+/// `this` live; `cat` NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_cat_z(
+    this: *mut core::ffi::c_void,
+    cat: *const c_char,
+    try_depth: u32,
+    empty_buffer: *const c_char,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe {
+        core_string::cat_z(this.cast::<core_string::StringPub>(), cat, try_depth, empty_buffer).cast::<core::ffi::c_void>()
+    })
+}
+
+/// `strCatChr(this, c)`.
+///
+/// # Safety
+///
+/// `this` live; `c != 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_cat_chr(
+    this: *mut core::ffi::c_void,
+    c: c_char,
+    try_depth: u32,
+    empty_buffer: *const c_char,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe {
+        core_string::cat_chr(this.cast::<core_string::StringPub>(), c, try_depth, empty_buffer).cast::<core::ffi::c_void>()
+    })
+}
+
+/// # Safety
+/// `this` must be a live `String *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_empty(this: *const core::ffi::c_void) -> bool {
+    with_panic_guard(|| unsafe { core_string::empty(this.cast::<core_string::StringPub>()) })
+}
+
+/// # Safety
+/// `this` is live; `prefix` is NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_begins_with_z(this: *const core::ffi::c_void, prefix: *const c_char) -> bool {
+    with_panic_guard(|| unsafe { core_string::begins_with_z(this.cast::<core_string::StringPub>(), prefix) })
+}
+
+/// # Safety
+/// `this` is live; `suffix` is NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_ends_with_z(this: *const core::ffi::c_void, suffix: *const c_char) -> bool {
+    with_panic_guard(|| unsafe { core_string::ends_with_z(this.cast::<core_string::StringPub>(), suffix) })
+}
+
+/// # Safety
+/// Either pointer may be null; otherwise must be a live `String *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_eq(a: *const core::ffi::c_void, b: *const core::ffi::c_void) -> bool {
+    with_panic_guard(|| unsafe { core_string::eq(a.cast::<core_string::StringPub>(), b.cast::<core_string::StringPub>()) })
+}
+
+/// # Safety
+/// `this` is live; `other` is NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_eq_z(this: *const core::ffi::c_void, other: *const c_char) -> bool {
+    with_panic_guard(|| unsafe { core_string::eq_z(this.cast::<core_string::StringPub>(), other) })
+}
+
+/// # Safety
+/// Either pointer may be null; otherwise must be a live `String *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_cmp(a: *const core::ffi::c_void, b: *const core::ffi::c_void) -> i32 {
+    with_panic_guard(|| unsafe { core_string::cmp(a.cast::<core_string::StringPub>(), b.cast::<core_string::StringPub>()) })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_chr(this: *const core::ffi::c_void, c: c_char) -> i32 {
+    with_panic_guard(|| unsafe { core_string::chr(this.cast::<core_string::StringPub>(), c) })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_first_upper(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::first_upper(this.cast::<core_string::StringPub>()).cast::<core::ffi::c_void>() })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_first_lower(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::first_lower(this.cast::<core_string::StringPub>()).cast::<core::ffi::c_void>() })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_lower(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::lower(this.cast::<core_string::StringPub>()).cast::<core::ffi::c_void>() })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_replace_chr(
+    this: *mut core::ffi::c_void,
+    find: c_char,
+    replace: c_char,
+) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe {
+        core_string::replace_chr(this.cast::<core_string::StringPub>(), find, replace).cast::<core::ffi::c_void>()
+    })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_trim(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::trim(this.cast::<core_string::StringPub>()).cast::<core::ffi::c_void>() })
+}
+
+/// # Safety
+/// `this` is live; `0 <= idx <= size`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_trunc_idx(this: *mut core::ffi::c_void, idx: i32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| unsafe { core_string::trunc_idx(this.cast::<core_string::StringPub>(), idx).cast::<core::ffi::c_void>() })
+}
+
+/// # Safety
+/// `this` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_base_z(this: *const core::ffi::c_void) -> *const c_char {
+    with_panic_guard(|| unsafe { core_string::base_z(this.cast::<core_string::StringPub>()) })
 }
 
 // ─── pgbr_string_z ─────────────────────────────────────────────────────────────────────────────

@@ -1,5 +1,15 @@
 /***********************************************************************************************************************************
 String Handler
+
+Thin C shims over `pgbr-core::string`. The `StringPub` layout (size + extra bitfields packed into a u64, then `char *buffer`) is
+mirrored byte-for-byte by the Rust side; the public `typedef struct String String;` keeps the layout opaque to external callers
+while the inline `strSize` / `strZ` accessors continue to work via the existing `THIS_PUB(String)` macro.
+
+Variadic constructors (`strNewFmt`, `strCatFmt`) keep their bodies on the C side — same precedent as `strStcFmt` (Phase 34) and
+`zNewFmt` (Phase 35): routing `va_list` through the FFI surface would be more code than the few remaining C lines they replace.
+The cross-module entry points (`strNewBuf`, `strNewEncode`, `strNewTime`, `strNewDiv`, `strNewPct`, `strNewStrId`, `strCatBuf`,
+`strCatEncode`, `strCatTime`, `strSizeFormat`, `strPathAbsolute`, `strToLog`) keep their structure too — they reach into Buffer /
+encode / cvt / StringList / strStc helpers that live elsewhere — but every actual `String` mutation goes through the FFI shims.
 ***********************************************************************************************************************************/
 #include <build.h>
 
@@ -11,10 +21,12 @@ String Handler
 #include <time.h>
 
 #include "common/debug.h"
+#include "common/error/error.h"
 #include "common/macro.h"
 #include "common/memContext.h"
 #include "common/type/string.h"
 #include "common/type/stringList.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Constant strings that are generally useful
@@ -34,22 +46,21 @@ STRING_EXTERN(Y_STR,                                                "y");
 STRING_EXTERN(ZERO_STR,                                             "0");
 
 /***********************************************************************************************************************************
-Buffer macros
+Object type — kept here so the C ABI keeps `sizeof(String)` resolvable. The Rust side owns the canonical layout via `#[repr(C)]`
+on `StringPub` (same field order, same bitfield packing).
 ***********************************************************************************************************************************/
-// Fixed size buffer allocated at the end of the object allocation
-#define STR_FIXED_BUFFER                                            (char *)(this + 1)
+struct String
+{
+    StringPub pub;                                                  // Publicly accessible variables
+};
 
-// Is the string using the fixed size buffer?
-#define STR_IS_FIXED_BUFFER()                                       (this->pub.buffer == STR_FIXED_BUFFER)
-
-// Empty buffer
-#define STR_EMPTY_BUFFER                                            (EMPTY_STR->pub.buffer)
-
-// Is the string using the empty buffer?
-#define STR_IS_EMPTY_BUFFER()                                       (this->pub.buffer == STR_EMPTY_BUFFER)
+// Build-time check that the C `StringPub` size matches what the Rust mirror assumes (two pointer-sized words on every supported
+// platform). Wrapped in a static-asserting struct so it stays at file scope.
+typedef char check_StringPub_size[sizeof(StringPub) == 2 * sizeof(void *) ? 1 : -1];
 
 /***********************************************************************************************************************************
-Maximum size of a string
+Maximum size of a string — kept here for the C-side CHECK_SIZE macro callers (the test asserts the boundary directly via the
+macro, and other modules text-include this file).
 ***********************************************************************************************************************************/
 #define STRING_SIZE_MAX                                            1073741824
 
@@ -62,12 +73,22 @@ Maximum size of a string
     while (0)
 
 /***********************************************************************************************************************************
-Object type
+strResize is consumed by `src/build/common/string.c` (which text-includes this file and adds the build-time `strReplace` helper).
+Keep the C-side name as a static shim around the FFI export so the build module keeps compiling. The `unused` attribute keeps the
+warning quiet for translation units that include `string.c` without needing strReplace's path (the main pgbackrust binary).
 ***********************************************************************************************************************************/
-struct String
+__attribute__((unused)) static void
+strResize(String *const this, const size_t requested)
 {
-    StringPub pub;                                                  // Publicly accessible variables
-};
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(STRING, this);
+        FUNCTION_TEST_PARAM(SIZE, requested);
+    FUNCTION_TEST_END();
+
+    pgbr_string_resize(this, requested, errorTryDepth(), EMPTY_STR->pub.buffer);
+
+    FUNCTION_TEST_RETURN_VOID();
+}
 
 /**********************************************************************************************************************************/
 FN_EXTERN String *
@@ -75,69 +96,7 @@ strNew(void)
 {
     FUNCTION_TEST_VOID();
 
-    OBJ_NEW_BEGIN(String, .allocQty = 1)
-    {
-        *this = (String)
-        {
-            .pub =
-            {
-                // Set empty so nothing is allocated until needed
-                .buffer = STR_EMPTY_BUFFER,
-            },
-        };
-    }
-    OBJ_NEW_END();
-
-    FUNCTION_TEST_RETURN(STRING, this);
-}
-
-/***********************************************************************************************************************************
-Create fixed size String
-***********************************************************************************************************************************/
-static String *
-strNewFixed(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    CHECK_SIZE(size);
-
-    // If the string is larger than the extra allowed with a mem context then allocate the buffer separately
-    const size_t allocExtra = sizeof(String) + size + 1;
-
-    if (allocExtra > MEM_CONTEXT_ALLOC_EXTRA_MAX)
-    {
-        OBJ_NEW_BEGIN(String, .allocQty = 1)
-        {
-            *this = (String)
-            {
-                .pub =
-                {
-                    .size = (unsigned int)size,
-                    .buffer = memNew(size + 1),
-                },
-            };
-        }
-        OBJ_NEW_END();
-
-        FUNCTION_TEST_RETURN(STRING, this);
-    }
-
-    OBJ_NEW_EXTRA_BEGIN(String, (uint16_t)(allocExtra))
-    {
-        *this = (String)
-        {
-            .pub =
-            {
-                .size = (unsigned int)size,
-                .buffer = STR_FIXED_BUFFER,
-            },
-        };
-    }
-    OBJ_NEW_END();
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_new(EMPTY_STR->pub.buffer, errorTryDepth()));
 }
 
 /**********************************************************************************************************************************/
@@ -150,14 +109,34 @@ strNewZ(const char *const string)
 
     ASSERT(string != NULL);
 
-    // Create object
-    String *const this = strNewFixed(strlen(string));
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_new_z(string, errorTryDepth()));
+}
 
-    // Assign string
-    memcpy(this->pub.buffer, string, strSize(this));
-    this->pub.buffer[strSize(this)] = '\0';
+/**********************************************************************************************************************************/
+FN_EXTERN String *
+strNewZN(const char *const string, const size_t size)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM_P(CHARDATA, string);
+        FUNCTION_TEST_PARAM(SIZE, size);
+    FUNCTION_TEST_END();
 
-    FUNCTION_TEST_RETURN(STRING, this);
+    ASSERT(string != NULL);
+
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_new_zn(string, size, errorTryDepth()));
+}
+
+/**********************************************************************************************************************************/
+FN_EXTERN String *
+strNewBuf(const Buffer *const buffer)
+{
+    FUNCTION_TEST_BEGIN();
+        FUNCTION_TEST_PARAM(BUFFER, buffer);
+    FUNCTION_TEST_END();
+
+    ASSERT(buffer != NULL);
+
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_new_zn((const char *)bufPtrConst(buffer), bufUsed(buffer), errorTryDepth()));
 }
 
 /**********************************************************************************************************************************/
@@ -232,28 +211,6 @@ strNewTime(const char *const format, const time_t timestamp, const StrNewTimePar
 
 /**********************************************************************************************************************************/
 FN_EXTERN String *
-strNewBuf(const Buffer *const buffer)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(BUFFER, buffer);
-    FUNCTION_TEST_END();
-
-    ASSERT(buffer != NULL);
-
-    // Create object
-    String *const this = strNewFixed(bufUsed(buffer));
-
-    // Assign string
-    if (strSize(this) != 0)
-        memcpy(this->pub.buffer, bufPtrConst(buffer), strSize(this));
-
-    this->pub.buffer[strSize(this)] = 0;
-
-    FUNCTION_TEST_RETURN(STRING, this);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN String *
 strNewEncode(const EncodingType type, const Buffer *const buffer)
 {
     FUNCTION_TEST_BEGIN();
@@ -263,8 +220,8 @@ strNewEncode(const EncodingType type, const Buffer *const buffer)
 
     ASSERT(buffer != NULL);
 
-    // Create object
-    String *const this = strNewFixed(encodeToStrSize(type, bufUsed(buffer)));
+    // Create object via Rust path; the buffer is sized for `encodeToStrSize` bytes plus the trailing NUL.
+    String *const this = pgbr_string_new_fixed(encodeToStrSize(type, bufUsed(buffer)), errorTryDepth());
 
     // Encode buffer
     if (bufUsed(buffer) > 0)
@@ -291,34 +248,13 @@ strNewFmt(const char *const format, ...)
     // Determine how long the allocated string needs to be and create object
     va_list argumentList;
     va_start(argumentList, format);
-    String *const this = strNewFixed((size_t)vsnprintf(NULL, 0, format, argumentList));
+    String *const this = pgbr_string_new_fixed((size_t)vsnprintf(NULL, 0, format, argumentList), errorTryDepth());
     va_end(argumentList);
 
     // Format string
     va_start(argumentList, format);
     vsnprintf(this->pub.buffer, strSize(this) + 1, format, argumentList);
     va_end(argumentList);
-
-    FUNCTION_TEST_RETURN(STRING, this);
-}
-
-/**********************************************************************************************************************************/
-FN_EXTERN String *
-strNewZN(const char *const string, const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(CHARDATA, string);
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    ASSERT(string != NULL);
-
-    // Create object
-    String *const this = strNewFixed(size);
-
-    // Assign string
-    memcpy(this->pub.buffer, string, strSize(this));
-    this->pub.buffer[strSize(this)] = 0;
 
     FUNCTION_TEST_RETURN(STRING, this);
 }
@@ -345,12 +281,7 @@ strBaseZ(const String *const this)
 
     ASSERT(this != NULL);
 
-    const char *end = this->pub.buffer + strSize(this);
-
-    while (end > this->pub.buffer && *(end - 1) != '/')
-        end--;
-
-    FUNCTION_TEST_RETURN_CONST(STRINGZ, end);
+    FUNCTION_TEST_RETURN_CONST(STRINGZ, pgbr_string_base_z(this));
 }
 
 /**********************************************************************************************************************************/
@@ -379,52 +310,7 @@ strBeginsWithZ(const String *const this, const char *const beginsWith)
     ASSERT(this != NULL);
     ASSERT(beginsWith != NULL);
 
-    bool result = false;
-    const unsigned int beginsWithSize = (unsigned int)strlen(beginsWith);
-
-    if (strSize(this) >= beginsWithSize)
-        result = strncmp(strZ(this), beginsWith, beginsWithSize) == 0;
-
-    FUNCTION_TEST_RETURN(BOOL, result);
-}
-
-/***********************************************************************************************************************************
-Resize the string to allow the requested number of characters to be appended
-***********************************************************************************************************************************/
-static void
-strResize(String *const this, const size_t requested)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(STRING, this);
-        FUNCTION_TEST_PARAM(SIZE, requested);
-    FUNCTION_TEST_END();
-
-    if (requested > this->pub.extra)
-    {
-        // Fixed size strings may not be resized
-        CHECK(AssertError, !STR_IS_FIXED_BUFFER(), "resize of fixed size string");
-
-        // Check size
-        CHECK_SIZE(strSize(this) + requested);
-
-        // Calculate new extra needs to satisfy request and leave extra space for new growth
-        this->pub.extra = (unsigned int)(requested + ((strSize(this) + requested) / 2));
-
-        // Adding too little extra space usually leads to immediate resizing so enforce a minimum
-        if (this->pub.extra < STRING_EXTRA_MIN)
-            this->pub.extra = STRING_EXTRA_MIN;
-
-        MEM_CONTEXT_OBJ_BEGIN(this)
-        {
-            if (STR_IS_EMPTY_BUFFER())
-                this->pub.buffer = memNew(strSize(this) + this->pub.extra + 1);
-            else
-                this->pub.buffer = memResize(this->pub.buffer, strSize(this) + this->pub.extra + 1);
-        }
-        MEM_CONTEXT_OBJ_END();
-    }
-
-    FUNCTION_TEST_RETURN_VOID();
+    FUNCTION_TEST_RETURN(BOOL, pgbr_string_begins_with_z(this, beginsWith));
 }
 
 /**********************************************************************************************************************************/
@@ -453,21 +339,7 @@ strCatZ(String *const this, const char *const cat)
     ASSERT(this != NULL);
     ASSERT(cat != NULL);
 
-    // Determine length of string to append
-    const size_t sizeGrow = strlen(cat);
-
-    if (sizeGrow != 0)
-    {
-        // Ensure there is enough space to grow the string
-        strResize(this, sizeGrow);
-
-        // Append the string
-        strcpy(this->pub.buffer + strSize(this), cat);
-        this->pub.size += (unsigned int)sizeGrow;
-        this->pub.extra -= (unsigned int)sizeGrow;
-    }
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_cat_z(this, cat, errorTryDepth(), EMPTY_STR->pub.buffer));
 }
 
 FN_EXTERN String *
@@ -480,24 +352,9 @@ strCatZN(String *const this, const char *const cat, const size_t size)
     FUNCTION_TEST_END();
 
     ASSERT(this != NULL);
+    ASSERT(size == 0 || cat != NULL);
 
-    if (size != 0)
-    {
-        ASSERT(cat != NULL);
-
-        // Ensure there is enough space to grow the string
-        strResize(this, size);
-
-        // Append the string
-        memcpy(this->pub.buffer + strSize(this), cat, size);
-        this->pub.buffer[strSize(this) + size] = '\0';
-
-        // Update size/extra
-        this->pub.size += (unsigned int)size;
-        this->pub.extra -= (unsigned int)size;
-    }
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_cat_zn(this, cat, size, errorTryDepth(), EMPTY_STR->pub.buffer));
 }
 
 /**********************************************************************************************************************************/
@@ -527,15 +384,7 @@ strCatChr(String *const this, const char cat)
     ASSERT(this != NULL);
     ASSERT(cat != 0);
 
-    // Ensure there is enough space to grow the string
-    strResize(this, 1);
-
-    // Append the character
-    this->pub.buffer[this->pub.size++] = cat;
-    this->pub.buffer[this->pub.size] = 0;
-    this->pub.extra--;
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_cat_chr(this, cat, errorTryDepth(), EMPTY_STR->pub.buffer));
 }
 
 /**********************************************************************************************************************************/
@@ -556,7 +405,7 @@ strCatEncode(String *const this, const EncodingType type, const Buffer *const bu
     if (encodeSize != 0)
     {
         // Ensure there is enough space to grow the string
-        strResize(this, encodeSize);
+        pgbr_string_resize(this, encodeSize, errorTryDepth(), EMPTY_STR->pub.buffer);
 
         // Append the encoded string
         encodeToStr(type, bufPtrConst(buffer), bufUsed(buffer), this->pub.buffer + strSize(this));
@@ -612,7 +461,7 @@ strCatFmt(String *const this, const char *const format, ...)
     if (sizeGrow != 0)
     {
         // Ensure there is enough space to grow the string
-        strResize(this, sizeGrow);
+        pgbr_string_resize(this, sizeGrow, errorTryDepth(), EMPTY_STR->pub.buffer);
 
         // Append the formatted string
         va_start(argumentList, format);
@@ -635,17 +484,7 @@ strCmp(const String *const this, const String *const compare)
         FUNCTION_TEST_PARAM(STRING, compare);
     FUNCTION_TEST_END();
 
-    if (this != NULL && compare != NULL)
-        FUNCTION_TEST_RETURN(INT, strcmp(strZ(this), strZ(compare)));
-    else if (this == NULL)
-    {
-        if (compare == NULL)
-            FUNCTION_TEST_RETURN(INT, 0);
-
-        FUNCTION_TEST_RETURN(INT, -1);
-    }
-
-    FUNCTION_TEST_RETURN(INT, 1);
+    FUNCTION_TEST_RETURN(INT, pgbr_string_cmp(this, compare));
 }
 
 FN_EXTERN int
@@ -667,12 +506,7 @@ strDup(const String *const this)
         FUNCTION_TEST_PARAM(STRING, this);
     FUNCTION_TEST_END();
 
-    String *result = NULL;
-
-    if (this != NULL)
-        result = strNewZ(strZ(this));
-
-    FUNCTION_TEST_RETURN(STRING, result);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_dup(this, errorTryDepth()));
 }
 
 /**********************************************************************************************************************************/
@@ -683,7 +517,7 @@ strEmpty(const String *const this)
         FUNCTION_TEST_PARAM(STRING, this);
     FUNCTION_TEST_END();
 
-    FUNCTION_TEST_RETURN(BOOL, strSize(this) == 0);
+    FUNCTION_TEST_RETURN(BOOL, pgbr_string_empty(this));
 }
 
 /**********************************************************************************************************************************/
@@ -712,19 +546,10 @@ strEndsWithZ(const String *const this, const char *const endsWith)
     ASSERT(this != NULL);
     ASSERT(endsWith != NULL);
 
-    bool result = false;
-    const unsigned int endsWithSize = (unsigned int)strlen(endsWith);
-
-    if (strSize(this) >= endsWithSize)
-        result = strcmp(strZ(this) + (strSize(this) - endsWithSize), endsWith) == 0;
-
-    FUNCTION_TEST_RETURN(BOOL, result);
+    FUNCTION_TEST_RETURN(BOOL, pgbr_string_ends_with_z(this, endsWith));
 }
 
-/***********************************************************************************************************************************
-There are two separate implementations because string objects can get the size very efficiently whereas the zero-terminated strings
-would need a call to strlen().
-***********************************************************************************************************************************/
+/**********************************************************************************************************************************/
 FN_EXTERN bool
 strEq(const String *const this, const String *const compare)
 {
@@ -733,17 +558,7 @@ strEq(const String *const this, const String *const compare)
         FUNCTION_TEST_PARAM(STRING, compare);
     FUNCTION_TEST_END();
 
-    bool result = false;
-
-    if (this != NULL && compare != NULL)
-    {
-        if (strSize(this) == strSize(compare))
-            result = strcmp(strZ(this), strZ(compare)) == 0;
-    }
-    else
-        result = this == NULL && compare == NULL;
-
-    FUNCTION_TEST_RETURN(BOOL, result);
+    FUNCTION_TEST_RETURN(BOOL, pgbr_string_eq(this, compare));
 }
 
 FN_EXTERN bool
@@ -757,7 +572,7 @@ strEqZ(const String *const this, const char *const compare)
     ASSERT(this != NULL);
     ASSERT(compare != NULL);
 
-    FUNCTION_TEST_RETURN(BOOL, strcmp(strZ(this), compare) == 0);
+    FUNCTION_TEST_RETURN(BOOL, pgbr_string_eq_z(this, compare));
 }
 
 /**********************************************************************************************************************************/
@@ -770,10 +585,7 @@ strFirstUpper(String *const this)
 
     ASSERT(this != NULL);
 
-    if (strSize(this) > 0)
-        this->pub.buffer[0] = (char)toupper(this->pub.buffer[0]);
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_first_upper(this));
 }
 
 /**********************************************************************************************************************************/
@@ -786,10 +598,7 @@ strFirstLower(String *const this)
 
     ASSERT(this != NULL);
 
-    if (strSize(this) > 0)
-        this->pub.buffer[0] = (char)tolower(this->pub.buffer[0]);
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_first_lower(this));
 }
 
 /**********************************************************************************************************************************/
@@ -802,10 +611,7 @@ strLower(String *const this)
 
     ASSERT(this != NULL);
 
-    for (size_t idx = 0; idx < strSize(this); idx++)
-        this->pub.buffer[idx] = (char)tolower(this->pub.buffer[idx]);
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_lower(this));
 }
 
 /**********************************************************************************************************************************/
@@ -937,13 +743,7 @@ strReplaceChr(String *const this, const char find, const char replace)
 
     ASSERT(this != NULL);
 
-    for (size_t stringIdx = 0; stringIdx < strSize(this); stringIdx++)
-    {
-        if (this->pub.buffer[stringIdx] == find)
-            this->pub.buffer[stringIdx] = replace;
-    }
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_replace_chr(this, find, replace));
 }
 
 /**********************************************************************************************************************************/
@@ -988,37 +788,7 @@ strTrim(String *const this)
 
     ASSERT(this != NULL);
 
-    // Nothing to trim if size is zero
-    if (strSize(this) > 0)
-    {
-        // Find the beginning of the string skipping all whitespace
-        char *begin = this->pub.buffer;
-
-        while (*begin != 0 && (*begin == ' ' || *begin == '\t' || *begin == '\r' || *begin == '\n'))
-            begin++;
-
-        // Find the end of the string skipping all whitespace
-        char *end = this->pub.buffer + (strSize(this) - 1);
-
-        while (end > begin && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
-            end--;
-
-        // Is there anything to trim?
-        const size_t newSize = (size_t)(end - begin + 1);
-
-        if (begin != this->pub.buffer || newSize < strSize(this))
-        {
-            // Calculate new size and extra
-            this->pub.extra = (unsigned int)(strSize(this) - newSize);
-            this->pub.size = (unsigned int)newSize;
-
-            // Move the substr to the beginning of the buffer
-            memmove(this->pub.buffer, begin, strSize(this));
-            this->pub.buffer[strSize(this)] = 0;
-        }
-    }
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_trim(this));
 }
 
 /**********************************************************************************************************************************/
@@ -1032,17 +802,7 @@ strChr(const String *const this, const char chr)
 
     ASSERT(this != NULL);
 
-    int result = -1;
-
-    if (strSize(this) > 0)
-    {
-        const char *const ptr = strchr(this->pub.buffer, chr);
-
-        if (ptr != NULL)
-            result = (int)(ptr - this->pub.buffer);
-    }
-
-    FUNCTION_TEST_RETURN(INT, result);
+    FUNCTION_TEST_RETURN(INT, pgbr_string_chr(this, chr));
 }
 
 /**********************************************************************************************************************************/
@@ -1056,15 +816,7 @@ strTruncIdx(String *const this, const int idx)
     ASSERT(this != NULL);
     ASSERT(idx >= 0 && (size_t)idx <= strSize(this));
 
-    if (strSize(this) > 0)
-    {
-        // Reset the size to end at the index
-        this->pub.extra = (unsigned int)(strSize(this) - (size_t)idx);
-        this->pub.size = (unsigned int)idx;
-        this->pub.buffer[strSize(this)] = 0;
-    }
-
-    FUNCTION_TEST_RETURN(STRING, this);
+    FUNCTION_TEST_RETURN(STRING, pgbr_string_trunc_idx(this, idx));
 }
 
 /**********************************************************************************************************************************/

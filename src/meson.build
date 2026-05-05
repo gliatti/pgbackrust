@@ -116,6 +116,7 @@ pgbr_ffi_inputs = files(
     '../crates/pgbr-core/src/mem_context.rs',
     '../crates/pgbr-core/src/object.rs',
     '../crates/pgbr-core/src/stack_trace.rs',
+    '../crates/pgbr-core/src/string.rs',
     '../crates/pgbr-core/src/string_static.rs',
     '../crates/pgbr-core/src/string_z.rs',
     '../crates/pgbr-encode/Cargo.toml',
