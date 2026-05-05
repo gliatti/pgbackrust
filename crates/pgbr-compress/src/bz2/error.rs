@@ -33,7 +33,11 @@ pub enum Classification {
     Ok { code: i32 },
     /// `code < 0` — throw `kind` with the given short message and the `code` formatted
     /// in.
-    Throw { code: i32, kind: ErrorKind, message: &'static str },
+    Throw {
+        code: i32,
+        kind: ErrorKind,
+        message: &'static str,
+    },
 }
 
 /// Inspect a libbz2 return code and decide whether it represents an error.

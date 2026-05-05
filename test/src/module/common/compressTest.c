@@ -9,6 +9,9 @@ Test Compression
 #include <lz4frame.h>                                                   // For the legacy_lz4Compress differential helper —
                                                                         // lz4/compress.c (Phase 18) no longer includes
                                                                         // lz4frame.h.
+#include <bzlib.h>                                                      // For the legacy_bz2Compress differential helper —
+                                                                        // bz2/compress.c (Phase 21) no longer includes
+                                                                        // bzlib.h.
 
 #include "common/io/bufferRead.h"
 #include "common/io/bufferWrite.h"
@@ -86,6 +89,33 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
     bufUsedSet(output, bufSize(output) - stream.avail_out);
 
     inflateEnd(&stream);
+
+    return output;
+}
+
+// `legacy_bz2Compress` mirrors the pre-Phase-21 body of `bz2CompressNew` / `bz2CompressProcess` — direct libbz2 calls with the
+// same parameters (level, workFactor=0, verbosity=0). One-shot compression; libbz2 is deterministic given fixed parameters.
+static Buffer *
+legacy_bz2Compress(const int level, const Buffer *const input)
+{
+    bz_stream stream = {.bzalloc = NULL, .bzfree = NULL, .opaque = NULL};
+
+    int ret = BZ2_bzCompressInit(&stream, level, 0, 0);
+    ASSERT(ret == BZ_OK);
+
+    Buffer *const output = bufNew(bufUsed(input) * 2 + 4096);
+
+    stream.avail_in = (unsigned int)bufUsed(input);
+    stream.next_in = (char *)(uintptr_t)bufPtrConst(input);
+    stream.avail_out = (unsigned int)bufSize(output);
+    stream.next_out = (char *)bufPtr(output);
+
+    ret = BZ2_bzCompress(&stream, BZ_FINISH);
+    ASSERT(ret == BZ_STREAM_END);
+
+    bufUsedSet(output, bufSize(output) - stream.avail_out);
+
+    BZ2_bzCompressEnd(&stream);
 
     return output;
 }
@@ -601,6 +631,52 @@ testRun(void)
 
         TEST_RESULT_VOID(FUNCTION_LOG_OBJECT_FORMAT(decompress, bz2DecompressToLog, buffer, sizeof(buffer)), "bz2DecompressToLog");
         TEST_RESULT_Z(buffer, "{inputSame: true, done: true, avail_in: 0}", "check log");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("bz2Compress differential vs direct libbz2 (10000+ inputs)");
+
+        // 10 000 random `(level, plaintext)` pairs. libbz2 is deterministic given fixed level + workFactor=0 + verbosity=0, so
+        // the new FFI path and `legacy_bz2Compress` (direct libbz2 calls with the same parameters) must produce byte-identical
+        // frames.
+        uint64_t bz2LcgState = UINT64_C(0xB22B22B22B22B22B);
+        unsigned int bz2Comparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            bz2LcgState = bz2LcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t bz2Len = (size_t)((bz2LcgState >> 32) & 0x3FF) + 1;            // 1..1024 bytes
+            const int bz2Level = (int)(((bz2LcgState >> 24) & 0xFF) % 9) + 1;           // 1..9
+
+            Buffer *const bz2Input = bufNew(bz2Len);
+            for (size_t i = 0; i < bz2Len; i++)
+            {
+                bz2LcgState = bz2LcgState * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(bz2Input)[i] = (uint8_t)(bz2LcgState >> 56);
+            }
+            bufUsedSet(bz2Input, bz2Len);
+
+            Buffer *const bz2NewOut = testCompress(
+                compressFilterP(compressTypeBz2, bz2Level), bz2Input, bz2Len, bz2Len * 2 + 4096);
+            Buffer *const bz2LegacyOut = legacy_bz2Compress(bz2Level, bz2Input);
+
+            if (!bufEq(bz2NewOut, bz2LegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "bz2Compress(level=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu", bz2Level, bz2Len, iter,
+                    bufUsed(bz2NewOut), bufUsed(bz2LegacyOut));
+            }
+
+            bufFree(bz2Input);
+            bufFree(bz2NewOut);
+            bufFree(bz2LegacyOut);
+
+            bz2Comparisons++;
+        }
+
+        TEST_RESULT_UINT(bz2Comparisons, 10000, "10k differential bz2Compress inputs all byte-identical");
     }
 
     // *****************************************************************************************************************************

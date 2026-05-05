@@ -1298,6 +1298,146 @@ pub unsafe extern "C" fn pgbr_lz4_compress_state_end(state: *mut core::ffi::c_vo
     })
 }
 
+// ---------- pgbr-compress bz2 compress bridge (Phase 21) ----------
+
+/// Allocate a streaming bzip2 compressor.
+///
+/// `level` matches the legacy `bz2CompressNew` parameter (`1..=9`). Returns a non-null
+/// pointer on success; the caller must release it via [`pgbr_bz2_compress_state_free`].
+/// On failure returns null and writes the raw libbz2 return code to `*err_out`.
+///
+/// # Safety
+///
+/// `err_out` must be either null or point to a writable `i32`. The returned pointer
+/// (when non-null) is owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_compress_state_new(level: i32, err_out: *mut i32) -> *mut core::ffi::c_void {
+    with_panic_guard(|| match pgbr_compress::bz2::compress::Compress::new(level) {
+        Ok(state) => Box::into_raw(Box::new(state)).cast::<core::ffi::c_void>(),
+        Err(code) => {
+            if !err_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { err_out.write(code) };
+            }
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_bz2_compress_state_new: BZ2_bzCompressInit returned {code}"),
+            ));
+            core::ptr::null_mut()
+        }
+    })
+}
+
+/// Drop a bz2 compress state previously returned by [`pgbr_bz2_compress_state_new`].
+///
+/// No-op on null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_bz2_compress_state_new`]
+/// that has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_compress_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the unique-ownership invariant.
+        let _ = unsafe { Box::from_raw(state.cast::<pgbr_compress::bz2::compress::Compress>()) };
+    });
+}
+
+/// Run one `BZ2_bzCompress` call.
+///
+/// On success returns `0` (`BZ_RUN_OK` family) or `4` (`BZ_STREAM_END`). On a libbz2
+/// error returns the raw negative code so the C caller can hand it to `bz2Error`.
+/// On a Rust-side invariant violation returns `-100`.
+///
+/// # Safety
+///
+/// `state` must be a live state pointer from [`pgbr_bz2_compress_state_new`]. `src`
+/// (if `src_size > 0`) and `dst` (if `dst_size > 0`) must point to valid buffers.
+/// `written_out` and `consumed_out` must point to writable `usize`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_bz2_compress_state_compress(
+    state: *mut core::ffi::c_void,
+    src: *const u8,
+    src_size: usize,
+    dst: *mut u8,
+    dst_size: usize,
+    finish: bool,
+    written_out: *mut usize,
+    consumed_out: *mut usize,
+) -> i32 {
+    with_panic_guard(|| {
+        let zero_outs = || {
+            if !written_out.is_null() {
+                // SAFETY: caller upholds the writable-pointer contract.
+                unsafe { written_out.write(0) };
+            }
+            if !consumed_out.is_null() {
+                // SAFETY: same.
+                unsafe { consumed_out.write(0) };
+            }
+        };
+
+        if state.is_null() || written_out.is_null() || consumed_out.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_compress_state_compress: null pointer",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if dst_size > 0 && dst.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_compress_state_compress: dst is null but dst_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+        if src_size > 0 && src.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_bz2_compress_state_compress: src is null but src_size > 0",
+            ));
+            zero_outs();
+            return -100;
+        }
+
+        // SAFETY: caller upholds the live-state-pointer invariant.
+        let state = unsafe { &mut *state.cast::<pgbr_compress::bz2::compress::Compress>() };
+        let src_slice: &[u8] = if src_size == 0 {
+            &[]
+        } else {
+            // SAFETY: caller upholds the size + non-null contracts.
+            unsafe { core::slice::from_raw_parts(src, src_size) }
+        };
+        let dst_slice: &mut [u8] = if dst_size == 0 {
+            &mut []
+        } else {
+            // SAFETY: same.
+            unsafe { core::slice::from_raw_parts_mut(dst, dst_size) }
+        };
+
+        match state.compress_tick(src_slice, dst_slice, finish) {
+            Ok(tick) => {
+                // SAFETY: null-checked above.
+                unsafe {
+                    written_out.write(tick.written);
+                    consumed_out.write(tick.consumed);
+                }
+                if tick.stream_end { 4 } else { 0 }
+            }
+            Err(code) => {
+                zero_outs();
+                code
+            }
+        }
+    })
+}
+
 // ---------- pgbr-compress bz2 error bridge (Phase 20) ----------
 
 /// Classify a libbz2 return code.
@@ -1315,12 +1455,7 @@ pub unsafe extern "C" fn pgbr_lz4_compress_state_end(state: *mut core::ffi::c_vo
 /// `kind_out` must point to a writable `i32`; `msg_out` must point to a writable buffer
 /// of at least `msg_size` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pgbr_bz2_error_classify(
-    code: i32,
-    kind_out: *mut i32,
-    msg_out: *mut c_char,
-    msg_size: usize,
-) -> i32 {
+pub unsafe extern "C" fn pgbr_bz2_error_classify(code: i32, kind_out: *mut i32, msg_out: *mut c_char, msg_size: usize) -> i32 {
     with_panic_guard(|| {
         if kind_out.is_null() || msg_out.is_null() {
             set_last_error(Error::new(ErrorType::Assert, "pgbr_bz2_error_classify: null pointer"));
