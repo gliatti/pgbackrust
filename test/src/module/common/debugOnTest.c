@@ -1,10 +1,51 @@
 /***********************************************************************************************************************************
 Test Debug Macros and Routines
 ***********************************************************************************************************************************/
+#include <string.h>
+
 #include "common/log.h"
 
 #include "common/harnessLog.h"
 #include "common/macro.h"
+
+/***********************************************************************************************************************************
+Differential helpers — `legacy_*` re-implementations of the pre-Phase-29 `typeToLog` / `objNameToLog` / `ptrToLog` bodies, kept
+verbatim from `src/common/debug.c`. The differential test below feeds identical inputs to both paths and asserts the output bytes
+and the returned size match for a wide grid of buffer sizes and name lengths.
+***********************************************************************************************************************************/
+static size_t
+legacy_typeToLog(const char *const typeName, char *const buffer, const size_t bufferSize)
+{
+    StringStatic debugLog = strStcInit(buffer, bufferSize);
+    strStcFmt(&debugLog, "%s", typeName);
+    return strStcResultSize(&debugLog);
+}
+
+static size_t
+legacy_objNameToLog(const void *const object, const char *const objectName, char *const buffer, const size_t bufferSize)
+{
+    StringStatic debugLog = strStcInit(buffer, bufferSize);
+
+    if (object == NULL)
+        strStcCat(&debugLog, NULL_Z);
+    else
+        strStcFmt(&debugLog, "{%s}", objectName);
+
+    return strStcResultSize(&debugLog);
+}
+
+static size_t
+legacy_ptrToLog(const void *const pointer, const char *const pointerName, char *const buffer, const size_t bufferSize)
+{
+    StringStatic debugLog = strStcInit(buffer, bufferSize);
+
+    if (pointer == NULL)
+        strStcCat(&debugLog, NULL_Z);
+    else
+        strStcFmt(&debugLog, "(%s)", pointerName);
+
+    return strStcResultSize(&debugLog);
+}
 
 static void
 testFunction3(void)
@@ -166,6 +207,94 @@ testRun(void)
 
         TEST_RESULT_UINT(strzToLog("test2", buffer, sizeof(buffer)), 7, "full string");
         TEST_RESULT_Z(buffer, "\"test2\"", "    check full string");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("differential parity vs legacy_* C re-implementation");
+
+        // Names span lengths from 0 to slightly above the smallest buffer size we drive, so the
+        // strStcCat truncation branch is exercised on both the present and the absent (`null`)
+        // paths. The grid has 4 names × 9 buffer sizes × 2 presence states × 3 functions =
+        // 216 paired byte-comparisons.
+        const char *const names[] = {"", "X", "Object", "verylongtype that exceeds buffers"};
+        const size_t bufferSizes[] = {0, 1, 2, 3, 4, 5, 8, 16, 256};
+
+        for (unsigned int sizeIdx = 0; sizeIdx < LENGTH_OF(bufferSizes); sizeIdx++)
+        {
+            const size_t bufferSize = bufferSizes[sizeIdx];
+            char newBuf[STACK_TRACE_PARAM_MAX];
+            char legacyBuf[STACK_TRACE_PARAM_MAX];
+
+            for (unsigned int nameIdx = 0; nameIdx < LENGTH_OF(names); nameIdx++)
+            {
+                const char *const name = names[nameIdx];
+
+                // Sentinel-fill so any byte the function fails to overwrite is visibly distinct.
+                memset(newBuf, 0xAA, sizeof(newBuf));
+                memset(legacyBuf, 0xAA, sizeof(legacyBuf));
+
+                // typeToLog
+                const size_t newType = typeToLog(name, newBuf, bufferSize);
+                const size_t legacyType = legacy_typeToLog(name, legacyBuf, bufferSize);
+
+                TEST_RESULT_UINT(
+                    newType, legacyType, zNewFmt("typeToLog: size=%zu name=%u — return matches", bufferSize, nameIdx));
+
+                if (bufferSize > 0)
+                {
+                    // Compare full-buffer payload up to and including the NUL the legacy path writes.
+                    TEST_RESULT_INT(
+                        memcmp(newBuf, legacyBuf, bufferSize), 0,
+                        zNewFmt("typeToLog: size=%zu name=%u — bytes match", bufferSize, nameIdx));
+                }
+
+                // objNameToLog (present and absent)
+                for (int present = 0; present <= 1; present++)
+                {
+                    const void *const object = present ? (const void *)1 : NULL;
+
+                    memset(newBuf, 0xAA, sizeof(newBuf));
+                    memset(legacyBuf, 0xAA, sizeof(legacyBuf));
+
+                    const size_t newObj = objNameToLog(object, name, newBuf, bufferSize);
+                    const size_t legacyObj = legacy_objNameToLog(object, name, legacyBuf, bufferSize);
+
+                    TEST_RESULT_UINT(
+                        newObj, legacyObj,
+                        zNewFmt("objNameToLog: size=%zu name=%u present=%d — return matches", bufferSize, nameIdx, present));
+
+                    if (bufferSize > 0)
+                    {
+                        TEST_RESULT_INT(
+                            memcmp(newBuf, legacyBuf, bufferSize), 0,
+                            zNewFmt(
+                                "objNameToLog: size=%zu name=%u present=%d — bytes match", bufferSize, nameIdx, present));
+                    }
+                }
+
+                // ptrToLog (present and absent)
+                for (int present = 0; present <= 1; present++)
+                {
+                    const void *const ptr = present ? (const void *)1 : NULL;
+
+                    memset(newBuf, 0xAA, sizeof(newBuf));
+                    memset(legacyBuf, 0xAA, sizeof(legacyBuf));
+
+                    const size_t newPtr = ptrToLog(ptr, name, newBuf, bufferSize);
+                    const size_t legacyPtr = legacy_ptrToLog(ptr, name, legacyBuf, bufferSize);
+
+                    TEST_RESULT_UINT(
+                        newPtr, legacyPtr,
+                        zNewFmt("ptrToLog: size=%zu name=%u present=%d — return matches", bufferSize, nameIdx, present));
+
+                    if (bufferSize > 0)
+                    {
+                        TEST_RESULT_INT(
+                            memcmp(newBuf, legacyBuf, bufferSize), 0,
+                            zNewFmt("ptrToLog: size=%zu name=%u present=%d — bytes match", bufferSize, nameIdx, present));
+                    }
+                }
+            }
+        }
     }
 
     // *****************************************************************************************************************************

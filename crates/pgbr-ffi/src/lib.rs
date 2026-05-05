@@ -12,6 +12,7 @@ use core::ffi::{CStr, c_char};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use pgbr_core::debug as core_debug;
 use pgbr_encode::{self as encode, EncodingType};
 use pgbr_error::retry::RetryState;
 use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
@@ -607,6 +608,97 @@ pub unsafe extern "C" fn pgbr_error_retry_state_format_message(state: *mut core:
         // SAFETY: caller guarantees the handle is alive and unaliased.
         let state_ref = unsafe { &mut *state.cast::<RetryState>() };
         state_ref.formatted_cstr().map_or(core::ptr::null(), |c| c.as_ptr())
+    })
+}
+
+/// Render a literal type label into the C-managed `buffer`.
+///
+/// Mirrors the legacy `typeToLog(typeName, buffer, bufferSize)` body in
+/// `src/common/debug.c` byte-for-byte: copy at most `buffer_size - 1` bytes from
+/// `type_name_utf8` and write the trailing NUL. Returns the number of bytes written
+/// (excluding the NUL).
+///
+/// Returns `0` when `buffer_size <= 1` (the legacy `strStcCat` requires `remainsSize > 1`
+/// before writing) or when any pointer argument is null.
+///
+/// # Safety
+///
+/// - `type_name_utf8` must be NUL-terminated and readable for the duration of the call.
+/// - `buffer` must point to at least `buffer_size` bytes of writable memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_debug_type_to_log(type_name_utf8: *const c_char, buffer: *mut c_char, buffer_size: usize) -> usize {
+    with_panic_guard(|| {
+        if type_name_utf8.is_null() || buffer.is_null() || buffer_size == 0 {
+            return 0;
+        }
+        // SAFETY: caller guarantees `type_name_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(type_name_utf8) };
+        let Ok(name) = cstr.to_str() else {
+            return 0;
+        };
+        // SAFETY: caller guarantees `buffer` points to at least `buffer_size` writable bytes.
+        let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), buffer_size) };
+        core_debug::type_to_log(name, buf)
+    })
+}
+
+/// Render `{name}` (when `present` is true) or `null` (otherwise) into `buffer`.
+///
+/// Mirrors the legacy `objNameToLog(object, name, buffer, bufferSize)` byte-for-byte —
+/// the `object` pointer is reduced to a boolean on the C side because the Rust shim
+/// only cares whether the legacy code would have taken the null branch.
+///
+/// # Safety
+///
+/// Same contract as [`pgbr_debug_type_to_log`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_debug_obj_name_to_log(
+    present: bool,
+    name_utf8: *const c_char,
+    buffer: *mut c_char,
+    buffer_size: usize,
+) -> usize {
+    with_panic_guard(|| {
+        if name_utf8.is_null() || buffer.is_null() || buffer_size == 0 {
+            return 0;
+        }
+        // SAFETY: caller guarantees `name_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(name_utf8) };
+        let Ok(name) = cstr.to_str() else {
+            return 0;
+        };
+        // SAFETY: caller guarantees `buffer` points to at least `buffer_size` writable bytes.
+        let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), buffer_size) };
+        core_debug::obj_name_to_log(present, name, buf)
+    })
+}
+
+/// Render `(name)` (when `present` is true) or `null` (otherwise) into `buffer`.
+///
+/// Mirrors the legacy `ptrToLog(pointer, name, buffer, bufferSize)` byte-for-byte.
+///
+/// # Safety
+///
+/// Same contract as [`pgbr_debug_type_to_log`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_debug_ptr_to_log(
+    present: bool,
+    name_utf8: *const c_char,
+    buffer: *mut c_char,
+    buffer_size: usize,
+) -> usize {
+    with_panic_guard(|| {
+        if name_utf8.is_null() || buffer.is_null() || buffer_size == 0 {
+            return 0;
+        }
+        // SAFETY: caller guarantees `name_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(name_utf8) };
+        let Ok(name) = cstr.to_str() else {
+            return 0;
+        };
+        // SAFETY: caller guarantees `buffer` points to at least `buffer_size` writable bytes.
+        let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), buffer_size) };
+        core_debug::ptr_to_log(present, name, buf)
     })
 }
 

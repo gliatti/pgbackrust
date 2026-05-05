@@ -346,6 +346,7 @@ name = "pgbr-ffi"
 version = "0.1.0"
 dependencies = [
  "pgbr-compress",
+ "pgbr-core",
  "pgbr-crypto",
  "pgbr-encode",
  "pgbr-error",

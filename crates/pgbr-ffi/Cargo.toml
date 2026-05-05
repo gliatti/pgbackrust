@@ -11,6 +11,7 @@ name = "pgbr_ffi"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+pgbr-core = { path = "../pgbr-core" }
 pgbr-error = { path = "../pgbr-error" }
 pgbr-encode = { path = "../pgbr-encode" }
 pgbr-postgres = { path = "../pgbr-postgres" }
