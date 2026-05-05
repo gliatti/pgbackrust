@@ -12,6 +12,7 @@ use core::ffi::{CStr, c_char};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use pgbr_core::blob as core_blob;
 use pgbr_core::debug as core_debug;
 use pgbr_core::log as core_log;
 use pgbr_core::mem_context as core_mem_context;
@@ -4694,6 +4695,38 @@ pub unsafe extern "C" fn pgbr_regex_prefix_len(pattern: *const c_char) -> usize 
         let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
         pgbr_regex::prefix_len(bytes)
     })
+}
+
+// ─── pgbr_blob ─────────────────────────────────────────────────────────────────────────────────
+
+/// `blbNew()`: create a new Blob in a fresh `MemContext`.
+///
+/// # Safety
+///
+/// Single-threaded mem-context invariant. `try_depth` must come from the C-side
+/// `errorTryDepth()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_blob_new(try_depth: u32) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the contract.
+    with_panic_guard(|| unsafe { core_blob::new(try_depth).cast::<core::ffi::c_void>() })
+}
+
+/// `blbAdd(this, data, size)`: copy `size` bytes from `data` into the blob and return
+/// a pointer to the stored copy.
+///
+/// # Safety
+///
+/// `this` must be a valid `Blob *` returned by [`pgbr_blob_new`]. `data` must point at
+/// `size` readable bytes. `try_depth` must come from `errorTryDepth()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_blob_add(
+    this: *mut core::ffi::c_void,
+    data: *const core::ffi::c_void,
+    size: usize,
+    try_depth: u32,
+) -> *const core::ffi::c_void {
+    // SAFETY: caller upholds the contract.
+    with_panic_guard(|| unsafe { core_blob::add(this.cast::<core_blob::Blob>(), data, size, try_depth) })
 }
 
 // ─── pgbr_string_z ─────────────────────────────────────────────────────────────────────────────

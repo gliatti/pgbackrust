@@ -1,16 +1,20 @@
 /***********************************************************************************************************************************
 Blob Handler
+
+Thin C shims over `pgbr-core::blob`. The `struct Blob { char *block; size_t pos; }` layout is mirrored byte-for-byte by the Rust
+side via `#[repr(C)]`; the public header keeps the opaque `typedef struct Blob Blob;`.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <string.h>
-
 #include "common/debug.h"
+#include "common/error/error.h"
 #include "common/memContext.h"
 #include "common/type/blob.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
-Object type
+Object type — kept here so `sizeof(Blob)` resolves for any shim caller that links against the C ABI through the legacy header.
+The Rust side owns the canonical layout via `#[repr(C)]` and the two pointer-sized fields in the same order.
 ***********************************************************************************************************************************/
 struct Blob
 {
@@ -24,16 +28,7 @@ blbNew(void)
 {
     FUNCTION_TEST_VOID();
 
-    OBJ_NEW_BEGIN(Blob, .allocQty = MEM_CONTEXT_QTY_MAX)
-    {
-        *this = (Blob)
-        {
-            .block = memNew(BLOB_BLOCK_SIZE),
-        };
-    }
-    OBJ_NEW_END();
-
-    FUNCTION_TEST_RETURN(BLOB, this);
+    FUNCTION_TEST_RETURN(BLOB, pgbr_blob_new(errorTryDepth()));
 }
 
 /**********************************************************************************************************************************/
@@ -46,38 +41,7 @@ blbAdd(Blob *const this, const void *const data, const size_t size)
         FUNCTION_TEST_PARAM(SIZE, size);
     FUNCTION_TEST_END();
 
-    void *result = NULL;
+    const void *const result = pgbr_blob_add(this, data, size, errorTryDepth());
 
-    MEM_CONTEXT_OBJ_BEGIN(this)
-    {
-        // If data is >= block size then allocate a special block for the data
-        if (size >= BLOB_BLOCK_SIZE)
-        {
-            result = memNew(size);
-            memcpy(result, data, size);
-        }
-        else
-        {
-            // If data will fit in the current block
-            if (BLOB_BLOCK_SIZE - this->pos >= size)
-            {
-                result = (uint8_t *)this->block + this->pos;
-
-                memcpy(result, data, size);
-                this->pos += size;
-            }
-            // Else allocate a new block
-            else
-            {
-                this->block = memNew(BLOB_BLOCK_SIZE);
-                result = this->block;
-
-                memcpy(result, data, size);
-                this->pos = size;
-            }
-        }
-    }
-    MEM_CONTEXT_OBJ_END();
-
-    FUNCTION_TEST_RETURN_P(VOID, result);
+    FUNCTION_TEST_RETURN_CONST_P(VOID, result);
 }
