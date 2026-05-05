@@ -1,5 +1,10 @@
 /***********************************************************************************************************************************
 Regular Expression Handler Extensions
+
+Build-time-only helpers (`regExpMatchPtr`, `regExpMatchStr`) used by the test linter and the log harness. The core compile /
+match logic flows through the Rust `pgbr-regex` crate via `pgbr_regex_match_offsets` (Phase 9 migration); this file just
+adapts those byte-offset returns into the `const char *` and `String *` shapes the C build callers expect, so the public
+header `build/common/regExp.h` stays unchanged.
 ***********************************************************************************************************************************/
 // Include core module
 #include "common/regExp.c"
