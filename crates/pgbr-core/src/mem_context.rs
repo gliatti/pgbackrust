@@ -25,7 +25,7 @@
 //! `pgbr_mem_context_init_top` hook (called from a `__attribute__((constructor))` in
 //! `memContext.c`) writes the pointer before `main` runs.
 
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 use core::ffi::c_char;
 use core::ffi::c_void;
 
@@ -93,43 +93,43 @@ pub const STACK_TYPE_NEW: i32 = 1;
 /// | 7-8          | 6-7            | `callback_qty`         |
 /// | 9            | 8              | `callback_initialized` |
 /// | 10-25        | 9-24           | `alloc_extra`          |
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_ACTIVE_SHIFT: u32 = 0;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_ACTIVE_MASK: u32 = 0x1;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_CHILD_QTY_SHIFT: u32 = 1;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_CHILD_QTY_SHIFT: u32 = 0;
 const FLAG_CHILD_QTY_MASK: u32 = 0x3;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_CHILD_INIT_SHIFT: u32 = 3;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_CHILD_INIT_SHIFT: u32 = 2;
 const FLAG_CHILD_INIT_MASK: u32 = 0x1;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_ALLOC_QTY_SHIFT: u32 = 4;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_ALLOC_QTY_SHIFT: u32 = 3;
 const FLAG_ALLOC_QTY_MASK: u32 = 0x3;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_ALLOC_INIT_SHIFT: u32 = 6;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_ALLOC_INIT_SHIFT: u32 = 5;
 const FLAG_ALLOC_INIT_MASK: u32 = 0x1;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_CALLBACK_QTY_SHIFT: u32 = 7;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_CALLBACK_QTY_SHIFT: u32 = 6;
 const FLAG_CALLBACK_QTY_MASK: u32 = 0x3;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_CALLBACK_INIT_SHIFT: u32 = 9;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_CALLBACK_INIT_SHIFT: u32 = 8;
 const FLAG_CALLBACK_INIT_MASK: u32 = 0x1;
-#[cfg(feature = "c-debug")]
+#[cfg(c_debug)]
 const FLAG_ALLOC_EXTRA_SHIFT: u32 = 10;
-#[cfg(not(feature = "c-debug"))]
+#[cfg(not(c_debug))]
 const FLAG_ALLOC_EXTRA_SHIFT: u32 = 9;
 const FLAG_ALLOC_EXTRA_MASK: u32 = 0xFFFF;
 
@@ -143,33 +143,33 @@ const FLAG_ALLOC_EXTRA_MASK: u32 = 0xFFFF;
 ///   * 32-bit release: 12 bytes.
 #[repr(C)]
 pub struct MemContext {
-    #[cfg(feature = "c-debug")]
+    #[cfg(c_debug)]
     pub name: *const c_char,
-    #[cfg(feature = "c-debug")]
+    #[cfg(c_debug)]
     pub sequence_new: u64,
-    flags: u32,
+    pub flags: u32,
     pub context_parent_idx: u32,
     pub context_parent: *mut Self,
 }
 
 /// Compile-time assertion that the Rust mirror matches the test-pinned C `sizeof`.
 const _: () = {
-    #[cfg(all(target_pointer_width = "64", feature = "c-debug"))]
+    #[cfg(all(target_pointer_width = "64", c_debug))]
     assert!(
         core::mem::size_of::<MemContext>() == 32,
         "MemContext must be 32 bytes on 64-bit DEBUG"
     );
-    #[cfg(all(target_pointer_width = "32", feature = "c-debug"))]
+    #[cfg(all(target_pointer_width = "32", c_debug))]
     assert!(
         core::mem::size_of::<MemContext>() == 24,
         "MemContext must be 24 bytes on 32-bit DEBUG"
     );
-    #[cfg(all(target_pointer_width = "64", not(feature = "c-debug")))]
+    #[cfg(all(target_pointer_width = "64", not(c_debug)))]
     assert!(
         core::mem::size_of::<MemContext>() == 16,
         "MemContext must be 16 bytes on 64-bit release"
     );
-    #[cfg(all(target_pointer_width = "32", not(feature = "c-debug")))]
+    #[cfg(all(target_pointer_width = "32", not(c_debug)))]
     assert!(
         core::mem::size_of::<MemContext>() == 12,
         "MemContext must be 12 bytes on 32-bit release"
@@ -191,11 +191,11 @@ impl MemContext {
     /// this accessor (the bit does not exist in the layout).
     #[must_use]
     pub const fn active(&self) -> bool {
-        #[cfg(feature = "c-debug")]
+        #[cfg(c_debug)]
         {
             (self.flags >> FLAG_ACTIVE_SHIFT) & FLAG_ACTIVE_MASK != 0
         }
-        #[cfg(not(feature = "c-debug"))]
+        #[cfg(not(c_debug))]
         {
             true
         }
@@ -203,7 +203,7 @@ impl MemContext {
 
     /// Set the active bit. No-op on non-DEBUG builds where the bit does not exist.
     pub fn set_active(&mut self, value: bool) {
-        #[cfg(feature = "c-debug")]
+        #[cfg(c_debug)]
         Self::set_bits(&mut self.flags, FLAG_ACTIVE_SHIFT, FLAG_ACTIVE_MASK, u32::from(value));
     }
 
@@ -490,6 +490,18 @@ unsafe fn mem_realloc_ptr_array<T>(old: *mut *mut T, old_count: usize, new_count
         ptr
     }
 }
+
+// ─── Tree algorithms (32B-3 / future) ──────────────────────────────────────────────────────────
+//
+// 32B-1 shipped the layout mirror, 32B-2 lands the dep-tracking improvements (build.rs +
+// `pgbr-core/*.rs` listed as ninja inputs) so the cargo build re-runs whenever the Rust mirror
+// changes. The actual algorithm migration was attempted in 32B-2 but a build-system-level cfg
+// propagation failure blocks it: `meson setup -Dbuildtype=debug` in test.pl flow ends up with
+// libpgbr_ffi.a built **without** the c-debug cfg even though `[build-ffi.sh] c_debug=1` is
+// printed and the same flags work when run manually from `/work/pgbackrust`. The Rust struct
+// then has the non-DEBUG layout (16 bytes) while the C side has the DEBUG layout (32 bytes),
+// and `mem_context_new` / `_callback_set` corrupt memory when reading bitfield-packed fields.
+// A 32B-3 sub-issue tracks the root-cause analysis of the test-build cfg path.
 
 // ─── Stack (32A) ───────────────────────────────────────────────────────────────────────────────
 

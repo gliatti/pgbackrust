@@ -108,6 +108,12 @@ pgbr_ffi_inputs = files(
     '../cbindgen.toml',
     '../crates/pgbr-ffi/Cargo.toml',
     '../crates/pgbr-ffi/src/lib.rs',
+    '../crates/pgbr-core/Cargo.toml',
+    '../crates/pgbr-core/src/lib.rs',
+    '../crates/pgbr-core/src/debug.rs',
+    '../crates/pgbr-core/src/mem_context.rs',
+    '../crates/pgbr-core/src/stack_trace.rs',
+    '../crates/pgbr-core/src/string_static.rs',
     '../crates/pgbr-encode/Cargo.toml',
     '../crates/pgbr-encode/src/lib.rs',
     '../crates/pgbr-error/Cargo.toml',
@@ -134,11 +140,12 @@ pgbr_ffi_target = custom_target(
         meson.project_build_root(),
         '@OUTPUT0@',
         '@OUTPUT1@',
+        # Forward the meson `debug` option to the cargo build so the `c-debug` feature flips on
+        # the layout-sensitive `MemContext` mirror in `pgbr-core::mem_context`. Passed as an
+        # argument because `custom_target`'s `env:` parameter does not always reach the script
+        # in this version of meson.
+        get_option('debug') ? '1' : '0',
     ],
-    # Forward the meson `debug` option to the cargo build so the `c-debug` feature flips on the
-    # layout-sensitive `MemContext` mirror in `pgbr-core::mem_context`. Without this the Rust
-    # crate would assume one layout while the C build uses the other, corrupting memory.
-    env: get_option('debug') ? {'PGBR_C_DEBUG': '1'} : {'PGBR_C_DEBUG': '0'},
     build_by_default: true,
     install: false,
     console: true,
