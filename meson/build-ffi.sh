@@ -52,8 +52,24 @@ cargo build \
     --package pgbr-ffi \
     "${CARGO_FEATURES_ARGS[@]}"
 
+# Fail-fast: cargo above is supposed to produce libpgbr_ffi.a in CARGO_TARGET_DIR/release/. If it
+# is missing here, something silently swapped the target dir under us (the kind of bug 32B-2 hit
+# when the test.pl flow's `meson setup -Dbuildtype=debug` produced a libpgbr_ffi.a that did not
+# match the C side's `c-debug` cfg). Better to abort here than to copy a stale archive.
+CARGO_OUTPUT_LIB="${CARGO_TARGET_DIR}/release/libpgbr_ffi.a"
+if [[ ! -f "${CARGO_OUTPUT_LIB}" ]]; then
+    echo "[build-ffi.sh] expected ${CARGO_OUTPUT_LIB} to exist after cargo build, but it doesn't" >&2
+    exit 70
+fi
+
+# Sentinel: write the active c_debug state next to the archive in BUILD_ROOT so the C runtime
+# constructor can compare it against the compile-time `sizeof(struct MemContext)`. This makes a
+# layout mismatch fail loudly during the test rather than silently corrupting memory at the first
+# `mem_context_new`.
+echo "${C_DEBUG_ARG}" > "${BUILD_ROOT}/.pgbr-c-debug-active"
+
 # Cargo writes target/release/libpgbr_ffi.a; copy it to the meson-expected output path.
-install -m 0644 "${CARGO_TARGET_DIR}/release/libpgbr_ffi.a" "${OUTPUT_LIB}"
+install -m 0644 "${CARGO_OUTPUT_LIB}" "${OUTPUT_LIB}"
 
 # Pass the same feature to cbindgen so the generated header matches the compiled archive.
 CBINDGEN_FEATURES_ARGS=()

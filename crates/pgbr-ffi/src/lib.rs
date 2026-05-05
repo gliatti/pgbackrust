@@ -1287,6 +1287,153 @@ pub unsafe extern "C" fn pgbr_mem_context_init_top(top: *mut core::ffi::c_void) 
     with_panic_guard(|| unsafe { core_mem_context::init_top(top) });
 }
 
+// ─── Tree algorithms (32B-3) ───────────────────────────────────────────────────────────────────
+//
+// `pgbr_mem_context_new` is the FFI surface for `memContextNewP`; the C wrapper retains the
+// parameter ASSERTs and the `errorTryDepth()` lookup. `pgbr_mem_context_free_callback_recurse`
+// and `_free_release_recurse` are the two halves of `memContextFree` so the C wrapper can keep
+// `TRY_BEGIN`/`FINALLY`/`TRY_END` around them (a callback may longjmp through the Rust frame —
+// this is unsafe in general but works in practice because the Rust frames here have no Drop
+// types or heap locals that would leak).
+
+/// Mirror of the C `MemContextNewParam` struct expanded by the `memContextNewP` macro. The
+/// leading `dummy` field maps to `VAR_PARAM_HEADER`.
+#[repr(C)]
+pub struct PgbrMemContextNewParam {
+    pub dummy: bool,
+    pub child_qty: u8,
+    pub alloc_qty: u8,
+    pub callback_qty: u8,
+    pub alloc_extra: u16,
+}
+
+/// Allocate and initialise a new mem context. Mirrors `memContextNew`.
+///
+/// Returns the pointer to the freshly-pushed `MemContext`; the C wrapper still owns the
+/// `name != NULL` / `name[0] != '\0'` and parameter-range ASSERTs.
+///
+/// # Safety
+///
+/// `name` must be a NUL-terminated C string with a lifetime that outlives the new context (when
+/// `cfg(c_debug)`; ignored otherwise). The current context (slot `memContextCurrentStackIdx`)
+/// must have `child_qty != MEM_QTY_NONE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_new(
+    name: *const c_char,
+    param: PgbrMemContextNewParam,
+    try_depth: u32,
+) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_new(
+            name,
+            param.child_qty,
+            param.alloc_qty,
+            param.callback_qty,
+            param.alloc_extra,
+            try_depth,
+        )
+        .cast::<core::ffi::c_void>()
+    })
+}
+
+/// Set the destructor callback on `this`. Mirrors `memContextCallbackSet`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `callback_qty != MEM_QTY_NONE`. `function` must
+/// remain a valid `extern "C" fn(*mut c_void)` for the lifetime of the context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_callback_set(
+    this: *mut core::ffi::c_void,
+    function: PgbrFreeCallback,
+    argument: *mut core::ffi::c_void,
+) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_callback_set(this.cast::<core_mem_context::MemContext>(), function, argument);
+    });
+}
+
+/// Clear the destructor callback on `this`. Mirrors `memContextCallbackClear`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `callback_qty != MEM_QTY_NONE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_callback_clear(this: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_callback_clear(this.cast::<core_mem_context::MemContext>());
+    });
+}
+
+/// Run the destructor callbacks for `this` and the subtree below it.
+///
+/// Half of `memContextFree`. The C wrapper keeps the other half —
+/// `pgbr_mem_context_free_release_recurse` — under `FINALLY` so callback longjmp does not leak
+/// the freed memory.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_free_callback_recurse(this: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_callback_recurse(this.cast::<core_mem_context::MemContext>());
+    });
+}
+
+/// Free the allocation tree rooted at `this`.
+///
+/// Returns null on success or the offending context pointer when the DEBUG-only "cannot free
+/// current context" invariant is violated; the C wrapper translates a non-null return into
+/// `THROW_FMT(AssertError, "cannot free current context '%s'", err->name)`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose subtree has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_free_release_recurse(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_free_release_recurse(this.cast::<core_mem_context::MemContext>()).cast::<core::ffi::c_void>()
+    })
+}
+
+/// Reparent `this` to `parent_new`. Mirrors `memContextMove`. No-op when `this` is null or
+/// already a child of `parent_new`.
+///
+/// # Safety
+///
+/// `this` (when non-null) and `parent_new` must be valid live `MemContext *`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_move(this: *mut core::ffi::c_void, parent_new: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_move(
+            this.cast::<core_mem_context::MemContext>(),
+            parent_new.cast::<core_mem_context::MemContext>(),
+        );
+    });
+}
+
+/// Sum the allocation footprint of `this` and the subtree below.
+///
+/// Mirrors the DEBUG-only `memContextSize`; in non-DEBUG builds the C wrapper does not call
+/// this — but the FFI symbol stays exported because the Rust algorithm itself is
+/// layout-agnostic and the test rewrite in 32D will need it.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_size(this: *const core::ffi::c_void) -> usize {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_context_size(this.cast::<core_mem_context::MemContext>()) })
+}
+
 /// Logging callback registered by the C side to receive every Rust-originated log line.
 ///
 /// The first argument is a numeric log level matching the C `LogLevel` enum (off=0, assert=1,

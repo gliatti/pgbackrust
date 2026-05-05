@@ -25,7 +25,6 @@
 //! `pgbr_mem_context_init_top` hook (called from a `__attribute__((constructor))` in
 //! `memContext.c`) writes the pointer before `main` runs.
 
-#[cfg(c_debug)]
 use core::ffi::c_char;
 use core::ffi::c_void;
 
@@ -419,11 +418,6 @@ const SIZE_POSSIBLE: [[[usize; 2]; 3]; 3] = [
 // …)` at memContextTest.c:43) calls the static helper directly and is unaffected — that path
 // stays in C and is exercised independently. The Rust side panics defensively because in
 // practice `memContextNewP` / `memNew` allocations succeed.
-//
-// 32B (this sub-issue) only ships the externs + the layout mirror so the surface is ready for
-// the 32B-2 algorithm migration (#236). No live caller exercises these helpers yet — the
-// `dead_code` allow stays until 32B-2 lands.
-#[allow(dead_code)]
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
@@ -432,7 +426,6 @@ unsafe extern "C" {
 
 /// Allocate `size` bytes via libc malloc. Panics on null return; the FFI panic guard surfaces
 /// the failure to the C caller as `ErrorType::Unknown`.
-#[allow(dead_code)]
 unsafe fn mem_alloc(size: usize) -> *mut c_void {
     // SAFETY: libc malloc is always callable with any size; null return is the failure
     // indicator we explicitly check for.
@@ -453,7 +446,6 @@ unsafe fn mem_realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void {
 
 /// libc free. Mirrors the legacy `memFreeInternal` minus the `ASSERT(buffer != NULL)` (the
 /// asserts live in the C wrapper).
-#[allow(dead_code)]
 unsafe fn mem_free(ptr: *mut c_void) {
     // SAFETY: caller asserts `ptr` came from a previous `mem_alloc` / libc malloc.
     unsafe { free(ptr) };
@@ -461,7 +453,7 @@ unsafe fn mem_free(ptr: *mut c_void) {
 
 /// Allocate an array of `count` `*mut T` pointers, all initialised to null. Mirrors the legacy
 /// `memAllocPtrArrayInternal`.
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 unsafe fn mem_alloc_ptr_array<T>(count: usize) -> *mut *mut T {
     // SAFETY: see `mem_alloc`. On success the returned buffer is `count * sizeof(*mut T)`
     // bytes; we zero-initialise via `write_bytes`.
@@ -477,7 +469,7 @@ unsafe fn mem_alloc_ptr_array<T>(count: usize) -> *mut *mut T {
 
 /// Reallocate the pointer array `old` (of `old_count` slots) to `new_count` slots, zero-filling
 /// the new tail. Mirrors `memReAllocPtrArrayInternal`.
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 unsafe fn mem_realloc_ptr_array<T>(old: *mut *mut T, old_count: usize, new_count: usize) -> *mut *mut T {
     // SAFETY: caller asserts `old` came from `mem_alloc_ptr_array` with `old_count` slots.
     unsafe {
@@ -491,17 +483,504 @@ unsafe fn mem_realloc_ptr_array<T>(old: *mut *mut T, old_count: usize, new_count
     }
 }
 
-// ─── Tree algorithms (32B-3 / future) ──────────────────────────────────────────────────────────
+// ─── Tree algorithms (32B-3) ───────────────────────────────────────────────────────────────────
 //
-// 32B-1 shipped the layout mirror, 32B-2 lands the dep-tracking improvements (build.rs +
-// `pgbr-core/*.rs` listed as ninja inputs) so the cargo build re-runs whenever the Rust mirror
-// changes. The actual algorithm migration was attempted in 32B-2 but a build-system-level cfg
-// propagation failure blocks it: `meson setup -Dbuildtype=debug` in test.pl flow ends up with
-// libpgbr_ffi.a built **without** the c-debug cfg even though `[build-ffi.sh] c_debug=1` is
-// printed and the same flags work when run manually from `/work/pgbackrust`. The Rust struct
-// then has the non-DEBUG layout (16 bytes) while the C side has the DEBUG layout (32 bytes),
-// and `mem_context_new` / `_callback_set` corrupt memory when reading bitfield-packed fields.
-// A 32B-3 sub-issue tracks the root-cause analysis of the test-build cfg path.
+// `mem_context_new` allocates and initialises a new context, registering it in the parent's
+// child list and pushing a `New` entry on the mem-context stack. `mem_context_callback_recurse`
+// runs the destructor callbacks tree-deep before any memory is freed (the C wrapper keeps these
+// halves under `TRY_BEGIN`/`FINALLY`/`TRY_END` so a callback longjmp does not leak the freed
+// memory). `mem_context_free_release_recurse` frees the allocation tree. `mem_context_move`
+// reparents an existing context, and `mem_context_size` (DEBUG-only on the C side) sums the
+// allocation totals for audit reporting.
+//
+// All readers of bitfield-packed fields go through the `MemContext::*` accessors, which honour
+// the `cfg(c_debug)` shifts. The C `__attribute__((constructor))` in `memContext.c` aborts the
+// process at load time if `pgbr_mem_context_struct_size()` disagrees with `sizeof(struct
+// MemContext)`, so reaching this code already guarantees the layouts match.
+//
+// Clippy allowances:
+//   * `cast_ptr_alignment` — these algorithms reach into a single malloc'd block via a `*mut u8`
+//     cursor that's then cast to the appropriate optional-region struct. Alignment is correct
+//     because `mem_context_new` pads `alloc_extra` to `align_of::<*mut c_void>()` before
+//     deciding the layout.
+//   * `must_use_candidate` / `too_long_first_doc_paragraph` — FFI-shape API; the documentation
+//     intentionally explains what the C wrapper expects, and the values are inspected by C
+//     callers rather than chained through Rust.
+
+/// Pointer to the optional child region following the `MemContext` header.
+unsafe fn child_offset_ptr(this: *mut MemContext) -> *mut u8 {
+    // SAFETY: caller upholds `this` validity; the returned pointer points inside the same
+    // malloc'd block as `this`.
+    unsafe {
+        let after_struct = this.add(1).cast::<u8>();
+        after_struct.add((*this).alloc_extra() as usize)
+    }
+}
+
+/// Pointer to the optional alloc region; sits after the child region.
+unsafe fn alloc_offset_ptr(this: *mut MemContext) -> *mut u8 {
+    // SAFETY: caller upholds `this` validity.
+    unsafe {
+        let after_struct = this.add(1).cast::<u8>();
+        let child_size = SIZE_POSSIBLE[(*this).child_qty() as usize][0][0];
+        after_struct.add(child_size + (*this).alloc_extra() as usize)
+    }
+}
+
+/// Pointer to the optional callback region; sits after the alloc region.
+unsafe fn callback_offset_ptr(this: *mut MemContext) -> *mut u8 {
+    // SAFETY: caller upholds `this` validity.
+    unsafe {
+        let after_struct = this.add(1).cast::<u8>();
+        let pre = SIZE_POSSIBLE[(*this).child_qty() as usize][(*this).alloc_qty() as usize][0];
+        after_struct.add(pre + (*this).alloc_extra() as usize)
+    }
+}
+
+/// Find an unused slot in the parent's child list, growing it if needed.
+/// Mirrors the legacy `memContextNewIndex`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `child_qty == MEM_QTY_MANY`. `child` must point
+/// at the parent's child-many region (returned by [`child_offset_ptr`] cast to
+/// `*mut MemContextChildMany`).
+unsafe fn mem_context_new_index(this: *mut MemContext, child: *mut MemContextChildMany) -> u32 {
+    // SAFETY: caller upholds the validity invariants above.
+    unsafe {
+        if (*this).child_initialized() {
+            let cm = &mut *child;
+            while cm.free_idx < cm.list_size {
+                if (*cm.list.add(cm.free_idx as usize)).is_null() {
+                    break;
+                }
+                cm.free_idx += 1;
+            }
+            if cm.free_idx == cm.list_size {
+                let new_size = cm.list_size * 2;
+                cm.list = mem_realloc_ptr_array(cm.list, cm.list_size as usize, new_size as usize);
+                cm.list_size = new_size;
+            }
+        } else {
+            core::ptr::write(
+                child,
+                MemContextChildMany {
+                    list: mem_alloc_ptr_array(MEM_CONTEXT_INITIAL_SIZE as usize),
+                    list_size: MEM_CONTEXT_INITIAL_SIZE,
+                    free_idx: 0,
+                },
+            );
+            (*this).set_child_initialized(true);
+        }
+        (*child).free_idx
+    }
+}
+
+/// Allocate and initialise a new `MemContext` whose parent is the current context.
+///
+/// Mirrors the legacy `memContextNew`. The C wrapper still owns the parameter validation
+/// (ASSERTs) and the `errorTryDepth()` lookup. On return the context is registered in the
+/// parent's child list and a `New` entry is pushed on the mem-context stack so an error unwind
+/// will free the partially-built context.
+///
+/// # Safety
+///
+/// `name` must be either a valid NUL-terminated C string with the lifetime of the new context
+/// (when `cfg(c_debug)` is on) or any value when `cfg(c_debug)` is off (the field doesn't
+/// exist). `try_depth` is the current `errorTryDepth()`. The current context (slot
+/// `memContextCurrentStackIdx`) must have `child_qty != MEM_QTY_NONE`.
+#[allow(
+    clippy::cast_ptr_alignment,
+    clippy::expect_used,
+    clippy::too_long_first_doc_paragraph,
+    clippy::must_use_candidate
+)]
+pub unsafe fn mem_context_new(
+    name: *const c_char,
+    child_qty_param: u8,
+    alloc_qty_param: u8,
+    callback_qty_param: u8,
+    alloc_extra_param: u16,
+    try_depth: u32,
+) -> *mut MemContext {
+    let _ = name;
+
+    // Pad allocExtra so trailing optional regions stay aligned.
+    let mut alloc_extra = alloc_extra_param as usize;
+    let align = core::mem::align_of::<*mut c_void>();
+    if !alloc_extra.is_multiple_of(align) {
+        alloc_extra += align - (alloc_extra & (align - 1));
+    }
+
+    let child_qty = if child_qty_param > 1 { MEM_QTY_MANY } else { child_qty_param };
+    let alloc_qty = if alloc_qty_param > 1 { MEM_QTY_MANY } else { alloc_qty_param };
+    let callback_qty = callback_qty_param;
+
+    // SAFETY: see module-level note. We only touch the new allocation and the parent's child
+    // list (read via the same accessors that `cfg(c_debug)` keeps in sync).
+    unsafe {
+        let context_current = current().cast::<MemContext>();
+
+        let total_size = core::mem::size_of::<MemContext>()
+            + alloc_extra
+            + SIZE_POSSIBLE[child_qty as usize][alloc_qty as usize][callback_qty as usize];
+
+        let this = mem_alloc(total_size).cast::<MemContext>();
+
+        core::ptr::write(
+            this,
+            MemContext {
+                #[cfg(c_debug)]
+                name,
+                #[cfg(c_debug)]
+                sequence_new: next_sequence(),
+                flags: 0,
+                context_parent_idx: 0,
+                context_parent: context_current,
+            },
+        );
+
+        let m = &mut *this;
+        m.set_active(true);
+        m.set_child_qty(child_qty);
+        m.set_alloc_qty(alloc_qty);
+        m.set_callback_qty(callback_qty);
+        m.set_alloc_extra(u32::try_from(alloc_extra).expect("alloc_extra fits in 16 bits"));
+
+        // Register `this` in the current context's child list.
+        if (*context_current).child_qty() == MEM_QTY_ONE {
+            let one = child_offset_ptr(context_current).cast::<MemContextChildOne>();
+            (*one).context = this;
+            (*context_current).set_child_initialized(true);
+        } else {
+            // MEM_QTY_MANY (none was rejected on the C side).
+            let many = child_offset_ptr(context_current).cast::<MemContextChildMany>();
+            let idx = mem_context_new_index(context_current, many);
+            (*this).context_parent_idx = idx;
+            *(*many).list.add(idx as usize) = this;
+            (*many).free_idx += 1;
+        }
+
+        // Push the new context onto the stack so an error unwind frees it.
+        push_new(this.cast::<c_void>(), try_depth);
+
+        this
+    }
+}
+
+/// Set the destructor callback on `this`. Mirrors `memContextCallbackSet`.
+///
+/// The C wrapper holds the `ASSERT(active)` / `ASSERT(callbackQty != none)` checks plus the
+/// DEBUG-only "callback is already set" diagnostic.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `callback_qty != MEM_QTY_NONE`. `function` must
+/// remain a valid `extern "C" fn(*mut c_void)` for the lifetime of the context.
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_callback_set(this: *mut MemContext, function: unsafe extern "C" fn(*mut c_void), argument: *mut c_void) {
+    // SAFETY: caller upholds `this` validity and `callback_qty != MEM_QTY_NONE`.
+    unsafe {
+        let cb = callback_offset_ptr(this).cast::<MemContextCallbackOne>();
+        core::ptr::write(
+            cb,
+            MemContextCallbackOne {
+                function: Some(function),
+                argument,
+            },
+        );
+        (*this).set_callback_initialized(true);
+    }
+}
+
+/// Clear the destructor callback on `this`. Mirrors `memContextCallbackClear`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `callback_qty != MEM_QTY_NONE`.
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_callback_clear(this: *mut MemContext) {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let cb = callback_offset_ptr(this).cast::<MemContextCallbackOne>();
+        core::ptr::write(
+            cb,
+            MemContextCallbackOne {
+                function: None,
+                argument: core::ptr::null_mut(),
+            },
+        );
+        (*this).set_callback_initialized(false);
+    }
+}
+
+/// Run the destructor callbacks for `this` and every context below it.
+///
+/// Mirrors `memContextCallbackRecurse`. A callback may longjmp via the C error machinery; the C
+/// wrapper of `memContextFree` puts this call inside `TRY_BEGIN`/`FINALLY` so the freed memory
+/// still gets reclaimed in `mem_context_free_release_recurse`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_callback_recurse(this: *mut MemContext) {
+    // SAFETY: caller upholds `this` validity. Recursion is bounded by the tree depth which the
+    // legacy code does not bound either; the test suite does not push deeper than ~10 levels.
+    unsafe {
+        // DEBUG: certain actions against `this` are no longer allowed.
+        (*this).set_active(false);
+
+        if (*this).callback_initialized() {
+            let cb = &*callback_offset_ptr(this).cast::<MemContextCallbackOne>();
+            if let Some(f) = cb.function {
+                f(cb.argument);
+            }
+            (*this).set_callback_initialized(false);
+        }
+
+        if (*this).child_initialized() {
+            if (*this).child_qty() == MEM_QTY_ONE {
+                let child = (*child_offset_ptr(this).cast::<MemContextChildOne>()).context;
+                if !child.is_null() {
+                    mem_context_callback_recurse(child);
+                }
+            } else {
+                let cm = &*child_offset_ptr(this).cast::<MemContextChildMany>();
+                for idx in 0..cm.list_size {
+                    let child = *cm.list.add(idx as usize);
+                    if !child.is_null() {
+                        mem_context_callback_recurse(child);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Free the allocation tree rooted at `this`. Mirrors `memContextFreeRecurse`.
+///
+/// Returns null on success or the offending context pointer when the DEBUG-only "cannot free
+/// current context" invariant is violated; the C wrapper translates a non-null return into a
+/// `THROW_FMT(AssertError, "cannot free current context '%s'", err->name)`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose tree has not been freed yet.
+#[allow(clippy::cast_ptr_alignment, clippy::needless_pass_by_ref_mut)]
+pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut MemContext {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let top = top_context();
+
+        // DEBUG: cannot free the current context (top is special — it can be reset).
+        #[cfg(c_debug)]
+        if this.cast::<c_void>() == current() && this.cast::<c_void>() != top {
+            return this;
+        }
+
+        // Free children.
+        if (*this).child_initialized() {
+            if (*this).child_qty() == MEM_QTY_ONE {
+                let child = (*child_offset_ptr(this).cast::<MemContextChildOne>()).context;
+                if !child.is_null() {
+                    let err = mem_context_free_release_recurse(child);
+                    if !err.is_null() {
+                        return err;
+                    }
+                }
+            } else {
+                let cm_ptr = child_offset_ptr(this).cast::<MemContextChildMany>();
+                let cm = &*cm_ptr;
+                for idx in 0..cm.list_size {
+                    let child = *cm.list.add(idx as usize);
+                    if !child.is_null() {
+                        let err = mem_context_free_release_recurse(child);
+                        if !err.is_null() {
+                            return err;
+                        }
+                    }
+                }
+                mem_free((*cm_ptr).list.cast::<c_void>());
+            }
+        }
+
+        // Free allocations.
+        if (*this).alloc_initialized() {
+            if (*this).alloc_qty() == MEM_QTY_ONE {
+                let ao = alloc_offset_ptr(this).cast::<MemContextAllocOne>();
+                let alloc = (*ao).alloc;
+                if !alloc.is_null() {
+                    mem_free(alloc.cast::<c_void>());
+                }
+            } else {
+                let am_ptr = alloc_offset_ptr(this).cast::<MemContextAllocMany>();
+                let am = &*am_ptr;
+                for idx in 0..am.list_size {
+                    let alloc = *am.list.add(idx as usize);
+                    if !alloc.is_null() {
+                        mem_free(alloc.cast::<c_void>());
+                    }
+                }
+                mem_free((*am_ptr).list.cast::<c_void>());
+            }
+        }
+
+        if this.cast::<c_void>() == top {
+            // Reset top: the legacy code re-initialises rather than freeing.
+            (*this).set_child_initialized(false);
+            (*this).set_alloc_initialized(false);
+            (*this).set_active(true);
+        } else {
+            // Detach from the parent's child list and free `this`.
+            let parent = (*this).context_parent;
+            if (*parent).child_qty() == MEM_QTY_ONE {
+                (*child_offset_ptr(parent).cast::<MemContextChildOne>()).context = core::ptr::null_mut();
+            } else {
+                let cm_ptr = child_offset_ptr(parent).cast::<MemContextChildMany>();
+                let cm = &mut *cm_ptr;
+                let idx = (*this).context_parent_idx;
+                if idx < cm.free_idx {
+                    cm.free_idx = idx;
+                }
+                *cm.list.add(idx as usize) = core::ptr::null_mut();
+            }
+            mem_free(this.cast::<c_void>());
+        }
+
+        core::ptr::null_mut()
+    }
+}
+
+/// Reparent `this` to `parent_new`. Mirrors `memContextMove`.
+///
+/// No-op when `this` is null or already a child of `parent_new`.
+///
+/// # Safety
+///
+/// `this` (when non-null) must be a valid live `MemContext *` and `parent_new` must be a valid
+/// live `MemContext *`. The C wrapper handles the `parent_new != NULL` ASSERT.
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_move(this: *mut MemContext, parent_new: *mut MemContext) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let old_parent = (*this).context_parent;
+        if old_parent == parent_new {
+            return;
+        }
+
+        // Null out the slot in the old parent.
+        if (*old_parent).child_qty() == MEM_QTY_ONE {
+            (*child_offset_ptr(old_parent).cast::<MemContextChildOne>()).context = core::ptr::null_mut();
+        } else {
+            let cm = &mut *child_offset_ptr(old_parent).cast::<MemContextChildMany>();
+            *cm.list.add((*this).context_parent_idx as usize) = core::ptr::null_mut();
+        }
+
+        // Place in the new parent.
+        if (*parent_new).child_qty() == MEM_QTY_ONE {
+            (*child_offset_ptr(parent_new).cast::<MemContextChildOne>()).context = this;
+            (*parent_new).set_child_initialized(true);
+        } else {
+            let cm_ptr = child_offset_ptr(parent_new).cast::<MemContextChildMany>();
+            let idx = mem_context_new_index(parent_new, cm_ptr);
+            (*this).context_parent_idx = idx;
+            *(*cm_ptr).list.add(idx as usize) = this;
+        }
+
+        (*this).context_parent = parent_new;
+    }
+}
+
+/// Sum the allocation footprint of `this` and the subtree below it.
+///
+/// Mirrors `memContextSize`, which the C side wraps in `#ifdef DEBUG`. Always-defined here
+/// because the layout-mirror constants compile in both flavours; the C wrapper still guards the
+/// call on `#ifdef DEBUG` so non-DEBUG builds do not pay the recursion cost.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[allow(clippy::cast_ptr_alignment, clippy::must_use_candidate)]
+pub unsafe fn mem_context_size(this: *const MemContext) -> usize {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let mut total: usize = 0;
+        let after_struct = this.cast::<u8>().add(core::mem::size_of::<MemContext>());
+        let mut offset = after_struct.add((*this).alloc_extra() as usize);
+
+        // Children.
+        match (*this).child_qty() {
+            MEM_QTY_ONE => {
+                if (*this).child_initialized() {
+                    let co = offset.cast::<MemContextChildOne>();
+                    if !(*co).context.is_null() {
+                        total += mem_context_size((*co).context);
+                    }
+                }
+                offset = offset.add(core::mem::size_of::<MemContextChildOne>());
+            }
+            MEM_QTY_MANY => {
+                if (*this).child_initialized() {
+                    let cm = offset.cast::<MemContextChildMany>();
+                    for idx in 0..(*cm).list_size {
+                        let child = *(*cm).list.add(idx as usize);
+                        if !child.is_null() {
+                            total += mem_context_size(child);
+                        }
+                    }
+                    total += (*cm).list_size as usize * core::mem::size_of::<*mut MemContext>();
+                }
+                offset = offset.add(core::mem::size_of::<MemContextChildMany>());
+            }
+            _ => {}
+        }
+
+        // Allocations.
+        match (*this).alloc_qty() {
+            MEM_QTY_ONE => {
+                if (*this).alloc_initialized() {
+                    let ao = offset.cast::<MemContextAllocOne>();
+                    if !(*ao).alloc.is_null() {
+                        total += (*(*ao).alloc).size as usize;
+                    }
+                }
+                offset = offset.add(core::mem::size_of::<MemContextAllocOne>());
+            }
+            MEM_QTY_MANY => {
+                if (*this).alloc_initialized() {
+                    let am = offset.cast::<MemContextAllocMany>();
+                    for idx in 0..(*am).list_size {
+                        let alloc = *(*am).list.add(idx as usize);
+                        if !alloc.is_null() {
+                            total += (*alloc).size as usize;
+                        }
+                    }
+                    total += (*am).list_size as usize * core::mem::size_of::<*mut MemContextAlloc>();
+                }
+                offset = offset.add(core::mem::size_of::<MemContextAllocMany>());
+            }
+            _ => {}
+        }
+
+        // Callback (no recursion needed; just adjust offset for the trailing region size).
+        if (*this).callback_qty() != MEM_QTY_NONE {
+            offset = offset.add(core::mem::size_of::<MemContextCallbackOne>());
+        }
+
+        ((offset as usize).wrapping_sub(this as usize)) + total
+    }
+}
+
+/// The top context (slot 0 of the mem-context stack). Set once at process start by [`init_top`].
+#[must_use]
+pub fn top_context() -> *mut c_void {
+    // SAFETY: see module-level note. Slot 0 is initialised before `main` runs.
+    unsafe { entry_at(0).mem_context }
+}
 
 // ─── Stack (32A) ───────────────────────────────────────────────────────────────────────────────
 

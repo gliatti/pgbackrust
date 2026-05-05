@@ -444,6 +444,14 @@ testBldUnit(TestBuild *const this)
             "    '%s/cbindgen.toml',\n"
             "    '%s/crates/pgbr-ffi/Cargo.toml',\n"
             "    '%s/crates/pgbr-ffi/src/lib.rs',\n"
+            "    '%s/crates/pgbr-ffi/build.rs',\n"
+            "    '%s/crates/pgbr-core/Cargo.toml',\n"
+            "    '%s/crates/pgbr-core/src/lib.rs',\n"
+            "    '%s/crates/pgbr-core/src/debug.rs',\n"
+            "    '%s/crates/pgbr-core/src/mem_context.rs',\n"
+            "    '%s/crates/pgbr-core/src/stack_trace.rs',\n"
+            "    '%s/crates/pgbr-core/src/string_static.rs',\n"
+            "    '%s/crates/pgbr-core/build.rs',\n"
             "    '%s/crates/pgbr-encode/Cargo.toml',\n"
             "    '%s/crates/pgbr-encode/src/lib.rs',\n"
             "    '%s/crates/pgbr-error/Cargo.toml',\n"
@@ -468,6 +476,12 @@ testBldUnit(TestBuild *const this)
             "        meson.project_build_root(),\n"
             "        '@OUTPUT0@',\n"
             "        '@OUTPUT1@',\n"
+            // 32B-3: forward the per-test build's debug option so build-ffi.sh enables the
+            // `c-debug` cargo feature when the C side is compiled with `-DDEBUG`. Without this
+            // the libpgbr_ffi.a archive ends up with the non-DEBUG `MemContext` mirror layout
+            // (16 bytes on 64-bit) while the C side has the DEBUG layout (32 bytes), and the
+            // Rust algorithms in pgbr-core::mem_context corrupt memory at the first call.
+            "        get_option('debug') ? '1' : '0',\n"
             "    ],\n"
             "    build_by_default: true,\n"
             "    install: false,\n"
@@ -483,7 +497,9 @@ testBldUnit(TestBuild *const this)
             strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
             strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
             strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
-            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel));
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
+            strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel), strZ(pathRepoRel),
+            strZ(pathRepoRel));
 
         // Configure features
         if (module->feature != NULL)
