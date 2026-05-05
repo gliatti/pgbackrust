@@ -98,6 +98,37 @@ legacy_gzDecompress(const bool raw, const Buffer *const input)
     return output;
 }
 
+// `legacy_zstDecompress` mirrors the pre-Phase-25 body of `zstDecompressNew` / `zstDecompressProcess` — direct libzstd calls.
+// One-shot decompression; libzstd's frame decoder is fully deterministic.
+#ifdef HAVE_LIBZST
+static Buffer *
+legacy_zstDecompress(const Buffer *const input)
+{
+    ZSTD_DStream *const ctx = ZSTD_createDStream();
+    ASSERT(ctx != NULL);
+    size_t ret = ZSTD_initDStream(ctx);
+    ASSERT(!ZSTD_isError(ret));
+
+    Buffer *const output = bufNew(bufUsed(input) * 64 + 4096);
+
+    ZSTD_inBuffer in = {.src = bufPtrConst(input), .size = bufUsed(input), .pos = 0};
+    ZSTD_outBuffer out = {.dst = bufPtr(output), .size = bufSize(output), .pos = 0};
+
+    do
+    {
+        ret = ZSTD_decompressStream(ctx, &out, &in);
+        ASSERT(!ZSTD_isError(ret));
+    }
+    while (ret != 0);
+
+    bufUsedSet(output, out.pos);
+
+    ZSTD_freeDStream(ctx);
+
+    return output;
+}
+#endif
+
 // `legacy_zstCompress` mirrors the pre-Phase-24 body of `zstCompressNew` / `zstCompressProcess` — direct libzstd calls with the
 // same level. One-shot compression; libzstd is deterministic given fixed level, so the new IoFilter path and this helper
 // produce byte-identical frames.
@@ -1015,6 +1046,56 @@ testRun(void)
         }
 
         TEST_RESULT_UINT(zstComparisons, 10000, "10k differential zstCompress inputs all byte-identical");
+
+        // -------------------------------------------------------------------------------------------------------------------------
+        TEST_TITLE("zstDecompress differential vs direct libzstd (10000+ inputs)");
+
+        // 10 000 random plaintexts. Compress through Phase 24 then decompress through both the new FFI path and
+        // `legacy_zstDecompress`; both must recover the original plaintext byte-for-byte.
+        uint64_t zstDcLcg = UINT64_C(0xFEEDC0DECAFEBABE);
+        unsigned int zstDcComparisons = 0;
+
+        for (unsigned int iter = 0; iter < 10000; iter++)
+        {
+            zstDcLcg = zstDcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+
+            const size_t zstDcLen = (size_t)((zstDcLcg >> 32) & 0x3FF) + 1;
+            const int zstDcLevel = (int)(((zstDcLcg >> 24) & 0xFF) % 30) - 7;
+
+            Buffer *const zstDcPlaintext = bufNew(zstDcLen);
+            for (size_t i = 0; i < zstDcLen; i++)
+            {
+                zstDcLcg = zstDcLcg * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                bufPtr(zstDcPlaintext)[i] = (uint8_t)(zstDcLcg >> 56);
+            }
+            bufUsedSet(zstDcPlaintext, zstDcLen);
+
+            Buffer *const zstDcCompressed = testCompress(
+                compressFilterP(compressTypeZst, zstDcLevel), zstDcPlaintext, zstDcLen, zstDcLen * 2 + 4096);
+
+            Buffer *const zstDcNewOut = testDecompress(
+                decompressFilterP(compressTypeZst), zstDcCompressed, zstDcLen, zstDcLen + 1);
+            Buffer *const zstDcLegacyOut = legacy_zstDecompress(zstDcCompressed);
+
+            if (!bufEq(zstDcNewOut, zstDcPlaintext) || !bufEq(zstDcLegacyOut, zstDcPlaintext) ||
+                !bufEq(zstDcNewOut, zstDcLegacyOut))
+            {
+                TEST_ERROR_FMT(
+                    THROW_FMT(AssertError, "differential mismatch"),
+                    AssertError,
+                    "zstDecompress(level=%d, len=%zu) iter=%u newSize=%zu legacySize=%zu plaintextSize=%zu", zstDcLevel, zstDcLen,
+                    iter, bufUsed(zstDcNewOut), bufUsed(zstDcLegacyOut), bufUsed(zstDcPlaintext));
+            }
+
+            bufFree(zstDcPlaintext);
+            bufFree(zstDcCompressed);
+            bufFree(zstDcNewOut);
+            bufFree(zstDcLegacyOut);
+
+            zstDcComparisons++;
+        }
+
+        TEST_RESULT_UINT(zstDcComparisons, 10000, "10k differential zstDecompress inputs all byte-identical");
 #else
         TEST_ERROR(compressTypePresent(compressTypeZst), OptionInvalidValueError, "pgBackRust not built with zst support");
 #endif // HAVE_LIBZST

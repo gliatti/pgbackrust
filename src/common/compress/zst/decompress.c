@@ -1,11 +1,14 @@
 /***********************************************************************************************************************************
 ZST Decompress
+
+Thin C wrapper over the Rust streaming decompressor in `crates/pgbr-compress::zst::decompress`. The IoFilter object, the
+input-cursor state, and the `frameDone` / `done` / `inputSame` flags stay on the C side; the libzstd calls
+(`ZSTD_createDStream`, `ZSTD_initDStream`, `ZSTD_decompressStream`, `ZSTD_freeDStream`) are replaced by FFI calls into
+libpgbr_ffi.a.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #ifdef HAVE_LIBZST
-
-#include <zstd.h>
 
 #include "common/compress/common.h"
 #include "common/compress/zst/common.h"
@@ -14,13 +17,14 @@ ZST Decompress
 #include "common/io/filter/filter.h"
 #include "common/log.h"
 #include "common/type/object.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Object type
 ***********************************************************************************************************************************/
 typedef struct ZstDecompress
 {
-    ZSTD_DStream *context;                                          // Decompression context
+    void *state;                                                    // Opaque pgbr_compress::zst::decompress::Decompress*
     IoFilter *filter;                                               // Filter interface
 
     bool inputSame;                                                 // Is the same input required on the next process call?
@@ -59,7 +63,8 @@ zstDecompressFreeResource(THIS_VOID)
 
     ASSERT(this != NULL);
 
-    ZSTD_freeDStream(this->context);
+    pgbr_zst_decompress_state_free(this->state);
+    this->state = NULL;
 
     FUNCTION_LOG_RETURN_VOID();
 }
@@ -79,13 +84,11 @@ zstDecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const de
     FUNCTION_LOG_END();
 
     ASSERT(this != NULL);
-    ASSERT(this->context != NULL);
+    ASSERT(this->state != NULL);
     ASSERT(decompressed != NULL);
 
-    // When there is no more input then decompression is done
     if (compressed == NULL)
     {
-        // If the current frame being decompressed was not completed then error
         if (!this->frameDone)
             THROW(FormatError, "unexpected eof in compressed data");
 
@@ -93,24 +96,23 @@ zstDecompressProcess(THIS_VOID, const Buffer *const compressed, Buffer *const de
     }
     else
     {
-        // Initialize input/output buffer
-        ZSTD_inBuffer in = {.src = bufPtrConst(compressed) + this->inputOffset, .size = bufUsed(compressed) - this->inputOffset};
-        ZSTD_outBuffer out = {.dst = bufRemainsPtr(decompressed), .size = bufRemains(decompressed)};
+        const size_t srcAvail = bufUsed(compressed) - this->inputOffset;
+        size_t written = 0;
+        size_t consumed = 0;
+        const size_t hint = pgbr_zst_decompress_state_decompress(
+            this->state, bufPtrConst(compressed) + this->inputOffset, srcAvail, bufRemainsPtr(decompressed),
+            bufRemains(decompressed), &written, &consumed);
 
-        // Perform decompression. Track frame done so we can detect unexpected EOF.
-        this->frameDone = zstError(ZSTD_decompressStream(this->context, &out, &in)) == 0;
-        bufUsedInc(decompressed, out.pos);
+        // Surface libzstd errors via the legacy classifier; `frameDone` flags hint==0.
+        this->frameDone = zstError(hint) == 0;
 
-        // If the input buffer was not entirely consumed then set inputSame and store the offset where processing will restart
-        if (in.pos < in.size)
+        bufUsedInc(decompressed, written);
+
+        if (consumed < srcAvail)
         {
-            // Output buffer should be completely full
-            ASSERT(out.pos == out.size);
-
             this->inputSame = true;
-            this->inputOffset += in.pos;
+            this->inputOffset += consumed;
         }
-        // Else ready for more input
         else
         {
             this->inputOffset = 0;
@@ -165,16 +167,20 @@ zstDecompressNew(const bool raw)
 
     OBJ_NEW_BEGIN(ZstDecompress, .childQty = MEM_CONTEXT_QTY_MAX, .callbackQty = 1)
     {
-        *this = (ZstDecompress)
+        *this = (ZstDecompress){.state = NULL};
+
+        // Create the Rust streaming decompressor
+        size_t errCode = 0;
+        this->state = pgbr_zst_decompress_state_new(&errCode);
+
+        if (this->state == NULL)
         {
-            .context = ZSTD_createDStream(),
-        };
+            pgbr_last_error_clear();
+            zstError(errCode);
+        }
 
         // Set callback to ensure zst context is freed
         memContextCallbackSet(objMemContext(this), zstDecompressFreeResource, this);
-
-        // Initialize context
-        zstError(ZSTD_initDStream(this->context));
     }
     OBJ_NEW_END();
 
