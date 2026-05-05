@@ -1,5 +1,9 @@
 /***********************************************************************************************************************************
 Zero-Terminated String Handler
+
+The allocation primitive `zNewInternal` is migrated to `pgbr-core::string_z::new`. The variadic `zNewFmt` and the StringId
+formatter `zNewStrId` keep their bodies on the C side because routing `va_list` and `strIdToZN` through the FFI surface would be
+more work than the few remaining C lines they replace — same trade-off as `strStcFmt` in `stringStatic.c`.
 ***********************************************************************************************************************************/
 #include <build.h>
 
@@ -7,10 +11,12 @@ Zero-Terminated String Handler
 #include <stdio.h>
 
 #include "common/debug.h"
+#include "common/error/error.h"
 #include "common/memContext.h"
 #include "common/type/object.h"
 #include "common/type/stringId.h"
 #include "common/type/stringZ.h"
+#include "pgbr_ffi.h"
 
 /**********************************************************************************************************************************/
 static char *
@@ -20,17 +26,7 @@ zNewInternal(const size_t size)
         FUNCTION_TEST_PARAM(SIZE, size);
     FUNCTION_TEST_END();
 
-    // Allocate the string as extra or a separate allocation based on how large it is
-    char *result;
-
-    OBJ_NEW_BASE_EXTRA_BEGIN(
-        char *, size > MEM_CONTEXT_ALLOC_EXTRA_MAX ? 0 : (uint16_t)size, .allocQty = size > MEM_CONTEXT_ALLOC_EXTRA_MAX ? 1 : 0)
-    {
-        result = size > MEM_CONTEXT_ALLOC_EXTRA_MAX ? memNew(size) : OBJ_NEW_ALLOC();
-    }
-    OBJ_NEW_END();
-
-    FUNCTION_TEST_RETURN(STRINGZ, result);
+    FUNCTION_TEST_RETURN(STRINGZ, pgbr_string_z_new(size, errorTryDepth()));
 }
 
 /**********************************************************************************************************************************/

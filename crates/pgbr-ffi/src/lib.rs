@@ -18,6 +18,7 @@ use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::object as core_object;
 use pgbr_core::stack_trace as core_stack_trace;
 use pgbr_core::string_static as core_string_static;
+use pgbr_core::string_z as core_string_z;
 use pgbr_encode::{self as encode, EncodingType};
 use pgbr_error::retry::RetryState;
 use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
@@ -4693,6 +4694,24 @@ pub unsafe extern "C" fn pgbr_regex_prefix_len(pattern: *const c_char) -> usize 
         let bytes = unsafe { CStr::from_ptr(pattern) }.to_bytes();
         pgbr_regex::prefix_len(bytes)
     })
+}
+
+// ─── pgbr_string_z ─────────────────────────────────────────────────────────────────────────────
+
+/// `zNewInternal(size)`: allocate a fresh `size`-byte buffer in a brand-new `MemContext`.
+///
+/// Mirrors the legacy `OBJ_NEW_BASE_EXTRA_BEGIN(char *, ...)` body — small sizes are
+/// folded into the new context's `allocExtra` slot, larger ones get a single child
+/// allocation. Either way the buffer survives past this call.
+///
+/// # Safety
+///
+/// Single-threaded mem-context invariant. `try_depth` must come from the C-side
+/// `errorTryDepth()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_string_z_new(size: usize, try_depth: u32) -> *mut c_char {
+    // SAFETY: caller upholds the contract.
+    with_panic_guard(|| unsafe { core_string_z::new(size, try_depth) })
 }
 
 // ─── pgbr_obj ──────────────────────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ pub mod mem_context;
 pub mod object;
 pub mod stack_trace;
 pub mod string_static;
+pub mod string_z;
 
 use core::ffi::{CStr, c_char};
 use core::fmt;
