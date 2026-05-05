@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::ffi::CString;
 
 pub mod format;
+pub mod retry;
 
 include!(concat!(env!("OUT_DIR"), "/error_types.rs"));
 

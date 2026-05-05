@@ -188,11 +188,7 @@ fn emit_str(out: &mut String, arg: Option<Arg<'_>>, precision: Option<u32>) {
         _ => "",
     };
     // Char-boundary safe truncation: walk char_indices to the p-th char.
-    let truncated = precision.map_or(s, |p| {
-        s.char_indices()
-            .nth(p as usize)
-            .map_or(s, |(idx, _)| &s[..idx])
-    });
+    let truncated = precision.map_or(s, |p| s.char_indices().nth(p as usize).map_or(s, |(idx, _)| &s[..idx]));
     out.push_str(truncated);
 }
 
@@ -266,10 +262,7 @@ mod tests {
     fn literal_template_passes_through() {
         assert_eq!(format_message("hello", &[]), "hello");
         assert_eq!(format_message("", &[]), "");
-        assert_eq!(
-            format_message("path /etc/foo bar", &[]),
-            "path /etc/foo bar"
-        );
+        assert_eq!(format_message("path /etc/foo bar", &[]), "path /etc/foo bar");
     }
 
     #[test]

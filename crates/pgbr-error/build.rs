@@ -269,6 +269,63 @@ fn emit_module(out: &mut fs::File, entries: &[Entry]) {
 
     writeln!(
         out,
+        "    /// C-side symbol name (`PascalCase` + `Error` suffix), matching the second argument of"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `ERROR_DEFINE` in `error.auto.c.inc` and the value returned by the C-side"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `errorTypeName`. Used by the retry-message formatter to reproduce the legacy"
+    )
+    .unwrap();
+    writeln!(out, "    /// `[FormatError]` / `[KernelError]` rendering byte-for-byte.").unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(out, "    pub const fn c_name(self) -> &'static str {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for entry in entries {
+        writeln!(
+            out,
+            "            Self::{} => \"{}Error\",",
+            to_pascal_case(&entry.name),
+            to_pascal_case(&entry.name)
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "    /// Lookup helper: numeric code → C-side symbol name. Returns the literal"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `\"UnknownError\"` for codes not in the shared table — the retry formatter never"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// receives unknown codes in production but the fallback keeps the function total"
+    )
+    .unwrap();
+    writeln!(out, "    /// and the C ABI well-defined for fuzz inputs.").unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(out, "    pub const fn c_name_for_code(code: i32) -> &'static str {{").unwrap();
+    writeln!(out, "        match Self::from_code(code) {{").unwrap();
+    writeln!(out, "            Some(t) => t.c_name(),").unwrap();
+    writeln!(out, "            None => \"UnknownError\",").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
         "    /// Parent variant in the error-type chain. The runtime entry is its own parent"
     )
     .unwrap();

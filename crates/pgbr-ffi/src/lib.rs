@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgbr_encode::{self as encode, EncodingType};
+use pgbr_error::retry::RetryState;
 use pgbr_error::{Error, ErrorType, clear_last_error, last_error_code, last_error_message, set_last_error};
 
 /// Version string of the embedded Rust FFI shim, tracking `Cargo.toml`'s workspace version.
@@ -298,11 +299,7 @@ pub unsafe extern "C" fn pgbr_error_format_message(
 /// SAFETY: the caller upholds the documented contract on `pgbr_error_format_message`.
 // The function unpacks a fixed-size payload from the FFI blob into typed Rust values; the casts
 // are exactly the contract documented on `PgbrFmtArg::value_a`.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 unsafe fn pgbr_error_format_message_impl(
     template_utf8: *const c_char,
     args: *const PgbrFmtArg,
@@ -442,6 +439,174 @@ pub unsafe extern "C" fn pgbr_error_type_from_name(name_utf8: *const c_char) -> 
             return 0;
         };
         ErrorType::from_name(name).map_or(0, ErrorType::code)
+    })
+}
+
+/// Build a fresh, empty [`RetryState`] baselined at `time_begin_ms` and return its boxed
+/// pointer to the C side.
+///
+/// The C wrapper in `src/common/error/retry.c` stores it as the opaque body of an
+/// `ErrorRetry` and releases it via [`pgbr_error_retry_state_free`] in the
+/// memory-context callback.
+///
+/// Never returns null in normal operation; the [`with_panic_guard`] wrapper substitutes a
+/// null pointer if the underlying allocation panics.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_retry_state_new(time_begin_ms: u64) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        let state = Box::new(RetryState::new(time_begin_ms));
+        Box::into_raw(state).cast()
+    })
+}
+
+/// Drop a [`RetryState`] previously returned by [`pgbr_error_retry_state_new`]. No-op on
+/// null.
+///
+/// # Safety
+///
+/// `state` must be a pointer previously returned by [`pgbr_error_retry_state_new`] that
+/// has not yet been freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_free(state: *mut core::ffi::c_void) {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: caller upholds the ownership invariant — the pointer came from
+        // `pgbr_error_retry_state_new` and has not been freed.
+        let _ = unsafe { Box::from_raw(state.cast::<RetryState>()) };
+    });
+}
+
+/// Record an error in the retry accumulator. The first call captures the type and message
+/// verbatim; subsequent calls dedupe by message text and update the latest retry time.
+///
+/// Returns `0` on success, `-1` on bad input (null `state` or null `message_utf8`, or
+/// `message_utf8` that is not valid UTF-8). On `-1` the thread-local last error is set.
+///
+/// # Safety
+///
+/// - `state` must be a non-null pointer from [`pgbr_error_retry_state_new`] that has not
+///   yet been freed.
+/// - `message_utf8` must be a non-null pointer to a NUL-terminated, valid UTF-8 byte
+///   sequence readable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_add(
+    state: *mut core::ffi::c_void,
+    error_type_code: i32,
+    message_utf8: *const c_char,
+    now_ms: u64,
+) -> i32 {
+    with_panic_guard(|| {
+        if state.is_null() || message_utf8.is_null() {
+            set_last_error(Error::new(ErrorType::Assert, "pgbr_error_retry_state_add: null argument"));
+            return -1;
+        }
+        // SAFETY: caller guarantees the handle is alive and unaliased; `add` does not retain `&mut`.
+        let state_ref = unsafe { &mut *state.cast::<RetryState>() };
+        // SAFETY: caller guarantees `message_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(message_utf8) };
+        let Ok(message) = cstr.to_str() else {
+            set_last_error(Error::new(
+                ErrorType::Format,
+                "pgbr_error_retry_state_add: message is not valid UTF-8",
+            ));
+            return -1;
+        };
+        state_ref.add(error_type_code, message, now_ms);
+        0
+    })
+}
+
+/// Numeric code of the first error recorded on `state`, or `-1` if no error has been
+/// added yet (or `state` is null).
+///
+/// # Safety
+///
+/// `state` must be either null or a pointer from [`pgbr_error_retry_state_new`] that has
+/// not yet been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_first_type_code(state: *const core::ffi::c_void) -> i32 {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return -1;
+        }
+        // SAFETY: caller guarantees the handle is alive.
+        let state_ref = unsafe { &*state.cast::<RetryState>() };
+        state_ref.first_type_code().unwrap_or(-1)
+    })
+}
+
+/// Pointer to the cached NUL-terminated UTF-8 first-error message, or null if no error
+/// has been added yet (or `state` is null).
+///
+/// The returned pointer is valid until the next [`pgbr_error_retry_state_add`] call on
+/// the same `state`. Callers must not free it.
+///
+/// # Safety
+///
+/// `state` must be either null or a pointer from [`pgbr_error_retry_state_new`] that has
+/// not yet been freed. The implementation lazily caches a `CString` mirror of the
+/// message inside `state`, so the supplied pointer must remain mutably accessible for
+/// the duration of the call (no aliasing).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_first_message(state: *mut core::ffi::c_void) -> *const c_char {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return core::ptr::null();
+        }
+        // SAFETY: caller guarantees the handle is alive and unaliased.
+        let state_ref = unsafe { &mut *state.cast::<RetryState>() };
+        state_ref.first_message_cstr().map_or(core::ptr::null(), |c| c.as_ptr())
+    })
+}
+
+/// Number of deduplicated retry items beyond the first error.
+///
+/// The C side mirrors `lstSize(this->list)` from the legacy implementation — the test
+/// harness uses a non-zero value to switch between the "first message only" and
+/// "RETRY DETAIL OMITTED" renderings.
+///
+/// Returns `0` if `state` is null.
+///
+/// # Safety
+///
+/// `state` must be either null or a pointer from [`pgbr_error_retry_state_new`] that has
+/// not yet been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_item_count(state: *const core::ffi::c_void) -> usize {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return 0;
+        }
+        // SAFETY: caller guarantees the handle is alive.
+        let state_ref = unsafe { &*state.cast::<RetryState>() };
+        state_ref.item_count()
+    })
+}
+
+/// Pointer to the cached NUL-terminated UTF-8 fully-formatted retry message, or null if
+/// no first error has been added.
+///
+/// The format reproduces the legacy C `errRetryMessage` output byte-for-byte (asserted
+/// by the differential test in `errorRetryTest.c`). The returned pointer is valid until
+/// the next [`pgbr_error_retry_state_add`] call on the same `state`.
+///
+/// # Safety
+///
+/// `state` must be either null or a pointer from [`pgbr_error_retry_state_new`] that has
+/// not yet been freed. The implementation lazily caches a `CString` mirror of the
+/// message inside `state`, so the supplied pointer must remain mutably accessible for
+/// the duration of the call (no aliasing).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_retry_state_format_message(state: *mut core::ffi::c_void) -> *const c_char {
+    with_panic_guard(|| {
+        if state.is_null() {
+            return core::ptr::null();
+        }
+        // SAFETY: caller guarantees the handle is alive and unaliased.
+        let state_ref = unsafe { &mut *state.cast::<RetryState>() };
+        state_ref.formatted_cstr().map_or(core::ptr::null(), |c| c.as_ptr())
     })
 }
 
