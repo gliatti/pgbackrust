@@ -159,6 +159,42 @@ mod tests {
     }
 
     #[test]
+    fn from_name_round_trips_known_variants() {
+        assert_eq!(ErrorType::from_name("memory"), Some(ErrorType::Memory));
+        assert_eq!(ErrorType::from_name("option-invalid"), Some(ErrorType::OptionInvalid));
+        assert_eq!(ErrorType::from_name("runtime"), Some(ErrorType::Runtime));
+        assert_eq!(ErrorType::from_name("Runtime"), None);
+        assert_eq!(ErrorType::from_name(""), None);
+        assert_eq!(ErrorType::from_name("nope"), None);
+    }
+
+    #[test]
+    fn parent_chain_is_flat_to_runtime_with_self_loop() {
+        // Every production entry currently parents to runtime; runtime is its own parent.
+        assert_eq!(ErrorType::Runtime.parent(), ErrorType::Runtime);
+        assert_eq!(ErrorType::Runtime.parent_code(), ErrorType::Runtime.code());
+        assert_eq!(ErrorType::Memory.parent(), ErrorType::Runtime);
+        assert_eq!(ErrorType::FileMissing.parent_code(), ErrorType::Runtime.code());
+    }
+
+    #[test]
+    fn extends_matches_c_semantics() {
+        // Strict: a non-self-parented type does not extend itself.
+        assert!(!ErrorType::Memory.extends(ErrorType::Memory));
+        assert!(!ErrorType::FileMissing.extends(ErrorType::FileMissing));
+
+        // Self-parented runtime extends runtime (first iteration finds the parent).
+        assert!(ErrorType::Runtime.extends(ErrorType::Runtime));
+
+        // Every non-runtime variant extends runtime through one hop.
+        assert!(ErrorType::Memory.extends(ErrorType::Runtime));
+        assert!(ErrorType::FileMissing.extends(ErrorType::Runtime));
+
+        // No production cross-relationships exist (everything parents to runtime).
+        assert!(!ErrorType::Memory.extends(ErrorType::FileMissing));
+    }
+
+    #[test]
     fn error_carries_type_and_message() {
         let err = Error::new(ErrorType::FileMissing, "no such file: /tmp/missing");
         assert_eq!(err.error_type(), ErrorType::FileMissing);

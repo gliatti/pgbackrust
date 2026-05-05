@@ -78,6 +78,12 @@ impl<T> FfiPanicReturn for *mut T {
     }
 }
 
+impl FfiPanicReturn for bool {
+    fn ffi_panic_return() -> Self {
+        false
+    }
+}
+
 /// Run `body` while protecting the FFI boundary from a Rust panic.
 ///
 /// If the body panics, the panic is recorded as the thread's last error
@@ -175,6 +181,63 @@ pub extern "C" fn pgbr_last_error_take_code() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn pgbr_last_error_clear() {
     with_panic_guard(clear_last_error);
+}
+
+/// Numeric code of the parent variant of the error type identified by `code`, or `-1` if `code`
+/// is not part of the shared error table.
+///
+/// Mirrors `errorTypeParent`, except that the runtime variant returns its own code (the C side
+/// also uses a self-loop so the chain walk in `errorTypeExtends` can terminate). The C-only
+/// `TestError` (DEBUG builds) and the test fixtures in `errorTest.c` are not part of the shared
+/// table and therefore return `-1`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_type_parent_code(code: i32) -> i32 {
+    with_panic_guard(|| ErrorType::from_code(code).map_or(-1, ErrorType::parent_code))
+}
+
+/// Returns `true` if the error type with code `child` extends (transitively, via parent chain)
+/// the error type with code `parent`.
+///
+/// Mirrors `errorTypeExtends`. Strict: a non-self-parented type does not extend itself; the
+/// runtime variant does extend itself because its parent self-loops. Returns `false` if either
+/// `child` or `parent` is not part of the shared error table.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_error_type_extends_by_code(child: i32, parent: i32) -> bool {
+    with_panic_guard(|| {
+        let Some(child_t) = ErrorType::from_code(child) else {
+            return false;
+        };
+        let Some(parent_t) = ErrorType::from_code(parent) else {
+            return false;
+        };
+        child_t.extends(parent_t)
+    })
+}
+
+/// Numeric code of the error type whose YAML kebab-case name matches `name_utf8`, or `0` if no
+/// such type exists, `name_utf8` is null, or the buffer is not valid UTF-8.
+///
+/// `0` is a safe sentinel because the production error table starts at `25` (assert) and `0` is
+/// not a valid `errorTypeCode`. The C `TestError` (DEBUG builds, code `1`) is not part of the
+/// shared table and therefore returns `0`.
+///
+/// # Safety
+///
+/// `name_utf8` must be either null or point to a NUL-terminated, valid UTF-8 byte sequence
+/// readable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_error_type_from_name(name_utf8: *const c_char) -> i32 {
+    with_panic_guard(|| {
+        if name_utf8.is_null() {
+            return 0;
+        }
+        // SAFETY: caller guarantees `name_utf8` is NUL-terminated and readable.
+        let cstr = unsafe { CStr::from_ptr(name_utf8) };
+        let Ok(name) = cstr.to_str() else {
+            return 0;
+        };
+        ErrorType::from_name(name).map_or(0, ErrorType::code)
+    })
 }
 
 /// Logging callback registered by the C side to receive every Rust-originated log line.

@@ -74,6 +74,14 @@ bldErrParseErrorList(Yaml *const yaml)
                     {
                         errRaw.fatal = yamlBoolParse(errDefVal);
                     }
+                    // The `parent:` sub-key is consumed by the Rust build.rs in crates/pgbr-error to wire up the parent chain
+                    // exposed via `pgbr_error_type_extends_by_code` / `pgbr_error_type_parent_code`. The C render side currently
+                    // hard-codes `RuntimeError` for every entry (see render.c), matching the production data where every entry
+                    // parents to runtime. Accepted here so the YAML grammar stays uniform across both languages.
+                    else if (strEqZ(errDef.value, "parent"))
+                    {
+                        // Consume value; nothing else to do.
+                    }
                     else
                         THROW_FMT(FormatError, "unknown error definition '%s'", strZ(errDef.value));
 

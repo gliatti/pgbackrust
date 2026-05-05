@@ -7,23 +7,28 @@
 //!
 //! Reads `src/build/error/error.yaml` (the C-side source of truth for error codes) and emits a
 //! Rust module `error_types.rs` into `OUT_DIR`. The generated module exposes an `ErrorType` enum
-//! with the same numeric discriminants as the C `errorType*` codes plus a `from_code` lookup and
-//! an `is_fatal` flag.
+//! with the same numeric discriminants as the C `errorType*` codes plus lookups by code/name and
+//! a parent-chain `extends` walk that mirrors the C `errorTypeExtends` semantics.
 //!
-//! The YAML grammar is intentionally narrow (single-document, two indentation levels, only `code`
-//! and `fatal` sub-keys) so we parse it with a hand-rolled state machine rather than pulling a
-//! YAML crate into the build graph.
+//! The YAML grammar is intentionally narrow (single-document, two indentation levels, only
+//! `code`, `fatal`, and an optional `parent:` sub-key) so we parse it with a hand-rolled state
+//! machine rather than pulling a YAML crate into the build graph.
 
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+// Sentinel parent name used when an entry omits `parent:`. The runtime entry is its own parent,
+// matching the C self-loop in `error.auto.c.inc`.
+const DEFAULT_PARENT: &str = "runtime";
+
 #[derive(Debug)]
 struct Entry {
     name: String,
     code: i32,
     fatal: bool,
+    parent: String,
 }
 
 fn main() {
@@ -41,6 +46,7 @@ fn main() {
 
     let content = fs::read_to_string(&yaml_path).unwrap_or_else(|e| panic!("read {}: {}", yaml_path.display(), e));
     let entries = parse_error_yaml(&content);
+    validate_parents(&entries);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let out_path = out_dir.join("error_types.rs");
@@ -51,7 +57,7 @@ fn main() {
 
 fn parse_error_yaml(content: &str) -> Vec<Entry> {
     let mut entries = Vec::new();
-    let mut pending: Option<(String, Option<i32>, bool)> = None;
+    let mut pending: Option<(String, Option<i32>, bool, String)> = None;
 
     for raw in content.lines() {
         let line = raw.split('#').next().unwrap_or("");
@@ -67,13 +73,18 @@ fn parse_error_yaml(content: &str) -> Vec<Entry> {
 
         if leading == 0 {
             // Flush any pending object-form entry before starting a new one.
-            if let Some((name, Some(code), fatal)) = pending.take() {
-                entries.push(Entry { name, code, fatal });
+            if let Some((name, Some(code), fatal, parent)) = pending.take() {
+                entries.push(Entry {
+                    name,
+                    code,
+                    fatal,
+                    parent,
+                });
             }
 
             if value.is_empty() {
                 // `name:` followed by indented sub-keys.
-                pending = Some((key.to_string(), None, false));
+                pending = Some((key.to_string(), None, false, DEFAULT_PARENT.to_string()));
             } else {
                 // `name: code` shorthand.
                 let code: i32 = value
@@ -83,10 +94,11 @@ fn parse_error_yaml(content: &str) -> Vec<Entry> {
                     name: key.to_string(),
                     code,
                     fatal: false,
+                    parent: DEFAULT_PARENT.to_string(),
                 });
             }
         } else {
-            let (_, code, fatal) = pending.as_mut().expect("indented line without parent key");
+            let (_, code, fatal, parent) = pending.as_mut().expect("indented line without parent key");
             match key {
                 "code" => {
                     *code = Some(value.parse().expect("integer `code:`"));
@@ -94,18 +106,43 @@ fn parse_error_yaml(content: &str) -> Vec<Entry> {
                 "fatal" => {
                     *fatal = matches!(value, "true" | "yes");
                 }
+                "parent" => {
+                    assert!(!value.is_empty(), "empty `parent:` value");
+                    *parent = value.to_string();
+                }
                 other => panic!("unsupported sub-key `{other}` on indented line"),
             }
         }
     }
 
-    if let Some((name, Some(code), fatal)) = pending {
-        entries.push(Entry { name, code, fatal });
+    if let Some((name, Some(code), fatal, parent)) = pending {
+        entries.push(Entry {
+            name,
+            code,
+            fatal,
+            parent,
+        });
     }
 
     entries
 }
 
+fn validate_parents(entries: &[Entry]) {
+    for entry in entries {
+        assert!(
+            entries.iter().any(|e| e.name == entry.parent),
+            "entry `{}` references unknown parent `{}` (must be the name of another YAML entry)",
+            entry.name,
+            entry.parent
+        );
+    }
+    assert!(
+        entries.iter().any(|e| e.name == DEFAULT_PARENT),
+        "YAML must define an entry named `{DEFAULT_PARENT}` (used as the default parent)"
+    );
+}
+
+#[allow(clippy::too_many_lines)]
 fn emit_module(out: &mut fs::File, entries: &[Entry]) {
     writeln!(
         out,
@@ -149,6 +186,29 @@ fn emit_module(out: &mut fs::File, entries: &[Entry]) {
             out,
             "            {} => Some(Self::{}),",
             entry.code,
+            to_pascal_case(&entry.name)
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "    /// Returns the variant whose YAML kebab-case name equals `name`, or `None` if no"
+    )
+    .unwrap();
+    writeln!(out, "    /// such variant exists.").unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(out, "    pub fn from_name(name: &str) -> Option<Self> {{").unwrap();
+    writeln!(out, "        match name {{").unwrap();
+    for entry in entries {
+        writeln!(
+            out,
+            "            \"{}\" => Some(Self::{}),",
+            entry.name,
             to_pascal_case(&entry.name)
         )
         .unwrap();
@@ -203,6 +263,75 @@ fn emit_module(out: &mut fs::File, entries: &[Entry]) {
         )
         .unwrap();
     }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "    /// Parent variant in the error-type chain. The runtime entry is its own parent"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// (matching the C self-loop), so `parent` is a total function on `ErrorType`."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    // The match arms are deliberately enumerated per variant rather than collapsed into a wildcard
+    // so a future YAML edit that introduces a non-runtime parent (e.g. `json-format` -> `format`)
+    // is a one-line change here. Today all entries currently parent to runtime, which the lint
+    // would flag as duplicate arms — silence it on this method only.
+    writeln!(out, "    #[allow(clippy::match_same_arms)]").unwrap();
+    writeln!(out, "    pub const fn parent(self) -> Self {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for entry in entries {
+        writeln!(
+            out,
+            "            Self::{} => Self::{},",
+            to_pascal_case(&entry.name),
+            to_pascal_case(&entry.parent)
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    /// Numeric code of the parent variant.").unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(out, "    pub const fn parent_code(self) -> i32 {{").unwrap();
+    writeln!(out, "        self.parent() as i32").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(
+        out,
+        "    /// Walks the parent chain starting from `self.parent()` and returns `true` if it"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// reaches `parent` before hitting the runtime self-loop. Strict: `self.extends(self)`"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// is `false` for any variant whose parent is not itself, matching `errorTypeExtends`."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(out, "    pub const fn extends(self, parent: Self) -> bool {{").unwrap();
+    writeln!(out, "        let mut find = self;").unwrap();
+    writeln!(out, "        loop {{").unwrap();
+    writeln!(out, "            let next = find.parent();").unwrap();
+    writeln!(out, "            if next as i32 == parent as i32 {{").unwrap();
+    writeln!(out, "                return true;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            if next as i32 == find as i32 {{").unwrap();
+    writeln!(out, "                return false;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            find = next;").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
 

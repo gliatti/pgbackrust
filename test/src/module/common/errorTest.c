@@ -2,8 +2,8 @@
 Test Error Handling
 ***********************************************************************************************************************************/
 #include <assert.h>
-
 #include "common/harnessFork.h"
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Declare some error locally because real errors won't work for some tests -- they could also break as errors change
@@ -78,6 +78,54 @@ testRun(void)
         assert(errorTypeExtends(&TestChildError, &TestParent1Error));
         assert(errorTypeExtends(&TestChildError, &TestParent2Error));
         assert(!errorTypeExtends(&TestChildError, &TestChildError));
+
+        // Differential check: every (child, parent) pair drawn from the production error table
+        // (codes 25..=125, the range enforced by src/build/error/parse.c) must agree between the
+        // C `errorTypeExtends` walk and the Rust `pgbr_error_type_extends_by_code` walk. The
+        // local TestParent*Error / TestChildError fixtures above are intentionally excluded —
+        // they're declared only in this test, not in `errorTypeList[]`, and not in the Rust
+        // `ErrorType` enum either, so they cannot participate in the cross-language comparison.
+        for (int childCode = 25; childCode <= 125; childCode++)
+        {
+            const ErrorType *const child = errorTypeFromCode(childCode);
+
+            // errorTypeFromCode falls back to UnknownError for codes not in the production list,
+            // so detect-and-skip the gaps (e.g. 33-36, 59, 65-66, 71, 77, 84-86, 90-92, 107-121, 123).
+            if (errorTypeCode(child) != childCode)
+                continue;
+
+            for (int parentCode = 25; parentCode <= 125; parentCode++)
+            {
+                const ErrorType *const parent = errorTypeFromCode(parentCode);
+                if (errorTypeCode(parent) != parentCode)
+                    continue;
+
+                const bool cResult = errorTypeExtends(child, parent);
+                const bool rustResult = pgbr_error_type_extends_by_code(childCode, parentCode);
+                assert(cResult == rustResult);
+            }
+
+            // pgbr_error_type_parent_code(child) must equal errorTypeCode(errorTypeParent(child)).
+            assert(pgbr_error_type_parent_code(childCode) == errorTypeCode(errorTypeParent(child)));
+        }
+
+        // pgbr_error_type_from_name uses the YAML kebab spelling (the on-the-wire form), not the C
+        // macro identifier. The C `errorTypeName()` returns the macro stringification (e.g.
+        // "AssertError"); FFI callers that need the kebab form receive it in JSON / protocol data,
+        // so a manual mapping spot-check is the right shape for this differential.
+        assert(pgbr_error_type_from_name("assert") == 25);
+        assert(pgbr_error_type_from_name("file-missing") == 55);
+        assert(pgbr_error_type_from_name("memory") == 94);
+        assert(pgbr_error_type_from_name("runtime") == 122);
+        assert(pgbr_error_type_from_name("unknown") == 125);
+
+        // Sentinels for unknown inputs.
+        assert(pgbr_error_type_parent_code(0) == -1);
+        assert(pgbr_error_type_from_name(NULL) == 0);
+        assert(pgbr_error_type_from_name("not-a-real-error") == 0);
+        assert(pgbr_error_type_from_name("AssertError") == 0);     // C macro spelling is rejected
+        assert(!pgbr_error_type_extends_by_code(0, 122));
+        assert(!pgbr_error_type_extends_by_code(122, 0));
     }
 
     // *****************************************************************************************************************************
