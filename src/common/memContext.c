@@ -103,6 +103,23 @@ typedef struct MemContextCallbackOne
 } MemContextCallbackOne;
 
 /***********************************************************************************************************************************
+Layout-drift guard: the Rust mirror in `crates/pgbr-core/src/mem_context.rs` is byte-identical to these C structs and is gated by
+the `c-debug` cargo feature (toggled via `PGBR_C_DEBUG=1` from the meson custom_target when `get_option('debug')` is true). Any
+size drift here would corrupt malloc'd allocations the Rust algorithms in 32B-2 (#236) operate on; catch it at build time.
+***********************************************************************************************************************************/
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
+#ifdef DEBUG
+_Static_assert(sizeof(MemContext) == 32, "Rust mirror expects sizeof(MemContext) == 32 on 64-bit DEBUG");
+#else
+_Static_assert(sizeof(MemContext) == 16, "Rust mirror expects sizeof(MemContext) == 16 on 64-bit release");
+#endif
+_Static_assert(sizeof(MemContextChildMany) == 16, "Rust mirror expects sizeof(MemContextChildMany) == 16 on 64-bit");
+_Static_assert(sizeof(MemContextAllocMany) == 16, "Rust mirror expects sizeof(MemContextAllocMany) == 16 on 64-bit");
+_Static_assert(sizeof(MemContextCallbackOne) == 16, "Rust mirror expects sizeof(MemContextCallbackOne) == 16 on 64-bit");
+_Static_assert(sizeof(MemContextAlloc) == 8, "Rust mirror expects sizeof(MemContextAlloc) == 8");
+#endif
+
+/***********************************************************************************************************************************
 Possible sizes for the manifest based on options
 ***********************************************************************************************************************************/
 // {uncrustify_off - formatting compressed to save space}

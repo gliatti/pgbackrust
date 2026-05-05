@@ -10,6 +10,12 @@ repository.workspace = true
 name = "pgbr_ffi"
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# Enable when the C side compiles with `#define DEBUG` (test.pl harness, meson `--buildtype=debug`).
+# Affects layout-sensitive struct mirrors in pgbr-core::mem_context. The default `meson setup
+# build` runs `buildtype=release` and does NOT define DEBUG, so the feature stays off.
+c-debug = ["pgbr-core/c-debug"]
+
 [dependencies]
 pgbr-core = { path = "../pgbr-core" }
 pgbr-error = { path = "../pgbr-error" }

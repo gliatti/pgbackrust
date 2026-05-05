@@ -25,10 +25,27 @@
 //! `pgbr_mem_context_init_top` hook (called from a `__attribute__((constructor))` in
 //! `memContext.c`) writes the pointer before `main` runs.
 
+#[cfg(feature = "c-debug")]
+use core::ffi::c_char;
 use core::ffi::c_void;
 
 /// Maximum stack depth tracked. Mirrors `MEM_CONTEXT_STACK_MAX` in `src/common/memContext.c`.
 pub const MEM_CONTEXT_STACK_MAX: usize = 128;
+
+/// Mirror of the C `MemQty` enum from `src/common/memContext.c`. The C bitfield uses 2 bits to
+/// hold one of these values.
+pub const MEM_QTY_NONE: u8 = 0;
+pub const MEM_QTY_ONE: u8 = 1;
+pub const MEM_QTY_MANY: u8 = 2;
+
+/// Number of `MemContext` slots reserved per child / alloc list when the list is first
+/// initialised. Mirrors `MEM_CONTEXT_INITIAL_SIZE` in `src/common/memContext.h`.
+pub const MEM_CONTEXT_INITIAL_SIZE: u32 = 4;
+
+/// Number of `MemContextAlloc` slots reserved per allocation list when first initialised.
+/// Mirrors `MEM_CONTEXT_ALLOC_INITIAL_SIZE` in `src/common/memContext.h`.
+#[allow(dead_code)]
+pub const MEM_CONTEXT_ALLOC_INITIAL_SIZE: u32 = 4;
 
 /// Discriminant for the `type` field of `MemContextStack`. Mirrors
 /// `memContextStackTypeSwitch` (= 0) in the C enum: a context that can be switched to for
@@ -40,7 +57,443 @@ pub const STACK_TYPE_SWITCH: i32 = 0;
 /// to.
 pub const STACK_TYPE_NEW: i32 = 1;
 
-/// Mirror of the C `struct MemContextStack` defined in `src/common/memContext.c`.
+// ─── Tree-structure mirrors (32B) ──────────────────────────────────────────────────────────────
+//
+// The C side keeps the bitfield-packed `struct MemContext` in `src/common/memContext.c` because
+// the test (`test/src/test.c` `#include`s the file directly) reads `memContext->name`,
+// `memContext->active`, etc. The Rust mirror below MUST agree byte-for-byte with the C struct so
+// the still-in-C `memContextNew` and the Rust `mem_context_*` algorithms can share malloc'd
+// allocations.
+//
+// 32B targets the DEBUG layout (the only flavour test.pl exercises). The C compiler asserts
+// `sizeof(struct MemContext) == 32` on 64-bit DEBUG and `24` on 32-bit DEBUG — see the
+// `_Static_assert` matrix at the top of `src/common/memContext.c`. A non-DEBUG production build
+// has a different (smaller) `MemContext` layout; the Rust mirror does not currently track it,
+// and `mem_context_new` / `mem_context_free` would mismatch in that build. A follow-up sub-issue
+// will add a build.rs reading the meson `c-debug` env var to switch layouts; for now the
+// pgbackrest binary already gates the DEBUG/non-DEBUG builds via meson_options.txt and the
+// test.pl harness only runs DEBUG.
+
+/// Bitfield-packed flags region of `MemContext`.
+///
+/// GCC's System V ABI packs consecutive bitfields LSB-first into a single 32-bit storage unit
+/// when the total bit count fits. The DEBUG layout uses 26 bits (with `active`); the non-DEBUG
+/// layout uses 25 (no `active`). Bit positions for the **non**-`active` fields shift by one
+/// between the two layouts, so the helper constants are `cfg`-gated.
+///
+/// LSB-first bit layout (matches GCC SysV ABI):
+///
+/// | bits (DEBUG) | bits (release) | field                  |
+/// |--------------|----------------|------------------------|
+/// | 0            | n/a            | `active` (DEBUG only)  |
+/// | 1-2          | 0-1            | `child_qty`            |
+/// | 3            | 2              | `child_initialized`    |
+/// | 4-5          | 3-4            | `alloc_qty`            |
+/// | 6            | 5              | `alloc_initialized`    |
+/// | 7-8          | 6-7            | `callback_qty`         |
+/// | 9            | 8              | `callback_initialized` |
+/// | 10-25        | 9-24           | `alloc_extra`          |
+#[cfg(feature = "c-debug")]
+const FLAG_ACTIVE_SHIFT: u32 = 0;
+#[cfg(feature = "c-debug")]
+const FLAG_ACTIVE_MASK: u32 = 0x1;
+#[cfg(feature = "c-debug")]
+const FLAG_CHILD_QTY_SHIFT: u32 = 1;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_CHILD_QTY_SHIFT: u32 = 0;
+const FLAG_CHILD_QTY_MASK: u32 = 0x3;
+#[cfg(feature = "c-debug")]
+const FLAG_CHILD_INIT_SHIFT: u32 = 3;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_CHILD_INIT_SHIFT: u32 = 2;
+const FLAG_CHILD_INIT_MASK: u32 = 0x1;
+#[cfg(feature = "c-debug")]
+const FLAG_ALLOC_QTY_SHIFT: u32 = 4;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_ALLOC_QTY_SHIFT: u32 = 3;
+const FLAG_ALLOC_QTY_MASK: u32 = 0x3;
+#[cfg(feature = "c-debug")]
+const FLAG_ALLOC_INIT_SHIFT: u32 = 6;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_ALLOC_INIT_SHIFT: u32 = 5;
+const FLAG_ALLOC_INIT_MASK: u32 = 0x1;
+#[cfg(feature = "c-debug")]
+const FLAG_CALLBACK_QTY_SHIFT: u32 = 7;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_CALLBACK_QTY_SHIFT: u32 = 6;
+const FLAG_CALLBACK_QTY_MASK: u32 = 0x3;
+#[cfg(feature = "c-debug")]
+const FLAG_CALLBACK_INIT_SHIFT: u32 = 9;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_CALLBACK_INIT_SHIFT: u32 = 8;
+const FLAG_CALLBACK_INIT_MASK: u32 = 0x1;
+#[cfg(feature = "c-debug")]
+const FLAG_ALLOC_EXTRA_SHIFT: u32 = 10;
+#[cfg(not(feature = "c-debug"))]
+const FLAG_ALLOC_EXTRA_SHIFT: u32 = 9;
+const FLAG_ALLOC_EXTRA_MASK: u32 = 0xFFFF;
+
+/// Byte-identical Rust mirror of the C `struct MemContext`.
+///
+/// `c-debug` feature gates the `name` / `sequence_new` fields and the `active` bit slot to
+/// match the C `#ifdef DEBUG` blocks. Sizes:
+///   * 64-bit DEBUG: 32 bytes (`8 name + 8 seq + 4 flags + 4 parent_idx + 8 parent`).
+///   * 32-bit DEBUG: 24 bytes (`u64` is 4-aligned on 32-bit Linux: `4+8+4+4+4`).
+///   * 64-bit release: 16 bytes (`4 flags + 4 parent_idx + 8 parent`).
+///   * 32-bit release: 12 bytes.
+#[repr(C)]
+pub struct MemContext {
+    #[cfg(feature = "c-debug")]
+    pub name: *const c_char,
+    #[cfg(feature = "c-debug")]
+    pub sequence_new: u64,
+    flags: u32,
+    pub context_parent_idx: u32,
+    pub context_parent: *mut Self,
+}
+
+/// Compile-time assertion that the Rust mirror matches the test-pinned C `sizeof`.
+const _: () = {
+    #[cfg(all(target_pointer_width = "64", feature = "c-debug"))]
+    assert!(
+        core::mem::size_of::<MemContext>() == 32,
+        "MemContext must be 32 bytes on 64-bit DEBUG"
+    );
+    #[cfg(all(target_pointer_width = "32", feature = "c-debug"))]
+    assert!(
+        core::mem::size_of::<MemContext>() == 24,
+        "MemContext must be 24 bytes on 32-bit DEBUG"
+    );
+    #[cfg(all(target_pointer_width = "64", not(feature = "c-debug")))]
+    assert!(
+        core::mem::size_of::<MemContext>() == 16,
+        "MemContext must be 16 bytes on 64-bit release"
+    );
+    #[cfg(all(target_pointer_width = "32", not(feature = "c-debug")))]
+    assert!(
+        core::mem::size_of::<MemContext>() == 12,
+        "MemContext must be 12 bytes on 32-bit release"
+    );
+};
+
+// Some accessors take `&self` / `&mut self` even when one cfg branch ignores both inputs (the
+// non-DEBUG `active` accessor returns a constant). Clippy complains; suppress at the impl level
+// so the public API stays uniform across cfg variants.
+#[allow(
+    clippy::unused_self,
+    clippy::needless_pass_by_ref_mut,
+    clippy::missing_const_for_fn,
+    unused_variables
+)]
+impl MemContext {
+    /// `true` while the context is in active use; cleared by `memContextCallbackRecurse` before
+    /// the callback fires. DEBUG-only on the C side; release builds always return `true` from
+    /// this accessor (the bit does not exist in the layout).
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        #[cfg(feature = "c-debug")]
+        {
+            (self.flags >> FLAG_ACTIVE_SHIFT) & FLAG_ACTIVE_MASK != 0
+        }
+        #[cfg(not(feature = "c-debug"))]
+        {
+            true
+        }
+    }
+
+    /// Set the active bit. No-op on non-DEBUG builds where the bit does not exist.
+    pub fn set_active(&mut self, value: bool) {
+        #[cfg(feature = "c-debug")]
+        Self::set_bits(&mut self.flags, FLAG_ACTIVE_SHIFT, FLAG_ACTIVE_MASK, u32::from(value));
+    }
+
+    /// Encoded `MemQty` (0 = none, 1 = one, 2 = many).
+    #[must_use]
+    pub const fn child_qty(&self) -> u8 {
+        ((self.flags >> FLAG_CHILD_QTY_SHIFT) & FLAG_CHILD_QTY_MASK) as u8
+    }
+
+    pub fn set_child_qty(&mut self, value: u8) {
+        Self::set_bits(&mut self.flags, FLAG_CHILD_QTY_SHIFT, FLAG_CHILD_QTY_MASK, u32::from(value));
+    }
+
+    #[must_use]
+    pub const fn child_initialized(&self) -> bool {
+        (self.flags >> FLAG_CHILD_INIT_SHIFT) & FLAG_CHILD_INIT_MASK != 0
+    }
+
+    pub fn set_child_initialized(&mut self, value: bool) {
+        Self::set_bits(&mut self.flags, FLAG_CHILD_INIT_SHIFT, FLAG_CHILD_INIT_MASK, u32::from(value));
+    }
+
+    #[must_use]
+    pub const fn alloc_qty(&self) -> u8 {
+        ((self.flags >> FLAG_ALLOC_QTY_SHIFT) & FLAG_ALLOC_QTY_MASK) as u8
+    }
+
+    pub fn set_alloc_qty(&mut self, value: u8) {
+        Self::set_bits(&mut self.flags, FLAG_ALLOC_QTY_SHIFT, FLAG_ALLOC_QTY_MASK, u32::from(value));
+    }
+
+    #[must_use]
+    pub const fn alloc_initialized(&self) -> bool {
+        (self.flags >> FLAG_ALLOC_INIT_SHIFT) & FLAG_ALLOC_INIT_MASK != 0
+    }
+
+    pub fn set_alloc_initialized(&mut self, value: bool) {
+        Self::set_bits(&mut self.flags, FLAG_ALLOC_INIT_SHIFT, FLAG_ALLOC_INIT_MASK, u32::from(value));
+    }
+
+    #[must_use]
+    pub const fn callback_qty(&self) -> u8 {
+        ((self.flags >> FLAG_CALLBACK_QTY_SHIFT) & FLAG_CALLBACK_QTY_MASK) as u8
+    }
+
+    pub fn set_callback_qty(&mut self, value: u8) {
+        Self::set_bits(
+            &mut self.flags,
+            FLAG_CALLBACK_QTY_SHIFT,
+            FLAG_CALLBACK_QTY_MASK,
+            u32::from(value),
+        );
+    }
+
+    #[must_use]
+    pub const fn callback_initialized(&self) -> bool {
+        (self.flags >> FLAG_CALLBACK_INIT_SHIFT) & FLAG_CALLBACK_INIT_MASK != 0
+    }
+
+    pub fn set_callback_initialized(&mut self, value: bool) {
+        Self::set_bits(
+            &mut self.flags,
+            FLAG_CALLBACK_INIT_SHIFT,
+            FLAG_CALLBACK_INIT_MASK,
+            u32::from(value),
+        );
+    }
+
+    /// Extra-allocation byte count appended after the `MemContext` header.
+    #[must_use]
+    pub const fn alloc_extra(&self) -> u32 {
+        (self.flags >> FLAG_ALLOC_EXTRA_SHIFT) & FLAG_ALLOC_EXTRA_MASK
+    }
+
+    pub fn set_alloc_extra(&mut self, value: u32) {
+        debug_assert!(value <= FLAG_ALLOC_EXTRA_MASK, "alloc_extra exceeds 16 bits");
+        Self::set_bits(&mut self.flags, FLAG_ALLOC_EXTRA_SHIFT, FLAG_ALLOC_EXTRA_MASK, value);
+    }
+
+    const fn set_bits(flags: &mut u32, shift: u32, mask: u32, value: u32) {
+        *flags = (*flags & !(mask << shift)) | ((value & mask) << shift);
+    }
+}
+
+/// Mirror of `struct MemContextChildOne` from `src/common/memContext.c`.
+///
+/// One child context held inline; size = 8 bytes on 64-bit / 4 bytes on 32-bit.
+#[repr(C)]
+pub struct MemContextChildOne {
+    pub context: *mut MemContext,
+}
+
+/// Mirror of `struct MemContextChildMany`. Test asserts size = 16 / 12.
+#[repr(C)]
+pub struct MemContextChildMany {
+    pub list: *mut *mut MemContext,
+    pub list_size: u32,
+    pub free_idx: u32,
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    assert!(core::mem::size_of::<MemContextChildMany>() == 16);
+    #[cfg(target_pointer_width = "32")]
+    assert!(core::mem::size_of::<MemContextChildMany>() == 12);
+};
+
+/// Mirror of `struct MemContextAllocOne`.
+#[repr(C)]
+pub struct MemContextAllocOne {
+    pub alloc: *mut MemContextAlloc,
+}
+
+/// Mirror of `struct MemContextAllocMany`. Test asserts size = 16 / 12.
+#[repr(C)]
+pub struct MemContextAllocMany {
+    pub list: *mut *mut MemContextAlloc,
+    pub list_size: u32,
+    pub free_idx: u32,
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    assert!(core::mem::size_of::<MemContextAllocMany>() == 16);
+    #[cfg(target_pointer_width = "32")]
+    assert!(core::mem::size_of::<MemContextAllocMany>() == 12);
+};
+
+/// Mirror of `struct MemContextCallbackOne`. Test asserts size = 16 / 8.
+#[repr(C)]
+pub struct MemContextCallbackOne {
+    pub function: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub argument: *mut c_void,
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    assert!(core::mem::size_of::<MemContextCallbackOne>() == 16);
+    #[cfg(target_pointer_width = "32")]
+    assert!(core::mem::size_of::<MemContextCallbackOne>() == 8);
+};
+
+/// Allocation header laid out before every buffer returned by `mem_new` / `mem_resize`. Mirror
+/// of `struct MemContextAlloc`. Test asserts size = 8 on both 32-bit and 64-bit.
+#[repr(C)]
+pub struct MemContextAlloc {
+    /// Index in the allocation list (32 bits in C, occupying the low 32 bits of the union word).
+    pub alloc_idx: u32,
+    /// Total allocation size in bytes (header + payload, 4 GB max).
+    pub size: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<MemContextAlloc>() == 8);
+
+/// Mirror of `MemContextNewParam` from `src/common/memContext.h` (the variadic-parameter struct
+/// used by the `memContextNewP` macro). The leading `bool dummy` field expands from
+/// `VAR_PARAM_HEADER`.
+#[repr(C)]
+pub struct MemContextNewParam {
+    pub dummy: bool,
+    pub child_qty: u8,
+    pub alloc_qty: u8,
+    pub callback_qty: u8,
+    pub alloc_extra: u16,
+}
+
+/// 3D table mirroring `memContextSizePossible[memQtyMany + 1][memQtyMany + 1][memQtyOne + 1]`
+/// from `src/common/memContext.c:108–139`. Indexed `[child_qty][alloc_qty][callback_qty]`,
+/// returns the total bytes needed for the trailing optional regions (child + alloc + callback)
+/// after the `MemContext` header and the alloc-extra padding.
+const fn child_one() -> usize {
+    core::mem::size_of::<MemContextChildOne>()
+}
+const fn child_many() -> usize {
+    core::mem::size_of::<MemContextChildMany>()
+}
+const fn alloc_one() -> usize {
+    core::mem::size_of::<MemContextAllocOne>()
+}
+const fn alloc_many() -> usize {
+    core::mem::size_of::<MemContextAllocMany>()
+}
+const fn callback_one() -> usize {
+    core::mem::size_of::<MemContextCallbackOne>()
+}
+
+#[allow(dead_code)]
+const SIZE_POSSIBLE: [[[usize; 2]; 3]; 3] = [
+    // child none
+    [
+        [0, callback_one()],                           // alloc none
+        [alloc_one(), alloc_one() + callback_one()],   // alloc one
+        [alloc_many(), alloc_many() + callback_one()], // alloc many
+    ],
+    // child one
+    [
+        [child_one(), child_one() + callback_one()],
+        [child_one() + alloc_one(), child_one() + alloc_one() + callback_one()],
+        [child_one() + alloc_many(), child_one() + alloc_many() + callback_one()],
+    ],
+    // child many
+    [
+        [child_many(), child_many() + callback_one()],
+        [child_many() + alloc_one(), child_many() + alloc_one() + callback_one()],
+        [child_many() + alloc_many(), child_many() + alloc_many() + callback_one()],
+    ],
+];
+
+// libc allocators. `pgbr_mem_context_*` allocations come from the same heap as the C
+// `memAllocInternal` so the C and Rust paths can share buffers byte-for-byte. On null return we
+// panic; the FFI guard maps the panic to `ErrorType::Unknown` for the C caller. The legacy C
+// `memAllocInternal` test (`TEST_ERROR(memAllocInternal((size_t)5629499534213120), MemoryError,
+// …)` at memContextTest.c:43) calls the static helper directly and is unaffected — that path
+// stays in C and is exercised independently. The Rust side panics defensively because in
+// practice `memContextNewP` / `memNew` allocations succeed.
+//
+// 32B (this sub-issue) only ships the externs + the layout mirror so the surface is ready for
+// the 32B-2 algorithm migration (#236). No live caller exercises these helpers yet — the
+// `dead_code` allow stays until 32B-2 lands.
+#[allow(dead_code)]
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut c_void;
+    fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+    fn free(ptr: *mut c_void);
+}
+
+/// Allocate `size` bytes via libc malloc. Panics on null return; the FFI panic guard surfaces
+/// the failure to the C caller as `ErrorType::Unknown`.
+#[allow(dead_code)]
+unsafe fn mem_alloc(size: usize) -> *mut c_void {
+    // SAFETY: libc malloc is always callable with any size; null return is the failure
+    // indicator we explicitly check for.
+    let ptr = unsafe { malloc(size) };
+    assert!(!ptr.is_null(), "malloc returned null for {size} bytes");
+    ptr
+}
+
+/// Reallocate `ptr` to `new_size` bytes via libc realloc. Panics on null return.
+#[allow(dead_code)]
+unsafe fn mem_realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void {
+    // SAFETY: caller asserts `ptr` came from a previous `mem_alloc` / libc malloc and is still
+    // live (or null, which makes realloc behave like malloc).
+    let new_ptr = unsafe { realloc(ptr, new_size) };
+    assert!(!new_ptr.is_null(), "realloc returned null for {new_size} bytes");
+    new_ptr
+}
+
+/// libc free. Mirrors the legacy `memFreeInternal` minus the `ASSERT(buffer != NULL)` (the
+/// asserts live in the C wrapper).
+#[allow(dead_code)]
+unsafe fn mem_free(ptr: *mut c_void) {
+    // SAFETY: caller asserts `ptr` came from a previous `mem_alloc` / libc malloc.
+    unsafe { free(ptr) };
+}
+
+/// Allocate an array of `count` `*mut T` pointers, all initialised to null. Mirrors the legacy
+/// `memAllocPtrArrayInternal`.
+#[allow(dead_code, clippy::expect_used)]
+unsafe fn mem_alloc_ptr_array<T>(count: usize) -> *mut *mut T {
+    // SAFETY: see `mem_alloc`. On success the returned buffer is `count * sizeof(*mut T)`
+    // bytes; we zero-initialise via `write_bytes`.
+    unsafe {
+        let bytes = count
+            .checked_mul(core::mem::size_of::<*mut T>())
+            .expect("ptr-array size overflow");
+        let ptr = mem_alloc(bytes).cast::<*mut T>();
+        core::ptr::write_bytes(ptr, 0, count);
+        ptr
+    }
+}
+
+/// Reallocate the pointer array `old` (of `old_count` slots) to `new_count` slots, zero-filling
+/// the new tail. Mirrors `memReAllocPtrArrayInternal`.
+#[allow(dead_code, clippy::expect_used)]
+unsafe fn mem_realloc_ptr_array<T>(old: *mut *mut T, old_count: usize, new_count: usize) -> *mut *mut T {
+    // SAFETY: caller asserts `old` came from `mem_alloc_ptr_array` with `old_count` slots.
+    unsafe {
+        let bytes = new_count
+            .checked_mul(core::mem::size_of::<*mut T>())
+            .expect("ptr-array size overflow");
+        let ptr = mem_realloc(old.cast::<c_void>(), bytes).cast::<*mut T>();
+        // Zero the new tail.
+        core::ptr::write_bytes(ptr.add(old_count), 0, new_count - old_count);
+        ptr
+    }
+}
+
+// ─── Stack (32A) ───────────────────────────────────────────────────────────────────────────────
+
+/// Mirror of `struct MemContextStack` defined in `src/common/memContext.c`.
 ///
 /// Layout-compatible: `MemContext *` (pointer, 8 bytes on 64-bit / 4 on 32-bit) + `enum` (treated
 /// as `int` by GCC/clang on the supported targets, 4 bytes) + `unsigned int` (4 bytes). 64-bit

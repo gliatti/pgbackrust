@@ -135,6 +135,10 @@ pgbr_ffi_target = custom_target(
         '@OUTPUT0@',
         '@OUTPUT1@',
     ],
+    # Forward the meson `debug` option to the cargo build so the `c-debug` feature flips on the
+    # layout-sensitive `MemContext` mirror in `pgbr-core::mem_context`. Without this the Rust
+    # crate would assume one layout while the C build uses the other, corrupting memory.
+    env: get_option('debug') ? {'PGBR_C_DEBUG': '1'} : {'PGBR_C_DEBUG': '0'},
     build_by_default: true,
     install: false,
     console: true,

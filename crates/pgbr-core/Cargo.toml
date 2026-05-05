@@ -8,5 +8,11 @@ repository.workspace = true
 
 [lib]
 
+[features]
+# Enable when the C side compiles with `#define DEBUG`. Adds the DEBUG-only `name`,
+# `sequence_new`, and `active` fields to the `MemContext` mirror so the Rust struct stays
+# byte-identical with the C bitfield layout.
+c-debug = []
+
 [lints]
 workspace = true

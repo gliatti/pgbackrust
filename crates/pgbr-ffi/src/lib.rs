@@ -1166,6 +1166,30 @@ pub extern "C" fn pgbr_mem_context_max_stack_idx() -> u32 {
     with_panic_guard(core_mem_context::max_stack_idx)
 }
 
+// ─── Field accessors used by the C wrapper to format DEBUG diagnostics (32B / 32D seed) ───────
+
+/// Read the `name` field. DEBUG-only on the C side; in non-DEBUG production builds the field
+/// does not exist in the struct layout, so this accessor returns null.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_field_name(this: *const core::ffi::c_void) -> *const c_char {
+    with_panic_guard(|| {
+        #[cfg(feature = "c-debug")]
+        {
+            // SAFETY: caller upholds pointer-validity.
+            unsafe { (*this.cast::<core_mem_context::MemContext>()).name }
+        }
+        #[cfg(not(feature = "c-debug"))]
+        {
+            let _ = this;
+            core::ptr::null()
+        }
+    })
+}
+
 /// Set `memContextStack[0].memContext = top`.
 ///
 /// Invoked from a C `__attribute__((constructor))` in `src/common/memContext.c` before `main`
