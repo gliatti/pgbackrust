@@ -29,13 +29,11 @@ typedef struct MemContextAlloc
 // Get the allocation header pointer given the allocation buffer pointer
 #define MEM_CONTEXT_ALLOC_HEADER(buffer)                            ((MemContextAlloc *)buffer - 1)
 
-// Make sure the allocation is valid for the current memory context. This check only works correctly if the allocation is valid and
-// allocated as one of many but belongs to another context. Otherwise, there is likely to be a segfault.
+// Make sure the allocation is valid for the current memory context. The actual validity check
+// lives in `pgbr_mem_alloc_valid` (`pgbr-core::mem_context::mem_alloc_valid`); the macro just
+// stringifies for the legacy `assertion '%s' failed` diagnostic.
 #define ASSERT_ALLOC_MANY_VALID(alloc)                                                                                             \
-    ASSERT(                                                                                                                        \
-        alloc != NULL && (uintptr_t)alloc != (uintptr_t)-sizeof(MemContextAlloc) &&                                                \
-        alloc->allocIdx < memContextAllocMany(memContextStack[memContextCurrentStackIdx].memContext)->listSize &&                  \
-        memContextAllocMany(memContextStack[memContextCurrentStackIdx].memContext)->list[alloc->allocIdx]);
+    ASSERT(pgbr_mem_alloc_valid(alloc))
 
 /***********************************************************************************************************************************
 Contains information about the memory context
@@ -190,7 +188,11 @@ memContextAllocOne(MemContext *const memContext)
     return (MemContextAllocOne *)MEM_CONTEXT_ALLOC_OFFSET(memContext);
 }
 
-static MemContextAllocMany *
+// `memContextAllocMany` is only used by the test (`#include`s this file) and by `ASSERT_ALLOC_MANY_VALID`
+// in DEBUG builds before the 32C macro rewrite. After 32C the macro delegates to
+// `pgbr_mem_alloc_valid` so the helper has no production C caller. Mark it `unused` so
+// `-Werror=unused-function` does not fire; the symbol stays compilable for the test.
+__attribute__((unused)) static MemContextAllocMany *
 memContextAllocMany(MemContext *const memContext)
 {
     return (MemContextAllocMany *)MEM_CONTEXT_ALLOC_OFFSET(memContext);
@@ -304,6 +306,10 @@ pgbr_mem_context_init_top_ctor(void)
 ***********************************************************************************************************************************/
 #ifdef DEBUG
 
+// Phase 32C: thin FFI shims. The audit walk lives in `pgbr-core::mem_context`; the C wrapper
+// retains the parameter ASSERTs and translates the `AuditEndResult` from
+// `pgbr_mem_context_audit_end` into the legacy `THROW_FMT(AssertError, "expected return type
+// '%s' ...", ...)` diagnostics that the test pins.
 FN_EXTERN void
 memContextAuditBegin(MemContextAuditState *const state)
 {
@@ -315,56 +321,9 @@ memContextAuditBegin(MemContextAuditState *const state)
     ASSERT(state->memContext != NULL);
     ASSERT(state->memContext == memContextTop() || state->memContext->sequenceNew != 0);
 
-    if (state->memContext->childInitialized)
-    {
-        ASSERT(state->memContext->childQty != memQtyNone);
-
-        if (state->memContext->childQty == memQtyOne)
-        {
-            MemContextChildOne *const memContextChild = memContextChildOne(state->memContext);
-
-            if (memContextChild->context != NULL)
-                state->sequenceContextNew = memContextChild->context->sequenceNew;
-        }
-        else
-        {
-            ASSERT(state->memContext->childQty == memQtyMany);
-            MemContextChildMany *const memContextChild = memContextChildMany(state->memContext);
-
-            for (unsigned int contextIdx = 0; contextIdx < memContextChild->listSize; contextIdx++)
-            {
-                if (memContextChild->list[contextIdx] != NULL &&
-                    memContextChild->list[contextIdx]->sequenceNew > state->sequenceContextNew)
-                {
-                    state->sequenceContextNew = memContextChild->list[contextIdx]->sequenceNew;
-                }
-            }
-        }
-    }
+    pgbr_mem_context_audit_begin(state);
 
     FUNCTION_TEST_RETURN_VOID();
-}
-
-static bool
-memContextAuditNameMatch(const char *const actual, const char *const expected)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(STRINGZ, actual);
-        FUNCTION_TEST_PARAM(STRINGZ, expected);
-    FUNCTION_TEST_END();
-
-    ASSERT(actual != NULL);
-    ASSERT(expected != NULL);
-
-    unsigned int actualIdx = 0;
-
-    while (actual[actualIdx] != '\0' && actual[actualIdx] == expected[actualIdx])
-        actualIdx++;
-
-    FUNCTION_TEST_RETURN(
-        BOOL,
-        (actual[actualIdx] == '\0' || strncmp(actual + actualIdx, "::", 2) == 0) &&
-        (expected[actualIdx] == '\0' || strcmp(expected + actualIdx, " *") == 0));
 }
 
 FN_EXTERN void
@@ -375,68 +334,17 @@ memContextAuditEnd(const MemContextAuditState *const state, const char *const re
         FUNCTION_TEST_PARAM(STRINGZ, returnType);
     FUNCTION_TEST_END();
 
-    if (state->returnTypeAny)
-        FUNCTION_TEST_RETURN_VOID();
+    const PGBR_PgbrAuditEndResult r = pgbr_mem_context_audit_end(state, returnType);
 
-    if (state->memContext->childInitialized)
+    if (r.kind == 1)
     {
-        ASSERT(state->memContext->childQty != memQtyNone);
-
-        const char *returnTypeInvalid = NULL;
-        const char *returnTypeFound = NULL;
-
-        if (state->memContext->childQty == memQtyOne)
-        {
-            MemContextChildOne *const memContextChild = memContextChildOne(state->memContext);
-
-            if (memContextChild->context != NULL && memContextChild->context->sequenceNew > state->sequenceContextNew &&
-                !memContextAuditNameMatch(memContextChild->context->name, returnType))
-            {
-                returnTypeInvalid = memContextChild->context->name;
-            }
-        }
-        else
-        {
-            ASSERT(state->memContext->childQty == memQtyMany);
-            MemContextChildMany *const memContextChild = memContextChildMany(state->memContext);
-
-            for (unsigned int contextIdx = 0; contextIdx < memContextChild->listSize; contextIdx++)
-            {
-                if (memContextChild->list[contextIdx] != NULL &&
-                    memContextChild->list[contextIdx]->sequenceNew > state->sequenceContextNew)
-                {
-                    if (memContextAuditNameMatch(memContextChild->list[contextIdx]->name, returnType))
-                    {
-                        if (returnTypeFound != NULL)
-                        {
-                            returnTypeInvalid = memContextChild->list[contextIdx]->name;
-                            break;
-                        }
-
-                        returnTypeFound = memContextChild->list[contextIdx]->name;
-                    }
-                    else
-                    {
-                        returnTypeInvalid = memContextChild->list[contextIdx]->name;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (returnTypeInvalid != NULL)
-        {
-            if (returnTypeFound != NULL)
-            {
-                THROW_FMT(
-                    AssertError, "expected return type '%s' already found but also found '%s'", returnTypeFound, returnTypeInvalid);
-            }
-            else
-            {
-                THROW_FMT(
-                    AssertError, "expected return type '%s' but found '%s'", returnType, returnTypeInvalid);
-            }
-        }
+        THROW_FMT(AssertError, "expected return type '%s' but found '%s'", returnType, r.return_type_invalid);
+    }
+    else if (r.kind == 2)
+    {
+        THROW_FMT(
+            AssertError, "expected return type '%s' already found but also found '%s'", r.return_type_found,
+            r.return_type_invalid);
     }
 
     FUNCTION_TEST_RETURN_VOID();
@@ -450,9 +358,7 @@ memContextAuditAllocExtraName(void *const allocExtra, const char *const name)
         FUNCTION_TEST_PARAM(STRINGZ, name);
     FUNCTION_TEST_END();
 
-    memContextFromAllocExtra(allocExtra)->name = name;
-
-    FUNCTION_TEST_RETURN_P(VOID, allocExtra);
+    FUNCTION_TEST_RETURN_P(VOID, pgbr_mem_context_audit_alloc_extra_name(allocExtra, name));
 }
 
 #endif
@@ -479,9 +385,11 @@ memAllocInternal(const size_t size)
 }
 
 /***********************************************************************************************************************************
-Allocate an array of pointers and set all entries to NULL
+Allocate an array of pointers and set all entries to NULL. Phase 32C: no longer called from C
+production code (the `pgbr-core::mem_context::mem_alloc_ptr_array` helper covers the live path).
+The helper stays so the test #include of this file keeps compiling.
 ***********************************************************************************************************************************/
-static void *
+__attribute__((unused)) static void *
 memAllocPtrArrayInternal(const size_t size)
 {
     FUNCTION_TEST_BEGIN();
@@ -524,9 +432,10 @@ memReAllocInternal(void *const bufferOld, const size_t sizeNew)
 }
 
 /***********************************************************************************************************************************
-Wrapper around realloc() with error handling
+Wrapper around realloc() with error handling. Phase 32C: no longer called from C production code
+(the `pgbr-core::mem_context::mem_realloc_ptr_array` helper covers the live path).
 ***********************************************************************************************************************************/
-static void *
+__attribute__((unused)) static void *
 memReAllocPtrArrayInternal(void *const bufferOld, const size_t sizeOld, const size_t sizeNew)
 {
     FUNCTION_TEST_BEGIN();
@@ -547,9 +456,11 @@ memReAllocPtrArrayInternal(void *const bufferOld, const size_t sizeOld, const si
 }
 
 /***********************************************************************************************************************************
-Wrapper around free()
+Wrapper around free(). Phase 32C: no longer called from C production code (the public `memFree`
+delegates straight to `pgbr_mem_free`); the helper stays so the test #include continues to
+exercise its `assertion 'buffer != NULL' failed` path.
 ***********************************************************************************************************************************/
-static void
+__attribute__((unused)) static void
 memFreeInternal(void *const buffer)
 {
     FUNCTION_TEST_BEGIN();
@@ -614,6 +525,7 @@ memContextNew(
 }
 
 /**********************************************************************************************************************************/
+// Phase 32C: thin FFI shim. ASSERTs stay on the C side so the test pins their text.
 FN_EXTERN void *
 memContextAllocExtra(MemContext *const this)
 {
@@ -624,7 +536,7 @@ memContextAllocExtra(MemContext *const this)
     ASSERT(this != NULL);
     ASSERT(this->allocExtra != 0);
 
-    FUNCTION_TEST_RETURN_P(VOID, this + 1);
+    FUNCTION_TEST_RETURN_P(VOID, pgbr_mem_context_alloc_extra(this));
 }
 
 /**********************************************************************************************************************************/
@@ -638,7 +550,7 @@ memContextFromAllocExtra(void *const allocExtra)
     ASSERT(allocExtra != NULL);
     ASSERT(((MemContext *)allocExtra - 1)->allocExtra != 0);
 
-    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)allocExtra - 1);
+    FUNCTION_TEST_RETURN(MEM_CONTEXT, (MemContext *)pgbr_mem_context_from_alloc_extra(allocExtra));
 }
 
 /**********************************************************************************************************************************/
@@ -688,122 +600,10 @@ memContextCallbackClear(MemContext *const this)
     FUNCTION_TEST_RETURN_VOID();
 }
 
-/***********************************************************************************************************************************
-Find an available slot in the memory context's allocation list and allocate memory
-***********************************************************************************************************************************/
-static MemContextAlloc *
-memContextAllocNew(const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    // Allocate memory
-    MemContextAlloc *const result = memAllocInternal(sizeof(MemContextAlloc) + size);
-
-    // Find space for the new allocation
-    MemContext *const contextCurrent = memContextStack[memContextCurrentStackIdx].memContext;
-    ASSERT(contextCurrent->allocQty != memQtyNone);
-
-    if (contextCurrent->allocQty == memQtyOne)
-    {
-        MemContextAllocOne *const contextAlloc = memContextAllocOne(contextCurrent);
-        ASSERT(!contextCurrent->allocInitialized || contextAlloc->alloc == NULL);
-
-        // Initialize allocation header
-        *result = (MemContextAlloc){.size = (unsigned int)(sizeof(MemContextAlloc) + size)};
-
-        // Set pointer in allocation
-        contextAlloc->alloc = result;
-        contextCurrent->allocInitialized = true;
-    }
-    else
-    {
-        ASSERT(contextCurrent->allocQty == memQtyMany);
-
-        MemContextAllocMany *const contextAlloc = memContextAllocMany(contextCurrent);
-
-        // Initialize (free space will always be index 0)
-        if (!contextCurrent->allocInitialized)
-        {
-            *contextAlloc = (MemContextAllocMany)
-            {
-                .list = memAllocPtrArrayInternal(MEM_CONTEXT_ALLOC_INITIAL_SIZE),
-                .listSize = contextAlloc->listSize = MEM_CONTEXT_ALLOC_INITIAL_SIZE,
-            };
-
-            contextCurrent->allocInitialized = true;
-        }
-        else
-        {
-            for (; contextAlloc->freeIdx < contextAlloc->listSize; contextAlloc->freeIdx++)
-                if (contextAlloc->list[contextAlloc->freeIdx] == NULL)
-                    break;
-
-            // If no space was found then allocate more
-            if (contextAlloc->freeIdx == contextAlloc->listSize)
-            {
-                // Calculate new list size
-                const unsigned int listSizeNew = contextAlloc->listSize * 2;
-
-                // Reallocate memory before modifying anything else in case there is an error
-                contextAlloc->list = memReAllocPtrArrayInternal(contextAlloc->list, contextAlloc->listSize, listSizeNew);
-
-                // Set new size
-                contextAlloc->listSize = listSizeNew;
-            }
-        }
-
-        // Initialize allocation header
-        *result = (MemContextAlloc){.allocIdx = contextAlloc->freeIdx, .size = (unsigned int)(sizeof(MemContextAlloc) + size)};
-
-        // Set pointer in allocation list
-        contextAlloc->list[contextAlloc->freeIdx] = result;
-
-        // Update free index to next location. This location may not be free but it is where the search should start next time.
-        contextAlloc->freeIdx++;
-    }
-
-    FUNCTION_TEST_RETURN_TYPE_P(MemContextAlloc, result);
-}
-
-/***********************************************************************************************************************************
-Resize memory that has already been allocated
-***********************************************************************************************************************************/
-static MemContextAlloc *
-memContextAllocResize(MemContextAlloc *alloc, const size_t size)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM_P(VOID, alloc);
-        FUNCTION_TEST_PARAM(SIZE, size);
-    FUNCTION_TEST_END();
-
-    // Resize the allocation
-    alloc = memReAllocInternal(alloc, sizeof(MemContextAlloc) + size);
-    alloc->size = (unsigned int)(sizeof(MemContextAlloc) + size);
-
-    // Update pointer in allocation list in case the realloc moved the allocation
-    MemContext *const currentContext = memContextStack[memContextCurrentStackIdx].memContext;
-    ASSERT(currentContext->allocQty != memQtyNone);
-    ASSERT(currentContext->allocInitialized);
-
-    if (currentContext->allocQty == memQtyOne)
-    {
-        ASSERT(memContextAllocOne(currentContext)->alloc != NULL);
-        memContextAllocOne(currentContext)->alloc = alloc;
-    }
-    else
-    {
-        ASSERT(currentContext->allocQty == memQtyMany);
-        ASSERT_ALLOC_MANY_VALID(alloc);
-
-        memContextAllocMany(currentContext)->list[alloc->allocIdx] = alloc;
-    }
-
-    FUNCTION_TEST_RETURN_TYPE_P(MemContextAlloc, alloc);
-}
-
 /**********************************************************************************************************************************/
+// Phase 32C: thin FFI shims. The static `memContextAllocNew` / `memContextAllocResize` helpers
+// moved to `pgbr-core::mem_context`. The C wrapper keeps the assertions and re-throws Rust's
+// MemoryError diagnostic via `pgbr_error_throw_from_last` when libc malloc/realloc fails.
 FN_EXTERN void *
 memNew(const size_t size)
 {
@@ -811,7 +611,14 @@ memNew(const size_t size)
         FUNCTION_TEST_PARAM(SIZE, size);
     FUNCTION_TEST_END();
 
-    FUNCTION_TEST_RETURN_P(VOID, MEM_CONTEXT_ALLOC_BUFFER(memContextAllocNew(size)));
+    ASSERT(((MemContext *)pgbr_mem_context_current())->allocQty != memQtyNone);
+
+    void *const buffer = pgbr_mem_new(size);
+
+    if (buffer == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+
+    FUNCTION_TEST_RETURN_P(VOID, buffer);
 }
 
 /**********************************************************************************************************************************/
@@ -822,12 +629,12 @@ memNewPtrArray(const size_t size)
         FUNCTION_TEST_PARAM(SIZE, size);
     FUNCTION_TEST_END();
 
-    // Allocate pointer array
-    void **const buffer = (void **const)MEM_CONTEXT_ALLOC_BUFFER(memContextAllocNew(size * sizeof(void *)));
+    ASSERT(((MemContext *)pgbr_mem_context_current())->allocQty != memQtyNone);
 
-    // Set pointers to NULL
-    for (size_t ptrIdx = 0; ptrIdx < size; ptrIdx++)
-        buffer[ptrIdx] = NULL;
+    void *const buffer = pgbr_mem_new_ptr_array(size);
+
+    if (buffer == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
 
     FUNCTION_TEST_RETURN_P(VOID, buffer);
 }
@@ -841,7 +648,14 @@ memResize(void *const buffer, const size_t size)
         FUNCTION_TEST_PARAM(SIZE, size);
     FUNCTION_TEST_END();
 
-    FUNCTION_TEST_RETURN_P(VOID, MEM_CONTEXT_ALLOC_BUFFER(memContextAllocResize(MEM_CONTEXT_ALLOC_HEADER(buffer), size)));
+    ASSERT(buffer != NULL);
+
+    void *const bufferNew = pgbr_mem_resize(buffer, size);
+
+    if (bufferNew == NULL)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+
+    FUNCTION_TEST_RETURN_P(VOID, bufferNew);
 }
 
 /**********************************************************************************************************************************/
@@ -852,35 +666,22 @@ memFree(void *const buffer)
         FUNCTION_TEST_PARAM_P(VOID, buffer);
     FUNCTION_TEST_END();
 
-    // Get the allocation
     MemContext *const contextCurrent = memContextStack[memContextCurrentStackIdx].memContext;
     ASSERT(contextCurrent->allocQty != memQtyNone);
     ASSERT(contextCurrent->allocInitialized);
     MemContextAlloc *const alloc = MEM_CONTEXT_ALLOC_HEADER(buffer);
 
-    // Remove allocation from the context
     if (contextCurrent->allocQty == memQtyOne)
     {
         ASSERT(memContextAllocOne(contextCurrent)->alloc == alloc);
-        memContextAllocOne(contextCurrent)->alloc = NULL;
     }
     else
     {
         ASSERT(contextCurrent->allocQty == memQtyMany);
         ASSERT_ALLOC_MANY_VALID(alloc);
-
-        // If this allocation is before the current free allocation then make it the current free allocation
-        MemContextAllocMany *const contextAlloc = memContextAllocMany(contextCurrent);
-
-        if (alloc->allocIdx < contextAlloc->freeIdx)
-            contextAlloc->freeIdx = alloc->allocIdx;
-
-        // Null the allocation
-        contextAlloc->list[alloc->allocIdx] = NULL;
     }
 
-    // Free the allocation
-    memFreeInternal(alloc);
+    pgbr_mem_free(buffer);
 
     FUNCTION_TEST_RETURN_VOID();
 }

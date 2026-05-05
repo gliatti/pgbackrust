@@ -1434,6 +1434,209 @@ pub unsafe extern "C" fn pgbr_mem_context_size(this: *const core::ffi::c_void) -
     with_panic_guard(|| unsafe { core_mem_context::mem_context_size(this.cast::<core_mem_context::MemContext>()) })
 }
 
+// ─── Allocations (32C) ────────────────────────────────────────────────────────────────────────
+//
+// `pgbr_mem_new` / `pgbr_mem_resize` / `pgbr_mem_free` are the public allocation API. The C
+// wrapper still owns the assertions and the `MemoryError` translation: when the Rust side
+// returns null we set the last error here so the C wrapper's `pgbr_error_throw_from_last`
+// produces the legacy `unable to allocate %zu bytes` diagnostic.
+
+/// Allocate `size` bytes in the current context. Returns the user-visible buffer pointer or
+/// null on libc OOM (in which case the thread-local last error is set to `MemoryError`).
+///
+/// # Safety
+///
+/// The current context (slot `memContextCurrentStackIdx`) must have
+/// `alloc_qty != MEM_QTY_NONE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_new(size: usize) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the current-context invariants.
+        let buffer = unsafe { core_mem_context::mem_new(size) };
+        if buffer.is_null() {
+            set_last_error(Error::new(ErrorType::Memory, format!("unable to allocate {size} bytes")));
+        }
+        buffer
+    })
+}
+
+/// Allocate an array of `count` `*mut c_void` pointers (zero-initialised). Same null-on-OOM
+/// behaviour as [`pgbr_mem_new`].
+///
+/// # Safety
+///
+/// Same as [`pgbr_mem_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_new_ptr_array(count: usize) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the current-context invariants.
+        let buffer = unsafe { core_mem_context::mem_new_ptr_array(count) };
+        if buffer.is_null() {
+            set_last_error(Error::new(
+                ErrorType::Memory,
+                format!(
+                    "unable to allocate {} bytes",
+                    count * core::mem::size_of::<*mut core::ffi::c_void>()
+                ),
+            ));
+        }
+        buffer
+    })
+}
+
+/// Resize `buffer` to `size` bytes. Returns the new buffer pointer or null on libc OOM (with
+/// the thread-local last error set to `MemoryError`).
+///
+/// # Safety
+///
+/// `buffer` must be a non-null pointer returned by `pgbr_mem_new` / `pgbr_mem_resize` in the
+/// current context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_resize(buffer: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the validity invariants.
+        let new_buffer = unsafe { core_mem_context::mem_resize(buffer, size) };
+        if new_buffer.is_null() {
+            set_last_error(Error::new(ErrorType::Memory, format!("unable to reallocate {size} bytes")));
+        }
+        new_buffer
+    })
+}
+
+/// Free `buffer`. Mirrors `memFree`; the C wrapper retains the `ASSERT_ALLOC_MANY_VALID` check
+/// (which now stringifies as `'pgbr_mem_alloc_valid(alloc)' failed`).
+///
+/// # Safety
+///
+/// `buffer` must be a valid pointer returned by `pgbr_mem_new` / `pgbr_mem_resize` in the
+/// current context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_free(buffer: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_free(buffer) });
+}
+
+/// Validation predicate used by `ASSERT_ALLOC_MANY_VALID`.
+///
+/// # Safety
+///
+/// `alloc` must either be null or point at the start of a `MemContextAlloc` header inside an
+/// allocation owned by the current context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_alloc_valid(alloc: *mut core::ffi::c_void) -> bool {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_alloc_valid(alloc.cast::<core_mem_context::MemContextAlloc>()) })
+}
+
+/// Returns the alloc-extra payload immediately following the `MemContext` header. Mirrors
+/// `memContextAllocExtra`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `alloc_extra > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_alloc_extra(this: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_context_alloc_extra(this.cast::<core_mem_context::MemContext>()) })
+}
+
+/// Recover the owning `MemContext *` given an alloc-extra pointer. Mirrors
+/// `memContextFromAllocExtra`.
+///
+/// # Safety
+///
+/// `alloc_extra` must be a pointer returned by `pgbr_mem_context_alloc_extra` of a live context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_from_alloc_extra(alloc_extra: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_context_from_alloc_extra(alloc_extra).cast::<core::ffi::c_void>() })
+}
+
+// ─── Audit (DEBUG-only) ────────────────────────────────────────────────────────────────────────
+//
+// Only exported when `cfg(c_debug)` because the audit walks DEBUG-only `name` and
+// `sequence_new` fields on `MemContext`. The C wrapper guards each call site with
+// `#ifdef DEBUG` so non-DEBUG builds never reference these symbols.
+
+/// Outcome of [`pgbr_mem_context_audit_end`]. Mirrors `core_mem_context::AuditEndResult`.
+///
+/// `kind`:
+///   * `0` = success, no diagnostic;
+///   * `1` = "expected return type X but found Y" (use `return_type_invalid`);
+///   * `2` = "expected return type X already found but also found Y" (`return_type_found` +
+///     `return_type_invalid`).
+#[cfg(c_debug)]
+#[repr(C)]
+pub struct PgbrAuditEndResult {
+    pub kind: i32,
+    pub return_type_found: *const c_char,
+    pub return_type_invalid: *const c_char,
+}
+
+#[cfg(c_debug)]
+impl FfiPanicReturn for PgbrAuditEndResult {
+    fn ffi_panic_return() -> Self {
+        Self {
+            kind: 99,
+            return_type_found: core::ptr::null(),
+            return_type_invalid: core::ptr::null(),
+        }
+    }
+}
+
+/// Begin an audit by stashing the highest `sequence_new` of the children of `state.mem_context`.
+///
+/// # Safety
+///
+/// `state` must be a valid `MemContextAuditState *`.
+#[cfg(c_debug)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_audit_begin(state: *mut core::ffi::c_void) {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        core_mem_context::mem_context_audit_begin(state.cast::<core_mem_context::MemContextAuditState>());
+    });
+}
+
+/// End an audit and report whether any unexpected return type was created.
+///
+/// # Safety
+///
+/// `state` must be a valid `MemContextAuditState *` produced by `pgbr_mem_context_audit_begin`,
+/// and `return_type` must be a valid NUL-terminated C string.
+#[cfg(c_debug)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_audit_end(
+    state: *const core::ffi::c_void,
+    return_type: *const c_char,
+) -> PgbrAuditEndResult {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe {
+        let r = core_mem_context::mem_context_audit_end(state.cast::<core_mem_context::MemContextAuditState>(), return_type);
+        PgbrAuditEndResult {
+            kind: r.kind,
+            return_type_found: r.return_type_found,
+            return_type_invalid: r.return_type_invalid,
+        }
+    })
+}
+
+/// Rename a context using its alloc-extra pointer. Mirrors `memContextAuditAllocExtraName`.
+///
+/// # Safety
+///
+/// `alloc_extra` must be a valid alloc-extra pointer for a live context, and `name` must be a
+/// NUL-terminated C string with a lifetime that outlives the context.
+#[cfg(c_debug)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_mem_context_audit_alloc_extra_name(
+    alloc_extra: *mut core::ffi::c_void,
+    name: *const c_char,
+) -> *mut core::ffi::c_void {
+    // SAFETY: caller upholds the validity invariants.
+    with_panic_guard(|| unsafe { core_mem_context::mem_context_audit_alloc_extra_name(alloc_extra, name) })
+}
+
 /// Logging callback registered by the C side to receive every Rust-originated log line.
 ///
 /// The first argument is a numeric log level matching the C `LogLevel` enum (off=0, assert=1,

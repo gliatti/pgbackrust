@@ -444,9 +444,9 @@ unsafe fn mem_realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void {
     new_ptr
 }
 
-/// libc free. Mirrors the legacy `memFreeInternal` minus the `ASSERT(buffer != NULL)` (the
-/// asserts live in the C wrapper).
-unsafe fn mem_free(ptr: *mut c_void) {
+/// libc free wrapped for tree-internal use. Different from the public [`mem_free`] (which
+/// operates on a user buffer); this helper just calls libc free on a malloc'd block.
+unsafe fn libc_free(ptr: *mut c_void) {
     // SAFETY: caller asserts `ptr` came from a previous `mem_alloc` / libc malloc.
     unsafe { free(ptr) };
 }
@@ -801,7 +801,7 @@ pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut Me
                         }
                     }
                 }
-                mem_free((*cm_ptr).list.cast::<c_void>());
+                libc_free((*cm_ptr).list.cast::<c_void>());
             }
         }
 
@@ -811,7 +811,7 @@ pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut Me
                 let ao = alloc_offset_ptr(this).cast::<MemContextAllocOne>();
                 let alloc = (*ao).alloc;
                 if !alloc.is_null() {
-                    mem_free(alloc.cast::<c_void>());
+                    libc_free(alloc.cast::<c_void>());
                 }
             } else {
                 let am_ptr = alloc_offset_ptr(this).cast::<MemContextAllocMany>();
@@ -819,10 +819,10 @@ pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut Me
                 for idx in 0..am.list_size {
                     let alloc = *am.list.add(idx as usize);
                     if !alloc.is_null() {
-                        mem_free(alloc.cast::<c_void>());
+                        libc_free(alloc.cast::<c_void>());
                     }
                 }
-                mem_free((*am_ptr).list.cast::<c_void>());
+                libc_free((*am_ptr).list.cast::<c_void>());
             }
         }
 
@@ -845,7 +845,7 @@ pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut Me
                 }
                 *cm.list.add(idx as usize) = core::ptr::null_mut();
             }
-            mem_free(this.cast::<c_void>());
+            libc_free(this.cast::<c_void>());
         }
 
         core::ptr::null_mut()
@@ -980,6 +980,483 @@ pub unsafe fn mem_context_size(this: *const MemContext) -> usize {
 pub fn top_context() -> *mut c_void {
     // SAFETY: see module-level note. Slot 0 is initialised before `main` runs.
     unsafe { entry_at(0).mem_context }
+}
+
+// ─── Allocations (32C) ────────────────────────────────────────────────────────────────────────
+//
+// `mem_new` / `mem_resize` / `mem_free` are the public allocation API; the still-in-C
+// `memAllocInternal` / `memReAllocInternal` / `memFreeInternal` static helpers stay because the
+// first `testBegin` in `memContextTest.c` exercises them directly with pinned `MemoryError`
+// diagnostics. The `mem_alloc_or_null` / `mem_realloc_or_null` helpers below mirror libc malloc /
+// realloc with no panic on failure — the FFI shim then sets a `MemoryError` last-error and
+// returns null so the C wrapper can `pgbr_error_throw_from_last`.
+
+/// Wrap libc `malloc`. Returns null on failure (caller is expected to translate to `MemoryError`).
+unsafe fn mem_alloc_or_null(size: usize) -> *mut c_void {
+    // SAFETY: libc malloc is safe to call with any size; null indicates failure.
+    unsafe { malloc(size) }
+}
+
+/// Wrap libc `realloc`. Returns null on failure.
+unsafe fn mem_realloc_or_null(ptr: *mut c_void, size: usize) -> *mut c_void {
+    // SAFETY: caller asserts `ptr` came from libc malloc / realloc.
+    unsafe { realloc(ptr, size) }
+}
+
+/// Find a free slot in the current context's alloc list and allocate
+/// `sizeof(MemContextAlloc) + size` bytes. Returns the new alloc header (or null on libc OOM).
+/// Mirrors `memContextAllocNew`.
+///
+/// # Safety
+///
+/// The current context (slot `memContextCurrentStackIdx`) must have
+/// `alloc_qty != MEM_QTY_NONE`.
+#[allow(clippy::cast_ptr_alignment, clippy::expect_used, clippy::must_use_candidate)]
+pub unsafe fn mem_context_alloc_new(size: usize) -> *mut MemContextAlloc {
+    // SAFETY: caller upholds the current-context invariants.
+    unsafe {
+        let total = core::mem::size_of::<MemContextAlloc>()
+            .checked_add(size)
+            .expect("alloc total overflow");
+        let result = mem_alloc_or_null(total).cast::<MemContextAlloc>();
+        if result.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        let ctx = current().cast::<MemContext>();
+
+        if (*ctx).alloc_qty() == MEM_QTY_ONE {
+            let one = alloc_offset_ptr(ctx).cast::<MemContextAllocOne>();
+            *result = MemContextAlloc {
+                alloc_idx: 0,
+                size: u32::try_from(total).expect("alloc total fits in 32 bits"),
+            };
+            (*one).alloc = result;
+            (*ctx).set_alloc_initialized(true);
+        } else {
+            // MEM_QTY_MANY (none rejected on the C side).
+            let many = alloc_offset_ptr(ctx).cast::<MemContextAllocMany>();
+
+            if (*ctx).alloc_initialized() {
+                while (*many).free_idx < (*many).list_size && !(*(*many).list.add((*many).free_idx as usize)).is_null() {
+                    (*many).free_idx += 1;
+                }
+
+                if (*many).free_idx == (*many).list_size {
+                    let new_size = (*many).list_size * 2;
+                    (*many).list = mem_realloc_ptr_array((*many).list, (*many).list_size as usize, new_size as usize);
+                    (*many).list_size = new_size;
+                }
+            } else {
+                core::ptr::write(
+                    many,
+                    MemContextAllocMany {
+                        list: mem_alloc_ptr_array(MEM_CONTEXT_ALLOC_INITIAL_SIZE as usize),
+                        list_size: MEM_CONTEXT_ALLOC_INITIAL_SIZE,
+                        free_idx: 0,
+                    },
+                );
+                (*ctx).set_alloc_initialized(true);
+            }
+
+            *result = MemContextAlloc {
+                alloc_idx: (*many).free_idx,
+                size: u32::try_from(total).expect("alloc total fits in 32 bits"),
+            };
+            *(*many).list.add((*many).free_idx as usize) = result;
+            (*many).free_idx += 1;
+        }
+
+        result
+    }
+}
+
+/// Resize an existing allocation; updates the list pointer in case realloc moved the buffer.
+/// Mirrors `memContextAllocResize`.
+///
+/// # Safety
+///
+/// `alloc` must be a valid `MemContextAlloc *` from a previous `mem_context_alloc_new` whose
+/// owning context is current.
+#[allow(clippy::cast_ptr_alignment, clippy::expect_used)]
+pub unsafe fn mem_context_alloc_resize(alloc: *mut MemContextAlloc, size: usize) -> *mut MemContextAlloc {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let total = core::mem::size_of::<MemContextAlloc>()
+            .checked_add(size)
+            .expect("alloc total overflow");
+        let new_alloc = mem_realloc_or_null(alloc.cast::<c_void>(), total).cast::<MemContextAlloc>();
+        if new_alloc.is_null() {
+            return core::ptr::null_mut();
+        }
+        (*new_alloc).size = u32::try_from(total).expect("alloc total fits in 32 bits");
+
+        let ctx = current().cast::<MemContext>();
+        if (*ctx).alloc_qty() == MEM_QTY_ONE {
+            (*alloc_offset_ptr(ctx).cast::<MemContextAllocOne>()).alloc = new_alloc;
+        } else {
+            let many = alloc_offset_ptr(ctx).cast::<MemContextAllocMany>();
+            *(*many).list.add((*new_alloc).alloc_idx as usize) = new_alloc;
+        }
+
+        new_alloc
+    }
+}
+
+/// Allocate `size` bytes in the current context.
+///
+/// Returns the user-visible buffer pointer (the alloc header sits immediately before it).
+/// Returns null on libc OOM.
+///
+/// # Safety
+///
+/// Same as [`mem_context_alloc_new`].
+#[allow(clippy::must_use_candidate)]
+pub unsafe fn mem_new(size: usize) -> *mut c_void {
+    // SAFETY: see [`mem_context_alloc_new`].
+    unsafe {
+        let alloc = mem_context_alloc_new(size);
+        if alloc.is_null() {
+            return core::ptr::null_mut();
+        }
+        alloc.add(1).cast::<c_void>()
+    }
+}
+
+/// Allocate an array of `count` `*mut c_void` pointers (zero-initialised). Returns null on OOM.
+///
+/// # Safety
+///
+/// Same as [`mem_new`].
+#[allow(clippy::must_use_candidate)]
+pub unsafe fn mem_new_ptr_array(count: usize) -> *mut c_void {
+    // SAFETY: see [`mem_new`].
+    unsafe {
+        let bytes = count * core::mem::size_of::<*mut c_void>();
+        let buffer = mem_new(bytes);
+        if buffer.is_null() {
+            return core::ptr::null_mut();
+        }
+        core::ptr::write_bytes(buffer.cast::<u8>(), 0, bytes);
+        buffer
+    }
+}
+
+/// Resize the buffer that backs `buffer`. Returns the new buffer pointer (which may differ from
+/// the input) or null on libc OOM.
+///
+/// # Safety
+///
+/// `buffer` must be a non-null pointer returned by a previous [`mem_new`] / [`mem_resize`] in
+/// the current context.
+#[allow(clippy::cast_ptr_alignment)]
+#[allow(clippy::must_use_candidate)]
+pub unsafe fn mem_resize(buffer: *mut c_void, size: usize) -> *mut c_void {
+    // SAFETY: caller upholds the invariants.
+    unsafe {
+        let alloc = buffer.cast::<MemContextAlloc>().sub(1);
+        let new_alloc = mem_context_alloc_resize(alloc, size);
+        if new_alloc.is_null() {
+            return core::ptr::null_mut();
+        }
+        new_alloc.add(1).cast::<c_void>()
+    }
+}
+
+/// Free a buffer previously returned by [`mem_new`] / [`mem_resize`]. Mirrors `memFree`.
+///
+/// The C wrapper retains the `ASSERT_ALLOC_MANY_VALID` check that pins specific text in the
+/// test; here we trust the caller.
+///
+/// # Safety
+///
+/// `buffer` must be a valid pointer returned by [`mem_new`] / [`mem_resize`] in the current
+/// context.
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_free(buffer: *mut c_void) {
+    // SAFETY: caller upholds the invariants.
+    unsafe {
+        let alloc = buffer.cast::<MemContextAlloc>().sub(1);
+        let ctx = current().cast::<MemContext>();
+
+        if (*ctx).alloc_qty() == MEM_QTY_ONE {
+            (*alloc_offset_ptr(ctx).cast::<MemContextAllocOne>()).alloc = core::ptr::null_mut();
+        } else {
+            let many = alloc_offset_ptr(ctx).cast::<MemContextAllocMany>();
+            let idx = (*alloc).alloc_idx;
+            if idx < (*many).free_idx {
+                (*many).free_idx = idx;
+            }
+            *(*many).list.add(idx as usize) = core::ptr::null_mut();
+        }
+
+        libc_free(alloc.cast::<c_void>());
+    }
+}
+
+/// Returns the pointer to the alloc-extra payload immediately following the `MemContext`
+/// header. Mirrors `memContextAllocExtra`.
+///
+/// # Safety
+///
+/// `this` must be a valid `MemContext *` whose `alloc_extra > 0`.
+#[must_use]
+pub const unsafe fn mem_context_alloc_extra(this: *mut MemContext) -> *mut c_void {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe { this.add(1).cast::<c_void>() }
+}
+
+/// Recover the owning `MemContext *` given an alloc-extra pointer.
+///
+/// Mirrors `memContextFromAllocExtra`.
+///
+/// # Safety
+///
+/// `alloc_extra` must be a pointer previously returned by [`mem_context_alloc_extra`] of a live
+/// context.
+#[allow(clippy::cast_ptr_alignment)]
+#[must_use]
+pub const unsafe fn mem_context_from_alloc_extra(alloc_extra: *mut c_void) -> *mut MemContext {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe { alloc_extra.cast::<MemContext>().sub(1) }
+}
+
+/// Validation predicate used by `ASSERT_ALLOC_MANY_VALID`.
+///
+/// Returns `true` when the alloc header is non-null, not the `NULL - sizeof(MemContextAlloc)`
+/// sentinel produced by passing NULL to `MEM_CONTEXT_ALLOC_HEADER`, and corresponds to a live
+/// entry in the current context's many-style alloc list.
+///
+/// # Safety
+///
+/// `alloc` must either be null or point at the start of a `MemContextAlloc` header inside an
+/// allocation owned by the current context.
+#[allow(clippy::cast_ptr_alignment, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#[must_use]
+pub unsafe fn mem_alloc_valid(alloc: *mut MemContextAlloc) -> bool {
+    if alloc.is_null() {
+        return false;
+    }
+    // The `MEM_CONTEXT_ALLOC_HEADER(buffer)` macro on the C side returns
+    // `(MemContextAlloc *)buffer - 1`, so passing `NULL` produces the
+    // `(uintptr_t)-sizeof(MemContextAlloc)` sentinel the macro guards against.
+    let alloc_int = alloc as usize;
+    let sentinel = 0_usize.wrapping_sub(core::mem::size_of::<MemContextAlloc>());
+    if alloc_int == sentinel {
+        return false;
+    }
+    // SAFETY: caller upholds the alloc-validity invariants for non-sentinel pointers.
+    unsafe {
+        let ctx = current().cast::<MemContext>();
+        if (*ctx).alloc_qty() != MEM_QTY_MANY || !(*ctx).alloc_initialized() {
+            return false;
+        }
+        let many = alloc_offset_ptr(ctx).cast::<MemContextAllocMany>();
+        let idx = (*alloc).alloc_idx;
+        if idx >= (*many).list_size {
+            return false;
+        }
+        !(*(*many).list.add(idx as usize)).is_null()
+    }
+}
+
+// ─── Audit (DEBUG-only) ────────────────────────────────────────────────────────────────────────
+//
+// The audit is only useful when `name` / `sequence_new` are present on `MemContext`, which only
+// happens with `cfg(c_debug)`. The C wrapper guards each call site with `#ifdef DEBUG` so the
+// FFI shims never fire in non-DEBUG builds; the cfg gate here keeps the symbols off the
+// non-DEBUG archive entirely.
+
+/// Mirror of the C `MemContextAuditState` struct. 64-bit layout: `8 mem_context` +
+/// `1 return_type_any + 7 padding` + `8 sequence_context_new` = 24 bytes.
+#[repr(C)]
+pub struct MemContextAuditState {
+    pub mem_context: *mut MemContext,
+    pub return_type_any: bool,
+    pub sequence_context_new: u64,
+}
+
+#[cfg(c_debug)]
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    assert!(core::mem::size_of::<MemContextAuditState>() == 24);
+};
+
+/// Walk `state.mem_context`'s child list and stash the highest `sequence_new` so a later
+/// [`mem_context_audit_end`] call can detect newly-created children. Mirrors
+/// `memContextAuditBegin`.
+///
+/// # Safety
+///
+/// `state` must be a valid `MemContextAuditState *` whose `mem_context` is live.
+#[cfg(c_debug)]
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_audit_begin(state: *mut MemContextAuditState) {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let s = &mut *state;
+        let mc = s.mem_context;
+
+        if !(*mc).child_initialized() {
+            return;
+        }
+
+        if (*mc).child_qty() == MEM_QTY_ONE {
+            let child = (*child_offset_ptr(mc).cast::<MemContextChildOne>()).context;
+            if !child.is_null() {
+                s.sequence_context_new = (*child).sequence_new;
+            }
+        } else {
+            // MEM_QTY_MANY
+            let cm = &*child_offset_ptr(mc).cast::<MemContextChildMany>();
+            for idx in 0..cm.list_size {
+                let child = *cm.list.add(idx as usize);
+                if !child.is_null() && (*child).sequence_new > s.sequence_context_new {
+                    s.sequence_context_new = (*child).sequence_new;
+                }
+            }
+        }
+    }
+}
+
+/// Compare a child context's name (`actual`) against the expected return type (`expected`).
+/// Allows actual to end with a `::extra` suffix and expected to end with ` *`. Mirrors the
+/// static `memContextAuditNameMatch`.
+///
+/// # Safety
+///
+/// Both pointers must be valid NUL-terminated C strings.
+#[cfg(c_debug)]
+unsafe fn audit_name_match(actual: *const c_char, expected: *const c_char) -> bool {
+    // SAFETY: caller upholds NUL-termination.
+    unsafe {
+        let mut i: usize = 0;
+        loop {
+            let a = *actual.add(i);
+            if a == 0 {
+                break;
+            }
+            if a != *expected.add(i) {
+                break;
+            }
+            i += 1;
+        }
+        let a = *actual.add(i);
+        let e = *expected.add(i);
+
+        // Either actual is exhausted or it continues with `::`.
+        let actual_ok = a == 0 || (a == b':' as c_char && *actual.add(i + 1) == b':' as c_char);
+        // Either expected is exhausted or it ends with ` *`.
+        let expected_ok = e == 0 || (e == b' ' as c_char && *expected.add(i + 1) == b'*' as c_char && *expected.add(i + 2) == 0);
+
+        actual_ok && expected_ok
+    }
+}
+
+/// Outcome of a [`mem_context_audit_end`] call.
+#[repr(C)]
+pub struct AuditEndResult {
+    /// `0` = success, `1` = "expected return type X but found Y",
+    /// `2` = "expected return type X already found but also found Y".
+    pub kind: i32,
+    /// On `kind == 2`, the previously-found name; null otherwise.
+    pub return_type_found: *const c_char,
+    /// On `kind != 0`, the offending name; null otherwise.
+    pub return_type_invalid: *const c_char,
+}
+
+impl AuditEndResult {
+    pub const OK: Self = Self {
+        kind: 0,
+        return_type_found: core::ptr::null(),
+        return_type_invalid: core::ptr::null(),
+    };
+}
+
+/// Walk the children created since the matching [`mem_context_audit_begin`] call and check that
+/// any whose name matches `return_type` is unique. Mirrors `memContextAuditEnd`. The C wrapper
+/// rethrows `kind != 0` as `AssertError`.
+///
+/// # Safety
+///
+/// `state` must be a valid `MemContextAuditState *` produced by `mem_context_audit_begin`.
+/// `return_type` must be a valid NUL-terminated C string.
+#[cfg(c_debug)]
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn mem_context_audit_end(state: *const MemContextAuditState, return_type: *const c_char) -> AuditEndResult {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let s = &*state;
+        if s.return_type_any {
+            return AuditEndResult::OK;
+        }
+
+        let mc = s.mem_context;
+        if !(*mc).child_initialized() {
+            return AuditEndResult::OK;
+        }
+
+        let mut return_type_invalid: *const c_char = core::ptr::null();
+        let mut return_type_found: *const c_char = core::ptr::null();
+
+        if (*mc).child_qty() == MEM_QTY_ONE {
+            let child = (*child_offset_ptr(mc).cast::<MemContextChildOne>()).context;
+            if !child.is_null() && (*child).sequence_new > s.sequence_context_new && !audit_name_match((*child).name, return_type) {
+                return_type_invalid = (*child).name;
+            }
+        } else {
+            let cm = &*child_offset_ptr(mc).cast::<MemContextChildMany>();
+            for idx in 0..cm.list_size {
+                let child = *cm.list.add(idx as usize);
+                if child.is_null() || (*child).sequence_new <= s.sequence_context_new {
+                    continue;
+                }
+                if audit_name_match((*child).name, return_type) {
+                    if !return_type_found.is_null() {
+                        return_type_invalid = (*child).name;
+                        break;
+                    }
+                    return_type_found = (*child).name;
+                } else {
+                    return_type_invalid = (*child).name;
+                    break;
+                }
+            }
+        }
+
+        if !return_type_invalid.is_null() {
+            if !return_type_found.is_null() {
+                return AuditEndResult {
+                    kind: 2,
+                    return_type_found,
+                    return_type_invalid,
+                };
+            }
+            return AuditEndResult {
+                kind: 1,
+                return_type_found: core::ptr::null(),
+                return_type_invalid,
+            };
+        }
+        AuditEndResult::OK
+    }
+}
+
+/// Rename a context using its alloc-extra pointer. Mirrors `memContextAuditAllocExtraName`.
+/// Returns the input `alloc_extra` unchanged so the macro can be used inline.
+///
+/// # Safety
+///
+/// `alloc_extra` must be a pointer returned by [`mem_context_alloc_extra`] of a live context.
+/// `name` must be a NUL-terminated C string with a lifetime that outlives the context.
+#[cfg(c_debug)]
+pub unsafe fn mem_context_audit_alloc_extra_name(alloc_extra: *mut c_void, name: *const c_char) -> *mut c_void {
+    // SAFETY: caller upholds the validity invariants.
+    unsafe {
+        let mc = mem_context_from_alloc_extra(alloc_extra);
+        (*mc).name = name;
+        alloc_extra
+    }
 }
 
 // ─── Stack (32A) ───────────────────────────────────────────────────────────────────────────────

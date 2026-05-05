@@ -256,12 +256,7 @@ testRun(void)
         // This test will change if the allocations above change
         TEST_RESULT_UINT(memContextSize(memContextCurrent()), TEST_64BIT() ? 217 : 153, "check size");
 
-        TEST_ERROR(
-            memFree(NULL), AssertError,
-            "assertion 'alloc != NULL && "
-            "(uintptr_t)alloc != (uintptr_t)-sizeof(MemContextAlloc) &&"
-            " alloc->allocIdx < memContextAllocMany(memContextStack[memContextCurrentStackIdx].memContext)->listSize &&"
-            " memContextAllocMany(memContextStack[memContextCurrentStackIdx].memContext)->list[alloc->allocIdx]' failed");
+        TEST_ERROR(memFree(NULL), AssertError, "assertion 'pgbr_mem_alloc_valid(alloc)' failed");
         memFree(buffer);
 
         memContextSwitch(memContextTop());
