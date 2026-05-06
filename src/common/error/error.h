@@ -39,7 +39,10 @@ IMPORTANT: Never call return from within any of the error-handling blocks.
 
 #include <errno.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <stdbool.h>
+
+#include "pgbr_ffi.h"
 
 /***********************************************************************************************************************************
 Error type object
@@ -90,6 +93,19 @@ A Rust shim populates the thread-local last-error slot via `pgbr_last_error_set`
 code into an ErrorType, clears the slot, and longjmps via `errorInternalThrowFmt`. Asserts if no last error is set.
 ***********************************************************************************************************************************/
 FN_EXTERN void pgbr_error_throw_from_last(const char *fileName, const char *functionName, int fileLine);
+
+/***********************************************************************************************************************************
+Format-string args marshaller shared between `errorInternalThrowFmt` (in this file) and `logInternalFmt` (in src/common/log.c).
+
+Walks `format` once, pulls each `va_arg` according to the spec, and packs the typed values into `out` in declaration order. Both
+the THROW_FMT and LOG_*_FMT routes hand the resulting blob to the Rust formatter (`pgbr_error_format_message`,
+`pgbr_log_internal_fmt`), so the spec must match `crates/pgbr-error/src/format.rs` byte-for-byte.
+
+Returns the number of args written into `out` (always less than `ERROR_FMT_ARG_MAX`). Asserts on overflow.
+***********************************************************************************************************************************/
+#define ERROR_FMT_ARG_MAX                                           16
+
+FN_EXTERN unsigned int errorMarshalArgs(const char *format, va_list args, PGBR_PgbrFmtArg *out);
 
 /***********************************************************************************************************************************
 Functions to get information about the current error within a CATCH() block. Invalid outside a CATCH() block.

@@ -1,36 +1,31 @@
 /***********************************************************************************************************************************
 Log Handler
 
-Thin C shims over the Rust state owned by `crates/pgbr-core::log`. The 12 file-scope variables (4 levels, 3 fds, banner /
-timestamp / dry-run flags, process metadata, plus the 32 KiB scratchpad) live in Rust; this file's body shrinks to FFI shims
-for the public `logInit` / `logClose` / `logFileSet` / `logAny` / `logLevelEnum` / `logLevelStr` API plus the formatter helpers
-(`logPre` / `logPost` / `logWriteIndent` / `logWrite` / `logRange` / `logSignal` / `logInternal*`) which sub-issue B will hoist
-into Rust.
+Thin C shims over the Rust state and formatter owned by `crates/pgbr-core::log`.
 
-`logFileSet` keeps the `open(2)` syscall and the `LOG_WARN_FMT` failure path on the C side because the formatter is still here.
+Sub-issue A migrated the file-scope state (4 levels, 3 fds, banner / timestamp / dry-run flags, process metadata, the 32 KiB
+scratchpad) into Rust. Sub-issue B (this revision) hoists the line formatter as well — `logPre` / `logPost` /
+`logWriteIndent` / `logWrite` / `logRange` are gone; `logInternal` / `logInternalFmt` / `logSignal` shrink to FFI shims that
+delegate to `pgbr_log_internal` / `pgbr_log_internal_fmt` / `pgbr_log_signal` and re-throw via `pgbr_error_throw_from_last` on
+write failure. `logFileSet` keeps the `open(2)` syscall and the `LOG_WARN_FMT` failure path on the C side (POSIX I/O remains a
+C build concern).
+
+The variadic `logInternalFmt` reuses the format-args marshaller `errorMarshalArgs` defined in `src/common/error/error.c`. Both
+THROW_FMT and LOG_*_FMT funnel into the same Rust formatter (`pgbr_error::format::format_message`) — sharing the marshaller
+keeps the C-side spec parser single-sourced.
 ***********************************************************************************************************************************/
 #include <build.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-#include <strings.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "common/debug.h"
+#include "common/error/error.h"
 #include "common/log.h"
 #include "common/macro.h"
-#include "common/time.h"
-#include "common/type/convert.h"
 #include "pgbr_ffi.h"
-
-/***********************************************************************************************************************************
-Dry run prefix
-***********************************************************************************************************************************/
-#define DRY_RUN_PREFIX                                              "[DRY-RUN] "
 
 /***********************************************************************************************************************************
 Test Asserts
@@ -183,260 +178,7 @@ logClose(void)
     FUNCTION_TEST_RETURN_VOID();
 }
 
-/***********************************************************************************************************************************
-Determine if the log level is in the specified range
-***********************************************************************************************************************************/
-static bool
-logRange(const LogLevel logLevel, const LogLevel logRangeMin, const LogLevel logRangeMax)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(ENUM, logLevel);
-        FUNCTION_TEST_PARAM(ENUM, logRangeMin);
-        FUNCTION_TEST_PARAM(ENUM, logRangeMax);
-    FUNCTION_TEST_END();
-
-    ASSERT_LOG_LEVEL(logLevel);
-    ASSERT_LOG_LEVEL(logRangeMin);
-    ASSERT_LOG_LEVEL(logRangeMax);
-    ASSERT(logRangeMin <= logRangeMax);
-
-    FUNCTION_TEST_RETURN(BOOL, logLevel >= logRangeMin && logLevel <= logRangeMax);
-}
-
-/***********************************************************************************************************************************
-Internal write function that handles errors
-***********************************************************************************************************************************/
-static void
-logWrite(const int fd, const char *const message, const size_t messageSize, const char *const errorDetail)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(INT, fd);
-        FUNCTION_TEST_PARAM(STRINGZ, message);
-        FUNCTION_TEST_PARAM(SIZE, messageSize);
-        FUNCTION_TEST_PARAM(STRINGZ, errorDetail);
-    FUNCTION_TEST_END();
-
-    ASSERT(fd != -1);
-    ASSERT(message != NULL);
-    ASSERT(messageSize != 0);
-    ASSERT(errorDetail != NULL);
-
-    if ((size_t)write(fd, message, messageSize) != messageSize)
-        THROW_SYS_ERROR_FMT(FileWriteError, "unable to write %s", errorDetail);
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/***********************************************************************************************************************************
-Write out log message and indent subsequent lines
-***********************************************************************************************************************************/
-static void
-logWriteIndent(const int fd, const char *message, const size_t indentSize, const char *const errorDetail)
-{
-    // Indent buffer -- used to write out indent space without having to loop
-    static const char indentBuffer[] = "                                                                                          ";
-
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(INT, fd);
-        FUNCTION_TEST_PARAM(STRINGZ, message);
-        FUNCTION_TEST_PARAM(SIZE, indentSize);
-        FUNCTION_TEST_PARAM(STRINGZ, errorDetail);
-    FUNCTION_TEST_END();
-
-    ASSERT(fd != -1);
-    ASSERT(message != NULL);
-    ASSERT(indentSize > 0 && indentSize < sizeof(indentBuffer));
-    ASSERT(errorDetail != NULL);
-
-    // Indent all lines after the first
-    const char *linefeedPtr = strchr(message, '\n');
-    bool first = true;
-
-    while (linefeedPtr != NULL)
-    {
-        if (!first)
-            logWrite(fd, indentBuffer, indentSize, errorDetail);
-        else
-            first = false;
-
-        logWrite(fd, message, (size_t)(linefeedPtr - message + 1), errorDetail);
-        message += (size_t)(linefeedPtr - message + 1);
-
-        linefeedPtr = strchr(message, '\n');
-    }
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
-/***********************************************************************************************************************************
-Generate the log header and anything else that needs to happen before the message is output
-***********************************************************************************************************************************/
-typedef struct LogPreResult
-{
-    size_t bufferPos;
-    char *logBufferStdErr;
-    size_t indentSize;
-} LogPreResult;
-
-static LogPreResult
-logPre(
-    const LogLevel logLevel, const unsigned int processId, const char *const fileName, const char *const functionName,
-    const int code)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(ENUM, logLevel);
-        FUNCTION_TEST_PARAM(UINT, processId);
-        FUNCTION_TEST_PARAM(STRINGZ, fileName);
-        FUNCTION_TEST_PARAM(STRINGZ, functionName);
-        FUNCTION_TEST_PARAM(INT, code);
-    FUNCTION_TEST_END();
-
-    ASSERT_LOG_LEVEL(logLevel);
-    ASSERT(fileName != NULL);
-    ASSERT(functionName != NULL);
-    ASSERT(
-        (code == 0 && logLevel > logLevelError) || (logLevel == logLevelError && code != errorTypeCode(&AssertError)) ||
-        (logLevel == logLevelAssert && code == errorTypeCode(&AssertError)));
-
-    // Cache state for the lifetime of this format pass
-    char *const logBuffer = pgbr_log_buffer_ptr();
-    const bool logTimestamp = pgbr_log_timestamp_get();
-    const unsigned int logProcessId = pgbr_log_process_id_get();
-    const int logProcessSize = pgbr_log_process_size_get();
-    const bool logDryRun = pgbr_log_dry_run_get();
-
-    // Initialize buffer position
-    LogPreResult result = {.bufferPos = 0};
-
-    // Add time
-    if (logTimestamp)
-    {
-        const TimeMSec logTimeMSec = timeMSec();
-        const time_t logTimeSec = (time_t)(logTimeMSec / MSEC_PER_SEC);
-
-        result.bufferPos += cvtTimeToZP(
-            "%Y-%m-%d %H:%M:%S", logTimeSec, logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos);
-        result.bufferPos += (size_t)snprintf(
-            logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos, ".%03d ", (int)(logTimeMSec % 1000));
-    }
-
-    // Add process and aligned log level
-    result.bufferPos += (size_t)snprintf(
-        logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos, "P%0*u %*s: ", logProcessSize,
-        processId == (unsigned int)-1 ? logProcessId : processId, 6, logLevelStr(logLevel));
-
-    // When writing to stderr the timestamp, process, and log level alignment will be skipped
-    result.logBufferStdErr = logBuffer + result.bufferPos - strlen(logLevelStr(logLevel)) - 2;
-
-    // Set the indent size -- this will need to be adjusted for stderr
-    result.indentSize = result.bufferPos;
-
-    // Add error code
-    if (code != 0)
-    {
-        result.bufferPos += (size_t)snprintf(
-            logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos, "[%03d]: ", code);
-    }
-
-    // Add dry-run prefix
-    if (logDryRun)
-    {
-        result.bufferPos += (size_t)snprintf(
-            logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos, DRY_RUN_PREFIX);
-    }
-
-    // Add debug info
-    if (logLevel >= logLevelDebug)
-    {
-        // Adding padding for debug and trace levels. Cast to handle compilers (e.g. MSVC) that coerce to signed after subtraction.
-        for (unsigned int paddingIdx = 0; paddingIdx < (unsigned int)((logLevel - logLevelDebug + 1) * 4); paddingIdx++)
-        {
-            logBuffer[result.bufferPos++] = ' ';
-            result.indentSize++;
-        }
-
-        result.bufferPos += (size_t)snprintf(
-            logBuffer + result.bufferPos, LOG_BUFFER_SIZE - result.bufferPos, "%.*s::%s: ", (int)strlen(fileName) - 2, fileName,
-            functionName);
-    }
-
-    FUNCTION_TEST_RETURN_TYPE(LogPreResult, result);
-}
-
-/***********************************************************************************************************************************
-Finalize formatting and log after the message has been added to the buffer
-***********************************************************************************************************************************/
-#define LOG_BANNER                                                  "-------------------PROCESS START-------------------\n"
-
-static void
-logPost(LogPreResult *const logData, const LogLevel logLevel, const LogLevel logRangeMin, const LogLevel logRangeMax)
-{
-    FUNCTION_TEST_BEGIN();
-        FUNCTION_TEST_PARAM(SIZE, logData->bufferPos);
-        FUNCTION_TEST_PARAM(STRINGZ, logData->logBufferStdErr);
-        FUNCTION_TEST_PARAM(SIZE, logData->indentSize);
-        FUNCTION_TEST_PARAM(ENUM, logLevel);
-        FUNCTION_TEST_PARAM(ENUM, logRangeMin);
-        FUNCTION_TEST_PARAM(ENUM, logRangeMax);
-    FUNCTION_TEST_END();
-
-    ASSERT_LOG_LEVEL(logLevel);
-    ASSERT_LOG_LEVEL(logRangeMin);
-    ASSERT_LOG_LEVEL(logRangeMax);
-    ASSERT(logRangeMin <= logRangeMax);
-
-    char *const logBuffer = pgbr_log_buffer_ptr();
-    const LogLevel logLevelStdOut = (LogLevel)pgbr_log_level_std_out_get();
-    const LogLevel logLevelStdErr = (LogLevel)pgbr_log_level_std_err_get();
-    const LogLevel logLevelFile = (LogLevel)pgbr_log_level_file_get();
-    const int logFdStdOut = pgbr_log_fd_std_out_get();
-    const int logFdStdErr = pgbr_log_fd_std_err_get();
-    const int logFdFile = pgbr_log_fd_file_get();
-
-    // Add linefeed
-    logBuffer[logData->bufferPos++] = '\n';
-    logBuffer[logData->bufferPos] = 0;
-
-    // Determine where to log the message based on log-level-stderr
-    if (logLevel <= logLevelStdErr)
-    {
-        if ((logLevelStdErr > logLevelStdOut && logRange(logLevelStdErr, logRangeMin, logRangeMax)) ||
-            (logLevelStdErr <= logLevelStdOut && logRange(logLevelStdOut, logRangeMin, logRangeMax)))
-        {
-            logWriteIndent(
-                logFdStdErr, logData->logBufferStdErr, logData->indentSize - (size_t)(logData->logBufferStdErr - logBuffer),
-                "log to stderr");
-        }
-    }
-    else if (logLevel <= logLevelStdOut && logRange(logLevelStdOut, logRangeMin, logRangeMax))
-        logWriteIndent(logFdStdOut, logBuffer, logData->indentSize, "log to stdout");
-
-    // Log to file
-    if (logLevel <= logLevelFile && logFdFile != -1 && logRange(logLevelFile, logRangeMin, logRangeMax))
-    {
-        // If the banner has not been written
-        if (!pgbr_log_file_banner_get())
-        {
-            // Add a blank line if the file already has content
-            if (lseek(logFdFile, 0, SEEK_END) > 0)
-                logWrite(logFdFile, "\n", 1, "banner spacing to file");
-
-            // Write process start banner
-            logWrite(logFdFile, LOG_BANNER, sizeof(LOG_BANNER) - 1, "banner to file");
-
-            // Mark banner as written
-            pgbr_log_file_banner_set(true);
-        }
-
-        logWriteIndent(logFdFile, logBuffer, logData->indentSize, "log to file");
-    }
-
-    FUNCTION_TEST_RETURN_VOID();
-}
-
 /**********************************************************************************************************************************/
-#define LOG_SIGNAL_MESSAGE_PRE                                      "terminated on signal "
-
 FN_EXTERN void
 logSignal(const LogLevel logLevel, const char *const signalName)
 {
@@ -446,20 +188,9 @@ logSignal(const LogLevel logLevel, const char *const signalName)
     FUNCTION_TEST_END();
 
     ASSERT(signalName != NULL);
-    STATIC_ASSERT_STMT(LOG_BUFFER_SIZE >= sizeof(LOG_SIGNAL_MESSAGE_PRE), "invalid log buffer size");
 
-    char *const logBuffer = pgbr_log_buffer_ptr();
-
-    // Initialize log buffer and data with static signal message
-    memcpy(logBuffer, LOG_SIGNAL_MESSAGE_PRE, sizeof(LOG_SIGNAL_MESSAGE_PRE) - 1);
-    LogPreResult logData = {.bufferPos = sizeof(LOG_SIGNAL_MESSAGE_PRE) - 1, .logBufferStdErr = logBuffer, .indentSize = 4};
-
-    // Add signal name and ensure string is zero-terminated
-    strncpy(logBuffer + logData.bufferPos, signalName, LOG_BUFFER_SIZE - logData.bufferPos - 1);
-    logData.bufferPos += strlen(signalName);
-    logBuffer[LOG_BUFFER_SIZE - 1] = 0;
-
-    logPost(&logData, logLevel, LOG_LEVEL_MIN, LOG_LEVEL_MAX);
+    if (pgbr_log_signal((int)logLevel, signalName) != 0)
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -483,16 +214,11 @@ logInternal(
 
     ASSERT(message != NULL);
 
-    LogPreResult logData = logPre(logLevel, processId, fileName, functionName, code);
-
-    char *const logBuffer = pgbr_log_buffer_ptr();
-
-    // Copy message into buffer and update buffer position
-    strncpy(logBuffer + logData.bufferPos, message, LOG_BUFFER_SIZE - logData.bufferPos);
-    logBuffer[LOG_BUFFER_SIZE - 1] = 0;
-    logData.bufferPos += strlen(logBuffer + logData.bufferPos);
-
-    logPost(&logData, logLevel, logRangeMin, logRangeMax);
+    if (pgbr_log_internal(
+            (int)logLevel, (int)logRangeMin, (int)logRangeMax, processId, fileName, functionName, code, message) != 0)
+    {
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+    }
 
     FUNCTION_TEST_RETURN_VOID();
 }
@@ -515,18 +241,20 @@ logInternalFmt(
 
     ASSERT(format != NULL);
 
-    LogPreResult logData = logPre(logLevel, processId, fileName, functionName, code);
-
-    char *const logBuffer = pgbr_log_buffer_ptr();
-
-    // Format message into buffer and update buffer position
+    // Marshal va_args through the same blob format the THROW_FMT path uses (Phase 27 sub-issue B). Reusing
+    // errorMarshalArgs keeps the spec parser single-sourced — both routes feed `pgbr_error::format::format_message`.
+    PGBR_PgbrFmtArg fmtArgs[ERROR_FMT_ARG_MAX];
     va_list argumentList;
     va_start(argumentList, format);
-    logData.bufferPos += (size_t)vsnprintf(
-        logBuffer + logData.bufferPos, LOG_BUFFER_SIZE - logData.bufferPos, format, argumentList);
+    const unsigned int nArgs = errorMarshalArgs(format, argumentList, fmtArgs);
     va_end(argumentList);
 
-    logPost(&logData, logLevel, logRangeMin, logRangeMax);
+    if (pgbr_log_internal_fmt(
+            (int)logLevel, (int)logRangeMin, (int)logRangeMax, processId, fileName, functionName, code, format, fmtArgs,
+            nArgs) != 0)
+    {
+        pgbr_error_throw_from_last(__FILE__, __func__, __LINE__);
+    }
 
     FUNCTION_TEST_RETURN_VOID();
 }

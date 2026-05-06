@@ -157,15 +157,9 @@ testRun(void)
     }
 
     // *****************************************************************************************************************************
-    if (testBegin("logWrite()"))
-    {
-        // Just test the error here -- success is well tested elsewhere
-        TEST_ERROR(
-            logWrite(-999, "message", 7, "invalid file descriptor"), FileWriteError,
-            "unable to write invalid file descriptor: [9] Bad file descriptor");
-    }
-
-    // *****************************************************************************************************************************
+    // The legacy `testBegin("logWrite()")` was removed in Phase 31 sub-issue B: `logWrite` no longer exists on the C side. The
+    // equivalent error path (write to a closed fd surfacing as FileWriteError) is exercised by the `logInternal()` block below
+    // through the public API and by `pgbr-core::log::format::tests::log_internal_returns_error_on_invalid_fd`.
     if (testBegin("logInternal() and logInternalFmt()"))
     {
         TEST_RESULT_VOID(logInit(logLevelOff, logLevelOff, logLevelOff, false, 0, 1, false), "init logging to off");

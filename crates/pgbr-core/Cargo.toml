@@ -14,5 +14,12 @@ repository.workspace = true
 # byte-identical with the C bitfield layout.
 c-debug = []
 
+[dependencies]
+# `log::format` reuses the printf-style formatter and typed `Arg` variants from
+# `pgbr-error::format` so logInternalFmt's args-blob round-trip mirrors the
+# error-side path established in Phase 27 sub-issue B. Also needed for the typed
+# `Error` value returned by `log::format::log_internal*` on `write(2)` failure.
+pgbr-error = { path = "../pgbr-error" }
+
 [lints]
 workspace = true

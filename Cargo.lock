@@ -318,6 +318,9 @@ version = "0.1.0"
 [[package]]
 name = "pgbr-core"
 version = "0.1.0"
+dependencies = [
+ "pgbr-error",
+]
 
 [[package]]
 name = "pgbr-crypto"

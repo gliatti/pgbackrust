@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use pgbr_core::blob as core_blob;
 use pgbr_core::debug as core_debug;
 use pgbr_core::log as core_log;
+use pgbr_core::log::format as core_log_format;
 use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::object as core_object;
 use pgbr_core::stack_trace as core_stack_trace;
@@ -5214,6 +5215,280 @@ pub extern "C" fn pgbr_log_dry_run_get() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn pgbr_log_dry_run_set(value: bool) {
     with_panic_guard(|| core_log::set_dry_run(value));
+}
+
+// ---------------------------------------------------------------------------
+// Formatter entry points (mirrors of logInternal / logInternalFmt / logSignal).
+//
+// All three return `0` on success and `-1` on failure. On failure the thread-local
+// last-error slot is populated; the C wrapper checks the return value and re-throws
+// via `pgbr_error_throw_from_last(__FILE__, __func__, __LINE__)` so the legacy stack
+// trace and TRY/CATCH semantics survive the migration.
+// ---------------------------------------------------------------------------
+
+/// SAFETY: caller upholds the contract documented on the public `pgbr_log_internal`
+/// shim. Splitting the unsafe body out keeps the diagnostic message thin when one of
+/// the input pointers is null.
+unsafe fn cstr_to_str_or_empty<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `ptr` is NUL-terminated and readable.
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    cstr.to_str().ok()
+}
+
+/// Render and dispatch a pre-formatted log message. Mirrors `logInternal` in
+/// `src/common/log.c`.
+///
+/// `process_id_param == u32::MAX` selects the process-global id from state, matching
+/// the C `(unsigned int)-1` sentinel used by `LOG_INTERNAL`.
+///
+/// Returns `0` on success, `-1` on `write(2)` failure or invalid input. On `-1` the
+/// thread-local last-error slot is populated.
+///
+/// # Safety
+///
+/// `file_name_utf8`, `function_name_utf8`, and `message_utf8` must each be either null
+/// or a NUL-terminated, valid UTF-8 byte sequence readable for the duration of the call.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pgbr_log_internal(
+    level: i32,
+    range_min: i32,
+    range_max: i32,
+    process_id_param: u32,
+    file_name_utf8: *const c_char,
+    function_name_utf8: *const c_char,
+    code: i32,
+    message_utf8: *const c_char,
+) -> i32 {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the contract on each pointer.
+        let Some(file_name) = (unsafe { cstr_to_str_or_empty(file_name_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal: file_name is null or non-UTF-8",
+            ));
+            return -1;
+        };
+        // SAFETY: see above.
+        let Some(function_name) = (unsafe { cstr_to_str_or_empty(function_name_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal: function_name is null or non-UTF-8",
+            ));
+            return -1;
+        };
+        // SAFETY: see above.
+        let Some(message) = (unsafe { cstr_to_str_or_empty(message_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal: message is null or non-UTF-8",
+            ));
+            return -1;
+        };
+
+        match core_log_format::log_internal(
+            level,
+            range_min,
+            range_max,
+            process_id_param,
+            file_name,
+            function_name,
+            code,
+            message,
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Render and dispatch a printf-formatted log message. Mirrors `logInternalFmt` in
+/// `src/common/log.c`.
+///
+/// Args follow the shared `pgbr_error::format` contract — see the docstring on
+/// [`pgbr_error_format_message`] and the C-side `errorMarshalArgs` helper that packs
+/// `va_list` into the typed [`PgbrFmtArg`] array.
+///
+/// # Safety
+///
+/// In addition to the contract on [`pgbr_log_internal`], `format_utf8` must be a
+/// NUL-terminated UTF-8 byte sequence and `args` must point to `args_len` valid
+/// `PgbrFmtArg` values whose `Str` slots reference UTF-8 byte ranges live for the call.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pgbr_log_internal_fmt(
+    level: i32,
+    range_min: i32,
+    range_max: i32,
+    process_id_param: u32,
+    file_name_utf8: *const c_char,
+    function_name_utf8: *const c_char,
+    code: i32,
+    format_utf8: *const c_char,
+    args: *const PgbrFmtArg,
+    args_len: usize,
+) -> i32 {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the contract on each pointer.
+        let Some(file_name) = (unsafe { cstr_to_str_or_empty(file_name_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal_fmt: file_name is null or non-UTF-8",
+            ));
+            return -1;
+        };
+        // SAFETY: see above.
+        let Some(function_name) = (unsafe { cstr_to_str_or_empty(function_name_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal_fmt: function_name is null or non-UTF-8",
+            ));
+            return -1;
+        };
+        // SAFETY: see above.
+        let Some(format) = (unsafe { cstr_to_str_or_empty(format_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal_fmt: format is null or non-UTF-8",
+            ));
+            return -1;
+        };
+
+        if args.is_null() && args_len > 0 {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_internal_fmt: args is null with args_len > 0",
+            ));
+            return -1;
+        }
+
+        // SAFETY: caller guarantees `args[..args_len]` are readable and well-formed.
+        let raw_args = if args_len == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(args, args_len) }
+        };
+
+        // SAFETY: `pgbr_fmt_args_to_typed` walks the same blob format documented on
+        // `pgbr_error_format_message`; any malformed slot returns Err and the typed
+        // error reaches the C caller through last-error.
+        let typed_args = match unsafe { pgbr_fmt_args_to_typed(raw_args) } {
+            Ok(args) => args,
+            Err(e) => {
+                set_last_error(e);
+                return -1;
+            }
+        };
+
+        match core_log_format::log_internal_fmt(
+            level,
+            range_min,
+            range_max,
+            process_id_param,
+            file_name,
+            function_name,
+            code,
+            format,
+            &typed_args,
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Render and dispatch a signal-exit log line. Mirrors `logSignal` in
+/// `src/common/log.c`.
+///
+/// # Safety
+///
+/// `signal_name_utf8` must be a non-null pointer to a NUL-terminated, valid UTF-8 byte
+/// sequence readable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_log_signal(level: i32, signal_name_utf8: *const c_char) -> i32 {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the contract on `signal_name_utf8`.
+        let Some(signal_name) = (unsafe { cstr_to_str_or_empty(signal_name_utf8) }) else {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_signal: signal_name is null or non-UTF-8",
+            ));
+            return -1;
+        };
+        match core_log_format::log_signal(level, signal_name) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// SAFETY: each `PgbrFmtArg::Str` slot must reference a UTF-8 byte range live for the
+/// call. Returns `Err(Error)` (typed `Assert`) if a slot is malformed; the caller
+/// surfaces the error through last-error.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+unsafe fn pgbr_fmt_args_to_typed(raw_args: &[PgbrFmtArg]) -> Result<Vec<pgbr_error::format::Arg<'_>>, Error> {
+    let mut typed = Vec::with_capacity(raw_args.len());
+    for raw in raw_args {
+        let kind = raw.kind;
+        let arg = if kind == PgbrFmtArgKind::I32 as i32 {
+            pgbr_error::format::Arg::I32(raw.value_a as u32 as i32)
+        } else if kind == PgbrFmtArgKind::U32 as i32 {
+            pgbr_error::format::Arg::U32(raw.value_a as u32)
+        } else if kind == PgbrFmtArgKind::I64 as i32 {
+            pgbr_error::format::Arg::I64(raw.value_a as i64)
+        } else if kind == PgbrFmtArgKind::U64 as i32 {
+            pgbr_error::format::Arg::U64(raw.value_a)
+        } else if kind == PgbrFmtArgKind::Isize as i32 {
+            pgbr_error::format::Arg::Isize(raw.value_a as i64 as isize)
+        } else if kind == PgbrFmtArgKind::Usize as i32 {
+            pgbr_error::format::Arg::Usize(raw.value_a as usize)
+        } else if kind == PgbrFmtArgKind::Char as i32 {
+            pgbr_error::format::Arg::Char(raw.value_a as u8)
+        } else if kind == PgbrFmtArgKind::Str as i32 {
+            let len = raw.value_b as usize;
+            let slice = if len == 0 {
+                ""
+            } else {
+                let ptr = raw.value_a as *const u8;
+                if ptr.is_null() {
+                    return Err(Error::new(
+                        ErrorType::Assert,
+                        "pgbr_log_internal_fmt: Str arg has null pointer with non-zero length",
+                    ));
+                }
+                // SAFETY: caller guarantees the (ptr, len) describe a readable byte range
+                // of valid UTF-8 for the duration of the call.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+                let Ok(s) = core::str::from_utf8(bytes) else {
+                    return Err(Error::new(
+                        ErrorType::Assert,
+                        "pgbr_log_internal_fmt: Str arg is not valid UTF-8",
+                    ));
+                };
+                s
+            };
+            pgbr_error::format::Arg::Str(slice)
+        } else {
+            return Err(Error::new(
+                ErrorType::Assert,
+                format!("pgbr_log_internal_fmt: unknown arg kind {kind}"),
+            ));
+        };
+        typed.push(arg);
+    }
+    Ok(typed)
 }
 
 #[cfg(test)]

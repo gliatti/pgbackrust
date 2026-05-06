@@ -131,10 +131,11 @@ specifier is skipped without consuming an arg, and the Rust side will surface it
 
 Returns the number of args written into `out`. Asserts on overflow rather than silently dropping arguments — every current
 THROW_FMT call site uses well under ERROR_FMT_ARG_MAX entries, so an overflow indicates a bug.
-***********************************************************************************************************************************/
-#define ERROR_FMT_ARG_MAX                                           16
 
-static unsigned int
+Exposed (non-static, declared in error.h) so `logInternalFmt` in `src/common/log.c` reuses the same marshaller — both routes feed
+into `pgbr_error_format_message` / `pgbr_log_internal_fmt` and must produce blob entries the Rust side understands.
+***********************************************************************************************************************************/
+FN_EXTERN unsigned int
 errorMarshalArgs(const char *format, va_list args, PGBR_PgbrFmtArg *const out)
 {
     unsigned int n = 0;

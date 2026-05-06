@@ -1,20 +1,24 @@
-//! Logger state shared with the C `logInit` / `logFileSet` / `logInternal` machinery.
+//! Logger state and line formatter for the C `logInit` / `logFileSet` / `logInternal`
+//! machinery.
 //!
-//! Owns every file-scope variable the legacy `src/common/log.c` used to keep.
+//! Owns every file-scope variable the legacy `src/common/log.c` used to keep, plus the
+//! prefix / message / dispatch helpers that build a complete log line and `write(2)` it
+//! to the right fd.
 //!
 //! Specifically: the four log levels (stdout / stderr / file / any), the three file
 //! descriptors (stdout / stderr / file), the banner / timestamp / dry-run flags, the
-//! process metadata, and the 32 KiB `logBuffer` scratchpad the formatter writes into.
-//!
-//! Sub-issue A migrates only the **state**. The line-formatting helpers
-//! (`logPre` / `logPost` / `logInternal` / `logInternalFmt`) stay on the C side and
-//! reach this state through FFI getters / setters defined in `crates/pgbr-ffi`.
-//! Sub-issue B will hoist the formatter itself into `pgbr-core::log::format`.
+//! process metadata, and the 32 KiB `logBuffer` scratchpad. Sub-issue A migrated only
+//! the state. Sub-issue B (this revision) hoists the formatter itself — header
+//! composition, message append, multi-fd dispatch, banner emission, multi-line indent
+//! — into the [`format`] submodule. Sub-issue C will replace the harness shim with an
+//! FFI capture buffer.
 //!
 //! Threading model mirrors `stack_trace` and `mem_context`: pgBackRust forks for
 //! parallelism, so each child process keeps its own copy of this state and a single
 //! thread serialises access. The `UnsafeGlobal` wrapper makes the state `Sync` for
 //! the static slot without paying for a runtime lock.
+
+pub mod format;
 
 use core::ffi::{CStr, c_char};
 use std::cell::UnsafeCell;
@@ -378,21 +382,33 @@ pub fn buffer_ptr() -> *mut c_char {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    //! Lock and `fresh_state` helper shared between this module's tests and
+    //! `log::format`'s tests.
+    //!
+    //! Both test sets touch the same process-global `LogState`. A single lock here
+    //! serialises them; if each module defined its own lock, parallel `cargo test`
+    //! could interleave a `log::tests::*` write with a `log::format::tests::*` read.
     use std::sync::Mutex;
 
-    // Tests share `STATE`. Serialise so a parallel test runner does not interleave.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn fresh_state() -> std::sync::MutexGuard<'static, ()> {
+    /// Acquire `TEST_LOCK`, reset `STATE` to a fresh `LogState`, and hand back the
+    /// guard so the caller's test run holds the lock for its lifetime.
+    pub fn fresh_state() -> std::sync::MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: TEST_LOCK serialises tests so no other reference is alive.
-        let state = unsafe { state_mut() };
-        *state = LogState::new();
+        let state = unsafe { super::state_mut() };
+        *state = super::LogState::new();
         guard
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::test_support::fresh_state;
+    use super::*;
 
     #[test]
     fn defaults_match_c_initialisers() {
