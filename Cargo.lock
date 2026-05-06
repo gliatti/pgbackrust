@@ -294,14 +294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgbr-build"
-version = "0.1.0"
-
-[[package]]
-name = "pgbr-command"
-version = "0.1.0"
-
-[[package]]
 name = "pgbr-compress"
 version = "0.1.0"
 dependencies = [
@@ -310,10 +302,6 @@ dependencies = [
  "lz4-sys",
  "zstd-sys",
 ]
-
-[[package]]
-name = "pgbr-config"
-version = "0.1.0"
 
 [[package]]
 name = "pgbr-core"
@@ -331,10 +319,6 @@ dependencies = [
  "openssl-sys",
  "xxhash-rust",
 ]
-
-[[package]]
-name = "pgbr-db"
-version = "0.1.0"
 
 [[package]]
 name = "pgbr-encode"
@@ -358,23 +342,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgbr-info"
-version = "0.1.0"
-
-[[package]]
-name = "pgbr-io"
-version = "0.1.0"
-
-[[package]]
-name = "pgbr-naming"
-version = "0.1.0"
-
-[[package]]
 name = "pgbr-postgres"
-version = "0.1.0"
-
-[[package]]
-name = "pgbr-protocol"
 version = "0.1.0"
 
 [[package]]
@@ -383,10 +351,6 @@ version = "0.1.0"
 dependencies = [
  "regex",
 ]
-
-[[package]]
-name = "pgbr-storage"
-version = "0.1.0"
 
 [[package]]
 name = "pkg-config"

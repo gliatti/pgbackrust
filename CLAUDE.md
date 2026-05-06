@@ -50,15 +50,30 @@ The `dev` service stays up (`sleep infinity`) so you can `docker compose exec de
 
 ## Rust workspace (target build)
 
-The migration target is `cargo build --workspace --release`, which produces the `pgbackrest` binary from the crates under `crates/`:
+The migration target is `cargo build --workspace --release`, which produces the `pgbackrest` binary from the crates under `crates/`.
 
-- `pgbr-core` — string, blob, memory primitives, log formatting
-- `pgbr-error` — error types and the panic/THROW bridge
-- `pgbr-encode`, `pgbr-crypto`, `pgbr-compress`, `pgbr-regex` — leaf utilities
-- `pgbr-config`, `pgbr-build`, `pgbr-naming` — option model and code generator for auto files
-- `pgbr-io`, `pgbr-storage`, `pgbr-postgres`, `pgbr-db`, `pgbr-protocol` — subsystem ports
-- `pgbr-info`, `pgbr-command` — info files and per-command implementations
+Existing crates (canonical Rust implementations):
+
+- `pgbr-core` — string, blob, memory primitives, log formatting, debug, stack trace, object base
+- `pgbr-error` — error types, format, retry, panic/THROW bridge
+- `pgbr-compress` — gz / bz2 / lz4 / zst compress + decompress filters
+- `pgbr-crypto` — xxhash and other crypto primitives
+- `pgbr-encode` — hex / base64 encoders
+- `pgbr-regex` — regex wrapper
+- `pgbr-postgres` — PostgreSQL version-aware interface (in progress)
 - `pgbr-ffi` — transitional C↔Rust glue, scheduled for removal once `src/` is gone
+
+Planned crates (created when their porting work starts, to keep the workspace honest about what exists):
+
+- `pgbr-build` — Rust replacement for the `src/build/` C code generator (auto files)
+- `pgbr-config` — option parsing and configuration model
+- `pgbr-io` — I/O filter chain
+- `pgbr-storage` — pluggable storage backends (posix, s3, azure, gcs, cifs, optional sftp)
+- `pgbr-db` — libpq client wrapper
+- `pgbr-protocol` — local/remote process protocol and parallel job dispatch
+- `pgbr-info` — on-disk info files (archive.info, backup.info, manifest, infoPg)
+- `pgbr-command` — per-command implementations (`backup`, `restore`, `archive/get`, `archive/push`, `expire`, `verify`, `info`, `stanza/*`, `repo/*`, `check`, `annotate`, `manifest`, `control/*`, `server/*`)
+- `pgbr-naming` — naming-helpers crate (the original 9-stub workspace had this; only re-create if the port actually needs a separate crate)
 
 ## C build (transitional — being removed)
 
