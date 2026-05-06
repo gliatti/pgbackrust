@@ -134,31 +134,33 @@ pub trait IoWrite {
     fn close(&mut self) -> Result<(), IoError>;
 }
 
-/// In-memory [`IoRead`] over a byte slice. Useful in tests and as a starting
-/// source when piping into a filter chain.
-pub struct MemRead<'a> {
-    data: &'a [u8],
+/// In-memory [`IoRead`]. Generic over the backing buffer (`Vec<u8>`,
+/// `&[u8]`, `[u8; N]`, …) so tests can pass either an owned or a borrowed
+/// byte source.
+pub struct MemRead<B: AsRef<[u8]>> {
+    data: B,
     cursor: usize,
 }
 
-impl<'a> MemRead<'a> {
-    /// Wrap a byte slice as a readable source.
+impl<B: AsRef<[u8]>> MemRead<B> {
+    /// Wrap a byte buffer as a readable source.
     #[must_use]
-    pub const fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: B) -> Self {
         Self { data, cursor: 0 }
     }
 }
 
-impl IoRead for MemRead<'_> {
+impl<B: AsRef<[u8]>> IoRead for MemRead<B> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        let n = min(buf.len(), self.data.len() - self.cursor);
-        buf[..n].copy_from_slice(&self.data[self.cursor..self.cursor + n]);
+        let data = self.data.as_ref();
+        let n = min(buf.len(), data.len() - self.cursor);
+        buf[..n].copy_from_slice(&data[self.cursor..self.cursor + n]);
         self.cursor += n;
         Ok(n)
     }
 
     fn eof(&self) -> bool {
-        self.cursor >= self.data.len()
+        self.cursor >= self.data.as_ref().len()
     }
 }
 
