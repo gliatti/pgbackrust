@@ -8,5 +8,9 @@ repository.workspace = true
 
 [lib]
 
+[dependencies]
+# Source-of-truth list of supported PG major versions.
+pgbr-build = { path = "../pgbr-build" }
+
 [lints]
 workspace = true

@@ -1,12 +1,22 @@
-//! PostgreSQL-specific helpers shared between the C and Rust sides of pgBackRust.
+//! `PostgreSQL`-specific helpers shared between the C and Rust sides of pgBackRust.
 //!
-//! For now this crate exposes a single function: [`crc32c_one`], the byte-wise CRC-32C
-//! computation used to validate `pg_control` and other `PostgreSQL` on-disk structures. The
-//! lookup table is built at compile time from the Castagnoli polynomial (0x1EDC6F41, reflected
-//! as 0x82F63B78) so the generated values match the table the upstream `src/postgres/interface/
-//! crc32.c` ships verbatim.
+//! Two surfaces today:
+//!
+//! - [`crc32c_one`]: byte-wise CRC-32C computation used to validate `pg_control`
+//!   and other `PostgreSQL` on-disk structures. The lookup table is built at
+//!   compile time from the Castagnoli polynomial (0x1EDC6F41, reflected as
+//!   0x82F63B78) so the generated values match the table the upstream
+//!   `src/postgres/interface/crc32.c` ships verbatim.
+//! - [`mod@version`]: a const registry of identifying header values
+//!   (`CATALOG_VERSION_NO`, `PG_CONTROL_VERSION`, `XLOG_BLCKSZ`, `BLCKSZ`)
+//!   for every supported `PostgreSQL` major version, with [`by_label`] and
+//!   [`by_catalog_version_no`] lookups.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
+
+pub mod version;
+
+pub use version::{SUPPORTED, VersionInterface, by_catalog_version_no, by_label};
 
 const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;
 
