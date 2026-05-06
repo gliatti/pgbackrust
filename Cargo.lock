@@ -404,6 +404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgbr-io"
+version = "0.1.0"
+dependencies = [
+ "pgbr-error",
+]
+
+[[package]]
 name = "pgbr-postgres"
 version = "0.1.0"
 

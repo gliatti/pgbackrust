@@ -1,0 +1,17 @@
+[package]
+name = "pgbr-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+# Errors raised during I/O share the typed `Error`/`ErrorType` infrastructure so callers
+# see a single error story.
+pgbr-error = { path = "../pgbr-error" }
+
+[lints]
+workspace = true
