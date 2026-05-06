@@ -61,16 +61,17 @@ Existing crates (canonical Rust implementations):
 - `pgbr-encode` — hex / base64 encoders
 - `pgbr-regex` — regex wrapper
 - `pgbr-postgres` — PostgreSQL version-aware interface (in progress; CRC-32C only at present)
-- `pgbr-build` — typed parsers for `src/build/{config/config.yaml, error/error.yaml, postgres/postgres.yaml}` (`help.xml` deferred). Lives in parallel with the C generator at `src/build/`; the latter keeps emitting `*.auto.{h,c.inc}` for the C build until `src/` is removed
-- `pgbr-config` — full configuration loading pipeline. Modules: `types` (`OptionType`, `ConfigCommandRole`, `LockType`, `OptionGroup`, `OptionSection`, `DefaultType`), `command` (`CfgCommand`), `option` (`CfgOption`, `ResolvedCommandUsage`, `ResolvedDepend`), `compile` (`Cfg`, `compile()` lowering with inheritance + `+role`/`+inherit`/`-command` shortcut expansion + topological-sort cycle detection), `value` (`OptionValue`, `parse_value()` for boolean/integer/size/time/path/string/list/hash), `cli` (`parse_cli` argv tokenizer + `resolve_cli` Cfg-aware resolution), `ini` (`parse_ini` for `pgbackrest.conf`), `merge` (`load_config` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range validation)
-- `pgbr-io` — I/O traits (`IoRead`, `IoWrite`), in-memory implementations (`MemRead`, `MemWrite`), and `FilterChain` for byte-stream transforms. Production filters live in their crates (`pgbr-compress`, `pgbr-crypto`, …) and plug in via the `Filter` trait
+- `pgbr-build` — typed parsers for `src/build/{config/config.yaml, error/error.yaml, help/help.xml, postgres/postgres.yaml}`. Lives in parallel with the C generator at `src/build/`; the latter keeps emitting `*.auto.{h,c.inc}` for the C build until `src/` is removed
+- `pgbr-config` — full configuration loading pipeline. Modules: `types` (`OptionType`, `ConfigCommandRole`, `LockType`, `OptionGroup`, `OptionSection`, `DefaultType`), `command` (`CfgCommand`), `option` (`CfgOption`, `ResolvedCommandUsage`, `ResolvedDepend`), `compile` (`Cfg`, `compile()` lowering with inheritance + `+role`/`+inherit`/`-command` shortcut expansion + topological-sort cycle detection), `value` (`OptionValue`, `parse_value()` for boolean/integer/size/time/path/string/list/hash), `cli` (`parse_cli` argv tokenizer + `resolve_cli` Cfg-aware resolution), `ini` (`parse_ini` for `pgbackrest.conf`), `merge` (`load_config` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range/depend validation)
+- `pgbr-io` — I/O traits (`IoRead`, `IoWrite`), in-memory implementations (`MemRead`, `MemWrite`), file-backed `FileRead`/`FileWrite`, and `FilterChain` for byte-stream transforms. Production filters live in their crates (`pgbr-compress`, `pgbr-crypto`, …) and plug in via the `Filter` trait
+- `pgbr-storage` — `Storage` trait + `Posix` backend backed by `std::fs`. Other backends (s3/azure/gcs/cifs/sftp) deferred
+- `pgbr-db` — safe libpq wrapper: `Connection::{open, execute, query}`, `QueryResult`, `Drop` impls calling `PQfinish`/`PQclear`. `Connection` is `!Send`
+- `pgbr-protocol` — JSON-line message types (`Request`, `Response { Ok | Err }`) + codec (`read_message`/`write_message`) over `pgbr_io::IoRead`/`IoWrite`. Transport, parallel dispatcher, and helpers deferred
+- `pgbr-postgres` — `crc32c_one` + `version` registry of supported PG major-version metadata (`CATALOG_VERSION_NO`, `PG_CONTROL_VERSION`, `XLOG_BLCKSZ`, `BLCKSZ` for PG 9.6 .. 18) with `by_label` / `by_catalog_version_no` lookups. Per-version on-disk struct layouts (`ControlFileData`, page header) deferred
 - `pgbr-ffi` — transitional C↔Rust glue, scheduled for removal once `src/` is gone
 
 Planned crates (created when their porting work starts, to keep the workspace honest about what exists):
 
-- `pgbr-storage` — pluggable storage backends (posix, s3, azure, gcs, cifs, optional sftp)
-- `pgbr-db` — libpq client wrapper
-- `pgbr-protocol` — local/remote process protocol and parallel job dispatch
 - `pgbr-info` — on-disk info files (archive.info, backup.info, manifest, infoPg)
 - `pgbr-command` — per-command implementations (`backup`, `restore`, `archive/get`, `archive/push`, `expire`, `verify`, `info`, `stanza/*`, `repo/*`, `check`, `annotate`, `manifest`, `control/*`, `server/*`)
 - `pgbr-naming` — naming-helpers crate (only re-create if the port actually needs a separate crate)
