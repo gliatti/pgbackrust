@@ -18,6 +18,7 @@
 //! thread serialises access. The `UnsafeGlobal` wrapper makes the state `Sync` for
 //! the static slot without paying for a runtime lock.
 
+pub mod capture;
 pub mod format;
 
 use core::ffi::{CStr, c_char};

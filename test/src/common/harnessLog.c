@@ -1,13 +1,15 @@
 /***********************************************************************************************************************************
 Log Test Harness
+
+Phase 31 sub-issue C migrated the harness from a `SHIM_MODULE`-based interception of
+`src/common/log.c` to an in-memory capture buffer owned by `pgbr_core::log::capture`.
+The harness no longer needs the C log internals — `pgbr_log_capture_install` redirects
+the file sink to a Rust-side `Vec<u8>` that the harness drains and compares.
 ***********************************************************************************************************************************/
 #include <build.h>
 
-#include <fcntl.h>
 #include <regex.h>
-#include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "build/common/regExp.h"
 #include "common/log.h"
@@ -20,11 +22,6 @@ Log Test Harness
 #include "common/harnessTest.h"
 
 /***********************************************************************************************************************************
-Include shimmed C modules
-***********************************************************************************************************************************/
-{[SHIM_MODULE]}
-
-/***********************************************************************************************************************************
 Log settings for testing
 ***********************************************************************************************************************************/
 static LogLevel logLevelTest = logLevelInfo;
@@ -32,36 +29,9 @@ static LogLevel logLevelTestDefault = logLevelOff;
 static bool logDryRunTest = false;
 
 /***********************************************************************************************************************************
-Name of file where logs are stored for testing
-***********************************************************************************************************************************/
-static char logFile[1024];
-
-/***********************************************************************************************************************************
 Buffer where log results are loaded for comparison purposes
 ***********************************************************************************************************************************/
 static char harnessLogBuffer[256 * 1024];
-
-/***********************************************************************************************************************************
-Open a log file -- centralized here for error handling
-***********************************************************************************************************************************/
-static int
-harnessLogOpen(const char *logFile, int flags, int mode)
-{
-    FUNCTION_HARNESS_BEGIN();
-        FUNCTION_HARNESS_PARAM(STRINGZ, logFile);
-        FUNCTION_HARNESS_PARAM(INT, flags);
-        FUNCTION_HARNESS_PARAM(INT, mode);
-
-        FUNCTION_HARNESS_ASSERT(logFile != NULL);
-    FUNCTION_HARNESS_END();
-
-    int result = open(logFile, flags, mode);
-
-    if (result == -1)
-        THROW_SYS_ERROR_FMT(FileOpenError, "unable to open log file '%s'", logFile);
-
-    FUNCTION_HARNESS_RETURN(INT, result);
-}
 
 /***********************************************************************************************************************************
 Initialize log for testing
@@ -74,10 +44,15 @@ harnessLogInit(void)
     FUNCTION_HARNESS_VOID();
 
     logInit(logLevelTestDefault, logLevelOff, logLevelInfo, false, pgbr_log_process_id_get(), 99, false);
+
+    // Pre-set the file banner so the test capture does not include the legacy
+    // "PROCESS START" banner — tests that explicitly want the banner toggle the flag back
+    // off through `pgbr_log_file_banner_set` (e.g. `logTest.c` does this when it calls
+    // `logFileSet(fileFile)`).
     pgbr_log_file_banner_set(true);
 
-    snprintf(logFile, sizeof(logFile), "%s/expect.log", hrnPath());
-    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
+    // Install the Rust-side capture; it replaces the legacy file fd as the file sink.
+    pgbr_log_capture_install();
     pgbr_log_any_set();
 
     FUNCTION_HARNESS_RETURN_VOID();
@@ -193,40 +168,23 @@ hrnLogProcessIdSet(unsigned int processId)
 #endif
 
 /***********************************************************************************************************************************
-Load log result from file into the log buffer
+Drain the Rust-side capture buffer into `harnessLogBuffer` and strip the trailing newline so the comparison helpers can work on a
+NUL-terminated string. After this call the capture is empty so the next test cycle starts fresh.
 ***********************************************************************************************************************************/
 static void
-harnessLogLoad(const char *logFile)
+harnessLogLoad(void)
 {
-    FUNCTION_HARNESS_BEGIN();
-        FUNCTION_HARNESS_PARAM(STRINGZ, logFile);
+    FUNCTION_HARNESS_VOID();
 
-        FUNCTION_HARNESS_ASSERT(logFile != NULL);
-    FUNCTION_HARNESS_END();
+    const size_t totalBytes = pgbr_log_capture_drain(harnessLogBuffer, sizeof(harnessLogBuffer));
 
-    harnessLogBuffer[0] = 0;
+    ASSERT(totalBytes != (size_t)-1);
+    ASSERT(totalBytes < sizeof(harnessLogBuffer));
 
-    int fd = harnessLogOpen(logFile, O_RDONLY, 0);
-
-    size_t totalBytes = 0;
-    ssize_t actualBytes = 0;
-
-    do
-    {
-        actualBytes = read(fd, harnessLogBuffer, sizeof(harnessLogBuffer) - totalBytes);
-
-        if (actualBytes == -1)
-            THROW_SYS_ERROR_FMT(FileOpenError, "unable to read log file '%s'", logFile);
-
-        totalBytes += (size_t)actualBytes;
-    }
-    while (actualBytes != 0);
-
-    if (close(fd) == -1)
-        THROW_SYS_ERROR_FMT(FileOpenError, "unable to close log file '%s'", logFile);
-
-    // Remove final linefeed
-    if (totalBytes > 0)
+    // Drop the trailing newline written by `log_post` so `strcmp` against the test
+    // expectation matches without forcing every test to terminate its expected string
+    // with `\n`.
+    if (totalBytes > 0 && harnessLogBuffer[totalBytes - 1] == '\n')
         harnessLogBuffer[totalBytes - 1] = 0;
 
     FUNCTION_HARNESS_RETURN_VOID();
@@ -436,7 +394,7 @@ harnessLogResult(const char *expected)
 
     ASSERT(expected != NULL);
 
-    harnessLogLoad(logFile);
+    harnessLogLoad();
     hrnLogReplace();
 
     if (strcmp(harnessLogBuffer, expected) != 0)
@@ -445,9 +403,6 @@ harnessLogResult(const char *expected)
             AssertError, "\nACTUAL LOG:\n\n%s\n\nBUT DIFF FROM EXPECTED IS (- remove from expected, + add to expected):\n\n%s",
             harnessLogBuffer, hrnDiff(expected, harnessLogBuffer));
     }
-
-    close(pgbr_log_fd_file_get());
-    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
 
     FUNCTION_HARNESS_RETURN_VOID();
 }
@@ -462,7 +417,7 @@ harnessLogResultEmptyOrContains(const char *const contains)
 
     ASSERT(contains != NULL);
 
-    harnessLogLoad(logFile);
+    harnessLogLoad();
     hrnLogReplace();
 
     if (strlen(harnessLogBuffer) != 0 && strstr(harnessLogBuffer, contains) == NULL)
@@ -471,9 +426,6 @@ harnessLogResultEmptyOrContains(const char *const contains)
             AssertError, "\nLOG MUST CONTAIN:\n\n%s\n\nBUT WAS ACTUALLY:\n\n%s",
             contains, harnessLogBuffer);
     }
-
-    close(pgbr_log_fd_file_get());
-    pgbr_log_fd_file_set(harnessLogOpen(logFile, O_WRONLY | O_CREAT | O_TRUNC, 0640));
 
     FUNCTION_HARNESS_RETURN_VOID();
 }
@@ -488,11 +440,11 @@ harnessLogFinal(void)
 {
     FUNCTION_HARNESS_VOID();
 
-    harnessLogLoad(logFile);
+    harnessLogLoad();
     hrnLogReplace();
 
-    // Close expect log file
-    close(pgbr_log_fd_file_get());
+    // Tear down the Rust capture so a subsequent test run starts clean.
+    pgbr_log_capture_uninstall();
 
     if (strcmp(harnessLogBuffer, "") != 0)
         THROW_FMT(AssertError, "\n\nexpected log to be empty but actual log was:\n\n%s\n\n", harnessLogBuffer);

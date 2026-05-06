@@ -113,6 +113,7 @@ pgbr_ffi_inputs = files(
     '../crates/pgbr-core/src/blob.rs',
     '../crates/pgbr-core/src/debug.rs',
     '../crates/pgbr-core/src/log/mod.rs',
+    '../crates/pgbr-core/src/log/capture.rs',
     '../crates/pgbr-core/src/log/format.rs',
     '../crates/pgbr-core/src/mem_context.rs',
     '../crates/pgbr-core/src/object.rs',

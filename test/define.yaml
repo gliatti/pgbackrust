@@ -221,8 +221,6 @@ unit:
         feature: log
         harness:
           name: log
-          shim:
-            common/log: ~
 
         coverage:
           - common/log

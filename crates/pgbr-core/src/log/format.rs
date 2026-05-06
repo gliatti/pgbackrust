@@ -350,23 +350,62 @@ pub fn log_post(data: &mut LogPreResult, level: i32, range_min: i32, range_max: 
         log_write_indent(log_fd_std_out, &buffer[..data.buffer_pos], data.indent_size, "log to stdout")?;
     }
 
-    // File routing — write the process-start banner the first time round.
-    if level <= log_level_file && log_fd_file != -1 && log_range(log_level_file, range_min, range_max) {
-        if !file_banner() {
-            // SAFETY: `lseek(SEEK_END)` on a regular file fd is well-defined; an error
-            // only happens for invalid fds, in which case the subsequent `write` will
-            // also fail and surface the real diagnostic.
-            let pos = unsafe { lseek(log_fd_file, 0, SEEK_END) };
-            if pos > 0 {
-                log_write(log_fd_file, b"\n", "banner spacing to file")?;
+    // File routing — capture takes precedence over a real fd so the test harness can
+    // collect the rendered bytes via `pgbr_log_capture_drain` without needing a real file
+    // on disk. The process-start banner runs through whichever sink is active.
+    if level <= log_level_file && log_range(log_level_file, range_min, range_max) {
+        let to_capture = super::capture::is_installed();
+        let to_fd = !to_capture && log_fd_file != -1;
+
+        if to_capture || to_fd {
+            if !file_banner() {
+                if to_fd {
+                    // SAFETY: `lseek(SEEK_END)` on a regular file fd is well-defined; an
+                    // error only happens for invalid fds, in which case the subsequent
+                    // `write` will also fail and surface the real diagnostic.
+                    let pos = unsafe { lseek(log_fd_file, 0, SEEK_END) };
+                    if pos > 0 {
+                        log_write(log_fd_file, b"\n", "banner spacing to file")?;
+                    }
+                    log_write(log_fd_file, LOG_BANNER, "banner to file")?;
+                } else {
+                    // Capture starts empty per `pgbr_log_capture_install`; no spacing
+                    // needed before the banner.
+                    super::capture::append(LOG_BANNER);
+                }
+                set_file_banner(true);
             }
-            log_write(log_fd_file, LOG_BANNER, "banner to file")?;
-            set_file_banner(true);
+            if to_fd {
+                log_write_indent(log_fd_file, &buffer[..data.buffer_pos], data.indent_size, "log to file")?;
+            } else {
+                capture_write_indent(&buffer[..data.buffer_pos], data.indent_size);
+            }
         }
-        log_write_indent(log_fd_file, &buffer[..data.buffer_pos], data.indent_size, "log to file")?;
     }
 
     Ok(())
+}
+
+/// Capture-side counterpart of [`log_write_indent`]. Walks the message line by line and
+/// prepends `indent_size` spaces to every continuation line so multi-line output matches
+/// the bytes the legacy file sink would have produced.
+fn capture_write_indent(message: &[u8], indent_size: usize) {
+    debug_assert!(
+        indent_size > 0 && indent_size < INDENT_BUFFER.len(),
+        "indent_size out of range"
+    );
+
+    let mut start = 0_usize;
+    let mut first = true;
+    while let Some(rel) = memchr(b'\n', &message[start..]) {
+        if first {
+            first = false;
+        } else {
+            super::capture::append(&INDENT_BUFFER[..indent_size]);
+        }
+        super::capture::append(&message[start..=start + rel]);
+        start += rel + 1;
+    }
 }
 
 /// Single `write(2)` call with the legacy `THROW_SYS_ERROR_FMT(FileWriteError, "unable

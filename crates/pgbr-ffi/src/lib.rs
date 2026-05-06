@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use pgbr_core::blob as core_blob;
 use pgbr_core::debug as core_debug;
 use pgbr_core::log as core_log;
+use pgbr_core::log::capture as core_log_capture;
 use pgbr_core::log::format as core_log_format;
 use pgbr_core::mem_context as core_mem_context;
 use pgbr_core::object as core_object;
@@ -5431,6 +5432,108 @@ pub unsafe extern "C" fn pgbr_log_signal(level: i32, signal_name_utf8: *const c_
                 -1
             }
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Test-harness capture (replaces the legacy `SHIM_MODULE` interception).
+//
+// `pgbr_log_capture_install` redirects the file sink to an in-memory buffer; the
+// harness drains it via `pgbr_log_capture_drain` and clears between assertions.
+// See `pgbr_core::log::capture` for the full contract.
+// ---------------------------------------------------------------------------
+
+/// Install the capture buffer. Subsequent file-sink writes go to the buffer instead of
+/// `fd_file`. Idempotent — calling twice clears the buffer the second time.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_capture_install() {
+    with_panic_guard(core_log_capture::install);
+}
+
+/// Drop the capture buffer and disable interception.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_capture_uninstall() {
+    with_panic_guard(core_log_capture::uninstall);
+}
+
+/// Whether [`pgbr_log_capture_install`] is currently active. Used by the harness to skip
+/// expensive replacement / regex passes when no capture has happened yet.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgbr_log_capture_is_installed() -> bool {
+    with_panic_guard(core_log_capture::is_installed)
+}
+
+/// Take the captured bytes and copy them into `dst` (truncating to `dst_size - 1` and
+/// always NUL-terminating). The internal buffer is cleared regardless of whether `dst`
+/// fits the entire payload.
+///
+/// Returns the number of bytes written (excluding the NUL), or `usize::MAX` on bad input
+/// (`dst` null with `dst_size > 0`). When `dst_size == 0` the function reports the
+/// available payload size without touching `dst` and without draining the buffer, so the
+/// harness can size its destination first.
+///
+/// # Safety
+///
+/// `dst` must point to at least `dst_size` writable bytes, or be null when `dst_size` is
+/// `0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_log_capture_drain(dst: *mut c_char, dst_size: usize) -> usize {
+    with_panic_guard(|| {
+        if dst.is_null() && dst_size > 0 {
+            set_last_error(Error::new(
+                ErrorType::Assert,
+                "pgbr_log_capture_drain: dst is null with dst_size > 0",
+            ));
+            return usize::MAX;
+        }
+        // Probe mode: caller is asking for the size only. Don't drain so a follow-up call
+        // with a larger buffer can read the payload.
+        if dst_size == 0 {
+            // SAFETY: read-only access to the captured bytes.
+            return unsafe { core_log_capture_payload_len() };
+        }
+        let bytes = core_log_capture::drain();
+        let copy_len = (dst_size - 1).min(bytes.len());
+        // SAFETY: caller guarantees `dst` points to at least `dst_size` writable bytes.
+        unsafe {
+            let out = core::slice::from_raw_parts_mut(dst.cast::<u8>(), dst_size);
+            out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            out[copy_len] = 0;
+        }
+        copy_len
+    })
+}
+
+/// SAFETY: probe-only helper used by `pgbr_log_capture_drain`'s `dst_size == 0` path.
+/// Reads the captured-byte length without draining.
+unsafe fn core_log_capture_payload_len() -> usize {
+    // We expose the length via a temporary drain + restore cycle; the buffer is not
+    // visible to other callers between `drain()` and the `extend_from_slice` because the
+    // single-threaded contract on `pgbr_core::log` forbids parallel access.
+    let bytes = core_log_capture::drain();
+    let len = bytes.len();
+    if !bytes.is_empty() {
+        // Re-install the bytes so a subsequent real drain still sees them.
+        core_log_capture::append(&bytes);
+    }
+    len
+}
+
+/// Whether the captured bytes contain `needle_utf8` as a UTF-8 substring. Returns `false`
+/// when `needle_utf8` is null or when the captured bytes are not valid UTF-8.
+///
+/// # Safety
+///
+/// `needle_utf8` must be either null or a NUL-terminated UTF-8 byte sequence readable for
+/// the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgbr_log_capture_contains(needle_utf8: *const c_char) -> bool {
+    with_panic_guard(|| {
+        // SAFETY: caller upholds the contract on `needle_utf8`.
+        let Some(needle) = (unsafe { cstr_to_str_or_empty(needle_utf8) }) else {
+            return false;
+        };
+        core_log_capture::contains(needle)
     })
 }
 
