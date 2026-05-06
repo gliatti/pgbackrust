@@ -15,12 +15,14 @@
 //! resolution (inheritance, `+role`/`-command` shortcut expansion, default
 //! application, allow-list checks) is deferred to subsequent revisions.
 
+pub mod cli;
 pub mod command;
 pub mod compile;
 pub mod option;
 pub mod types;
 pub mod value;
 
+pub use crate::cli::{CliError, CliInput, CliModifier, CliOptionEntry, CliResolveError, ResolvedCli, parse_cli, resolve_cli};
 pub use crate::command::CfgCommand;
 pub use crate::compile::{Cfg, CompileError, compile};
 pub use crate::option::{CfgOption, ResolvedCommandUsage, ResolvedDepend};
