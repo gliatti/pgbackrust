@@ -1,0 +1,21 @@
+[package]
+name = "pgbr-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+# Source-of-truth parser for `src/build/config/config.yaml`. `pgbr-config` consumes its
+# typed Config and lowers it into the runtime configuration model used at the start of
+# each pgBackRest invocation.
+pgbr-build = { path = "../pgbr-build" }
+# Errors raised during config compilation/resolution share the typed `Error`/`ErrorType`
+# infrastructure so callers see a single error story.
+pgbr-error = { path = "../pgbr-error" }
+
+[lints]
+workspace = true

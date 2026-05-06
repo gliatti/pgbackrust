@@ -357,6 +357,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgbr-config"
+version = "0.1.0"
+dependencies = [
+ "pgbr-build",
+ "pgbr-error",
+]
+
+[[package]]
 name = "pgbr-core"
 version = "0.1.0"
 dependencies = [
