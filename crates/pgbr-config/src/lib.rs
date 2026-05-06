@@ -17,8 +17,10 @@
 
 pub mod command;
 pub mod compile;
+pub mod option;
 pub mod types;
 
 pub use crate::command::CfgCommand;
 pub use crate::compile::{Cfg, CompileError, compile};
-pub use crate::types::{ConfigCommandRole, LockType};
+pub use crate::option::{CfgOption, ResolvedCommandUsage, ResolvedDepend};
+pub use crate::types::{ConfigCommandRole, DefaultType, LockType, OptionGroup, OptionSection, OptionType};

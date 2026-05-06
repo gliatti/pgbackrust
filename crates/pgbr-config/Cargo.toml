@@ -16,6 +16,10 @@ pgbr-build = { path = "../pgbr-build" }
 # Errors raised during config compilation/resolution share the typed `Error`/`ErrorType`
 # infrastructure so callers see a single error story.
 pgbr-error = { path = "../pgbr-error" }
+# `serde_yml::Value` appears in resolved option fields where the schema is type-
+# dependent (`default:`, `allow-list:`, `allow-range:`, `depend.list`, …). Same version as
+# pgbr-build's transitively-pulled copy.
+serde_yml = "0.0.12"
 
 [lints]
 workspace = true

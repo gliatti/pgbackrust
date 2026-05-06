@@ -362,6 +362,7 @@ version = "0.1.0"
 dependencies = [
  "pgbr-build",
  "pgbr-error",
+ "serde_yml",
 ]
 
 [[package]]
