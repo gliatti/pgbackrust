@@ -17,8 +17,10 @@
 
 pub mod config;
 pub mod error;
+pub mod help;
 pub mod postgres;
 
 pub use crate::config::{Config, parse_config};
 pub use crate::error::{ErrorDef, parse_errors};
+pub use crate::help::{ConfigKey, ConfigSection, Help, HelpCommand, HelpCommandOption, HelpError, parse_help};
 pub use crate::postgres::{PostgresVersions, parse_postgres};
