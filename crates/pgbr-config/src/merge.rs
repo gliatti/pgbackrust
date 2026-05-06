@@ -71,6 +71,20 @@ pub enum LoadError {
         value: String,
         range: String,
     },
+    /// An option's `depend:` constraint is not satisfied — the depended option
+    /// has a value not in the dependency's `list`, and the dep doesn't supply a
+    /// fallback `default`.
+    DependNotSatisfied {
+        option: String,
+        group_index: Option<u32>,
+        depend_option: String,
+        /// String form of the depended option's resolved value (or `"unset"` if
+        /// nothing was set).
+        depend_value: String,
+        /// String forms of the values in `depend.list`. Empty when the depend
+        /// only requires the option to be set.
+        depend_list: Vec<String>,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -112,6 +126,27 @@ impl fmt::Display for LoadError {
             } => {
                 let suffix = group_index.map(|i| format!(" (group {i})")).unwrap_or_default();
                 write!(f, "option `{option}`{suffix}: value `{value}` is outside allow-range {range}")
+            }
+            Self::DependNotSatisfied {
+                option,
+                group_index,
+                depend_option,
+                depend_value,
+                depend_list,
+            } => {
+                let suffix = group_index.map(|i| format!(" (group {i})")).unwrap_or_default();
+                if depend_list.is_empty() {
+                    write!(
+                        f,
+                        "option `{option}`{suffix}: depends on option `{depend_option}` being set (currently {depend_value})",
+                    )
+                } else {
+                    write!(
+                        f,
+                        "option `{option}`{suffix}: depends on option `{depend_option}` value being one of [{}] (currently {depend_value})",
+                        depend_list.join(", "),
+                    )
+                }
             }
         }
     }
@@ -189,6 +224,8 @@ pub fn load_config(cli: ResolvedCli, ini: &IniFile, cfg: &Cfg) -> Result<LoadedC
             }
         }
     }
+
+    validate_depends(&options, cfg, &cli.command)?;
 
     Ok(LoadedConfig {
         command: cli.command,
@@ -371,6 +408,89 @@ fn yaml_to_i64(v: &serde_yml::Value) -> Option<i64> {
         serde_yml::Value::String(s) => s.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// Match candidates for an [`OptionValue`] when comparing against an
+/// allow-list / depend-list entry. Returns the primary string form first;
+/// booleans also include the `y`/`n` shorthand because depend-lists in
+/// `config.yaml` historically use either spelling.
+fn option_value_match_candidates(v: &OptionValue) -> Vec<String> {
+    match v {
+        OptionValue::Boolean(true) => vec!["true".to_owned(), "y".to_owned()],
+        OptionValue::Boolean(false) => vec!["false".to_owned(), "n".to_owned()],
+        _ => option_value_to_match_str(v).into_iter().collect(),
+    }
+}
+
+fn validate_depends(options: &BTreeMap<(String, Option<u32>), OptionValue>, cfg: &Cfg, command: &str) -> Result<(), LoadError> {
+    for (name, idx) in options.keys() {
+        let Some(opt) = cfg.options.get(name) else {
+            continue;
+        };
+        // Per-command override wins, falls back to option-level.
+        let depend = opt
+            .commands
+            .get(command)
+            .and_then(|usage| usage.depend.as_ref())
+            .or(opt.depend.as_ref());
+        let Some(depend) = depend else {
+            continue;
+        };
+
+        // Look up the depended option's value. If the depending option is
+        // grouped, look at the same index; otherwise None. If the depended
+        // option is grouped but the depending one isn't, fall back to index 1.
+        let dep_opt = cfg.options.get(&depend.option);
+        let dep_idx: Option<u32> = match (idx, dep_opt.and_then(|o| o.group)) {
+            (Some(i), Some(_)) => Some(*i),
+            (None, Some(_)) => Some(1),
+            _ => None,
+        };
+        let dep_value = options.get(&(depend.option.clone(), dep_idx));
+
+        let depend_list_strs: Vec<String> = depend
+            .list
+            .as_ref()
+            .map(|l| l.iter().filter_map(value_to_match_str).collect())
+            .unwrap_or_default();
+
+        match dep_value {
+            None => {
+                // Depended option has no resolved value.
+                if depend.default.is_some() {
+                    // Lenient: dep is unsatisfied but tolerated. Future,
+                    // type-aware substitution will plug in `depend.default`.
+                    continue;
+                }
+                return Err(LoadError::DependNotSatisfied {
+                    option: name.clone(),
+                    group_index: *idx,
+                    depend_option: depend.option.clone(),
+                    depend_value: "unset".to_owned(),
+                    depend_list: depend_list_strs,
+                });
+            }
+            Some(v) => {
+                if depend.list.is_none() {
+                    // Bare `depend: <name>` — satisfied iff dep has any value.
+                    continue;
+                }
+                let candidates = option_value_match_candidates(v);
+                if candidates.iter().any(|c| depend_list_strs.iter().any(|d| d == c)) {
+                    continue;
+                }
+                let value_str = candidates.first().cloned().unwrap_or_else(|| "<opaque>".to_owned());
+                return Err(LoadError::DependNotSatisfied {
+                    option: name.clone(),
+                    group_index: *idx,
+                    depend_option: depend.option.clone(),
+                    depend_value: value_str,
+                    depend_list: depend_list_strs,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_default(
@@ -670,5 +790,235 @@ option:
         )
         .unwrap();
         assert_eq!(r.command, "backup");
+    }
+
+    #[test]
+    fn depend_satisfied_when_value_in_list() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  online:
+    type: boolean
+    default: true
+    negate: true
+    command:
+      backup: {}
+  force:
+    type: boolean
+    default: false
+    negate: true
+    depend:
+      option: online
+      list: [false]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--no-online", "--force"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("force".into(), None)], OptionValue::Boolean(true));
+        assert_eq!(r.options[&("online".into(), None)], OptionValue::Boolean(false));
+    }
+
+    #[test]
+    fn depend_not_satisfied_when_value_not_in_list() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  online:
+    type: boolean
+    default: true
+    negate: true
+    command:
+      backup: {}
+  force:
+    type: boolean
+    default: false
+    negate: true
+    depend:
+      option: online
+      list: [false]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        // online stays true (its default); force is set explicitly.
+        let cli = parse_cli(["backup", "--stanza=demo", "--force"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::DependNotSatisfied {
+                option,
+                depend_option,
+                depend_value,
+                depend_list,
+                ..
+            } => {
+                assert_eq!(option, "force");
+                assert_eq!(depend_option, "online");
+                assert_eq!(depend_value, "true");
+                assert_eq!(depend_list, vec!["false".to_owned()]);
+            }
+            other => panic!("expected DependNotSatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_string_depend_satisfied_when_dep_set() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  alpha:
+    type: string
+    command:
+      backup: {}
+  beta:
+    type: string
+    depend: alpha
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--alpha=hi", "--beta=there"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("beta".into(), None)], OptionValue::String("there".into()));
+    }
+
+    #[test]
+    fn bare_string_depend_violated_when_dep_unset() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  alpha:
+    type: string
+    command:
+      backup: {}
+  beta:
+    type: string
+    depend: alpha
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--beta=there"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::DependNotSatisfied {
+                option,
+                depend_option,
+                depend_value,
+                depend_list,
+                ..
+            } => {
+                assert_eq!(option, "beta");
+                assert_eq!(depend_option, "alpha");
+                assert_eq!(depend_value, "unset");
+                assert!(depend_list.is_empty());
+            }
+            other => panic!("expected DependNotSatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depend_with_fallback_default_skips_strict_check() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  alpha:
+    type: string
+    command:
+      backup: {}
+  beta:
+    type: string
+    depend:
+      option: alpha
+      default: fallback
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        // alpha is unset; beta is set. The dep has a fallback default, so the
+        // depend constraint is treated leniently and beta keeps its value.
+        let cli = parse_cli(["backup", "--stanza=demo", "--beta=there"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("beta".into(), None)], OptionValue::String("there".into()));
+    }
+
+    #[test]
+    fn per_command_depend_overrides_option_depend() {
+        // beta's option-level depend is `alpha`, but for `backup` the
+        // depend is overridden to `gamma`. Set alpha and beta but NOT gamma:
+        // the per-command override should fire and reject beta.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  alpha:
+    type: string
+    command:
+      backup: {}
+  gamma:
+    type: string
+    command:
+      backup: {}
+  beta:
+    type: string
+    depend: alpha
+    command:
+      backup:
+        depend: gamma
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--alpha=a", "--beta=b"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::DependNotSatisfied {
+                option, depend_option, ..
+            } => {
+                assert_eq!(option, "beta");
+                assert_eq!(depend_option, "gamma");
+            }
+            other => panic!("expected DependNotSatisfied(gamma), got {other:?}"),
+        }
     }
 }
