@@ -57,6 +57,20 @@ pub enum LoadError {
     Required { option: String, group_index: Option<u32> },
     /// An INI section uses a key that doesn't match any declared option.
     UnknownIniKey { section: IniSection, key: String },
+    /// The resolved value isn't in the option's `allow-list`.
+    NotInAllowList {
+        option: String,
+        group_index: Option<u32>,
+        value: String,
+        allowed: Vec<String>,
+    },
+    /// The resolved numeric value is outside the option's `allow-range`.
+    OutOfAllowRange {
+        option: String,
+        group_index: Option<u32>,
+        value: String,
+        range: String,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -76,6 +90,28 @@ impl fmt::Display for LoadError {
             },
             Self::UnknownIniKey { section, key } => {
                 write!(f, "INI section {section:?} references unknown option `{key}`")
+            }
+            Self::NotInAllowList {
+                option,
+                group_index,
+                value,
+                allowed,
+            } => {
+                let suffix = group_index.map(|i| format!(" (group {i})")).unwrap_or_default();
+                write!(
+                    f,
+                    "option `{option}`{suffix}: value `{value}` is not in allow-list [{}]",
+                    allowed.join(", "),
+                )
+            }
+            Self::OutOfAllowRange {
+                option,
+                group_index,
+                value,
+                range,
+            } => {
+                let suffix = group_index.map(|i| format!(" (group {i})")).unwrap_or_default();
+                write!(f, "option `{option}`{suffix}: value `{value}` is outside allow-range {range}")
             }
         }
     }
@@ -143,6 +179,7 @@ pub fn load_config(cli: ResolvedCli, ini: &IniFile, cfg: &Cfg) -> Result<LoadedC
             };
 
             if let Some(value) = final_value {
+                validate_value(&value, opt, usage, name, idx)?;
                 options.insert(key, value);
             } else if opt.required && (usage.required != Some(false)) {
                 return Err(LoadError::Required {
@@ -253,6 +290,87 @@ fn lookup_ini(
         }
     }
     Ok(None)
+}
+
+fn validate_value(
+    value: &OptionValue,
+    opt: &CfgOption,
+    usage: &crate::option::ResolvedCommandUsage,
+    option_name: &str,
+    group_index: Option<u32>,
+) -> Result<(), LoadError> {
+    // allow-list — per-command override wins, falls back to option-level.
+    if let Some(allowed) = usage.allow_list.as_ref().or(opt.allow_list.as_ref()) {
+        let allowed_strs: Vec<String> = allowed.iter().filter_map(value_to_match_str).collect();
+        if let Some(value_str) = option_value_to_match_str(value)
+            && !allowed_strs.iter().any(|a| a == &value_str)
+        {
+            return Err(LoadError::NotInAllowList {
+                option: option_name.to_owned(),
+                group_index,
+                value: value_str,
+                allowed: allowed_strs,
+            });
+        }
+    }
+
+    // allow-range — only the simple `[min, max]` shape is enforced here.
+    // Per-flavor allow-range (e.g. `[{bz2: [1, 9]}, {gz: [-1, 9]}]`) is left
+    // to the flavor-aware caller.
+    if let Some(range) = opt.allow_range.as_ref() {
+        let serde_yml::Value::Sequence(items) = range else {
+            return Ok(());
+        };
+        if items.len() != 2 {
+            return Ok(());
+        }
+        let (Some(min), Some(max)) = (yaml_to_i64(&items[0]), yaml_to_i64(&items[1])) else {
+            return Ok(());
+        };
+        let n = match value {
+            OptionValue::Integer(n) => Some(*n),
+            OptionValue::Time(n) | OptionValue::Size(n) => i64::try_from(*n).ok(),
+            _ => None,
+        };
+        if let Some(v) = n
+            && (v < min || v > max)
+        {
+            return Err(LoadError::OutOfAllowRange {
+                option: option_name.to_owned(),
+                group_index,
+                value: v.to_string(),
+                range: format!("[{min}, {max}]"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn value_to_match_str(v: &serde_yml::Value) -> Option<String> {
+    match v {
+        serde_yml::Value::String(s) => Some(s.clone()),
+        serde_yml::Value::Bool(b) => Some(b.to_string()),
+        serde_yml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn option_value_to_match_str(v: &OptionValue) -> Option<String> {
+    match v {
+        OptionValue::String(s) | OptionValue::StringId(s) | OptionValue::Path(s) => Some(s.clone()),
+        OptionValue::Boolean(b) => Some(b.to_string()),
+        OptionValue::Integer(n) => Some(n.to_string()),
+        OptionValue::Size(n) | OptionValue::Time(n) => Some(n.to_string()),
+        OptionValue::List(_) | OptionValue::Hash(_) => None,
+    }
+}
+
+fn yaml_to_i64(v: &serde_yml::Value) -> Option<i64> {
+    match v {
+        serde_yml::Value::Number(n) => n.as_i64(),
+        serde_yml::Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn resolve_default(
@@ -434,6 +552,110 @@ option:
     fn negate_in_cli_yields_boolean_false() {
         let r = load(&["backup", "--stanza=demo", "--pg1-path=/data", "--no-online"], "").unwrap();
         assert_eq!(r.options[&("online".into(), None)], OptionValue::Boolean(false));
+    }
+
+    #[test]
+    fn allow_list_rejects_disallowed_value() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  output:
+    type: string-id
+    default: text
+    allow-list:
+      - text
+      - json
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--output=xml"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        assert!(matches!(err, LoadError::NotInAllowList { .. }));
+    }
+
+    #[test]
+    fn allow_list_accepts_allowed_value() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  output:
+    type: string-id
+    default: text
+    allow-list:
+      - text
+      - json
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--output=json"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("output".into(), None)], OptionValue::StringId("json".into()));
+    }
+
+    #[test]
+    fn allow_range_rejects_out_of_range_integer() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  process-max:
+    type: integer
+    default: 1
+    allow-range: [1, 999]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--process-max=2000"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        assert!(matches!(err, LoadError::OutOfAllowRange { .. }));
+    }
+
+    #[test]
+    fn allow_range_accepts_in_range_integer() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  process-max:
+    type: integer
+    default: 1
+    allow-range: [1, 999]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--process-max=8"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("process-max".into(), None)], OptionValue::Integer(8));
     }
 
     #[test]
