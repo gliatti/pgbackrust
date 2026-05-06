@@ -25,8 +25,10 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod file;
+pub mod filter;
 
 pub use crate::file::{FileRead, FileWrite};
+pub use crate::filter::{Sha1, Sha256, Size};
 
 use std::cmp::min;
 use std::fmt;
