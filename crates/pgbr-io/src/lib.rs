@@ -24,6 +24,10 @@
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod file;
+
+pub use crate::file::{FileRead, FileWrite};
+
 use std::cmp::min;
 use std::fmt;
 
