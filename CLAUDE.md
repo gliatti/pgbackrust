@@ -60,20 +60,20 @@ Existing crates (canonical Rust implementations):
 - `pgbr-crypto` — xxhash and other crypto primitives
 - `pgbr-encode` — hex / base64 encoders
 - `pgbr-regex` — regex wrapper
-- `pgbr-postgres` — PostgreSQL version-aware interface (in progress)
+- `pgbr-postgres` — PostgreSQL version-aware interface (in progress; CRC-32C only at present)
+- `pgbr-build` — typed parsers for `src/build/{config/config.yaml, error/error.yaml, postgres/postgres.yaml}` (`help.xml` deferred). Lives in parallel with the C generator at `src/build/`; the latter keeps emitting `*.auto.{h,c.inc}` for the C build until `src/` is removed
+- `pgbr-config` — full configuration loading pipeline. Modules: `types` (`OptionType`, `ConfigCommandRole`, `LockType`, `OptionGroup`, `OptionSection`, `DefaultType`), `command` (`CfgCommand`), `option` (`CfgOption`, `ResolvedCommandUsage`, `ResolvedDepend`), `compile` (`Cfg`, `compile()` lowering with inheritance + `+role`/`+inherit`/`-command` shortcut expansion + topological-sort cycle detection), `value` (`OptionValue`, `parse_value()` for boolean/integer/size/time/path/string/list/hash), `cli` (`parse_cli` argv tokenizer + `resolve_cli` Cfg-aware resolution), `ini` (`parse_ini` for `pgbackrest.conf`), `merge` (`load_config` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range validation)
+- `pgbr-io` — I/O traits (`IoRead`, `IoWrite`), in-memory implementations (`MemRead`, `MemWrite`), and `FilterChain` for byte-stream transforms. Production filters live in their crates (`pgbr-compress`, `pgbr-crypto`, …) and plug in via the `Filter` trait
 - `pgbr-ffi` — transitional C↔Rust glue, scheduled for removal once `src/` is gone
 
 Planned crates (created when their porting work starts, to keep the workspace honest about what exists):
 
-- `pgbr-build` — Rust replacement for the `src/build/` C code generator (auto files)
-- `pgbr-config` — option parsing and configuration model
-- `pgbr-io` — I/O filter chain
 - `pgbr-storage` — pluggable storage backends (posix, s3, azure, gcs, cifs, optional sftp)
 - `pgbr-db` — libpq client wrapper
 - `pgbr-protocol` — local/remote process protocol and parallel job dispatch
 - `pgbr-info` — on-disk info files (archive.info, backup.info, manifest, infoPg)
 - `pgbr-command` — per-command implementations (`backup`, `restore`, `archive/get`, `archive/push`, `expire`, `verify`, `info`, `stanza/*`, `repo/*`, `check`, `annotate`, `manifest`, `control/*`, `server/*`)
-- `pgbr-naming` — naming-helpers crate (the original 9-stub workspace had this; only re-create if the port actually needs a separate crate)
+- `pgbr-naming` — naming-helpers crate (only re-create if the port actually needs a separate crate)
 
 ## C build (transitional — being removed)
 
