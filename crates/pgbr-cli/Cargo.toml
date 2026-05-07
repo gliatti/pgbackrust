@@ -1,0 +1,22 @@
+[package]
+name = "pgbr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pgbackrest"
+path = "src/main.rs"
+
+[lib]
+
+[dependencies]
+pgbr-build = { path = "../pgbr-build" }
+pgbr-config = { path = "../pgbr-config" }
+# Re-exported as the error type for `pgbr_build::parse_config` failures.
+serde_yml = "0.0.12"
+
+[lints]
+workspace = true
