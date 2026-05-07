@@ -575,6 +575,7 @@ name = "pgbr-postgres"
 version = "0.1.0"
 dependencies = [
  "pgbr-build",
+ "pgbr-io",
 ]
 
 [[package]]
