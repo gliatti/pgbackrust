@@ -26,8 +26,10 @@ use std::path::{Path, PathBuf};
 
 use pgbr_io::{IoError, IoRead, IoWrite};
 
+pub mod cifs;
 pub mod posix;
 
+pub use crate::cifs::Cifs;
 pub use crate::posix::Posix;
 
 /// Metadata about an entry in a storage backend.
