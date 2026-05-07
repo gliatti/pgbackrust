@@ -477,8 +477,10 @@ dependencies = [
  "pgbr-build",
  "pgbr-config",
  "pgbr-error",
+ "pgbr-info",
  "pgbr-io",
  "pgbr-storage",
+ "serde_json",
  "tempfile",
 ]
 
