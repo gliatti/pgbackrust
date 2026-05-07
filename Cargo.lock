@@ -471,6 +471,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgbr-command"
+version = "0.1.0"
+dependencies = [
+ "pgbr-build",
+ "pgbr-config",
+ "pgbr-error",
+ "pgbr-io",
+ "pgbr-storage",
+ "tempfile",
+]
+
+[[package]]
 name = "pgbr-compress"
 version = "0.1.0"
 dependencies = [
