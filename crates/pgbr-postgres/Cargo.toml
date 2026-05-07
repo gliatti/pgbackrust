@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 # Source-of-truth list of supported PG major versions.
 pgbr-build = { path = "../pgbr-build" }
+# Buffer-oriented I/O traits used by the pg_control reader.
+pgbr-io = { path = "../pgbr-io" }
 
 [lints]
 workspace = true
