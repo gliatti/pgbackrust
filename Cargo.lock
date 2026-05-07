@@ -536,6 +536,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgbr-info"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "pgbr-io",
+ "pgbr-storage",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+]
+
+[[package]]
 name = "pgbr-io"
 version = "0.1.0"
 dependencies = [

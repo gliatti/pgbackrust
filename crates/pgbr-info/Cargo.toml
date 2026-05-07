@@ -1,0 +1,30 @@
+[package]
+name = "pgbr-info"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+# Storage trait + Posix backend used to load and save info files. `pgbr-info` itself is
+# backend-agnostic — callers pass any `&dyn Storage` implementor.
+pgbr-storage = { path = "../pgbr-storage" }
+# IoRead / IoWrite are how `Storage::open_read` and `Storage::open_write` hand back streams.
+pgbr-io = { path = "../pgbr-io" }
+# `[backup:current]` entries are JSON values keyed by backup label; the `[db:history]`
+# rows are also JSON-encoded objects on the right-hand side of the `=`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-1 over the file content with the checksum line removed.
+sha1 = "0.10"
+# Parsed sections / keys retain their insertion order so parse->render is byte-identical.
+indexmap = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
