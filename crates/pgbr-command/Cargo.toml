@@ -1,0 +1,22 @@
+[package]
+name = "pgbr-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+pgbr-build = { path = "../pgbr-build" }
+pgbr-config = { path = "../pgbr-config" }
+pgbr-error = { path = "../pgbr-error" }
+pgbr-io = { path = "../pgbr-io" }
+pgbr-storage = { path = "../pgbr-storage" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
