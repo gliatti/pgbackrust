@@ -12,8 +12,10 @@ repository.workspace = true
 pgbr-build = { path = "../pgbr-build" }
 pgbr-config = { path = "../pgbr-config" }
 pgbr-error = { path = "../pgbr-error" }
+pgbr-info = { path = "../pgbr-info" }
 pgbr-io = { path = "../pgbr-io" }
 pgbr-storage = { path = "../pgbr-storage" }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
