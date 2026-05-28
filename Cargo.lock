@@ -542,6 +542,7 @@ dependencies = [
  "pgbr-error",
  "pgbr-info",
  "pgbr-io",
+ "pgbr-postgres",
  "pgbr-storage",
  "serde_json",
  "tempfile",
