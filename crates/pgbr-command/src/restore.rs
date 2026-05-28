@@ -104,6 +104,20 @@
 //! the symlink-creation path. Links that are not tablespace links
 //! (`pg_tblspc/<oid>`) keep their recorded destination unchanged.
 //!
+//! # Generic link remapping (`--link-map`)
+//!
+//! A non-tablespace symlink (e.g. `pg_wal`) can be re-created pointing at a
+//! different destination via `--link-map=<link-name>=<path>`, where `<link-name>`
+//! is the link's path relative to the PG data dir (the manifest link name with its
+//! `pg_data/` prefix stripped). When a manifest link's name has a `--link-map`
+//! entry, the link is created at the mapped destination instead of the manifest's
+//! recorded target; unmapped links keep their recorded target. The pure
+//! [`resolve_link_target`] function does the resolution. Tablespace links are
+//! never subject to `--link-map` (they are remapped only via `--tablespace-map` /
+//! `--tablespace-map-all`), matching the C generator, which errors if a tablespace
+//! is named in `--link-map`. C ref: the link-remap loop in
+//! `src/command/restore/remap.c.inc`.
+//!
 //! # Selective database restore (`--db-include` / `--db-exclude`)
 //!
 //! `--db-include` restores ONLY the named databases; `--db-exclude` restores all
@@ -148,15 +162,26 @@
 //!   `recovery_target_timeline = 'current'` so recovery does not chase the latest
 //!   timeline it cannot reach (mirrors the C workaround for a `PostgreSQL` bug).
 //!
+//! On top of the built-in lines, `--recovery-option=<key>=<value>` (a `Hash`
+//! option) writes arbitrary extra recovery settings verbatim into the generated
+//! config (e.g. `archive_cleanup_command=...`, a `restore_command=...` override,
+//! `primary_conninfo=...`). The user options are merged in AFTER the built-in
+//! recovery-target lines, so a user key that collides with a built-in (notably
+//! `restore_command`) wins: the built-in line is suppressed and the user value
+//! emitted instead. Keys arrive `-`-separated (users naturally type pgBackRest's
+//! own option style) and are normalised to `_` before writing; values are
+//! single-quoted, matching the recovery-conf `key = 'value'` format. C ref:
+//! `restoreRecoveryOption` in `src/command/restore/config.c.inc`.
+//!
 //! The generator is the pure [`recovery_files`] function so it is unit-testable
 //! without any storage.
 //!
 //! # Deferred to later commits
 //!
-//! - `--type=preserve` (leave any existing recovery file untouched) and the full
-//!   `--recovery-option` passthrough — only the resolved recovery-target settings
-//!   (`--type`, `--target`, `--target-exclusive`, `--target-action`,
-//!   `--target-timeline`) are generated here.
+//! - `--type=preserve` (leave any existing recovery file untouched). The resolved
+//!   recovery-target settings (`--type`, `--target`, `--target-exclusive`,
+//!   `--target-action`, `--target-timeline`) plus arbitrary `--recovery-option`
+//!   passthrough are generated here.
 //!
 //! This is the full raw-restore path; everything above is genuinely out of
 //! scope for the slice, not silently dropped.
@@ -249,6 +274,30 @@ fn tablespace_map_all(config: &LoadedConfig) -> Option<String> {
     match config.options.get(&("tablespace-map-all".to_owned(), None)) {
         Some(OptionValue::Path(value) | OptionValue::String(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+/// The `--link-map` hash (link-name -> new destination path). Absent or non-hash
+/// resolves to an empty map. Keys are link names relative to the PG data dir
+/// (e.g. `pg_wal`), matching the manifest link's name with its `pg_data/` prefix
+/// stripped. C ref: `cfgOptLinkMap` in `src/command/restore/remap.c.inc`.
+fn link_map(config: &LoadedConfig) -> BTreeMap<String, String> {
+    match config.options.get(&("link-map".to_owned(), None)) {
+        Some(OptionValue::Hash(map)) => map.clone(),
+        _ => BTreeMap::new(),
+    }
+}
+
+/// The `--recovery-option` hash (recovery-setting key -> value). Absent or
+/// non-hash resolves to an empty map. Keys arrive with `-` separators (users
+/// naturally type `archive-cleanup-command`); the recovery-config generator
+/// normalises `-` to `_` before writing, mirroring the C `strReplaceChr(key,
+/// '-', '_')`. C ref: `restoreRecoveryOption` in
+/// `src/command/restore/config.c.inc`.
+fn recovery_options(config: &LoadedConfig) -> BTreeMap<String, String> {
+    match config.options.get(&("recovery-option".to_owned(), None)) {
+        Some(OptionValue::Hash(map)) => map.clone(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -382,7 +431,7 @@ fn restore_command(stanza: &str) -> String {
 /// The resolved recovery-target settings the [`recovery_block`] generator emits,
 /// beyond the always-present `restore_command` / target-type lines. Bundled into a
 /// struct so the signature stays readable as the family grows.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct RecoverySettings<'a> {
     /// The `--target` value (used for `time` / `name` / `lsn` / `xid` types).
     target: Option<&'a str>,
@@ -393,14 +442,35 @@ struct RecoverySettings<'a> {
     action: &'a str,
     /// The `--target-timeline` value, if supplied.
     timeline: Option<&'a str>,
+    /// Arbitrary extra recovery settings from `--recovery-option` (key -> value),
+    /// merged in AFTER the built-in lines. Keys arrive `-`-separated and are
+    /// normalised to `_` before writing; a user key that collides with a built-in
+    /// (e.g. `restore_command`) wins — the built-in line is suppressed and the
+    /// user value written instead.
+    recovery_options: &'a BTreeMap<String, String>,
+}
+
+/// Normalise a `--recovery-option` key to the `_`-separated GUC form `PostgreSQL`
+/// expects. Users naturally type `archive-cleanup-command` (matching pgBackRest's
+/// own option style), so `-` is replaced with `_`. Mirrors the C
+/// `strReplaceChr(key, '-', '_')`.
+fn normalise_recovery_key(key: &str) -> String {
+    key.replace('-', "_")
+}
+
+/// Whether the user supplied a `--recovery-option` whose normalised key matches
+/// `guc` — used to suppress the matching built-in line so the user value wins.
+fn user_overrides(recovery_options: &BTreeMap<String, String>, guc: &str) -> bool {
+    recovery_options.keys().any(|k| normalise_recovery_key(k) == guc)
 }
 
 /// Render the recovery settings block (a `key = 'value'` line per setting) for the
 /// given PG major version, resolved recovery type, and recovery-target settings.
-/// The leading header line identifies the restore. Always emits `restore_command`;
-/// the recovery-target lines depend on the type and settings. Returns an empty
-/// string for [`RecoveryType::None`] (callers should not write any recovery file
-/// in that case).
+/// The leading header line identifies the restore. Always emits `restore_command`
+/// (unless the user overrode it via `--recovery-option`); the recovery-target lines
+/// depend on the type and settings. Any `--recovery-option` entries are merged in
+/// AFTER the built-in lines (user wins on key collision). Returns an empty string
+/// for [`RecoveryType::None`] (callers should not write any recovery file then).
 fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: RecoverySettings<'_>) -> String {
     use std::fmt::Write as _;
 
@@ -408,9 +478,16 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
         return String::new();
     }
 
+    let opts = settings.recovery_options;
     let mut out = String::from("# Recovery settings generated by pgBackRest restore\n");
-    // `write!` into a `String` is infallible.
-    let _ = writeln!(out, "restore_command = '{}'", restore_command(stanza));
+
+    // restore_command — built-in unless the user overrides it via --recovery-option,
+    // in which case the user's value is emitted with the other user options below
+    // (mirrors the C generator, which skips the built-in restore_command when the
+    // user already supplied one). `write!` into a `String` is infallible.
+    if !user_overrides(opts, "restore_command") {
+        let _ = writeln!(out, "restore_command = '{}'", restore_command(stanza));
+    }
 
     match ty {
         RecoveryType::Immediate => out.push_str("recovery_target = 'immediate'\n"),
@@ -459,6 +536,16 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
         }
     }
 
+    // Merge the user's --recovery-option settings AFTER the built-in lines. Keys are
+    // normalised (`-` -> `_`) and emitted in sorted order (BTreeMap iterates
+    // ascending) so the output is deterministic. A user key that matched a built-in
+    // (e.g. restore_command) had its built-in line suppressed above, so writing it
+    // here makes the user value win. Values are single-quoted, matching the
+    // recovery-conf `key = 'value'` format.
+    for (key, value) in opts {
+        let _ = writeln!(out, "{} = '{value}'", normalise_recovery_key(key));
+    }
+
     out
 }
 
@@ -488,11 +575,14 @@ fn recovery_files(db_version: &str, stanza: &str, config: &LoadedConfig) -> Vec<
     }
 
     let db_major = db_major_version(db_version);
+    // Owned so the borrow in `RecoverySettings` outlives the `recovery_block` call.
+    let recovery_opts = recovery_options(config);
     let settings = RecoverySettings {
         target: string_option(config, "target"),
         exclusive: target_exclusive(config),
         action: target_action(config),
         timeline: target_timeline(config),
+        recovery_options: &recovery_opts,
     };
     let block = recovery_block(db_major, stanza, ty, settings);
 
@@ -617,6 +707,26 @@ fn resolve_tablespace_target(link: &ManifestLink, map: &BTreeMap<String, String>
 
     // 3. Fall back to the manifest's recorded destination.
     PathBuf::from(&link.destination)
+}
+
+/// The PG-data-relative name of a manifest link (its name with the leading
+/// `pg_data/` target prefix stripped), used to look the link up in `--link-map`.
+/// pgBackRest records every link under the `pg_data` manifest target, so the
+/// link's path looks like `pg_data/pg_wal`; the `--link-map` key is `pg_wal`.
+/// A link without the `pg_data/` prefix is returned unchanged.
+fn link_relative_name(link_path: &str) -> &str {
+    link_path.strip_prefix("pg_data/").unwrap_or(link_path)
+}
+
+/// Resolve where a manifest link should be re-created to point, honouring
+/// `--link-map`. When `link_name` (the PG-data-relative link name) has an entry
+/// in `link_map`, the mapped destination wins; otherwise the manifest's recorded
+/// target is kept unchanged. Pure so it can be unit-tested without storage.
+///
+/// C ref: the link-remap loop in `src/command/restore/remap.c.inc`, where a
+/// `--link-map=<link>=<path>` entry updates the manifest link/target destination.
+fn resolve_link_target(link_name: &str, recorded_target: &str, link_map: &BTreeMap<String, String>) -> String {
+    link_map.get(link_name).cloned().unwrap_or_else(|| recorded_target.to_owned())
 }
 
 /// Whether a manifest file belongs to a database that should be restored, given
@@ -980,6 +1090,9 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     let ts_map = tablespace_map(config);
     let ts_map_all = tablespace_map_all(config);
 
+    // Generic link remapping (`--link-map`), applied to non-tablespace links.
+    let links_map = link_map(config);
+
     let (label, metadata, info) = select_backup(config, repo, stanza)?;
 
     // The transform the restored backup applied — read from the recorded
@@ -1090,9 +1203,19 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             pg.create_path(parent, true)?;
         }
         // Tablespace links (`pg_tblspc/<oid>`) may be redirected by
-        // `--tablespace-map` / `--tablespace-map-all`; other links keep their
-        // recorded destination.
-        let target = resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref());
+        // `--tablespace-map` / `--tablespace-map-all`; non-tablespace links may
+        // be redirected by `--link-map` (keyed on the link's PG-data-relative
+        // name). A tablespace link is never subject to `--link-map` (the C
+        // generator errors on that), so only non-tablespace links consult it.
+        let target = if tablespace_oid(link).is_some() {
+            resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref())
+        } else {
+            PathBuf::from(resolve_link_target(
+                link_relative_name(&link.path),
+                &link.destination,
+                &links_map,
+            ))
+        };
         match pg.create_symlink(&link_path, &target) {
             Ok(()) => links_created += 1,
             Err(_) => skipped_links += 1,
@@ -2026,6 +2149,116 @@ mod tests {
         );
     }
 
+    // ---- arbitrary recovery options (--recovery-option) ---------------------
+
+    /// A restore config carrying `--type` and an arbitrary `--recovery-option`
+    /// hash, for the recovery-option passthrough tests.
+    fn cfg_recovery_option(stanza: &str, ty: Option<&str>, recovery_option: &[(&str, &str)]) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        if let Some(ty) = ty {
+            options.insert(("type".to_owned(), None), OptionValue::StringId(ty.to_owned()));
+        }
+        if !recovery_option.is_empty() {
+            let mut map = BTreeMap::new();
+            for (k, v) in recovery_option {
+                map.insert((*k).to_owned(), (*v).to_owned());
+            }
+            options.insert(("recovery-option".to_owned(), None), OptionValue::Hash(map));
+        }
+        LoadedConfig {
+            command: "restore".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_option_lines_appended_and_override() {
+        let stanza = "demo";
+
+        // An arbitrary recovery-option is appended verbatim AFTER the built-in
+        // lines, with `-` in the key normalised to `_` and the value quoted.
+        let cfg_extra = cfg_recovery_option(stanza, Some("default"), &[("archive-cleanup-command", "/usr/bin/cleanup %r")]);
+        let extra = super::recovery_files("14", stanza, &cfg_extra);
+        let block = &extra[0].1;
+        assert!(
+            block.contains("restore_command = 'pgbackrest --stanza=demo archive-get %f \"%p\"'"),
+            "built-in restore_command must still be present: {block}"
+        );
+        assert!(
+            block.contains("archive_cleanup_command = '/usr/bin/cleanup %r'"),
+            "user recovery-option must be appended with - normalised to _: {block}"
+        );
+        // The user option comes AFTER the built-in restore_command line.
+        let cmd_pos = block.find("restore_command").expect("restore_command present");
+        let extra_pos = block.find("archive_cleanup_command").expect("user option present");
+        assert!(extra_pos > cmd_pos, "user option must follow the built-in lines: {block}");
+
+        // A user-supplied restore_command OVERRIDES the built-in one: the built-in
+        // line is suppressed and only the user's value appears.
+        let cfg_override = cfg_recovery_option(stanza, Some("default"), &[("restore_command", "my-custom-archive-get %f %p")]);
+        let overridden = super::recovery_files("14", stanza, &cfg_override);
+        let oblock = &overridden[0].1;
+        assert!(
+            oblock.contains("restore_command = 'my-custom-archive-get %f %p'"),
+            "user restore_command must be written: {oblock}"
+        );
+        assert!(
+            !oblock.contains("pgbackrest --stanza=demo archive-get"),
+            "built-in restore_command must be suppressed when the user overrides it: {oblock}"
+        );
+        assert_eq!(
+            oblock.matches("restore_command").count(),
+            1,
+            "exactly one restore_command line must be present: {oblock}"
+        );
+
+        // The dashed form of the override key collides with the built-in too,
+        // since keys are normalised before comparison.
+        let cfg_override_dashed = cfg_recovery_option(stanza, Some("default"), &[("restore-command", "dashed-archive-get %f %p")]);
+        let dashed = super::recovery_files("14", stanza, &cfg_override_dashed);
+        let dblock = &dashed[0].1;
+        assert!(
+            dblock.contains("restore_command = 'dashed-archive-get %f %p'"),
+            "dashed override key must normalise and win: {dblock}"
+        );
+        assert_eq!(
+            dblock.matches("restore_command").count(),
+            1,
+            "exactly one restore_command line even with the dashed override: {dblock}"
+        );
+    }
+
+    #[test]
+    fn recovery_option_end_to_end() {
+        // End-to-end: a restore with --recovery-option writes the user setting into
+        // the generated postgresql.auto.conf (PG 14).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let cfg = cfg_recovery_option(stanza, None, &[("archive-cleanup-command", "foo")]);
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(
+            outcome.recovery_files_written,
+            vec!["postgresql.auto.conf".to_owned(), "recovery.signal".to_owned()]
+        );
+
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("postgresql.auto.conf")).expect("open auto.conf");
+            String::from_utf8(r.read_all().expect("read auto.conf")).unwrap()
+        };
+        assert!(
+            contents.contains("archive_cleanup_command = 'foo'"),
+            "recovery-option must appear in the generated config: {contents}"
+        );
+    }
+
     // ---- delta restore -----------------------------------------------------
 
     #[test]
@@ -2842,6 +3075,130 @@ mod tests {
 
         let read = std::fs::read_link(pg.path().join("pg_data/pg_tblspc/16395")).expect("read_link");
         assert_eq!(read, Path::new(&new_loc_str), "symlink must point at the mapped destination");
+    }
+
+    // ---- generic link remapping (--link-map) -------------------------------
+
+    #[test]
+    fn resolve_link_target_mapped_and_unmapped() {
+        let mut map = BTreeMap::new();
+        map.insert("pg_wal".to_owned(), "/mnt/fast/pg_wal".to_owned());
+
+        // A mapped link name uses the mapped destination, ignoring the recorded one.
+        assert_eq!(
+            super::resolve_link_target("pg_wal", "/var/lib/pg_wal", &map),
+            "/mnt/fast/pg_wal",
+            "mapped link must use the --link-map destination"
+        );
+
+        // An unmapped link name keeps its recorded destination.
+        assert_eq!(
+            super::resolve_link_target("pg_log", "/var/log/pg_log", &map),
+            "/var/log/pg_log",
+            "unmapped link must keep its recorded destination"
+        );
+
+        // An empty map always falls back to the recorded destination.
+        let empty = BTreeMap::new();
+        assert_eq!(
+            super::resolve_link_target("pg_wal", "/var/lib/pg_wal", &empty),
+            "/var/lib/pg_wal",
+            "empty link-map must keep the recorded destination"
+        );
+    }
+
+    #[test]
+    fn link_relative_name_strips_pgdata_prefix() {
+        // The manifest records links under the pg_data target; --link-map keys are
+        // the link name with that prefix stripped.
+        assert_eq!(super::link_relative_name("pg_data/pg_wal"), "pg_wal");
+        assert_eq!(super::link_relative_name("pg_data/some/deep/link"), "some/deep/link");
+        // A path without the prefix is returned unchanged.
+        assert_eq!(super::link_relative_name("pg_wal"), "pg_wal");
+    }
+
+    #[test]
+    fn restore_remaps_link_with_link_map() {
+        // End-to-end: a manifest with a non-tablespace link (pg_wal) and a
+        // --link-map entry re-creates the symlink at the mapped destination.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let mapped = pg.path().join("relocated_wal");
+        let mapped_str = mapped.to_string_lossy().into_owned();
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data"],
+            &[("pg_data/pg_wal", "/var/lib/original_wal")],
+        );
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![(
+                ("link-map", None),
+                OptionValue::Hash({
+                    let mut m = BTreeMap::new();
+                    m.insert("pg_wal".to_owned(), mapped_str.clone());
+                    m
+                }),
+            )],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1);
+
+        let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
+        assert_eq!(
+            read,
+            Path::new(&mapped_str),
+            "symlink must point at the --link-map destination, not the recorded one"
+        );
+    }
+
+    #[test]
+    fn restore_unmapped_link_keeps_recorded_destination() {
+        // A link with NO --link-map entry keeps its recorded destination even when
+        // a --link-map for a different link is supplied.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data"],
+            &[("pg_data/pg_wal", "/var/lib/original_wal")],
+        );
+
+        // A --link-map naming a DIFFERENT link must not touch pg_wal.
+        let cfg = restore_cfg(
+            stanza,
+            vec![(
+                ("link-map", None),
+                OptionValue::Hash({
+                    let mut m = BTreeMap::new();
+                    m.insert("pg_log".to_owned(), "/somewhere/else".to_owned());
+                    m
+                }),
+            )],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1);
+
+        let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
+        assert_eq!(
+            read,
+            Path::new("/var/lib/original_wal"),
+            "unmapped link must keep its recorded destination"
+        );
     }
 
     // ---- selective database restore ----------------------------------------
