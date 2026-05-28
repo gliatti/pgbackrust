@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_protocol::PGBACKREST_PROGRAM;
-use pgbr_storage::{Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Storage};
+use pgbr_storage::{
+    Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage,
+};
 
 use crate::CliRunError;
 use crate::remote_storage::RemoteProcessStorage;
@@ -81,11 +83,7 @@ pub fn build_repo_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRun
         "s3" => build_s3(cfg),
         "azure" => build_azure(cfg),
         "gcs" => build_gcs(cfg),
-        "sftp" => Err(CliRunError::NotSupportedYet(
-            "repo-type=sftp: SFTP repository storage is not wired into the binary yet \
-             (the pgbr-storage::Sftp backend exists, but selecting it from config is a follow-up)"
-                .to_owned(),
-        )),
+        "sftp" => build_sftp(cfg),
         other => Err(CliRunError::StorageConfig(format!(
             "unrecognised repo-type `{other}` (expected one of posix, cifs, s3, azure, gcs, sftp)"
         ))),
@@ -248,6 +246,53 @@ fn build_gcs(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunError> {
     Ok(Box::new(Gcs::new(GcsConfig { bucket, endpoint, auth })))
 }
 
+/// Assemble an [`SftpConfig`] from the resolved `repo-sftp-*` option family.
+///
+/// pgBackRest's SFTP repository authenticates with a private key
+/// (`repo-sftp-private-key-file`, optional `repo-sftp-private-key-passphrase`);
+/// `repo-sftp-host` / `repo-sftp-host-user` are required and
+/// `repo-sftp-host-port` defaults to 22. The remote root is `repo-path`. Pure
+/// and unit-testable (no connection is made here).
+///
+/// # Errors
+///
+/// [`CliRunError::StorageConfig`] when a required option is missing or the port
+/// is out of range.
+fn sftp_config_from(cfg: &LoadedConfig) -> Result<SftpConfig, CliRunError> {
+    let host = require_string(cfg, "repo-sftp-host")?;
+    let user = require_string(cfg, "repo-sftp-host-user")?;
+    let private_key = path_option(cfg, "repo-sftp-private-key-file").ok_or_else(|| {
+        CliRunError::StorageConfig("repo-type=sftp requires repo-sftp-private-key-file".to_owned())
+    })?;
+    let passphrase = string_option(cfg, "repo-sftp-private-key-passphrase");
+    let port = match integer_option(cfg, "repo-sftp-host-port") {
+        None => pgbr_storage::sftp::DEFAULT_PORT,
+        Some(n) => u16::try_from(n)
+            .map_err(|_| CliRunError::StorageConfig(format!("repo-sftp-host-port out of range: {n}")))?,
+    };
+    let base_path = path_option(cfg, "repo-path").unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_PATH));
+    Ok(SftpConfig {
+        host,
+        port,
+        user,
+        base_path,
+        auth: SftpAuth::KeyFile { private_key, passphrase },
+    })
+}
+
+/// Build the SFTP repository backend, opening the SSH/SFTP connection.
+///
+/// # Errors
+///
+/// [`CliRunError::StorageConfig`] for a malformed `repo-sftp-*` family (via
+/// [`sftp_config_from`]) and [`CliRunError::Storage`] when the connection or
+/// authentication fails.
+fn build_sftp(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunError> {
+    let config = sftp_config_from(cfg)?;
+    let sftp = Sftp::connect(config).map_err(CliRunError::Storage)?;
+    Ok(Box::new(sftp))
+}
+
 /// Prepend `https://` to `host` when it carries no `http(s)://` scheme,
 /// matching the C default of `httpProtocolTypeHttps`.
 fn with_scheme(host: &str) -> String {
@@ -301,8 +346,9 @@ mod tests {
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
 
-    use super::{build_pg_storage, build_repo_storage};
+    use super::{build_pg_storage, build_repo_storage, sftp_config_from};
     use crate::CliRunError;
+    use pgbr_storage::SftpAuth;
 
     /// Build a minimal `LoadedConfig` carrying the given grouped/ungrouped
     /// options for the `command`. Options are supplied as
@@ -527,6 +573,79 @@ mod tests {
             // `Box<dyn Storage>` is not Debug, so handle Ok without formatting it.
             Ok(_) => panic!("expected StorageConfig(pg-path required), got Ok(storage)"),
             Err(other) => panic!("expected StorageConfig(pg-path required), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sftp_config_from_builds_key_auth_with_defaults() {
+        let config = cfg(
+            "info",
+            &[
+                ("repo-type", Some(1), OptionValue::StringId("sftp".to_owned())),
+                ("repo-sftp-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("repo-sftp-host-user", Some(1), OptionValue::String("pgbackrest".to_owned())),
+                (
+                    "repo-sftp-private-key-file",
+                    Some(1),
+                    OptionValue::Path("/home/pgbackrest/.ssh/id_ed25519".to_owned()),
+                ),
+                ("repo-path", Some(1), OptionValue::Path("/srv/backups".to_owned())),
+            ],
+        );
+        let sftp = sftp_config_from(&config).expect("sftp config");
+        assert_eq!(sftp.host, "backup.example.com");
+        assert_eq!(sftp.user, "pgbackrest");
+        assert_eq!(sftp.port, 22, "port defaults to 22");
+        assert_eq!(sftp.base_path, Path::new("/srv/backups"));
+        match sftp.auth {
+            SftpAuth::KeyFile { private_key, passphrase } => {
+                assert_eq!(private_key, Path::new("/home/pgbackrest/.ssh/id_ed25519"));
+                assert!(passphrase.is_none());
+            }
+            SftpAuth::Password(_) => panic!("expected key-file auth"),
+        }
+    }
+
+    #[test]
+    fn sftp_config_from_honors_custom_port_and_passphrase() {
+        let config = cfg(
+            "info",
+            &[
+                ("repo-sftp-host", Some(1), OptionValue::String("host".to_owned())),
+                ("repo-sftp-host-user", Some(1), OptionValue::String("u".to_owned())),
+                ("repo-sftp-host-port", Some(1), OptionValue::Integer(2222)),
+                ("repo-sftp-private-key-file", Some(1), OptionValue::Path("/k".to_owned())),
+                (
+                    "repo-sftp-private-key-passphrase",
+                    Some(1),
+                    OptionValue::String("secret".to_owned()),
+                ),
+            ],
+        );
+        let sftp = sftp_config_from(&config).expect("sftp config");
+        assert_eq!(sftp.port, 2222);
+        match sftp.auth {
+            SftpAuth::KeyFile { passphrase, .. } => assert_eq!(passphrase.as_deref(), Some("secret")),
+            SftpAuth::Password(_) => panic!("expected key-file auth"),
+        }
+    }
+
+    #[test]
+    fn sftp_config_from_requires_host_user_and_key() {
+        // Missing host.
+        let c1 = cfg("info", &[("repo-sftp-host-user", Some(1), OptionValue::String("u".to_owned()))]);
+        assert!(matches!(sftp_config_from(&c1), Err(CliRunError::StorageConfig(_))));
+        // Missing private key.
+        let c2 = cfg(
+            "info",
+            &[
+                ("repo-sftp-host", Some(1), OptionValue::String("h".to_owned())),
+                ("repo-sftp-host-user", Some(1), OptionValue::String("u".to_owned())),
+            ],
+        );
+        match sftp_config_from(&c2) {
+            Err(CliRunError::StorageConfig(msg)) => assert!(msg.contains("private-key"), "msg was {msg}"),
+            other => panic!("expected StorageConfig(private-key), got {other:?}"),
         }
     }
 }
