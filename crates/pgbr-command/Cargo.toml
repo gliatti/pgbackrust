@@ -25,6 +25,9 @@ pgbr-info = { path = "../pgbr-info" }
 pgbr-io = { path = "../pgbr-io" }
 pgbr-postgres = { path = "../pgbr-postgres" }
 pgbr-protocol = { path = "../pgbr-protocol" }
+# Regex wrapper: backs the `repo-ls --filter` option (a regular expression
+# matched against entry names), matching the C `cfgOptFilter` behaviour.
+pgbr-regex = { path = "../pgbr-regex" }
 pgbr-storage = { path = "../pgbr-storage" }
 # Pure-Rust TLS. Disable the default `aws_lc_rs` provider (which links the
 # aws-lc C library via bindgen/clang) and use the `ring` provider instead, so

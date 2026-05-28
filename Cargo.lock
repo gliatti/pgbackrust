@@ -922,6 +922,7 @@ dependencies = [
  "pgbr-io",
  "pgbr-postgres",
  "pgbr-protocol",
+ "pgbr-regex",
  "pgbr-storage",
  "rcgen",
  "rustls",

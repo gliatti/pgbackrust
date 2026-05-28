@@ -184,6 +184,13 @@ pub fn ls_entries(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<V
     let mut entries = Vec::new();
     collect_entries(repo_storage, &target, "", recurse, &mut entries)?;
 
+    // `--filter`: keep only entries whose name matches the regular expression.
+    if let Some(pattern) = filter_opt(config) {
+        let regex = pgbr_regex::Regex::new(pattern.as_bytes())
+            .map_err(|err| CommandError::Other(format!("invalid --filter regex `{pattern}`: {err}")))?;
+        entries.retain(|e| regex.is_match(e.name.as_bytes()));
+    }
+
     match sort_order_opt(config) {
         SortOrder::None => {}
         SortOrder::Asc => entries.sort_by(|a, b| a.name.cmp(&b.name)),
@@ -542,6 +549,15 @@ fn boolean_opt(config: &LoadedConfig, name: &str) -> Option<bool> {
     }
 }
 
+/// The `--filter` option for `repo-ls`: a regular expression matched against
+/// each entry's name. `None` when unset.
+fn filter_opt(config: &LoadedConfig) -> Option<String> {
+    match config.options.get(&("filter".to_owned(), None)) {
+        Some(OptionValue::String(value) | OptionValue::StringId(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -870,6 +886,41 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert_eq!(desc, vec!["c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn ls_entries_filter_regex_keeps_matching_names() {
+        let (_repo, storage) = posix_repo();
+        seed(&storage, "20260101-100000F", b"x");
+        seed(&storage, "20260102-100000F_20260103-110000I", b"x");
+        seed(&storage, "backup.info", b"x");
+        seed(&storage, "archive.info", b"x");
+
+        // Keep only full backup labels (end in F).
+        let cfg = fake_config_with(
+            "repo-ls",
+            vec![".".to_owned()],
+            vec![("filter", OptionValue::String("F$".to_owned()))],
+        );
+        let got: Vec<String> = ls_entries(&cfg, &storage)
+            .expect("ls_entries filter")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(got, vec!["20260101-100000F"]);
+    }
+
+    #[test]
+    fn ls_entries_filter_invalid_regex_errors() {
+        let (_repo, storage) = posix_repo();
+        seed(&storage, "a.txt", b"x");
+        let cfg = fake_config_with(
+            "repo-ls",
+            vec![".".to_owned()],
+            vec![("filter", OptionValue::String("[unterminated".to_owned()))],
+        );
+        let err = ls_entries(&cfg, &storage).expect_err("invalid regex must error");
+        assert!(format!("{err}").contains("invalid --filter regex"));
     }
 
     #[test]
