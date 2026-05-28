@@ -9,18 +9,22 @@
 //! - ok:       `{"out": <value>}`
 //! - err:      `{"err": <code>, "out": "<message>", "errStack": "<trace>"}`
 //!
-//! This crate ships only the message *types* and a line-delimited *codec*
-//! over [`pgbr_io::IoRead`] / [`pgbr_io::IoWrite`]. The actual transport
-//! (sockets, pipes), the parallel job dispatcher, and helpers like
-//! `protocolHelperGet` are intentionally deferred — they will build on
-//! the message types added here.
+//! This crate ships the message *types*, a line-delimited *codec* over
+//! [`pgbr_io::IoRead`] / [`pgbr_io::IoWrite`], and a process *transport*
+//! ([`transport`]) that spawns a child worker over piped stdin/stdout and
+//! exchanges messages with it. The socket transport and helpers like
+//! `protocolHelperGet` build on these.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod codec;
 pub mod message;
 pub mod parallel;
+pub mod transport;
 
 pub use crate::codec::{CodecError, read_message, write_message};
 pub use crate::message::{ErrResponse, Message, OkResponse, Request, Response};
 pub use crate::parallel::{Job, JobResult, ParallelExecutor};
+pub use crate::transport::{
+    EXIT_COMMAND, NOOP_COMMAND, PipeRead, PipeWrite, ProcessClient, ProtocolClient, ProtocolError, RequestHandler, serve,
+};
