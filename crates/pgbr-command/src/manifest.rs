@@ -143,6 +143,9 @@ mod tests {
                     checksum: Some("e1f2c3d4".to_owned()),
                     checksum_page: None,
                     reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -151,6 +154,9 @@ mod tests {
                     checksum: Some("a0b1c2d3".to_owned()),
                     checksum_page: Some(true),
                     reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
             ],
             paths: vec![ManifestPath {

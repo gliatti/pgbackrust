@@ -399,6 +399,9 @@ mod tests {
             checksum,
             checksum_page: None,
             reference: None,
+            mode: None,
+            user: None,
+            group: None,
         }
     }
 

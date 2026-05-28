@@ -773,14 +773,45 @@ struct RestoreCopyJob {
     transform: RepoTransform,
     /// Plaintext SHA-1 the manifest recorded, or `None` for a zero-length file.
     expected_checksum: Option<String>,
+    /// Unix file mode the manifest recorded, re-applied to the restored file via
+    /// `std::fs::set_permissions` on Unix. `None` when the manifest did not record
+    /// a mode (older backups, non-Unix source) — the restored file keeps its
+    /// freshly-created default mode. uid/gid are recorded-only (re-applying owner
+    /// needs privilege; documented follow-up). C ref: chmod in
+    /// `src/command/restore/restore.c`.
+    mode: Option<u32>,
+}
+
+/// Re-apply a manifest-recorded Unix file mode to a restored file.
+///
+/// On Unix, when `mode` is `Some`, `std::fs::set_permissions` sets the file's
+/// permission bits to it (masked to `0o7777`, the permission + setuid/setgid/
+/// sticky bits the backup recorded). `None` leaves the file at its
+/// freshly-created default mode. uid/gid are NOT applied (re-applying owner needs
+/// privilege; recorded-only, documented follow-up).
+#[cfg(unix)]
+fn apply_mode(abs_dst: &Path, mode: Option<u32>) -> Result<(), CommandError> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(abs_dst, std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|err| CommandError::Other(format!("chmod {}: {err}", abs_dst.display())))?;
+    }
+    Ok(())
+}
+
+/// Non-Unix stub: file mode is not modelled, so this is a no-op (no mode is ever
+/// recorded on a non-Unix backup).
+#[cfg(not(unix))]
+fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
+    Ok(())
 }
 
 /// Restore one file in a worker: read `abs_src` via `std::fs`, reverse the
 /// transform to recover the plaintext, create the destination's parent dir,
-/// write `abs_dst`, and verify the recovered plaintext's SHA-1 against the
-/// manifest's recorded checksum. Because the manifest records the *plaintext*
-/// checksum, that single check validates the whole
-/// compress -> encrypt -> decrypt -> decompress round trip.
+/// write `abs_dst`, verify the recovered plaintext's SHA-1 against the
+/// manifest's recorded checksum, and re-apply the recorded Unix file mode.
+/// Because the manifest records the *plaintext* checksum, that single check
+/// validates the whole compress -> encrypt -> decrypt -> decompress round trip.
 ///
 /// This is the per-file unit of work run on a dispatcher worker thread. It does
 /// all of its I/O through `std::fs` against absolute paths, so it needs no
@@ -802,6 +833,12 @@ fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
     }
     std::fs::write(&job.abs_dst, &plaintext)
         .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dst.display())))?;
+
+    // Re-apply the recorded Unix file mode (if any). On non-Unix this is a no-op
+    // (no mode is ever recorded). uid/gid are recorded-only — re-applying owner
+    // needs privilege and is a documented follow-up. C ref: chmod in
+    // `src/command/restore/restore.c`.
+    apply_mode(&job.abs_dst, job.mode)?;
 
     // Hard-fail SHA-1 check, per file, in the worker. Zero-length files carry no
     // checksum; nothing to compare.
@@ -1022,6 +1059,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             abs_dst,
             transform: src_transform,
             expected_checksum: file.checksum.clone(),
+            mode: file.mode,
         });
     }
 
@@ -1330,6 +1368,9 @@ mod tests {
                 checksum: checksum.clone(),
                 checksum_page: None,
                 reference: None,
+                mode: None,
+                user: None,
+                group: None,
             })
             .collect();
 
@@ -2175,6 +2216,9 @@ mod tests {
             checksum: Some(sha1_hex(bytes)),
             checksum_page: None,
             reference: None,
+            mode: None,
+            user: None,
+            group: None,
         };
 
         // Missing target: does not match.
@@ -2214,6 +2258,9 @@ mod tests {
             checksum: None,
             checksum_page: None,
             reference: None,
+            mode: None,
+            user: None,
+            group: None,
         };
         seed_pg_file(&pg_s, "pg_data/empty", b"");
         assert!(
@@ -2336,6 +2383,42 @@ mod tests {
             };
             assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_then_restore_preserves_file_mode() {
+        // A source file seeded with a distinctive mode (0o640) must, after a real
+        // backup -> restore round trip, land on the restore target with the same
+        // permission bits — the mode is recorded in the manifest by backup and
+        // re-applied by restore.
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+        seed_pg_file(&pg_src_s, "base/1/1259", b"relation data with a specific mode");
+
+        // Stamp a distinctive mode on the source file.
+        let abs_src = pg_src_s.info(Path::new("base/1/1259")).expect("stat source").path;
+        std::fs::set_permissions(&abs_src, std::fs::Permissions::from_mode(0o640)).expect("chmod source");
+
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let outcome = restore_inner(&restore_cfg(stanza, Vec::new()), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.files_restored, 1);
+
+        // The restored file's permission bits must match the source's mode.
+        let abs_dst = pg_dst_s.info(Path::new("base/1/1259")).expect("stat restored").path;
+        let restored_mode = std::fs::metadata(&abs_dst).expect("restored metadata").permissions().mode() & 0o7777;
+        assert_eq!(restored_mode, 0o640, "restored file must carry the recorded mode");
     }
 
     #[test]

@@ -93,6 +93,19 @@ struct FileValue {
     /// `None`, so full-backup manifests render byte-for-byte as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reference: Option<String>,
+    /// Unix file mode bits (e.g. `0o600`). `None` on platforms / backups that
+    /// did not record it. Absent from the JSON when `None`, so manifests written
+    /// without the field stay byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<u32>,
+    /// Owner user id (uid). `None` when not recorded. Absent from the JSON when
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<u32>,
+    /// Owner group id (gid). `None` when not recorded. Absent from the JSON when
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<u32>,
 }
 
 /// JSON shape of a `[target:link]` value.
@@ -118,6 +131,19 @@ pub struct ManifestFile {
     /// bytes itself; `Some(label)` when a differential / incremental backup
     /// references an earlier backup's copy instead of re-copying the file.
     pub reference: Option<String>,
+    /// Unix file mode bits (e.g. `0o600`), as captured at backup time. `None` on
+    /// non-Unix platforms and on manifests that predate mode recording. Re-applied
+    /// to the restored file (`std::fs::set_permissions`) on Unix. C ref:
+    /// `ManifestFile.mode` in `src/info/manifest.c`.
+    pub mode: Option<u32>,
+    /// Owner user id (uid) captured at backup time. `None` when not recorded.
+    /// Recorded only — re-applying owner needs privilege (documented follow-up).
+    /// C ref: `ManifestFile.user`.
+    pub user: Option<u32>,
+    /// Owner group id (gid) captured at backup time. `None` when not recorded.
+    /// Recorded only — re-applying owner needs privilege (documented follow-up).
+    /// C ref: `ManifestFile.group`.
+    pub group: Option<u32>,
 }
 
 /// One path (directory) entry in `[target:path]`.
@@ -247,6 +273,9 @@ impl Manifest {
                     checksum: value.checksum,
                     checksum_page: value.checksum_page,
                     reference: value.reference,
+                    mode: value.mode,
+                    user: value.user,
+                    group: value.group,
                 });
             }
         }
@@ -306,6 +335,9 @@ impl Manifest {
                 checksum: entry.checksum.clone(),
                 checksum_page: entry.checksum_page,
                 reference: entry.reference.clone(),
+                mode: entry.mode,
+                user: entry.user,
+                group: entry.group,
             };
             let json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
             file.set(TARGET_FILE_SECTION, &entry.path, json);
@@ -367,6 +399,9 @@ mod tests {
                     checksum: Some("e1f2c3d4".to_owned()),
                     checksum_page: None,
                     reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -375,6 +410,9 @@ mod tests {
                     checksum: Some("a0b1c2d3".to_owned()),
                     checksum_page: Some(true),
                     reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -435,6 +473,9 @@ mod tests {
                     checksum: Some("deadbeef".to_owned()),
                     checksum_page: None,
                     reference: Some("20240101-120000F".to_owned()),
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
                 ManifestFile {
                     path: "pg_data/changed".to_owned(),
@@ -443,6 +484,9 @@ mod tests {
                     checksum: Some("cafebabe".to_owned()),
                     checksum_page: None,
                     reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -473,6 +517,85 @@ mod tests {
             Some("20240101-120000F")
         );
         assert_eq!(parsed.file("pg_data/changed").unwrap().reference, None);
+    }
+
+    #[test]
+    fn manifest_file_mode_owner_round_trips() {
+        // A file recording mode/user/group must render those keys into its JSON
+        // entry and re-parse them; a file with all three `None` must omit them
+        // entirely so manifests written without the fields stay byte-unchanged.
+        let manifest = Manifest {
+            backup_label: "20240101-120000F".to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![
+                ManifestFile {
+                    path: "pg_data/with_mode".to_owned(),
+                    size: 4,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("abcd1234".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: Some(0o640),
+                    user: Some(1000),
+                    group: Some(1001),
+                },
+                ManifestFile {
+                    path: "pg_data/no_mode".to_owned(),
+                    size: 2,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("99887766".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                },
+            ],
+            paths: vec![ManifestPath {
+                path: "pg_data".to_owned(),
+            }],
+            links: Vec::new(),
+        };
+
+        let text = manifest.to_text();
+        // The mode-bearing file records mode (decimal `0o640` == 416) plus uid/gid.
+        let with_mode_line = text
+            .lines()
+            .find(|line| line.starts_with("pg_data/with_mode="))
+            .expect("with_mode line");
+        assert!(
+            with_mode_line.contains("\"mode\":416"),
+            "mode-bearing file must record its mode: {with_mode_line}"
+        );
+        assert!(
+            with_mode_line.contains("\"user\":1000") && with_mode_line.contains("\"group\":1001"),
+            "mode-bearing file must record uid/gid: {with_mode_line}"
+        );
+        // The no-mode file omits all three JSON keys. (Check for the quoted JSON
+        // keys, not bare substrings — the path "no_mode" itself contains "mode".)
+        let no_mode_value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("pg_data/no_mode="))
+            .expect("no_mode line");
+        assert!(
+            !no_mode_value.contains("\"mode\"") && !no_mode_value.contains("\"user\"") && !no_mode_value.contains("\"group\""),
+            "file without mode/owner must omit those keys: {no_mode_value}"
+        );
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed, manifest);
+        let with_mode = parsed.file("pg_data/with_mode").unwrap();
+        assert_eq!(with_mode.mode, Some(0o640));
+        assert_eq!(with_mode.user, Some(1000));
+        assert_eq!(with_mode.group, Some(1001));
+        let no_mode = parsed.file("pg_data/no_mode").unwrap();
+        assert_eq!(no_mode.mode, None);
+        assert_eq!(no_mode.user, None);
+        assert_eq!(no_mode.group, None);
     }
 
     #[test]

@@ -287,6 +287,28 @@ fn warn_invalid_pages(rel: &str, invalid_blocks: &[u32]) {
     eprintln!("WARN: invalid page checksum(s) found in file {rel} at block(s) {blocks}");
 }
 
+/// Read a source file's Unix mode / owner uid / gid from its on-disk path.
+///
+/// Returns `(mode, uid, gid)` recorded into the [`ManifestFile`] on backup so
+/// restore can re-apply the file mode (uid/gid are recorded only). The mode is
+/// masked to the permission + setuid/setgid/sticky bits (`0o7777`), dropping the
+/// file-type bits `st_mode` also carries. On non-Unix platforms (or if the stat
+/// fails) every field is `None`. C ref: `ManifestFile.mode/user/group` in
+/// `src/info/manifest.c`.
+#[cfg(unix)]
+fn file_mode_owner(abs_path: &Path) -> (Option<u32>, Option<u32>, Option<u32>) {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(abs_path).map_or((None, None, None), |meta| {
+        (Some(meta.mode() & 0o7777), Some(meta.uid()), Some(meta.gid()))
+    })
+}
+
+/// Non-Unix stub: file mode / owner are not modelled, so all three are `None`.
+#[cfg(not(unix))]
+fn file_mode_owner(_abs_path: &Path) -> (Option<u32>, Option<u32>, Option<u32>) {
+    (None, None, None)
+}
+
 /// One entry discovered by [`walk`]: its PG-data-relative path plus the
 /// `StorageInfo` the backend reported for it.
 struct WalkEntry {
@@ -522,6 +544,10 @@ fn plan_file(
     prior_label: Option<&str>,
     checksum_page: bool,
 ) -> Result<FilePlan, CommandError> {
+    // Capture the source file's Unix mode / owner from the metadata already on
+    // disk (the same stat the walk performed for size/mtime). Recorded into the
+    // manifest so restore can re-apply the file mode; `None` on non-Unix.
+    let (mode, user, group) = file_mode_owner(&entry.info.path);
     let skeleton = ManifestFile {
         path: entry.rel.clone(),
         size: entry.info.size,
@@ -529,6 +555,9 @@ fn plan_file(
         checksum: None,
         checksum_page: None,
         reference: None,
+        mode,
+        user,
+        group,
     };
 
     // For a diff/incr: when the prior backup *might* hold this file unchanged
@@ -1310,6 +1339,31 @@ mod tests {
         let file = manifest.file("base/1/1259").expect("file in manifest");
         assert_eq!(file.checksum.as_deref(), Some(sha1_hex(content).as_str()));
         assert_eq!(file.size, content.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_records_file_mode_and_owner() {
+        // A seeded file with an explicit mode must have that mode (and the
+        // process's uid/gid) recorded in the manifest on Unix.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation-data-with-mode");
+
+        // Set a distinctive, non-default mode on the source file.
+        let abs_src = pg_s.info(Path::new("base/1/1259")).expect("stat source").path;
+        std::fs::set_permissions(&abs_src, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let src_meta = std::fs::metadata(&abs_src).expect("metadata");
+
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let file = manifest.file("base/1/1259").expect("file in manifest");
+        assert_eq!(file.mode, Some(0o640), "manifest must record the source file mode");
+        assert_eq!(file.user, Some(src_meta.uid()), "manifest must record the source uid");
+        assert_eq!(file.group, Some(src_meta.gid()), "manifest must record the source gid");
     }
 
     #[test]
