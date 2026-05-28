@@ -183,13 +183,27 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_implemented_path_for_backup() {
+    fn not_yet_implemented_path_for_restore() {
+        let cfg = fake_config("restore", Some("demo"), None);
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("restore is not yet implemented");
+        match err {
+            CommandError::NotYetImplemented { command } => assert_eq!(command, "restore"),
+            other => panic!("expected NotYetImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_dispatches_to_real_implementation() {
+        // `backup` is implemented now: dispatching it against an empty repo
+        // surfaces the uninitialized-stanza error from the command, not the
+        // generic `NotYetImplemented` stub response.
         let cfg = fake_config("backup", Some("demo"), None);
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("backup is not yet implemented");
+        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("backup against an empty repo must error");
         match err {
-            CommandError::NotYetImplemented { command } => assert_eq!(command, "backup"),
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            CommandError::Other(msg) => assert_eq!(msg, "stanza not initialized; run stanza-create first"),
+            other => panic!("expected Other(not initialized), got {other:?}"),
         }
     }
 
