@@ -226,6 +226,51 @@ pub struct BackupBracket {
     pub wal_segment_size: u64,
 }
 
+/// The archive / page integrity checks a DB-driven backup applies, resolved
+/// from `archive-check` / `archive-mode-check` / `page-header-check` (and the
+/// `archive-timeout` that bounds the archive-check wait).
+///
+/// All three booleans default to `true` (the option model's defaults). The
+/// DB-free test wrappers pass [`IntegrityChecks::disabled`] so the existing
+/// file-copy-only tests are byte-for-byte unchanged (they have no live cluster
+/// to check archive_mode against and no archive to wait on).
+#[derive(Debug, Clone, Copy)]
+struct IntegrityChecks {
+    /// `archive-check`: after `pg_backup_stop`, verify the required WAL segments
+    /// (archive-start..archive-stop) are present in the repo archive.
+    archive_check: bool,
+    /// `archive-mode-check`: before the copy, verify the cluster's `archive_mode`
+    /// is enabled (and warn on `always`, which is unexpected on a primary).
+    archive_mode_check: bool,
+    /// `page-header-check`: validate each relation page's header in addition to
+    /// its stored checksum.
+    page_header_check: bool,
+    /// Bound on the `archive-check` wait for a required WAL segment to arrive.
+    archive_timeout: std::time::Duration,
+}
+
+impl IntegrityChecks {
+    /// All checks off — the DB-free file-copy test path.
+    fn disabled() -> Self {
+        Self {
+            archive_check: false,
+            archive_mode_check: false,
+            page_header_check: false,
+            archive_timeout: std::time::Duration::from_secs(60),
+        }
+    }
+
+    /// Read the integrity-check options from the resolved configuration.
+    fn from_options(config: &LoadedConfig) -> Self {
+        Self {
+            archive_check: archive_check_enabled(config),
+            archive_mode_check: archive_mode_check_enabled(config),
+            page_header_check: page_header_check_enabled(config),
+            archive_timeout: archive_timeout(config),
+        }
+    }
+}
+
 fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
     config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
@@ -419,17 +464,27 @@ fn is_relation_segment_name(name: &str) -> bool {
     }
 }
 
-/// Whether a single `PAGE_SIZE` page passes checksum validation.
+/// Whether a single `PAGE_SIZE` page passes validation.
 ///
 /// An all-zero page is treated as valid (pgBackRest's empty-page handling: a
 /// freshly extended but never-written page is all zeroes and carries no
-/// meaningful checksum). Any other page is valid iff its stored `pd_checksum`
-/// matches the value [`pgbr_postgres::page::pg_checksum_page`] computes for the
-/// given `block_no`. A page whose length is not exactly `PAGE_SIZE` is treated
-/// as invalid (it cannot be a well-formed data page).
-fn is_valid_page(page: &[u8], block_no: u32) -> bool {
+/// meaningful checksum). Any other page is valid iff:
+///
+/// - its stored `pd_checksum` matches the value
+///   [`pgbr_postgres::page::pg_checksum_page`] computes for `block_no`, **and**
+/// - when `check_header` is set (`page-header-check`), its header bookkeeping is
+///   structurally sane per [`pgbr_postgres::page::page_header_valid`]
+///   (pd_lower/upper/special bounds; `pd_lsn` is not bounded here because the
+///   backup-stop LSN is not threaded into the per-file copy path).
+///
+/// A page whose length is not exactly `PAGE_SIZE` is treated as invalid (it
+/// cannot be a well-formed data page).
+fn is_valid_page(page: &[u8], block_no: u32, check_header: bool) -> bool {
     if page.iter().all(|&b| b == 0) {
         return true;
+    }
+    if check_header && !pgbr_postgres::page::page_header_valid(page, PAGE_SIZE, None) {
+        return false;
     }
     pgbr_postgres::page::page_checksum_valid(page, block_no).unwrap_or(false)
 }
@@ -437,14 +492,15 @@ fn is_valid_page(page: &[u8], block_no: u32) -> bool {
 /// Validate every page of a page-aligned relation file.
 ///
 /// `bytes` must already be confirmed page-aligned (a multiple of `PAGE_SIZE`)
-/// by the caller. Returns the (possibly empty) list of block numbers whose
-/// stored checksum did not validate, in ascending order. An all-empty (or
-/// empty-`bytes`) file yields an empty list.
-fn validate_relation_pages(bytes: &[u8]) -> Vec<u32> {
+/// by the caller. `check_header` enables the per-page header validation
+/// (`page-header-check`) in addition to the checksum. Returns the (possibly
+/// empty) list of block numbers that did not validate, in ascending order. An
+/// all-empty (or empty-`bytes`) file yields an empty list.
+fn validate_relation_pages(bytes: &[u8], check_header: bool) -> Vec<u32> {
     let mut invalid = Vec::new();
     for (idx, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
         let block_no = u32::try_from(idx).unwrap_or(u32::MAX);
-        if !is_valid_page(page, block_no) {
+        if !is_valid_page(page, block_no, check_header) {
             invalid.push(block_no);
         }
     }
@@ -566,6 +622,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let excludes = excludes_from_config(config);
     let start_fast = start_fast_enabled(config);
     let archive_copy = archive_copy_enabled(config);
+    let integrity = IntegrityChecks::from_options(config);
 
     // File-bundling / block-incremental features. Validate the cross-option
     // constraints up front: bundling and repo-hardlink are mutually exclusive
@@ -611,6 +668,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         start_fast,
         features,
         archive_copy,
+        integrity,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -734,6 +792,46 @@ fn start_fast_enabled(config: &LoadedConfig) -> bool {
         config.options.get(&("start-fast".to_owned(), None)),
         Some(OptionValue::Boolean(true))
     )
+}
+
+/// Read a boolean option that **defaults to true** (the option model's default
+/// for `archive-check` / `archive-mode-check` / `page-header-check`): unset or
+/// non-boolean resolves to `true`; only an explicit `false` disables it.
+fn boolean_default_true(config: &LoadedConfig, name: &str) -> bool {
+    !matches!(config.options.get(&(name.to_owned(), None)), Some(OptionValue::Boolean(false)))
+}
+
+/// Whether `archive-check` is enabled (default true). When on, a DB-driven
+/// backup verifies the WAL segments needed for consistency are present in the
+/// repo archive after `pg_backup_stop`.
+fn archive_check_enabled(config: &LoadedConfig) -> bool {
+    boolean_default_true(config, "archive-check")
+}
+
+/// Whether `archive-mode-check` is enabled (default true). When on, a DB-driven
+/// backup verifies the cluster's `archive_mode` is enabled before starting.
+fn archive_mode_check_enabled(config: &LoadedConfig) -> bool {
+    boolean_default_true(config, "archive-mode-check")
+}
+
+/// Whether `page-header-check` is enabled (default true). When on (and together
+/// with the page-checksum pass), each relation page's header bookkeeping is
+/// validated in addition to its stored checksum.
+fn page_header_check_enabled(config: &LoadedConfig) -> bool {
+    boolean_default_true(config, "page-header-check")
+}
+
+/// Resolve `--archive-timeout` (a [`OptionValue::Time`] in milliseconds) into a
+/// [`std::time::Duration`], defaulting to 60s (the pgBackRest default) when
+/// unset. Used to bound the `archive-check` wait for required WAL.
+fn archive_timeout(config: &LoadedConfig) -> std::time::Duration {
+    match config.options.get(&("archive-timeout".to_owned(), None)) {
+        Some(OptionValue::Time(ms)) => std::time::Duration::from_millis(*ms),
+        Some(OptionValue::Integer(secs)) if *secs >= 0 => {
+            std::time::Duration::from_secs(u64::try_from(*secs).unwrap_or(60))
+        }
+        _ => std::time::Duration::from_secs(60),
+    }
 }
 
 /// Resolve the `backup-standby` option to a [`StandbyMode`].
@@ -1042,6 +1140,11 @@ struct CopyJob {
     /// an eligible relation file when `--checksum-page` is on; the worker still
     /// re-checks page alignment before validating.
     validate_pages: bool,
+    /// Whether the worker should additionally validate each page's *header*
+    /// (`page-header-check`, default on). Only meaningful when `validate_pages`
+    /// is set — the header check rides on the same page-validation pass and a
+    /// header failure flags the page exactly like a checksum failure.
+    validate_page_header: bool,
 }
 
 /// What a worker reports back for one [`CopyJob`].
@@ -1087,6 +1190,7 @@ enum FilePlan {
 /// Any file that is new or changed (and every file in a full backup) yields a
 /// [`FilePlan::Copy`] whose worker re-reads the source and computes the checksum
 /// itself, so the bytes are read off disk exactly once on the copy path.
+#[allow(clippy::too_many_arguments)]
 fn plan_file(
     pg_storage: &dyn Storage,
     entry: &WalkEntry,
@@ -1095,6 +1199,7 @@ fn plan_file(
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
     checksum_page: bool,
+    page_header_check: bool,
 ) -> Result<FilePlan, CommandError> {
     // Capture the source file's Unix mode / owner from the metadata already on
     // disk (the same stat the walk performed for size/mtime). Recorded into the
@@ -1151,6 +1256,8 @@ fn plan_file(
             abs_src: entry.info.path.clone(),
             abs_dest,
             validate_pages,
+            // The header check only matters when the page-validation pass runs.
+            validate_page_header: validate_pages && page_header_check,
         },
     })
 }
@@ -1187,7 +1294,7 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
     // non-relation file, which is never flagged) is left unvalidated
     // (`checksum_page == None`).
     let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-        let invalid = validate_relation_pages(&bytes);
+        let invalid = validate_relation_pages(&bytes, job.validate_page_header);
         (Some(invalid.is_empty()), invalid)
     } else {
         (None, Vec::new())
@@ -1279,9 +1386,9 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
             std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
         let checksum = plaintext_sha1(&bytes)?;
 
-        // Page-checksum validation, identical to the per-file path.
+        // Page-checksum + page-header validation, identical to the per-file path.
         let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-            let invalid = validate_relation_pages(&bytes);
+            let invalid = validate_relation_pages(&bytes, job.validate_page_header);
             (Some(invalid.is_empty()), invalid)
         } else {
             (None, Vec::new())
@@ -1536,6 +1643,7 @@ fn copy_job_to_request(job: &CopyJob) -> Request {
             json!(job.abs_src.to_string_lossy()),
             json!(job.abs_dest.to_string_lossy()),
             json!(job.validate_pages),
+            json!(job.validate_page_header),
         ],
     }
 }
@@ -1556,11 +1664,14 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
     // Older-shaped requests without the validate-pages flag default to false
     // (no page-checksum validation), preserving the prior behaviour.
     let validate_pages = request.param.get(2).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    // The page-header flag defaults to false for older-shaped requests too.
+    let validate_page_header = request.param.get(3).and_then(serde_json::Value::as_bool).unwrap_or(false);
     Ok(CopyJob {
         rel: request.cmd.clone(),
         abs_src: PathBuf::from(abs_src),
         abs_dest: PathBuf::from(abs_dest),
         validate_pages,
+        validate_page_header,
     })
 }
 
@@ -1703,6 +1814,7 @@ struct BackupPlan {
 /// # Errors
 ///
 /// Propagates walk / read failures and any error from [`plan_file`].
+#[allow(clippy::too_many_arguments)]
 fn plan_backup(
     pg_storage: &dyn Storage,
     abs_repo_backup_root: &Path,
@@ -1710,6 +1822,7 @@ fn plan_backup(
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
     checksum_page: bool,
+    page_header_check: bool,
     excludes: &[String],
 ) -> Result<BackupPlan, CommandError> {
     let mut plan = BackupPlan {
@@ -1734,6 +1847,7 @@ fn plan_backup(
                 prior_manifest,
                 prior_label,
                 checksum_page,
+                page_header_check,
             )? {
                 FilePlan::Referenced(file) => plan.referenced.push(file),
                 FilePlan::Copy { skeleton, job } => {
@@ -1909,6 +2023,7 @@ pub fn backup_inner_with_workers(
         false,
         BackupFeatures::disabled(),
         false,
+        IntegrityChecks::disabled(),
     )
 }
 
@@ -1958,6 +2073,7 @@ fn run_backup(
     start_fast: bool,
     features: BackupFeatures,
     archive_copy: bool,
+    integrity: IntegrityChecks,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -1975,6 +2091,18 @@ fn run_backup(
         Some(control) => Some(validate_server_against_stanza(&mut **control, &info)?),
         None => None,
     };
+
+    // archive-mode-check: a DB-driven backup that relies on the archive must
+    // confirm the cluster actually archives WAL, or the required WAL would never
+    // reach the repo. Checked on the primary up front so the backup fails fast
+    // rather than after copying every file. C ref: backup.c's
+    // dbBackupStart() archive_mode validation.
+    if integrity.archive_mode_check
+        && let Some(control) = control.as_mut()
+    {
+        let in_recovery = control.is_in_recovery()?;
+        check_archive_mode(&mut **control, in_recovery)?;
+    }
 
     // For a diff/incr, resolve the prior backup and load its manifest so
     // unchanged files can be detected by (size, checksum).
@@ -2017,6 +2145,7 @@ fn run_backup(
         prior_manifest.as_ref(),
         prior_label.as_deref(),
         checksum_page,
+        integrity.page_header_check,
         excludes,
     )?;
 
@@ -2086,6 +2215,18 @@ fn run_backup(
         }
         _ => None,
     };
+
+    // archive-check: verify the WAL segments needed to make this backup
+    // consistent (archive-start..archive-stop) are present in the repo archive,
+    // waiting up to `archive-timeout` for each to arrive (PostgreSQL's
+    // archive_command archives the stop segment only after pg_backup_stop). A
+    // required segment that never lands is a hard error — the backup cannot be
+    // restored to consistency without it. Done after the bracket (which yields
+    // the segment range) and before archive-copy (which also needs them present).
+    // C ref: backupArchiveCheckCopy() in src/command/backup/backup.c.
+    if integrity.archive_check && let Some(bracket) = bracket.as_ref() {
+        wait_for_required_wal(repo_storage, stanza, bracket, integrity.archive_timeout, WAL_POLL_INTERVAL)?;
+    }
 
     // archive-copy: when enabled, copy every WAL segment from the start segment
     // through the stop segment (inclusive) out of the repo archive into this
@@ -2424,6 +2565,89 @@ fn copy_archive_wal(
         ));
     }
     Ok(out)
+}
+
+/// Poll interval while [`wait_for_required_wal`] waits for a required WAL
+/// segment to be archived.
+const WAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Verify a cluster's `archive_mode` is enabled (`archive-mode-check`).
+///
+/// `archive_mode` must be `on` (a primary archiving WAL). A standby in recovery
+/// may legitimately run with `archive_mode = always`, but a *primary* reporting
+/// `always` is unexpected (it would double-archive), so it is rejected unless the
+/// cluster is in recovery. `off` is always an error: the WAL a backup needs would
+/// never reach the repo. C reference: the `archive_mode` validation in
+/// `src/command/backup/backup.c` / `src/command/check/check.c`.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when `archive_mode` is `off`, when it is `always` on a
+/// primary (not in recovery), or when the setting cannot be read.
+fn check_archive_mode(control: &mut dyn BackupControl, in_recovery: bool) -> Result<(), CommandError> {
+    let mode = control.archive_mode()?;
+    match mode.as_str() {
+        "on" => Ok(()),
+        "always" if in_recovery => Ok(()),
+        "always" => Err(CommandError::Other(
+            "archive_mode is 'always' on a primary, which is unexpected; expected 'on'".to_owned(),
+        )),
+        other => Err(CommandError::Other(format!(
+            "archive_mode must be enabled for backup (is '{other}'); set archive_mode = on"
+        ))),
+    }
+}
+
+/// Wait (bounded by `timeout`) for every WAL segment required to make the backup
+/// consistent — `backup-archive-start` through `backup-archive-stop` inclusive —
+/// to be present in the repo archive.
+///
+/// Implements `archive-check`. The range is enumerated by
+/// [`pgbr_postgres::lsn::wal_segment_range`] (honouring the cluster
+/// `wal_segment_size` and the live timeline in `bracket`); each segment is probed
+/// via [`crate::archive::read_archived_segment`] (which transparently finds the
+/// plaintext or any compressed stored form). A segment not yet present is
+/// re-polled every `poll_interval` until it appears or `timeout` elapses; a
+/// segment that never arrives is a hard error. C reference:
+/// `backupArchiveCheckCopy()` in `src/command/backup/backup.c`.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the range cannot be enumerated or a required
+/// segment does not arrive within `timeout`; storage / IO failures from the
+/// archive probe.
+fn wait_for_required_wal(
+    repo_storage: &dyn Storage,
+    stanza: &str,
+    bracket: &BackupBracket,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), CommandError> {
+    let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
+        CommandError::Other(format!(
+            "archive-check: could not enumerate WAL segment range {}..{}",
+            bracket.archive_start, bracket.archive_stop
+        ))
+    })?;
+
+    for segment in &segments {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if crate::archive::read_archived_segment(repo_storage, stanza, segment)?.is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(CommandError::Other(format!(
+                    "archive-check: required WAL segment {segment} did not arrive in the repository archive \
+                     within {}s; check the cluster's archive_command",
+                    timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(std::time::Instant::now())));
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve the live cluster timeline + `wal_segment_size`, used to derive the
@@ -3608,9 +3832,16 @@ mod tests {
     /// construction: its header checksum matches what `pg_checksum_page` derives.
     fn valid_page(block_no: u32, fill: u8) -> Vec<u8> {
         let mut page = vec![fill.max(1); BLCKSZ];
+        // A structurally-sane header so page-header-check (on by default) passes:
+        // pd_lsn small, header(24) <= pd_lower(40) <= pd_upper <= pd_special(8192).
+        page[0..8].copy_from_slice(&0u64.to_le_bytes()); // pd_lsn
+        page[12..14].copy_from_slice(&40u16.to_le_bytes()); // pd_lower
+        page[14..16].copy_from_slice(&8192u16.to_le_bytes()); // pd_upper
+        page[16..18].copy_from_slice(&8192u16.to_le_bytes()); // pd_special
         // Vary the body a little per block so distinct pages differ (no casts:
-        // write the block number's low bytes straight from its LE encoding).
-        page[16..20].copy_from_slice(&block_no.to_le_bytes());
+        // write the block number's low bytes straight from its LE encoding) —
+        // past the header so the header fields above stay valid.
+        page[40..44].copy_from_slice(&block_no.to_le_bytes());
         // Zero the stored-checksum field, compute, then write it back (LE).
         page[8] = 0;
         page[9] = 0;
@@ -3687,15 +3918,15 @@ mod tests {
     fn is_valid_page_handles_zero_and_checksum() {
         // All-zero page is valid (empty-page handling).
         let zero = vec![0u8; BLCKSZ];
-        assert!(is_valid_page(&zero, 0));
+        assert!(is_valid_page(&zero, 0, false));
         // A correctly-checksummed page validates; corrupting it fails.
         let good = valid_page(7, 0x55);
-        assert!(is_valid_page(&good, 7));
+        assert!(is_valid_page(&good, 7, false));
         let mut bad = good.clone();
         bad[8] ^= 0x01; // flip a stored-checksum bit
-        assert!(!is_valid_page(&bad, 7));
+        assert!(!is_valid_page(&bad, 7, false));
         // A page validated against the wrong block number fails (transposed page).
-        assert!(!is_valid_page(&good, 8));
+        assert!(!is_valid_page(&good, 8, false));
     }
 
     #[test]
@@ -3839,6 +4070,8 @@ mod tests {
         in_recovery: bool,
         /// Sequence of replay LSNs `replay_lsn` returns (last value repeats).
         replay_lsns: Vec<Option<String>>,
+        /// Value `archive_mode` reports (`"on"` by default).
+        archive_mode: String,
         /// Call log, for asserting the protocol order / arguments.
         calls: std::cell::RefCell<Vec<String>>,
         /// Cursor into `replay_lsns`.
@@ -3857,6 +4090,7 @@ mod tests {
                 stop,
                 in_recovery: false,
                 replay_lsns: Vec::new(),
+                archive_mode: "on".to_owned(),
                 calls: std::cell::RefCell::new(Vec::new()),
                 replay_cursor: std::cell::Cell::new(0),
             }
@@ -3909,12 +4143,22 @@ mod tests {
             // 0 means the fake wasn`t given an explicit timeline: report 1.
             Ok(if self.timeline == 0 { 1 } else { self.timeline })
         }
+
+        fn archive_mode(&mut self) -> Result<String, CommandError> {
+            self.calls.borrow_mut().push("archive_mode".to_owned());
+            Ok(self.archive_mode.clone())
+        }
     }
 
     /// The `backup.info` identity the [`init_stanza`] helper writes (PG 14).
     const STANZA_SYSTEM_ID: u64 = 6_873_049_345_984_568_091;
 
     /// Run a control-driven backup through `run_backup` with a fake primary.
+    ///
+    /// Integrity checks are disabled so the bracket tests stay focused on the
+    /// backup-control protocol (no archive.info / archived WAL is seeded); the
+    /// dedicated archive-check / archive-mode-check tests opt in via
+    /// [`run_backup_with_integrity`].
     fn run_backup_with_fake(
         repo_s: &Posix,
         pg_s: &Posix,
@@ -3925,7 +4169,8 @@ mod tests {
     }
 
     /// Like [`run_backup_with_fake`] but lets a test pin the transform and the
-    /// `archive_copy` flag (used by the archive-copy round-trip tests).
+    /// `archive_copy` flag (used by the archive-copy round-trip tests). Integrity
+    /// checks remain disabled.
     fn run_backup_with_fake_opts(
         repo_s: &Posix,
         pg_s: &Posix,
@@ -3950,6 +4195,35 @@ mod tests {
             start_fast,
             BackupFeatures::disabled(),
             archive_copy,
+            IntegrityChecks::disabled(),
+        )
+    }
+
+    /// Run a control-driven backup with explicit [`IntegrityChecks`], for the
+    /// archive-check / archive-mode-check / page-header-check tests.
+    fn run_backup_with_integrity(
+        repo_s: &Posix,
+        pg_s: &Posix,
+        control: &mut FakeBackupControl,
+        integrity: IntegrityChecks,
+    ) -> Result<BackupOutcome, CommandError> {
+        run_backup(
+            "demo",
+            repo_s,
+            pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            1,
+            false,
+            &[],
+            Some(control as &mut dyn BackupControl),
+            None,
+            false,
+            BackupFeatures::disabled(),
+            false,
+            integrity,
         )
     }
 
@@ -4556,6 +4830,7 @@ mod tests {
             true,
             BackupFeatures::disabled(),
             false,
+            IntegrityChecks::disabled(),
         )
         .expect("live control-driven backup");
 
@@ -4711,5 +4986,222 @@ mod tests {
         );
         // Small file: no block map.
         assert!(manifest.file("PG_VERSION").unwrap().block_map.is_none());
+    }
+
+    // ---- page-header-check -------------------------------------------------
+
+    /// Like [`valid_page`] but with a structurally-**invalid** header: pd_lower
+    /// is set *inside* the page header (impossible), while the checksum is still
+    /// computed over the page so the checksum itself validates.
+    fn corrupt_header_page(block_no: u32) -> Vec<u8> {
+        let mut page = valid_page(block_no, 0x55);
+        // pd_lower = 4 (inside the 24-byte header) is impossible.
+        page[12..14].copy_from_slice(&4u16.to_le_bytes());
+        // Recompute the checksum so the page passes the CHECKSUM test (only the
+        // header is broken), isolating the header check.
+        page[8] = 0;
+        page[9] = 0;
+        let cksum = pg_checksum_page(&page, block_no).expect("checksum");
+        page[8..10].copy_from_slice(&cksum.to_le_bytes());
+        page
+    }
+
+    #[test]
+    fn validate_relation_pages_header_flags_bad_header() {
+        // A page whose checksum is valid but header is broken: flagged only when
+        // the header check is enabled.
+        let bytes = corrupt_header_page(0);
+        // Checksum-only: the page passes (the checksum is valid).
+        assert!(
+            validate_relation_pages(&bytes, false).is_empty(),
+            "checksum-only must not flag a checksum-valid page"
+        );
+        // Header check on: the broken pd_lower is caught.
+        assert_eq!(
+            validate_relation_pages(&bytes, true),
+            vec![0],
+            "header check must flag the broken header"
+        );
+    }
+
+    #[test]
+    fn is_valid_page_header_check_distinguishes_header() {
+        let good = valid_page(3, 0x40);
+        assert!(is_valid_page(&good, 3, true), "a fully-valid page passes with header check");
+        let bad = corrupt_header_page(3);
+        assert!(
+            is_valid_page(&bad, 3, false),
+            "checksum-only accepts the page (header ignored)"
+        );
+        assert!(!is_valid_page(&bad, 3, true), "header check rejects the broken header");
+    }
+
+    #[test]
+    fn backup_page_header_check_flags_corrupt_header() {
+        // checksum-page on (so the page pass runs) + page-header-check on (the
+        // default): a relation page with a valid checksum but broken header is
+        // flagged checksum_page=Some(false).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let relation = corrupt_header_page(0);
+        seed_file(&pg_s, "base/1/1259", &relation);
+
+        // checksum_page_cfg leaves page-header-check unset -> defaults true.
+        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(false),
+            "a page with a broken header must be flagged even though its checksum is valid"
+        );
+    }
+
+    #[test]
+    fn backup_page_header_check_off_ignores_header() {
+        // With page-header-check=n, the same checksum-valid/broken-header page
+        // passes (Some(true)) because only the checksum is verified.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", &corrupt_header_page(0));
+
+        let mut cfg = checksum_page_cfg("demo");
+        cfg.options
+            .insert(("page-header-check".to_owned(), None), OptionValue::Boolean(false));
+        backup(&cfg, &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(true),
+            "with header-check off only the (valid) checksum is enforced"
+        );
+    }
+
+    // ---- archive-mode-check ------------------------------------------------
+
+    #[test]
+    fn check_archive_mode_accepts_on() {
+        let mut control = FakeBackupControl::primary(140_010, STANZA_SYSTEM_ID, "0/0", BackupStopResult::default());
+        control.archive_mode = "on".to_owned();
+        check_archive_mode(&mut control, false).expect("'on' is accepted on a primary");
+    }
+
+    #[test]
+    fn check_archive_mode_rejects_off() {
+        let mut control = FakeBackupControl::primary(140_010, STANZA_SYSTEM_ID, "0/0", BackupStopResult::default());
+        control.archive_mode = "off".to_owned();
+        let err = check_archive_mode(&mut control, false).expect_err("'off' must fail");
+        assert!(err.to_string().contains("archive_mode must be enabled"), "msg was {err}");
+    }
+
+    #[test]
+    fn check_archive_mode_rejects_always_on_primary() {
+        let mut control = FakeBackupControl::primary(140_010, STANZA_SYSTEM_ID, "0/0", BackupStopResult::default());
+        control.archive_mode = "always".to_owned();
+        let err = check_archive_mode(&mut control, false).expect_err("'always' on a primary is unexpected");
+        assert!(err.to_string().contains("unexpected"), "msg was {err}");
+        // ... but 'always' on a standby (in recovery) is allowed.
+        check_archive_mode(&mut control, true).expect("'always' is fine on a standby");
+    }
+
+    #[test]
+    fn backup_archive_mode_check_fails_when_off() {
+        // A DB-driven backup with archive-mode-check on must fail fast when the
+        // cluster's archive_mode is off (before copying any file).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/1000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+        control.archive_mode = "off".to_owned();
+
+        let integrity = IntegrityChecks {
+            archive_check: false,
+            archive_mode_check: true,
+            page_header_check: false,
+            archive_timeout: std::time::Duration::from_millis(10),
+        };
+        let err = run_backup_with_integrity(&repo_s, &pg_s, &mut control, integrity)
+            .expect_err("archive_mode off must fail the backup");
+        assert!(err.to_string().contains("archive_mode must be enabled"), "msg was {err}");
+    }
+
+    // ---- archive-check -----------------------------------------------------
+
+    #[test]
+    fn backup_archive_check_passes_when_required_wal_present() {
+        // archive-check on: the start..stop WAL segments are present in the repo
+        // archive, so the backup completes.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+        // Range 0/1000000 (seg 1) .. 0/2000000 (seg 2); seed both.
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000001", b"wal-1");
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000002", b"wal-2");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/2000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+        let integrity = IntegrityChecks {
+            archive_check: true,
+            archive_mode_check: false,
+            page_header_check: false,
+            archive_timeout: std::time::Duration::from_millis(50),
+        };
+        run_backup_with_integrity(&repo_s, &pg_s, &mut control, integrity).expect("backup with all WAL present");
+    }
+
+    #[test]
+    fn backup_archive_check_errors_when_required_wal_missing() {
+        // archive-check on but a required segment never arrives: the backup must
+        // time out and error.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+        // Range is seg 1..2 but only seg 1 is archived.
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000001", b"wal-1");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/2000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+        let integrity = IntegrityChecks {
+            archive_check: true,
+            archive_mode_check: false,
+            page_header_check: false,
+            archive_timeout: std::time::Duration::from_millis(20),
+        };
+        let err = run_backup_with_integrity(&repo_s, &pg_s, &mut control, integrity)
+            .expect_err("missing required WAL must fail the backup");
+        assert!(err.to_string().contains("did not arrive"), "msg was {err}");
     }
 }

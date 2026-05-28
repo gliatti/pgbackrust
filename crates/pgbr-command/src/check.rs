@@ -365,6 +365,7 @@ pub fn check_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<
 /// [`CommandError::Other`] when the cluster cannot be reached, its identity does
 /// not match the stanza, archiving is misconfigured, or the segment never
 /// arrives within `timeout`.
+#[allow(clippy::too_many_arguments)]
 fn check_pg<D: CheckDb>(
     db: &mut D,
     archive: &InfoArchive,
@@ -373,6 +374,7 @@ fn check_pg<D: CheckDb>(
     repo_storage: &dyn Storage,
     timeout: Duration,
     poll_interval: Duration,
+    archive_mode_check: bool,
 ) -> Result<PgCheckReport, CommandError> {
     // 6. Identity cross-check: server version + system id must match the
     //    stanza's active db identity (exactly as the C check confirms the
@@ -396,12 +398,29 @@ fn check_pg<D: CheckDb>(
         )));
     }
 
-    // 7. archive_mode must be on and archive_command must reference pgbackrest.
+    // Whether the cluster is a standby (in recovery) — needed both to validate
+    // archive_mode (a primary should not be 'always') and to pick the WAL-switch
+    // strategy below.
+    let in_recovery = db.is_in_recovery()?;
+
+    // 7. archive_mode must be enabled (archive-mode-check) and archive_command
+    //    must reference pgbackrest. `always` is expected only on a standby; a
+    //    primary reporting `always` is unexpected and rejected. The archive_mode
+    //    half is skipped when archive-mode-check is off.
     let (archive_mode, archive_command) = db.archive_settings()?;
-    if !matches!(archive_mode.as_str(), "on" | "always") {
-        return Err(CommandError::Other(format!(
-            "archive_mode must be enabled (is '{archive_mode}')"
-        )));
+    if archive_mode_check {
+        match archive_mode.as_str() {
+            "on" => {}
+            "always" if in_recovery => {}
+            "always" => {
+                return Err(CommandError::Other(
+                    "archive_mode is 'always' on a primary, which is unexpected; expected 'on'".to_owned(),
+                ));
+            }
+            other => {
+                return Err(CommandError::Other(format!("archive_mode must be enabled (is '{other}')")));
+            }
+        }
     }
     if !archive_command.contains("pgbackrest") {
         return Err(CommandError::Other(format!(
@@ -411,7 +430,6 @@ fn check_pg<D: CheckDb>(
 
     // 8. Force a fresh segment to archive (primary), or pick the latest already
     //    produced segment (standby — a switch cannot be forced in recovery).
-    let in_recovery = db.is_in_recovery()?;
     let wal_segment = if in_recovery {
         db.last_wal_segment(server_version_num)?
     } else {
@@ -624,9 +642,20 @@ pub fn run_check(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Ch
         repo_storage,
         archive_timeout(config),
         Duration::from_millis(250),
+        archive_mode_check(config),
     )?;
     report.pg = Some(pg);
     Ok(report)
+}
+
+/// Whether `archive-mode-check` is enabled (default true, the option model's
+/// default): only an explicit `false` disables the cluster's `archive_mode`
+/// validation in the live-PG check.
+fn archive_mode_check(config: &LoadedConfig) -> bool {
+    !matches!(
+        config.options.get(&("archive-mode-check".to_owned(), None)),
+        Some(OptionValue::Boolean(false))
+    )
 }
 
 /// `check` — verify the configured repository is reachable, the stanza is
@@ -1070,6 +1099,7 @@ mod tests {
             &storage,
             Duration::from_millis(50),
             Duration::from_millis(2),
+            true,
         )
         .expect("primary check should succeed");
 
@@ -1100,6 +1130,7 @@ mod tests {
             &storage,
             Duration::from_millis(50),
             Duration::from_millis(2),
+            true,
         )
         .expect("standby check should succeed");
 
@@ -1125,6 +1156,7 @@ mod tests {
             &storage,
             Duration::from_millis(20),
             Duration::from_millis(5),
+            true,
         )
         .expect_err("missing segment must fail");
         match err {
@@ -1146,6 +1178,7 @@ mod tests {
             &storage,
             Duration::from_millis(5),
             Duration::from_millis(1),
+            true,
         )
         .expect_err("system-id mismatch must fail");
         match err {
@@ -1168,6 +1201,7 @@ mod tests {
             &storage,
             Duration::from_millis(5),
             Duration::from_millis(1),
+            true,
         )
         .expect_err("version mismatch must fail");
         match err {
@@ -1193,6 +1227,7 @@ mod tests {
             &storage,
             Duration::from_millis(5),
             Duration::from_millis(1),
+            true,
         )
         .expect_err("archive_mode off must fail");
         match err {
@@ -1212,6 +1247,7 @@ mod tests {
             &storage,
             Duration::from_millis(5),
             Duration::from_millis(1),
+            true,
         )
         .expect_err("archive_command not referencing pgbackrest must fail");
         match err {
@@ -1236,6 +1272,7 @@ mod tests {
             &storage,
             Duration::from_millis(5),
             Duration::from_millis(1),
+            true,
         )
         .expect_err("connect failure must propagate");
         match err {

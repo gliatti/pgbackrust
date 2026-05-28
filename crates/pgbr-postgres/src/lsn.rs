@@ -182,6 +182,125 @@ pub fn wal_segment_range(start: &str, stop: &str, wal_segment_size: u64) -> Opti
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// WAL segment header
+// ---------------------------------------------------------------------------
+
+/// `XLP_LONG_HEADER` bit of `xlp_info`: set on the first page of every WAL
+/// segment, marking that the page carries the long header (with the system id /
+/// segment size). Mirrors `XLP_LONG_HEADER` in
+/// `src/include/access/xlog_internal.h`.
+const XLP_LONG_HEADER: u16 = 0x0002;
+
+/// Byte offset of `xlp_seg_size` (u32 LE) within `XLogLongPageHeaderData`.
+///
+/// Layout (all little-endian, the struct is MAXALIGN=8 padded so the long
+/// header begins at offset 24): `xlp_magic` u16 @0, `xlp_info` u16 @2,
+/// `xlp_tli` u32 @4, `xlp_pageaddr` u64 @8, `xlp_rem_len` u32 @16, (4 bytes pad),
+/// then `xlp_sysid` u64 @24, `xlp_seg_size` u32 @32, `xlp_xlog_blcksz` u32 @36.
+const XLP_SYSID_OFFSET: usize = 24;
+/// Byte offset of `xlp_seg_size` (u32 LE).
+const XLP_SEG_SIZE_OFFSET: usize = 32;
+/// Minimum bytes needed to decode the long page header (through `xlp_seg_size`).
+const WAL_LONG_HEADER_LEN: usize = XLP_SEG_SIZE_OFFSET + 4;
+
+/// `(wal_magic, major-version-label)` for every supported `PostgreSQL` release,
+/// mirroring `XLOG_PAGE_MAGIC` in each release's
+/// `src/include/access/xlog_internal.h`. The magic bumps every major (and
+/// occasionally a minor with a WAL-format change), so it identifies the version
+/// that wrote a WAL segment. Provenance matches the C tree's per-version
+/// `walMagic` in `src/postgres/interface/version.vendor.h`.
+const WAL_MAGIC_VERSIONS: &[(u16, &str)] = &[
+    (0xD093, "9.6"),
+    (0xD097, "10"),
+    (0xD098, "11"),
+    (0xD101, "12"),
+    (0xD106, "13"),
+    (0xD10D, "14"),
+    (0xD110, "15"),
+    (0xD113, "16"),
+    (0xD116, "17"),
+    (0xD117, "18"),
+];
+
+/// Decoded long page header from the first page of a WAL segment.
+///
+/// pgBackRest reads this on `archive-push` (`archive-header-check`) to confirm a
+/// completed WAL segment belongs to the stanza's cluster before storing it. C
+/// reference: `pgWalFromBuffer()` in `src/postgres/interface.c`, which decodes a
+/// `PgWal { version, systemId, size }` from the same bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalHeader {
+    /// `xlp_magic` — identifies the `PostgreSQL` version that wrote the segment.
+    pub magic: u16,
+    /// Major-version label the magic maps to (`"14"`, …), or `None` for an
+    /// unrecognised magic.
+    pub version: Option<&'static str>,
+    /// `xlp_tli` — the timeline id the segment belongs to.
+    pub timeline: u32,
+    /// `xlp_sysid` — the cluster system identifier the segment was written by.
+    pub system_id: u64,
+    /// `xlp_seg_size` — the cluster's configured WAL segment size, in bytes.
+    pub segment_size: u32,
+}
+
+/// Map a WAL `xlp_magic` to the `PostgreSQL` major-version label that uses it,
+/// or `None` for an unrecognised magic. Mirrors the per-version `XLOG_PAGE_MAGIC`.
+#[must_use]
+pub fn wal_version_from_magic(magic: u16) -> Option<&'static str> {
+    WAL_MAGIC_VERSIONS
+        .iter()
+        .find_map(|(m, label)| if *m == magic { Some(*label) } else { None })
+}
+
+/// Parse the long page header at the start of a WAL segment buffer.
+///
+/// `buf` must be at least the first page of the segment (the long header lives
+/// in the first [`WAL_LONG_HEADER_LEN`] bytes). The first page of every WAL
+/// segment carries the long header (its `xlp_info` has [`XLP_LONG_HEADER`] set);
+/// this is a hard requirement, so a buffer whose first page is *not* a long
+/// header is rejected. C reference: `pgWalFromBuffer()` in
+/// `src/postgres/interface.c`.
+///
+/// Returns `None` when the buffer is too short or its first page is not a WAL
+/// long-header page.
+#[must_use]
+pub fn parse_wal_header(buf: &[u8]) -> Option<WalHeader> {
+    if buf.len() < WAL_LONG_HEADER_LEN {
+        return None;
+    }
+    let magic = u16::from_le_bytes([buf[0], buf[1]]);
+    let info = u16::from_le_bytes([buf[2], buf[3]]);
+    // The first page of a segment must be a long header.
+    if info & XLP_LONG_HEADER == 0 {
+        return None;
+    }
+    let timeline = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let system_id = u64::from_le_bytes([
+        buf[XLP_SYSID_OFFSET],
+        buf[XLP_SYSID_OFFSET + 1],
+        buf[XLP_SYSID_OFFSET + 2],
+        buf[XLP_SYSID_OFFSET + 3],
+        buf[XLP_SYSID_OFFSET + 4],
+        buf[XLP_SYSID_OFFSET + 5],
+        buf[XLP_SYSID_OFFSET + 6],
+        buf[XLP_SYSID_OFFSET + 7],
+    ]);
+    let segment_size = u32::from_le_bytes([
+        buf[XLP_SEG_SIZE_OFFSET],
+        buf[XLP_SEG_SIZE_OFFSET + 1],
+        buf[XLP_SEG_SIZE_OFFSET + 2],
+        buf[XLP_SEG_SIZE_OFFSET + 3],
+    ]);
+    Some(WalHeader {
+        magic,
+        version: wal_version_from_magic(magic),
+        timeline,
+        system_id,
+        segment_size,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -381,6 +500,57 @@ mod tests {
             wal_segment_range("not-a-segment", "000000010000000000000001", WAL_SEGMENT_SIZE_DEFAULT),
             None
         );
+    }
+
+    /// Build a WAL segment first-page buffer with the given header fields.
+    fn wal_header_buf(magic: u16, info: u16, timeline: u32, system_id: u64, segment_size: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; WAL_LONG_HEADER_LEN];
+        buf[0..2].copy_from_slice(&magic.to_le_bytes());
+        buf[2..4].copy_from_slice(&info.to_le_bytes());
+        buf[4..8].copy_from_slice(&timeline.to_le_bytes());
+        buf[XLP_SYSID_OFFSET..XLP_SYSID_OFFSET + 8].copy_from_slice(&system_id.to_le_bytes());
+        buf[XLP_SEG_SIZE_OFFSET..XLP_SEG_SIZE_OFFSET + 4].copy_from_slice(&segment_size.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn wal_version_from_magic_maps_known_magics() {
+        assert_eq!(wal_version_from_magic(0xD10D), Some("14"));
+        assert_eq!(wal_version_from_magic(0xD113), Some("16"));
+        assert_eq!(wal_version_from_magic(0xD093), Some("9.6"));
+        assert_eq!(wal_version_from_magic(0x0000), None, "unknown magic");
+    }
+
+    #[test]
+    fn parse_wal_header_decodes_long_header() {
+        // PG 14 magic, long-header flag set, timeline 7, a system id and 16 MiB segments.
+        let buf = wal_header_buf(0xD10D, XLP_LONG_HEADER, 7, 6_873_049_345_984_568_091, 16 * 1024 * 1024);
+        let header = parse_wal_header(&buf).expect("long header parses");
+        assert_eq!(header.magic, 0xD10D);
+        assert_eq!(header.version, Some("14"));
+        assert_eq!(header.timeline, 7);
+        assert_eq!(header.system_id, 6_873_049_345_984_568_091);
+        assert_eq!(header.segment_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_wal_header_rejects_short_buffer() {
+        assert_eq!(parse_wal_header(&[0u8; WAL_LONG_HEADER_LEN - 1]), None);
+    }
+
+    #[test]
+    fn parse_wal_header_rejects_non_long_first_page() {
+        // The XLP_LONG_HEADER bit clear means this is not a segment's first page.
+        let buf = wal_header_buf(0xD10D, 0, 1, 42, 16 * 1024 * 1024);
+        assert_eq!(parse_wal_header(&buf), None, "first page must be a long header");
+    }
+
+    #[test]
+    fn parse_wal_header_unknown_magic_yields_none_version() {
+        let buf = wal_header_buf(0xABCD, XLP_LONG_HEADER, 1, 42, 16 * 1024 * 1024);
+        let header = parse_wal_header(&buf).expect("still parses structurally");
+        assert_eq!(header.magic, 0xABCD);
+        assert_eq!(header.version, None, "unknown magic has no version label");
     }
 
     #[test]

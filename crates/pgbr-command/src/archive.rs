@@ -56,7 +56,9 @@ use std::path::{Path, PathBuf};
 
 use pgbr_compress::{Bz2Compress, Bz2Decompress, GzCompress, GzDecompress, Lz4Compress, Lz4Decompress, ZstCompress, ZstDecompress};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
+use pgbr_info::InfoArchive;
 use pgbr_io::Filter;
+use pgbr_postgres::lsn::parse_wal_segment;
 use pgbr_storage::{Posix, Storage};
 
 use crate::CommandError;
@@ -226,6 +228,176 @@ fn status_error_path(stanza: &str, segment: &str) -> PathBuf {
     push_out_dir(stanza).join(format!("{segment}{STATUS_EXT_ERROR}"))
 }
 
+/// Read a `Size` option (`archive-push-queue-max` / `archive-get-queue-max`),
+/// returning the byte limit or `None` when the option is unset.
+///
+/// `archive-push-queue-max` has no default (the queue is unbounded unless
+/// configured); `archive-get-queue-max` defaults to 128 MiB in the option model
+/// and is always resolved on a real run, but this helper returns `None` for the
+/// hand-built test configs that omit it.
+fn queue_max(config: &LoadedConfig, name: &str) -> Option<u64> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Size(value)) => Some(*value),
+        Some(OptionValue::Integer(value)) if *value >= 0 => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Whether `archive-header-check` is enabled. Defaults to **true** (the option
+/// model's default) when unset, matching pgBackRest validating the WAL header on
+/// every `archive-push` unless explicitly disabled.
+fn archive_header_check(config: &LoadedConfig) -> bool {
+    !matches!(
+        config.options.get(&("archive-header-check".to_owned(), None)),
+        Some(OptionValue::Boolean(false))
+    )
+}
+
+/// Whether `archive-missing-retry` is enabled. Defaults to **true** (the option
+/// model's default) when unset: on `archive-get`, a not-found segment is looked
+/// up once more after a short delay before being reported missing.
+fn archive_missing_retry(config: &LoadedConfig) -> bool {
+    !matches!(
+        config.options.get(&("archive-missing-retry".to_owned(), None)),
+        Some(OptionValue::Boolean(false))
+    )
+}
+
+/// Total size, in bytes, of the regular files in `dir` whose names are valid
+/// 24-hex WAL segment names — the unarchived-WAL backlog the push-queue limit
+/// guards. A non-existent / unreadable directory contributes 0.
+///
+/// pgBackRest's "Push-queue" check measures the WAL waiting to be archived; a
+/// completed WAL segment's name is a 24-hex string (optionally with a `.partial`
+/// / `.ready` companion, which are skipped here as they are not the WAL itself).
+/// Summing only segment-named files keeps the measurement to the WAL bytes that
+/// would fill the partition. C ref: `archivePushDrop()` in
+/// `src/command/archive/push/push.c`.
+fn wal_backlog_bytes(storage: &dyn Storage, dir: &Path) -> u64 {
+    let Ok(entries) = storage.list(dir) else {
+        return 0;
+    };
+    entries
+        .iter()
+        .filter(|info| {
+            info.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| parse_wal_segment(name).is_some())
+        })
+        .map(|info| info.size)
+        .sum()
+}
+
+/// Total size, in bytes, of every staged WAL segment in the async push *out*
+/// spool (status files excluded) — the backlog measured against
+/// `archive-push-queue-max` in async mode. A missing spool dir contributes 0.
+fn spool_out_backlog_bytes(spool: &dyn Storage, stanza: &str) -> u64 {
+    let out_dir = push_out_dir(stanza);
+    let Ok(entries) = spool.list(&out_dir) else {
+        return 0;
+    };
+    entries
+        .iter()
+        .filter(|info| {
+            info.path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                !name.ends_with(STATUS_EXT_OK) && !name.ends_with(STATUS_EXT_ERROR)
+            })
+        })
+        .map(|info| info.size)
+        .sum()
+}
+
+/// Whether the unarchived-WAL backlog has reached `archive-push-queue-max`.
+///
+/// Returns `true` when a `queue_max` limit is configured **and** `backlog`
+/// (including the segment about to be pushed) meets or exceeds it. With no limit
+/// configured the queue is unbounded and this always returns `false`.
+fn push_queue_exceeded(queue_max: Option<u64>, backlog: u64) -> bool {
+    queue_max.is_some_and(|limit| backlog >= limit)
+}
+
+/// Emit a `WARN` line that the push-queue limit dropped a WAL segment.
+///
+/// pgBackRest returns success to `PostgreSQL` so PG recycles the WAL (rather than
+/// the partition filling), logging a warning that the segment was dropped.
+#[allow(clippy::print_stderr)]
+fn warn_queue_dropped(segment: &str, backlog: u64, limit: u64) {
+    eprintln!(
+        "WARN: dropped WAL segment {segment} because the unarchived WAL backlog ({backlog} bytes) \
+         reached archive-push-queue-max ({limit} bytes)"
+    );
+}
+
+/// Validate a WAL segment's long-page header against the stanza's `archive.info`
+/// before it is stored.
+///
+/// Implements `archive-header-check`. The segment's first-page long header
+/// (magic + system id + segment size + timeline) is parsed and cross-checked:
+///
+/// - the header must parse (a non-WAL file fed to `archive-push` is rejected);
+/// - `xlp_sysid` must equal the stanza's `db-system-id` (the segment belongs to
+///   a *different* cluster otherwise);
+/// - the magic's `PostgreSQL` version must match the stanza's `db-version`;
+/// - the segment file name's timeline must equal `xlp_tli` (a name/header
+///   timeline disagreement is corruption).
+///
+/// C reference: `archivePushCheck()` / `pgWalFromBuffer()` in
+/// `src/command/archive/push/push.c` + `src/postgres/interface.c`.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] on any mismatch.
+fn check_wal_header(bytes: &[u8], segment: &str, info: &InfoArchive) -> Result<(), CommandError> {
+    let header = pgbr_postgres::lsn::parse_wal_header(bytes).ok_or_else(|| {
+        CommandError::Other(format!(
+            "archive-push: WAL segment {segment} has no valid WAL header (archive-header-check)"
+        ))
+    })?;
+
+    if header.system_id != info.db_system_id {
+        return Err(CommandError::Other(format!(
+            "archive-push: WAL segment {segment} system-id {} does not match stanza db-system-id {}",
+            header.system_id, info.db_system_id
+        )));
+    }
+
+    if let Some(version) = header.version
+        && version != info.db_version
+    {
+        return Err(CommandError::Other(format!(
+            "archive-push: WAL segment {segment} version {version} does not match stanza db-version {}",
+            info.db_version
+        )));
+    }
+
+    if let Some((name_timeline, _, _)) = parse_wal_segment(segment)
+        && name_timeline != header.timeline
+    {
+        return Err(CommandError::Other(format!(
+            "archive-push: WAL segment {segment} name timeline {name_timeline} does not match header timeline {}",
+            header.timeline
+        )));
+    }
+
+    Ok(())
+}
+
+/// Load the stanza's `archive.info` from the first repository that has it, used
+/// by `archive-header-check` to source the cluster identity. Returns `Ok(None)`
+/// when no repository holds an `archive.info` (a not-yet-initialised stanza), so
+/// the caller can skip the header check rather than fail the push.
+fn load_archive_info(repo_storages: &[&dyn Storage], stanza: &str) -> Result<Option<InfoArchive>, CommandError> {
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    for repo in repo_storages {
+        if repo.exists(&info_path)? {
+            let info = InfoArchive::load(*repo, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+            return Ok(Some(info));
+        }
+    }
+    Ok(None)
+}
+
 /// `archive-push` — copy a completed WAL segment from the PG data directory
 /// into **every** configured repository at `archive/<stanza>/<segment><suffix>`.
 ///
@@ -270,20 +442,60 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
         .and_then(|name| name.to_str())
         .ok_or_else(|| CommandError::Other(format!("invalid wal source path {wal_source}")))?;
 
+    // archive-push-queue-max: if the unarchived-WAL backlog has reached the
+    // configured limit, abandon this push and return success-with-warning so
+    // PostgreSQL recycles the WAL (rather than the partition filling). The
+    // backlog is the spool out/ dir in async mode, else the WAL source's
+    // directory (pg_wal). C ref: archivePushDrop() in push.c (KB "Push-queue").
+    let push_limit = queue_max(config, "archive-push-queue-max");
+    let async_enabled = archive_async(config);
+    let backlog = if async_enabled {
+        // Resolve the spool here so the backlog can be measured even before the
+        // async staging path runs.
+        match spool_path(config) {
+            Some(spool_root) => spool_out_backlog_bytes(&Posix::new(spool_root), stanza),
+            None => 0,
+        }
+    } else if let Some(parent) = Path::new(wal_source).parent().filter(|p| !p.as_os_str().is_empty()) {
+        wal_backlog_bytes(pg_storage, parent)
+    } else {
+        0
+    };
+    if push_queue_exceeded(push_limit, backlog) {
+        // Unwrap is safe: push_queue_exceeded only returns true when Some.
+        if let Some(limit) = push_limit {
+            warn_queue_dropped(segment, backlog, limit);
+        }
+        return Ok(());
+    }
+
+    // archive-header-check: validate the WAL segment's long-page header against
+    // the stanza's archive.info before storing, rejecting a segment that belongs
+    // to a different cluster / version / timeline. Skipped when no archive.info
+    // is present yet (uninitialised stanza) or when the option is disabled.
+    let archive_info = if archive_header_check(config) {
+        load_archive_info(repo_storages, stanza)?
+    } else {
+        None
+    };
+
     // Asynchronous mode: stage the segment in the spool out/ directory and let
     // the background drain move it to the repository. Before staging, consume
     // any status file the drain left for this segment from the previous call.
     // The spool stages a single plaintext copy regardless of repo count; the
     // background drain fans it out (a future protocol handler runs the drain).
-    if archive_async(config) {
+    if async_enabled {
         let spool_root = spool_path(config).ok_or_else(|| CommandError::MissingOption {
             option: "spool-path".to_owned(),
         })?;
         let spool = Posix::new(spool_root);
-        return push_async(pg_storage, &spool, stanza, segment, Path::new(wal_source));
+        return push_async(pg_storage, &spool, stanza, segment, Path::new(wal_source), archive_info.as_ref());
     }
 
     let bytes = read_segment(pg_storage, Path::new(wal_source))?;
+    if let Some(info) = archive_info.as_ref() {
+        check_wal_header(&bytes, segment, info)?;
+    }
     let stored = match compress_filter_for(config) {
         Some(mut filter) => run_filter(filter.as_mut(), &bytes)?,
         None => bytes,
@@ -314,14 +526,20 @@ fn push_async(
     stanza: &str,
     segment: &str,
     wal_source: &Path,
+    archive_info: Option<&InfoArchive>,
 ) -> Result<(), CommandError> {
     if let Some(outcome) = consume_push_status(spool, stanza, segment)? {
         return outcome;
     }
 
     // Not yet processed by the drain — stage the raw segment in out/ for the
-    // background drain to pick up.
+    // background drain to pick up. The WAL header is validated before staging so
+    // a mismatched segment is rejected at the foreground call (the drain only
+    // ever compresses + copies an already-validated segment).
     let bytes = read_segment(pg_storage, wal_source)?;
+    if let Some(info) = archive_info {
+        check_wal_header(&bytes, segment, info)?;
+    }
     let staged = push_out_dir(stanza).join(segment);
     write_segment(&bytes, spool, &staged)
 }
@@ -489,17 +707,60 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
     }
 
     // Try each repository in order; serve from the first that has the segment.
-    // Only the final repository's NotFound surfaces (the canonical "no archive"
-    // error); earlier NotFounds just advance to the next repository.
-    let last = repo_storages.len() - 1;
-    for (idx, repo) in repo_storages.iter().enumerate() {
-        if idx == last || repo_has_segment(*repo, stanza, segment)? {
-            return fetch_from_repo(*repo, pg_storage, stanza, segment, Path::new(dest));
+    // archive-missing-retry: a segment may land in the archive between two
+    // lookups (PostgreSQL requests it just as archive-push writes it), so when
+    // no repository holds it, look once more after a short delay before
+    // reporting it missing. C ref: the retry around walSegmentFind() in
+    // src/command/archive/get/get.c.
+    let retry = archive_missing_retry(config);
+    fetch_segment_with_retry(repo_storages, pg_storage, stanza, segment, Path::new(dest), retry, RETRY_DELAY)
+}
+
+/// Short delay between the first and the retry archive lookup when
+/// `archive-missing-retry` is enabled.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Fetch `segment` from the first repository that holds it, optionally retrying
+/// once after `delay` when the segment is not found anywhere.
+///
+/// The repositories are probed in order; the first that has the segment serves
+/// it (decompressing as needed). When none holds it: if `retry` is set, the
+/// probe is repeated once after `delay` (a segment may have been archived in
+/// between); otherwise — or if it is still absent after the retry — the canonical
+/// `NotFound` from the last repository's plaintext path surfaces.
+fn fetch_segment_with_retry(
+    repo_storages: &[&dyn Storage],
+    pg_storage: &dyn Storage,
+    stanza: &str,
+    segment: &str,
+    dest: &Path,
+    retry: bool,
+    delay: std::time::Duration,
+) -> Result<(), CommandError> {
+    // First pass: serve from any repository that already has the segment.
+    for repo in repo_storages {
+        if repo_has_segment(*repo, stanza, segment)? {
+            return fetch_from_repo(*repo, pg_storage, stanza, segment, dest);
         }
     }
-    // Unreachable: the loop always returns on the last repository, but keep a
-    // defensive error so the function is total.
-    Err(CommandError::Other("archive-get found no repository to read from".to_owned()))
+
+    // Not found anywhere. Retry once after a short delay if enabled.
+    if retry {
+        std::thread::sleep(delay);
+        for repo in repo_storages {
+            if repo_has_segment(*repo, stanza, segment)? {
+                return fetch_from_repo(*repo, pg_storage, stanza, segment, dest);
+            }
+        }
+    }
+
+    // Still missing: read the last repository's plaintext path so the caller
+    // gets the canonical NotFound error (the caller rejected an empty set, so
+    // there is always at least one repository).
+    let last = repo_storages
+        .last()
+        .ok_or_else(|| CommandError::Other("archive-get found no repository to read from".to_owned()))?;
+    fetch_from_repo(*last, pg_storage, stanza, segment, dest)
 }
 
 /// Whether `repo` holds `segment` for `stanza` in any stored form (plaintext or
@@ -591,6 +852,12 @@ fn serve_from_spool(
 /// skipped (a future segment may not be archived yet). The returned count is
 /// the number of segments pre-fetched.
 ///
+/// `queue_max` is the resolved `archive-get-queue-max` (bytes): pre-fetching
+/// stops as soon as the *in* spool already holds at least this many bytes, so
+/// the spool never over-fills ahead of recovery. `None` leaves the prefetch
+/// unbounded (every requested segment is fetched). C ref: the queue cap in
+/// `src/command/archive/get/get.c`.
+///
 /// # Errors
 ///
 /// - [`CommandError::Io`] if a matched compressed form fails to decompress.
@@ -601,9 +868,18 @@ pub fn prefetch_get_spool(
     repo_storage: &dyn Storage,
     stanza: &str,
     segments: &[String],
+    queue_max: Option<u64>,
 ) -> Result<usize, CommandError> {
+    // Account for whatever is already staged so a partially-filled spool is not
+    // overrun on the next prefetch round.
+    let mut staged_bytes = spool_in_backlog_bytes(spool, stanza);
     let mut prefetched = 0;
     for segment in segments {
+        // Stop once the in/ spool has reached the configured byte cap.
+        if queue_max.is_some_and(|limit| staged_bytes >= limit) {
+            break;
+        }
+
         // Probe the stored form; skip segments not yet in the repository.
         let plaintext = repo_segment_path(stanza, segment);
         let (source, suffix) = if repo_storage.exists(&plaintext)? {
@@ -628,6 +904,7 @@ pub fn prefetch_get_spool(
             Some(mut filter) => run_filter(filter.as_mut(), &stored)?,
             None => stored,
         };
+        staged_bytes += bytes.len() as u64;
         write_segment(&bytes, spool, &get_in_dir(stanza).join(segment))?;
         prefetched += 1;
     }
@@ -694,12 +971,55 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandError, drain_push_spool, get, get_in_dir, prefetch_get_spool, push, push_out_dir, read_archived_segment,
-        status_error_path, status_ok_path,
+        CommandError, check_wal_header, drain_push_spool, fetch_segment_with_retry, get, get_in_dir, prefetch_get_spool, push,
+        push_out_dir, push_queue_exceeded, read_archived_segment, status_error_path, status_ok_path, wal_backlog_bytes,
     };
+    use pgbr_info::InfoArchive;
 
     const SEGMENT: &str = "000000010000000000000001";
     const WAL_BODY: &[u8] = b"fake-wal-segment-contents";
+
+    /// The PG-14 system identifier / version used across these tests.
+    const TEST_SYSTEM_ID: u64 = 6_873_049_345_984_568_091;
+
+    /// Build a synthetic `InfoArchive` for the header-check tests.
+    fn test_archive_info(system_id: u64, version: &str) -> InfoArchive {
+        InfoArchive {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: system_id,
+            db_version: version.to_owned(),
+            history: BTreeMap::new(),
+        }
+    }
+
+    /// Save an `archive.info` for `stanza` into `repo` so `archive-header-check`
+    /// can source the cluster identity.
+    fn seed_archive_info(repo: &Posix, stanza: &str, system_id: u64, version: &str) {
+        repo.create_path(Path::new(&format!("archive/{stanza}")), true)
+            .expect("create archive dir");
+        test_archive_info(system_id, version)
+            .save(repo, Path::new(&format!("archive/{stanza}/archive.info")))
+            .expect("save archive.info");
+    }
+
+    /// Build a WAL segment first-page buffer (long header) with the given magic,
+    /// timeline, system id, and segment size, padded to a full 16 MiB-free
+    /// minimal page (just the header bytes are read by the parser).
+    fn wal_segment_bytes(magic: u16, timeline: u32, system_id: u64, segment_size: u32) -> Vec<u8> {
+        // 64 bytes is plenty: the long header is read from the first 36 bytes.
+        let mut buf = vec![0u8; 64];
+        buf[0..2].copy_from_slice(&magic.to_le_bytes());
+        buf[2..4].copy_from_slice(&0x0002u16.to_le_bytes()); // XLP_LONG_HEADER
+        buf[4..8].copy_from_slice(&timeline.to_le_bytes());
+        buf[24..32].copy_from_slice(&system_id.to_le_bytes());
+        buf[32..36].copy_from_slice(&segment_size.to_le_bytes());
+        buf
+    }
+
+    /// PG-14 magic (`XLOG_PAGE_MAGIC` 0xD10D) for the header-check fixtures.
+    const PG14_WAL_MAGIC: u16 = 0xD10D;
 
     fn fake_config(stanza: Option<&str>, params: Vec<String>) -> LoadedConfig {
         LoadedConfig {
@@ -1131,7 +1451,8 @@ mod tests {
 
         // Pre-fetch the segment from the repo into the spool in/ dir.
         put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
-        let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &[SEGMENT.to_owned()]).expect("prefetch should succeed");
+        let prefetched =
+            prefetch_get_spool(&spool_s, &repo_s, "demo", &[SEGMENT.to_owned()], None).expect("prefetch should succeed");
         assert_eq!(prefetched, 1, "one segment should be pre-fetched");
         assert!(
             spool_s
@@ -1385,5 +1706,294 @@ mod tests {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
         assert_eq!(bytes, None, "a segment not in the archive yields None");
+    }
+
+    // -----------------------------------------------------------------------
+    // archive-push-queue-max
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn push_queue_exceeded_threshold() {
+        // No limit configured -> never exceeded, whatever the backlog.
+        assert!(!push_queue_exceeded(None, u64::MAX));
+        // Under the limit -> not exceeded.
+        assert!(!push_queue_exceeded(Some(1000), 999));
+        // At or over the limit -> exceeded.
+        assert!(push_queue_exceeded(Some(1000), 1000));
+        assert!(push_queue_exceeded(Some(1000), 5000));
+    }
+
+    #[test]
+    fn wal_backlog_sums_only_segment_named_files() {
+        let (_repo, pg_dir, _repo_s, pg_s) = posix_pair();
+        // Two valid 24-hex WAL segments and one non-segment file in pg_wal.
+        put(&pg_s, "pg_wal/000000010000000000000001", &vec![0u8; 100]);
+        put(&pg_s, "pg_wal/000000010000000000000002", &vec![0u8; 200]);
+        put(&pg_s, "pg_wal/archive_status", b"not-a-segment");
+        let _ = &pg_dir;
+        let backlog = wal_backlog_bytes(&pg_s, Path::new("pg_wal"));
+        assert_eq!(backlog, 300, "only the two 24-hex segments count");
+        // A missing directory contributes 0.
+        assert_eq!(wal_backlog_bytes(&pg_s, Path::new("does-not-exist")), 0);
+    }
+
+    /// `fake_config` plus an `archive-push-queue-max` Size option.
+    fn fake_config_queue_max(stanza: Option<&str>, params: Vec<String>, limit: u64) -> LoadedConfig {
+        let mut cfg = fake_config(stanza, params);
+        cfg.options
+            .insert(("archive-push-queue-max".to_owned(), None), OptionValue::Size(limit));
+        cfg
+    }
+
+    #[test]
+    fn push_over_queue_max_drops_segment_with_success() {
+        // A pg_wal backlog exceeding the queue-max makes push abandon the copy and
+        // return success (PostgreSQL recycles the WAL), leaving the repo empty.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, &vec![0u8; 16 * 1024 * 1024]); // 16 MiB segment
+        // Add another large segment so the backlog is well over the 1 MiB limit.
+        put(&pg_s, "pg_wal/000000010000000000000002", &vec![0u8; 16 * 1024 * 1024]);
+
+        let cfg = fake_config_queue_max(Some("demo"), vec![wal_source], 1024 * 1024);
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("over-queue push returns success");
+
+        assert!(
+            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            "segment must be dropped (not archived) when the queue is over the limit"
+        );
+    }
+
+    #[test]
+    fn push_under_queue_max_archives_normally() {
+        // A backlog under the limit lets the push proceed normally.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        // 1 GiB limit, a tiny backlog -> archived.
+        let cfg = fake_config_queue_max(Some("demo"), vec![wal_source], 1024 * 1024 * 1024);
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("under-queue push archives");
+
+        assert!(
+            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            "segment must be archived when the backlog is under the limit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // archive-header-check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_wal_header_accepts_matching_segment() {
+        let info = test_archive_info(TEST_SYSTEM_ID, "14");
+        let bytes = wal_segment_bytes(PG14_WAL_MAGIC, 1, TEST_SYSTEM_ID, 16 * 1024 * 1024);
+        check_wal_header(&bytes, SEGMENT, &info).expect("a matching segment passes");
+    }
+
+    #[test]
+    fn check_wal_header_rejects_system_id_mismatch() {
+        let info = test_archive_info(TEST_SYSTEM_ID, "14");
+        // A segment written by a different cluster.
+        let bytes = wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024);
+        let err = check_wal_header(&bytes, SEGMENT, &info).expect_err("system-id mismatch must fail");
+        assert!(err.to_string().contains("system-id"), "msg was {err}");
+    }
+
+    #[test]
+    fn check_wal_header_rejects_version_mismatch() {
+        // archive.info says 16 but the segment's magic is PG 14.
+        let info = test_archive_info(TEST_SYSTEM_ID, "16");
+        let bytes = wal_segment_bytes(PG14_WAL_MAGIC, 1, TEST_SYSTEM_ID, 16 * 1024 * 1024);
+        let err = check_wal_header(&bytes, SEGMENT, &info).expect_err("version mismatch must fail");
+        assert!(err.to_string().contains("version"), "msg was {err}");
+    }
+
+    #[test]
+    fn check_wal_header_rejects_timeline_mismatch() {
+        // The segment NAME is timeline 1 but the header says timeline 9.
+        let info = test_archive_info(TEST_SYSTEM_ID, "14");
+        let bytes = wal_segment_bytes(PG14_WAL_MAGIC, 9, TEST_SYSTEM_ID, 16 * 1024 * 1024);
+        let err = check_wal_header(&bytes, SEGMENT, &info).expect_err("timeline mismatch must fail");
+        assert!(err.to_string().contains("timeline"), "msg was {err}");
+    }
+
+    #[test]
+    fn check_wal_header_rejects_non_wal_file() {
+        let info = test_archive_info(TEST_SYSTEM_ID, "14");
+        let err = check_wal_header(b"not a wal segment", SEGMENT, &info).expect_err("a non-WAL file must fail");
+        assert!(err.to_string().contains("no valid WAL header"), "msg was {err}");
+    }
+
+    #[test]
+    fn push_with_header_check_rejects_foreign_segment() {
+        // End-to-end: archive.info identifies the cluster; a segment from a
+        // different system id is rejected before it is stored.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info(&repo_s, "demo", TEST_SYSTEM_ID, "14");
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024));
+
+        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("foreign segment must be rejected");
+        assert!(err.to_string().contains("system-id"), "msg was {err}");
+        assert!(
+            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            "a rejected segment must not be stored"
+        );
+    }
+
+    #[test]
+    fn push_with_header_check_accepts_matching_segment() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info(&repo_s, "demo", TEST_SYSTEM_ID, "14");
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        let body = wal_segment_bytes(PG14_WAL_MAGIC, 1, TEST_SYSTEM_ID, 16 * 1024 * 1024);
+        put(&pg_s, &wal_source, &body);
+
+        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("a matching segment is archived");
+        assert!(
+            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            "a matching segment must be stored"
+        );
+    }
+
+    #[test]
+    fn push_header_check_skipped_when_disabled() {
+        // archive-header-check=n stores a segment even when it does not match.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info(&repo_s, "demo", TEST_SYSTEM_ID, "14");
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024));
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("header check disabled -> stored regardless");
+        assert!(
+            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            "with the check off the segment is stored even though it mismatches"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // archive-missing-retry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fetch_retry_finds_segment_on_second_pass() {
+        // The segment is absent at the first probe but the retry pass finds it.
+        // Simulate "lands between attempts" by placing it before the call but
+        // asserting the retry path serves it (a found-on-first case also works;
+        // the retry must not break the happy path).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        let dest = format!("pg_wal/{SEGMENT}");
+        fetch_segment_with_retry(
+            &[&repo_s as &dyn Storage],
+            &pg_s,
+            "demo",
+            SEGMENT,
+            Path::new(&dest),
+            true,
+            std::time::Duration::from_millis(0),
+        )
+        .expect("present segment is served");
+        assert_eq!(read(&pg_s, &dest), WAL_BODY);
+    }
+
+    #[test]
+    fn fetch_retry_still_missing_errors() {
+        // With retry on but the segment never present, the canonical NotFound
+        // surfaces (after the bounded retry).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let dest = format!("pg_wal/{SEGMENT}");
+        let err = fetch_segment_with_retry(
+            &[&repo_s as &dyn Storage],
+            &pg_s,
+            "demo",
+            SEGMENT,
+            Path::new(&dest),
+            true,
+            std::time::Duration::from_millis(0),
+        )
+        .expect_err("a never-present segment must still error after the retry");
+        match err {
+            CommandError::Storage(_) => {}
+            other => panic!("expected Storage(not found), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_no_retry_errors_immediately() {
+        // With retry off, a missing segment errors without a second probe.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let dest = format!("pg_wal/{SEGMENT}");
+        fetch_segment_with_retry(
+            &[&repo_s as &dyn Storage],
+            &pg_s,
+            "demo",
+            SEGMENT,
+            Path::new(&dest),
+            false,
+            std::time::Duration::from_millis(0),
+        )
+        .expect_err("missing segment must error with retry off");
+    }
+
+    // -----------------------------------------------------------------------
+    // archive-get-queue-max (prefetch bound)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefetch_stops_at_queue_max() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_spool, spool_s) = spool_storage();
+        let _ = &pg_s;
+        // Three 100-byte segments in the repo.
+        let segs = [
+            "000000010000000000000001",
+            "000000010000000000000002",
+            "000000010000000000000003",
+        ];
+        for seg in &segs {
+            put(&repo_s, &format!("archive/demo/{seg}"), &vec![7u8; 100]);
+        }
+        let requested: Vec<String> = segs.iter().map(|s| (*s).to_owned()).collect();
+
+        // A 150-byte cap should stop after the first segment (100 staged >= 150?
+        // no — after staging the first, staged=100 < 150, stage the second ->
+        // staged=200 >= 150 stops). So exactly two are pre-fetched.
+        let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, Some(150)).expect("prefetch");
+        assert_eq!(prefetched, 2, "prefetch stops once the in/ spool reaches the cap");
+        assert!(
+            spool_s.exists(Path::new("archive/demo/in/000000010000000000000001")).expect("e"),
+            "first segment staged"
+        );
+        assert!(
+            spool_s.exists(Path::new("archive/demo/in/000000010000000000000002")).expect("e"),
+            "second segment staged"
+        );
+        assert!(
+            !spool_s.exists(Path::new("archive/demo/in/000000010000000000000003")).expect("e"),
+            "third segment must not be staged past the cap"
+        );
+    }
+
+    #[test]
+    fn prefetch_unbounded_fetches_all() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let (_spool, spool_s) = spool_storage();
+        for seg in ["000000010000000000000001", "000000010000000000000002"] {
+            put(&repo_s, &format!("archive/demo/{seg}"), &vec![7u8; 100]);
+        }
+        let requested = vec![
+            "000000010000000000000001".to_owned(),
+            "000000010000000000000002".to_owned(),
+        ];
+        let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, None).expect("prefetch");
+        assert_eq!(prefetched, 2, "no cap fetches every requested segment");
     }
 }

@@ -159,6 +159,98 @@ pub fn page_checksum_valid(page: &[u8], block_no: u32) -> Option<bool> {
     Some(computed == stored)
 }
 
+/// Size of the fixed `PageHeaderData` prefix (`SizeOfPageHeaderData`), the bytes
+/// before the per-page item-pointer array. Every data page begins with this
+/// 24-byte header.
+pub const SIZE_OF_PAGE_HEADER_DATA: usize = 24;
+
+/// Byte offset of `pd_lower` (`LocationIndex`, u16 LE) in `PageHeaderData`:
+/// after `pd_lsn` (8), `pd_checksum` (2), `pd_flags` (2).
+const PD_LOWER_OFFSET: usize = 12;
+/// Byte offset of `pd_upper` (u16 LE) in `PageHeaderData`.
+const PD_UPPER_OFFSET: usize = 14;
+/// Byte offset of `pd_special` (u16 LE) in `PageHeaderData`.
+const PD_SPECIAL_OFFSET: usize = 16;
+
+/// Read the page's `pd_lsn` (the first 8 bytes of the header) as a 64-bit LSN.
+///
+/// `pd_lsn` is a `PageXLogRecPtr` — `xlogid` (high 32 bits) at offset 0 and
+/// `xrecoff` (low 32 bits) at offset 4, both little-endian. Returns `None` when
+/// the slice is shorter than 8 bytes.
+#[must_use]
+pub fn page_lsn(page: &[u8]) -> Option<u64> {
+    if page.len() < 8 {
+        return None;
+    }
+    let xlogid = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
+    let xrecoff = u32::from_le_bytes([page[4], page[5], page[6], page[7]]);
+    Some((u64::from(xlogid) << 32) | u64::from(xrecoff))
+}
+
+/// Whether a data page's *header* is structurally sane, independent of the
+/// checksum.
+///
+/// pgBackRest validates a page's header before (and in addition to) its
+/// checksum so a page whose checksum happens to collide can still be rejected
+/// when its bookkeeping fields are impossible. C reference: the
+/// `PageHeaderData` field checks `PostgreSQL` itself uses in `PageIsVerified`
+/// (`src/backend/storage/page/bufpage.c`) — `pd_upper`/`pd_lower`/`pd_special`
+/// must describe a consistent free-space layout, and `pd_lsn` must not exceed
+/// the highest LSN the cluster has reached.
+///
+/// A page passes when **all** of the following hold (with `page.len()` being the
+/// page size, normally [`BLCKSZ`]):
+///
+/// - the slice is at least [`SIZE_OF_PAGE_HEADER_DATA`] bytes (it can hold a
+///   header at all);
+/// - `pd_lower >= SizeOfPageHeaderData` (the line-pointer array starts after the
+///   header) **or** `pd_lower == 0` (a never-initialised / empty page);
+/// - `pd_lower <= pd_upper` (the free space between the line pointers and the
+///   tuples is non-negative);
+/// - `pd_upper <= pd_special` (the tuples sit at or before the special space);
+/// - `pd_special <= page_size` (the special space ends within the page);
+/// - when `max_lsn` is supplied, `pd_lsn <= max_lsn` (the page cannot claim a
+///   WAL position the cluster has not reached — a strong corruption signal).
+///
+/// An all-zero page (a freshly extended, never-written block) trivially passes:
+/// every field is zero, `pd_lower == 0`, and `pd_lsn == 0`.
+///
+/// `max_lsn` is the cluster's current insert/flush LSN (the backup stop LSN is a
+/// safe upper bound). Pass `None` to skip the `pd_lsn` ceiling check (e.g. when
+/// no LSN is available).
+#[must_use]
+pub fn page_header_valid(page: &[u8], page_size: usize, max_lsn: Option<u64>) -> bool {
+    if page.len() < SIZE_OF_PAGE_HEADER_DATA {
+        return false;
+    }
+
+    let read_u16 = |off: usize| usize::from(u16::from_le_bytes([page[off], page[off + 1]]));
+    let pd_lower = read_u16(PD_LOWER_OFFSET);
+    let pd_upper = read_u16(PD_UPPER_OFFSET);
+    let pd_special = read_u16(PD_SPECIAL_OFFSET);
+
+    // pd_lower must either start past the header (line-pointer array) or be 0
+    // (an empty / never-initialised page).
+    if pd_lower != 0 && pd_lower < SIZE_OF_PAGE_HEADER_DATA {
+        return false;
+    }
+    // The three free-space boundaries must be monotonically ordered and fit the
+    // page: header <= pd_lower <= pd_upper <= pd_special <= page_size.
+    if pd_lower > pd_upper || pd_upper > pd_special || pd_special > page_size {
+        return false;
+    }
+
+    // pd_lsn must not exceed the highest LSN the cluster has reached.
+    if let Some(max_lsn) = max_lsn
+        && let Some(lsn) = page_lsn(page)
+        && lsn > max_lsn
+    {
+        return false;
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +371,75 @@ mod tests {
         // Corrupt the stored checksum -> invalid.
         page[8] ^= 0x01;
         assert_eq!(page_checksum_valid(&page, 5), Some(false));
+    }
+
+    /// Build a page with a structurally-sane header: pd_lower past the header,
+    /// pd_upper / pd_special at the page end, and an LSN of `lsn`.
+    fn header_page(lsn: u64, pd_lower: u16, pd_upper: u16, pd_special: u16) -> Vec<u8> {
+        let mut page = vec![0u8; BLCKSZ];
+        let xlogid = u32::try_from(lsn >> 32).unwrap_or(u32::MAX);
+        let xrecoff = u32::try_from(lsn & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+        page[0..4].copy_from_slice(&xlogid.to_le_bytes());
+        page[4..8].copy_from_slice(&xrecoff.to_le_bytes());
+        page[PD_LOWER_OFFSET..PD_LOWER_OFFSET + 2].copy_from_slice(&pd_lower.to_le_bytes());
+        page[PD_UPPER_OFFSET..PD_UPPER_OFFSET + 2].copy_from_slice(&pd_upper.to_le_bytes());
+        page[PD_SPECIAL_OFFSET..PD_SPECIAL_OFFSET + 2].copy_from_slice(&pd_special.to_le_bytes());
+        page
+    }
+
+    #[test]
+    fn page_lsn_reads_xlogid_and_xrecoff() {
+        let page = header_page((1 << 32) | 0x0123_4567, 24, 8192, 8192);
+        assert_eq!(page_lsn(&page), Some((1 << 32) | 0x0123_4567));
+        assert_eq!(page_lsn(&[0u8; 4]), None, "too short");
+    }
+
+    #[test]
+    fn page_header_valid_accepts_well_formed_page() {
+        // header(24) <= pd_lower(40) <= pd_upper(2000) <= pd_special(8192) <= 8192.
+        let page = header_page(0x16B_3E40, 40, 2000, 8192);
+        assert!(page_header_valid(&page, BLCKSZ, Some(0x0FFF_FFFF_FFFF)));
+    }
+
+    #[test]
+    fn page_header_valid_accepts_all_zero_page() {
+        // A never-written page is all zeroes: pd_lower == 0, every field 0.
+        let zero = vec![0u8; BLCKSZ];
+        assert!(page_header_valid(&zero, BLCKSZ, Some(123)));
+        assert!(page_header_valid(&zero, BLCKSZ, None));
+    }
+
+    #[test]
+    fn page_header_valid_rejects_pd_lower_inside_header() {
+        // A non-zero pd_lower smaller than the header start is impossible.
+        let page = header_page(0, 10, 2000, 8192);
+        assert!(!page_header_valid(&page, BLCKSZ, None));
+    }
+
+    #[test]
+    fn page_header_valid_rejects_unordered_boundaries() {
+        // pd_lower > pd_upper.
+        let page = header_page(0, 3000, 2000, 8192);
+        assert!(!page_header_valid(&page, BLCKSZ, None));
+        // pd_upper > pd_special.
+        let page = header_page(0, 40, 8000, 4000);
+        assert!(!page_header_valid(&page, BLCKSZ, None));
+        // pd_special > page_size.
+        let page = header_page(0, 40, 2000, 8192);
+        assert!(!page_header_valid(&page, 4096, None));
+    }
+
+    #[test]
+    fn page_header_valid_rejects_future_lsn() {
+        // A page claiming an LSN past the cluster's max is corrupt.
+        let page = header_page(0x1_0000_0000, 40, 2000, 8192);
+        assert!(!page_header_valid(&page, BLCKSZ, Some(0xFFFF_FFFF)));
+        // The same page passes when no LSN ceiling is enforced.
+        assert!(page_header_valid(&page, BLCKSZ, None));
+    }
+
+    #[test]
+    fn page_header_valid_rejects_too_short() {
+        assert!(!page_header_valid(&[0u8; SIZE_OF_PAGE_HEADER_DATA - 1], BLCKSZ, None));
     }
 }
