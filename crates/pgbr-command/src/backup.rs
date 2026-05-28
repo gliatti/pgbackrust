@@ -64,7 +64,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
-use pgbr_postgres::lsn::{WAL_SEGMENT_SIZE_DEFAULT, lsn_text_to_wal_segment, parse_lsn};
+use pgbr_postgres::lsn::{lsn_text_to_wal_segment, parse_lsn, wal_segment_range};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageInfo, StorageKind};
@@ -218,6 +218,12 @@ pub struct BackupBracket {
     pub archive_start: String,
     /// WAL segment name containing the stop LSN (`backup-archive-stop`).
     pub archive_stop: String,
+    /// Timeline id the start / stop segments are on (sourced from the live
+    /// cluster rather than hardcoded), used to enumerate the archive-copy range.
+    pub timeline: u32,
+    /// Cluster `wal_segment_size` in bytes, used to enumerate the archive-copy
+    /// range and to map each LSN to its segment name.
+    pub wal_segment_size: u64,
 }
 
 fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
@@ -559,6 +565,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let checksum_page = checksum_page_enabled(config);
     let excludes = excludes_from_config(config);
     let start_fast = start_fast_enabled(config);
+    let archive_copy = archive_copy_enabled(config);
 
     // File-bundling / block-incremental features. Validate the cross-option
     // constraints up front: bundling and repo-hardlink are mutually exclusive
@@ -603,6 +610,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         standby.as_mut().map(|c| c as &mut dyn BackupControl),
         start_fast,
         features,
+        archive_copy,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -702,6 +710,20 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
     }
 
     Ok(ControlConnections { primary, standby })
+}
+
+/// Whether the resolved `archive-copy` option is set.
+///
+/// `archive-copy=y` copies the WAL segments needed to make the backup
+/// consistent (`backup-archive-start` .. `backup-archive-stop`) into the
+/// backup `pg_wal/` directory. It is a `Boolean` defaulting to false; absent or
+/// non-boolean values resolve to false. Only effective on a DB-driven backup
+/// (one with a bracket); the DB-free file-copy path has no WAL range to copy.
+fn archive_copy_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("archive-copy".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
 }
 
 /// Whether the resolved `start-fast` option is set (forces an immediate
@@ -1886,6 +1908,7 @@ pub fn backup_inner_with_workers(
         None,
         false,
         BackupFeatures::disabled(),
+        false,
     )
 }
 
@@ -1934,6 +1957,7 @@ fn run_backup(
     mut standby: Option<&mut dyn BackupControl>,
     start_fast: bool,
     features: BackupFeatures,
+    archive_copy: bool,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -2044,30 +2068,47 @@ fn run_backup(
     let mut paths = plan.paths;
     let mut links = plan.links;
 
+    let timestamp_stop = timestamp_start;
+    let mut repo_size = repo_size;
+
+    // Close the online backup (on the same session) and assemble the bracket.
+    // The stop also yields the `backup_label` / `tablespace_map` file contents,
+    // which are written into the backup root. The timeline + `wal_segment_size`
+    // are sourced from the live cluster (`pg_control_checkpoint()` / `pg_settings`)
+    // so the recorded WAL segment names are correct on non-default-segment
+    // clusters and post-failover timelines.
+    let bracket = match (control.as_mut(), start_lsn) {
+        (Some(control), Some(start_lsn)) => {
+            let (timeline, wal_segment_size) = resolve_wal_geometry(&mut **control)?;
+            let stop = control.backup_stop()?;
+            write_backup_label_files(repo_storage, &backup_root, &stop)?;
+            Some(build_bracket(&start_lsn, &stop, timeline, wal_segment_size)?)
+        }
+        _ => None,
+    };
+
+    // archive-copy: when enabled, copy every WAL segment from the start segment
+    // through the stop segment (inclusive) out of the repo archive into this
+    // backup's `pg_wal/`, recording each as a regular ManifestFile so restore
+    // places them. Done after the bracket (which yields the segment range) and
+    // before totals are computed so the copied WAL counts toward the manifest.
+    if archive_copy && let Some(bracket) = bracket.as_ref() {
+        let copied = copy_archive_wal(repo_storage, stanza, &backup_root, transform, bracket)?;
+        for (file, repo_bytes) in copied {
+            repo_size += repo_bytes;
+            files.push(file);
+        }
+    }
+
     // Sort every manifest list by path so the on-disk manifest (and its
-    // checksum) is deterministic regardless of worker completion order.
+    // checksum) is deterministic regardless of worker completion order. (The
+    // archive-copy pg_wal entries are sorted in alongside the data files.)
     files.sort_by(|a, b| a.path.cmp(&b.path));
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     links.sort_by(|a, b| a.path.cmp(&b.path));
 
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     let file_count = files.len();
-    let timestamp_stop = timestamp_start;
-
-    // Close the online backup (on the same session) and assemble the bracket.
-    // The stop also yields the `backup_label` / `tablespace_map` file contents,
-    // which are written into the backup root. The backup timeline is taken from
-    // the start LSN's WAL — for this slice (no streaming standby promotion) the
-    // start and stop share timeline 1; pgBackRest reads the real timeline from
-    // pg_control, deferred until the fuller pg_control decode lands.
-    let bracket = match (control.as_mut(), start_lsn) {
-        (Some(control), Some(start_lsn)) => {
-            let stop = control.backup_stop()?;
-            write_backup_label_files(repo_storage, &backup_root, &stop)?;
-            Some(build_bracket(&start_lsn, &stop)?)
-        }
-        _ => None,
-    };
 
     let manifest = Manifest {
         backup_label: label.clone(),
@@ -2258,17 +2299,23 @@ fn wait_for_standby_replay(standby: &mut dyn BackupControl, start_lsn: &str) -> 
 
 /// Build a [`BackupBracket`] from the textual start LSN and the stop result.
 ///
-/// Each LSN is mapped to the WAL segment that contains it on timeline 1 using
-/// the default 16 MiB segment size (the only size this slice models — the real
-/// timeline + `wal_segment_size` come from `pg_control`, deferred to the fuller
-/// decode). An unparseable LSN is a hard error: the server returned something
-/// that is not a `PostgreSQL` LSN.
+/// Each LSN is mapped to the WAL segment that contains it on `timeline` using
+/// the cluster `wal_segment_size`. Both are sourced from the live cluster (the
+/// timeline from `pg_control_checkpoint()`, the segment size from
+/// `pg_settings`), so `backup-archive-start` / `backup-archive-stop` are correct
+/// on non-default-segment clusters and post-failover timelines. An unparseable
+/// LSN is a hard error: the server returned something that is not a `PostgreSQL`
+/// LSN.
 ///
 /// # Errors
 ///
 /// [`CommandError::Other`] when either LSN cannot be parsed.
-fn build_bracket(start_lsn: &str, stop: &BackupStopResult) -> Result<BackupBracket, CommandError> {
-    const TIMELINE: u32 = 1;
+fn build_bracket(
+    start_lsn: &str,
+    stop: &BackupStopResult,
+    timeline: u32,
+    wal_segment_size: u64,
+) -> Result<BackupBracket, CommandError> {
     // Confirm both LSNs parse (the WAL-segment derivation needs valid hex halves).
     if parse_lsn(start_lsn).is_none() {
         return Err(CommandError::Other(format!(
@@ -2281,16 +2328,120 @@ fn build_bracket(start_lsn: &str, stop: &BackupStopResult) -> Result<BackupBrack
             stop.lsn
         )));
     }
-    let archive_start = lsn_text_to_wal_segment(TIMELINE, start_lsn, WAL_SEGMENT_SIZE_DEFAULT)
+    let archive_start = lsn_text_to_wal_segment(timeline, start_lsn, wal_segment_size)
         .ok_or_else(|| CommandError::Other(format!("could not derive WAL segment for start LSN {start_lsn}")))?;
-    let archive_stop = lsn_text_to_wal_segment(TIMELINE, &stop.lsn, WAL_SEGMENT_SIZE_DEFAULT)
+    let archive_stop = lsn_text_to_wal_segment(timeline, &stop.lsn, wal_segment_size)
         .ok_or_else(|| CommandError::Other(format!("could not derive WAL segment for stop LSN {}", stop.lsn)))?;
     Ok(BackupBracket {
         lsn_start: start_lsn.to_owned(),
         lsn_stop: stop.lsn.clone(),
         archive_start,
         archive_stop,
+        timeline,
+        wal_segment_size,
     })
+}
+
+/// Copy the WAL segments required to make this backup consistent out of the repo
+/// archive into this backup `pg_wal` directory, recording each as a regular
+/// [`ManifestFile`] so restore re-places them.
+///
+/// Implements `archive-copy=y`. C reference: the archive-copy path in
+/// `src/command/backup/backup.c`. The range is `backup-archive-start` through
+/// `backup-archive-stop` inclusive, enumerated by
+/// [`pgbr_postgres::lsn::wal_segment_range`] (honouring the cluster
+/// `wal_segment_size` and the live timeline carried in `bracket`). For each
+/// segment:
+///
+/// 1. Locate it in the repo archive and read its plaintext bytes (transparently
+///    decompressing whatever stored form is present) via
+///    [`crate::archive::read_archived_segment`]. A required segment that is
+///    absent from the archive is a hard error — the backup cannot be made
+///    consistent without it (matching pgBackRest, which errors rather than
+///    silently omitting WAL).
+/// 2. Run the plaintext through this backup [`RepoTransform`] (compress then
+///    encrypt) just like any backup file, and write it to
+///    `backup/<stanza>/<label>/pg_wal/<segment><suffix>`.
+/// 3. Build a [`ManifestFile`] at `pg_wal/<segment>` carrying the plaintext size
+///    and SHA-1 (with `reference: None`, since this backup physically holds the
+///    bytes) so the file round-trips on restore through the normal file path.
+///
+/// Returns `(ManifestFile, repo_bytes_written)` for every copied segment.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when a required segment is missing from the archive;
+/// plus storage / IO / filter failures from the read, transform, or write.
+fn copy_archive_wal(
+    repo_storage: &dyn Storage,
+    stanza: &str,
+    backup_root: &str,
+    transform: &RepoTransform,
+    bracket: &BackupBracket,
+) -> Result<Vec<(ManifestFile, u64)>, CommandError> {
+    let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
+        CommandError::Other(format!(
+            "could not enumerate WAL segment range {}..{} for archive-copy",
+            bracket.archive_start, bracket.archive_stop
+        ))
+    })?;
+
+    let suffix = transform.repo_suffix();
+    // Ensure the destination `pg_wal/` directory exists before writing segments
+    // (the data-file copy path creates parents per file via std::fs; here the
+    // repo storage backend creates the shared directory once).
+    repo_storage.create_path(Path::new(&format!("{backup_root}/pg_wal")), true)?;
+    let mut out = Vec::with_capacity(segments.len());
+    for segment in &segments {
+        let bytes = crate::archive::read_archived_segment(repo_storage, stanza, segment)?.ok_or_else(|| {
+            CommandError::Other(format!(
+                "archive-copy: required WAL segment {segment} is missing from the archive"
+            ))
+        })?;
+        let checksum = plaintext_sha1(&bytes)?;
+        let repo_bytes = transform.apply_forward(&bytes)?;
+
+        let rel = format!("pg_wal/{segment}");
+        let dest = format!("{backup_root}/{rel}{suffix}");
+        write_repo_file(repo_storage, &dest, &repo_bytes)?;
+
+        out.push((
+            ManifestFile {
+                path: rel,
+                size: bytes.len() as u64,
+                timestamp: 0,
+                checksum: Some(checksum),
+                checksum_page: None,
+                reference: None,
+                mode: None,
+                user: None,
+                group: None,
+                bundle_id: None,
+                bundle_offset: None,
+                block_map: None,
+            },
+            repo_bytes.len() as u64,
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolve the live cluster timeline + `wal_segment_size`, used to derive the
+/// WAL segment names recorded in the bracket and to enumerate the archive-copy
+/// range.
+///
+/// Both come from the one backup-control connection (the same session that runs
+/// `pg_backup_start` / `pg_backup_stop`): the timeline from
+/// `pg_control_checkpoint()` and the segment size from `pg_settings`. Sourcing
+/// them per-backup replaces the former hardcoded timeline 1 / 16 MiB assumption.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when either query / parse fails.
+fn resolve_wal_geometry(control: &mut dyn BackupControl) -> Result<(u32, u64), CommandError> {
+    let timeline = control.timeline()?;
+    let wal_segment_size = control.wal_segment_size()?;
+    Ok((timeline, wal_segment_size))
 }
 
 #[cfg(test)]
@@ -2300,6 +2451,8 @@ mod tests {
 
     use pgbr_io::{Filter, Sha1};
     use pgbr_storage::Posix;
+
+    use pgbr_postgres::lsn::WAL_SEGMENT_SIZE_DEFAULT;
 
     use super::*;
     use crate::pipeline::{CompressType, RepoTransform};
@@ -3674,6 +3827,10 @@ mod tests {
         /// Reported server version number / system identifier.
         server_version_num: u32,
         system_identifier: u64,
+        /// Reported cluster `wal_segment_size` (bytes); 0 means "use the default".
+        wal_segment_size: u64,
+        /// Reported current timeline id; 0 means "use timeline 1".
+        timeline: u32,
         /// LSN `backup_start` returns.
         start_lsn: String,
         /// Stop LSN + label / spcmap files `backup_stop` returns.
@@ -3694,6 +3851,8 @@ mod tests {
             Self {
                 server_version_num,
                 system_identifier,
+                wal_segment_size: 0,
+                timeline: 0,
                 start_lsn: start_lsn.to_owned(),
                 stop,
                 in_recovery: false,
@@ -3734,6 +3893,22 @@ mod tests {
             self.replay_cursor.set(self.replay_cursor.get() + 1);
             Ok(self.replay_lsns.get(idx).cloned().flatten())
         }
+
+        fn wal_segment_size(&mut self) -> Result<u64, CommandError> {
+            self.calls.borrow_mut().push("wal_segment_size".to_owned());
+            // 0 means the fake wasn`t given an explicit size: report the default.
+            Ok(if self.wal_segment_size == 0 {
+                WAL_SEGMENT_SIZE_DEFAULT
+            } else {
+                self.wal_segment_size
+            })
+        }
+
+        fn timeline(&mut self) -> Result<u32, CommandError> {
+            self.calls.borrow_mut().push("timeline".to_owned());
+            // 0 means the fake wasn`t given an explicit timeline: report 1.
+            Ok(if self.timeline == 0 { 1 } else { self.timeline })
+        }
     }
 
     /// The `backup.info` identity the [`init_stanza`] helper writes (PG 14).
@@ -3746,6 +3921,19 @@ mod tests {
         control: &mut FakeBackupControl,
         start_fast: bool,
     ) -> Result<BackupOutcome, CommandError> {
+        run_backup_with_fake_opts(repo_s, pg_s, control, start_fast, &RepoTransform::identity(), false)
+    }
+
+    /// Like [`run_backup_with_fake`] but lets a test pin the transform and the
+    /// `archive_copy` flag (used by the archive-copy round-trip tests).
+    fn run_backup_with_fake_opts(
+        repo_s: &Posix,
+        pg_s: &Posix,
+        control: &mut FakeBackupControl,
+        start_fast: bool,
+        transform: &RepoTransform,
+        archive_copy: bool,
+    ) -> Result<BackupOutcome, CommandError> {
         run_backup(
             "demo",
             repo_s,
@@ -3753,7 +3941,7 @@ mod tests {
             BackupType::Full,
             Some(LABEL),
             1_704_110_400,
-            &RepoTransform::identity(),
+            transform,
             1,
             false,
             &[],
@@ -3761,6 +3949,7 @@ mod tests {
             None,
             start_fast,
             BackupFeatures::disabled(),
+            archive_copy,
         )
     }
 
@@ -3793,13 +3982,17 @@ mod tests {
         assert_eq!(bracket.archive_start, "000000010000000000000001");
         assert_eq!(bracket.archive_stop, "000000010000000000000001");
 
-        // Protocol order: server_info, backup_start(label,fast=true), backup_stop.
+        // Protocol order: server_info, backup_start(label,fast=true), then the
+        // WAL-geometry queries (timeline + wal_segment_size sourced from the live
+        // cluster), then backup_stop.
         let calls = control.calls.borrow().clone();
         assert_eq!(
             calls,
             vec![
                 "server_info".to_owned(),
                 format!("backup_start({LABEL},true)"),
+                "timeline".to_owned(),
+                "wal_segment_size".to_owned(),
                 "backup_stop".to_owned(),
             ],
             "protocol calls in order"
@@ -3985,10 +4178,239 @@ mod tests {
             label_file: String::new(),
             spcmap_file: String::new(),
         };
-        let bracket = build_bracket("0/16B3E40", &stop).expect("bracket");
+        let bracket = build_bracket("0/16B3E40", &stop, 1, WAL_SEGMENT_SIZE_DEFAULT).expect("bracket");
         assert_eq!(bracket.archive_start, "000000010000000000000001");
         // 0/2000000 = 0x02000000 / 16 MiB (0x01000000) = 2 -> ...00000002.
         assert_eq!(bracket.archive_stop, "000000010000000000000002");
+    }
+
+    #[test]
+    fn build_bracket_uses_supplied_timeline_and_segment_size() {
+        // A post-failover timeline (3) and 1 GiB segments must both flow into the
+        // recorded WAL segment names instead of the old hardcoded tl=1 / 16 MiB.
+        let stop = BackupStopResult {
+            lsn: "0/40000000".to_owned(),
+            label_file: String::new(),
+            spcmap_file: String::new(),
+        };
+        let bracket = build_bracket("0/0", &stop, 3, 0x4000_0000).expect("bracket");
+        assert_eq!(bracket.timeline, 3);
+        assert_eq!(bracket.wal_segment_size, 0x4000_0000);
+        // Timeline 3 in the leading 8 digits; 0/0 -> segment 0, 0/40000000 (1 GiB)
+        // -> segment 1 with 1 GiB segments.
+        assert_eq!(bracket.archive_start, "000000030000000000000000");
+        assert_eq!(bracket.archive_stop, "000000030000000000000001");
+    }
+
+    #[test]
+    fn control_driven_backup_records_live_timeline_and_segment_size() {
+        // The bracket (and backup.info) must carry the timeline / segment size the
+        // control reports, not the former hardcoded values.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        // A standby-promoted cluster on timeline 5 with 1 GiB segments.
+        let mut control = FakeBackupControl {
+            timeline: 5,
+            wal_segment_size: 0x4000_0000,
+            ..FakeBackupControl::primary(
+                140_010,
+                STANZA_SYSTEM_ID,
+                "0/0",
+                BackupStopResult {
+                    lsn: "0/30".to_owned(),
+                    label_file: "lbl\n".to_owned(),
+                    spcmap_file: String::new(),
+                },
+            )
+        };
+
+        let outcome = run_backup_with_fake(&repo_s, &pg_s, &mut control, false).expect("backup");
+        let bracket = outcome.bracket.expect("bracket");
+        assert_eq!(bracket.timeline, 5);
+        assert_eq!(bracket.wal_segment_size, 0x4000_0000);
+        // 0/0 and 0/30 both fall in segment 0 of timeline 5 with 1 GiB segments.
+        assert_eq!(bracket.archive_start, "000000050000000000000000");
+        assert_eq!(bracket.archive_stop, "000000050000000000000000");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let entry = info.current.get(LABEL).expect("entry");
+        assert_eq!(entry["backup-archive-start"], json!("000000050000000000000000"));
+        assert_eq!(entry["backup-archive-stop"], json!("000000050000000000000000"));
+    }
+
+    /// Seed a plaintext WAL segment into the repo archive for `stanza`.
+    fn seed_archive_segment(repo: &Posix, stanza: &str, segment: &str, body: &[u8]) {
+        let rel = format!("archive/{stanza}/{segment}");
+        let path = PathBuf::from(&rel);
+        if let Some(parent) = path.parent() {
+            repo.create_path(parent, true).expect("create archive dir");
+        }
+        let mut w = repo.open_write(&path).expect("open archive seg");
+        w.write(body).expect("write archive seg");
+        w.close().expect("close archive seg");
+    }
+
+    #[test]
+    fn archive_copy_populates_pg_wal_manifest_entries() {
+        // archive-copy=y must copy every segment in the start..stop range out of
+        // the archive into the backup pg_wal/ and record a ManifestFile each.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        // A backup spanning three segments: start 0/1000000 (segment 1) through
+        // stop 0/3000000 (segment 3). Seed all three in the archive.
+        let bodies = [
+            ("000000010000000000000001", b"wal-seg-001".as_slice()),
+            ("000000010000000000000002", b"wal-seg-002".as_slice()),
+            ("000000010000000000000003", b"wal-seg-003".as_slice()),
+        ];
+        for (seg, body) in bodies {
+            seed_archive_segment(&repo_s, "demo", seg, body);
+        }
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/3000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        let outcome =
+            run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &RepoTransform::identity(), true).expect("backup");
+        let bracket = outcome.bracket.expect("bracket");
+        assert_eq!(bracket.archive_start, "000000010000000000000001");
+        assert_eq!(bracket.archive_stop, "000000010000000000000003");
+
+        // The three WAL segments are physically in the backup pg_wal/ ...
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        for (seg, body) in bodies {
+            let path = backup_root.join(format!("pg_wal/{seg}"));
+            assert!(path.exists(), "archive-copy must write pg_wal/{seg}");
+            assert_eq!(std::fs::read(&path).unwrap(), body, "pg_wal/{seg} contents");
+        }
+
+        // ... and each is recorded as a ManifestFile with its plaintext checksum.
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("manifest");
+        for (seg, body) in bodies {
+            let mf = manifest
+                .file(&format!("pg_wal/{seg}"))
+                .unwrap_or_else(|| panic!("pg_wal/{seg} in manifest"));
+            assert_eq!(mf.size, body.len() as u64, "pg_wal/{seg} size");
+            assert_eq!(mf.checksum.as_deref(), Some(sha1_hex(body).as_str()), "pg_wal/{seg} checksum");
+            assert_eq!(mf.reference, None, "this backup physically holds the WAL");
+        }
+    }
+
+    #[test]
+    fn archive_copy_missing_segment_is_an_error() {
+        // A required segment absent from the archive fails the backup (it cannot
+        // be made consistent without it).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        // Range is segment 1..2 but only segment 1 is archived.
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000001", b"only-seg-1");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/2000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        let err = run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &RepoTransform::identity(), true)
+            .expect_err("missing required WAL must fail the backup");
+        assert!(err.to_string().contains("missing from the archive"), "got {err}");
+    }
+
+    #[test]
+    fn archive_copy_round_trips_through_restore() {
+        // End-to-end: a backup with archive-copy, restored into a fresh PG dir,
+        // must place the copied WAL under pg_wal/ with its original bytes.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents to back up");
+
+        let wal_a = b"recovery-wal-segment-A".as_slice();
+        let wal_b = b"recovery-wal-segment-B".as_slice();
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000001", wal_a);
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000002", wal_b);
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/2000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+        run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &RepoTransform::identity(), true).expect("backup");
+
+        // Restore into a fresh target and confirm the WAL came back byte-for-byte.
+        let target = tempfile::tempdir().expect("restore target");
+        let target_s = Posix::new(target.path());
+        let restore_cfg = typed_cfg("demo", "full");
+        crate::restore::restore(&restore_cfg, &repo_s, &target_s).expect("restore");
+
+        for (seg, body) in [("000000010000000000000001", wal_a), ("000000010000000000000002", wal_b)] {
+            let path = target.path().join(format!("pg_wal/{seg}"));
+            assert!(path.exists(), "restore must place pg_wal/{seg}");
+            assert_eq!(std::fs::read(&path).unwrap(), body, "restored pg_wal/{seg} contents");
+        }
+        // The ordinary data file restored too.
+        assert!(target.path().join("base/1/1259").exists(), "data file restored");
+    }
+
+    #[test]
+    fn archive_copy_round_trips_with_compression() {
+        // Same round-trip but through a gz transform: the WAL is stored compressed
+        // in the backup and restore reverses it to the original plaintext.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents to back up");
+
+        let wal = b"compressible compressible compressible WAL bytes".as_slice();
+        seed_archive_segment(&repo_s, "demo", "000000010000000000000001", wal);
+
+        let transform = RepoTransform::with_key(CompressType::Gz, 6, None);
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/1000000",
+            BackupStopResult {
+                lsn: "0/1000000".to_owned(),
+                label_file: "lbl\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+        run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &transform, true).expect("backup");
+
+        // The stored WAL carries the compression suffix and is NOT the plaintext.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        let stored = backup_root.join("pg_wal/000000010000000000000001.gz");
+        assert!(stored.exists(), "compressed WAL stored with .gz suffix");
+        assert_ne!(std::fs::read(&stored).unwrap(), wal, "stored bytes are compressed");
+
+        // Restore reverses the transform back to the plaintext WAL.
+        let target = tempfile::tempdir().expect("restore target");
+        let target_s = Posix::new(target.path());
+        crate::restore::restore(&typed_cfg("demo", "full"), &repo_s, &target_s).expect("restore");
+        let restored = target.path().join("pg_wal/000000010000000000000001");
+        assert_eq!(std::fs::read(&restored).unwrap(), wal, "restored WAL equals the original");
     }
 
     #[test]
@@ -4133,6 +4555,7 @@ mod tests {
             None,
             true,
             BackupFeatures::disabled(),
+            false,
         )
         .expect("live control-driven backup");
 

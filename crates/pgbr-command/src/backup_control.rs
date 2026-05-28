@@ -133,6 +133,30 @@ pub trait BackupControl {
     ///
     /// Surfaces query failures as [`CommandError::Other`].
     fn replay_lsn(&mut self) -> Result<Option<String>, CommandError>;
+
+    /// The cluster `wal_segment_size`, in bytes (e.g. `16777216` for the 16 MiB
+    /// default).
+    ///
+    /// Mirrors `SELECT setting::int8 * (...) FROM pg_settings WHERE name =
+    /// 'wal_segment_size'`. The size determines how an LSN maps to a WAL segment
+    /// name ([`pgbr_postgres::lsn::lsn_to_wal_segment`]), so a non-default-segment
+    /// cluster records the correct `backup-archive-start` / `backup-archive-stop`.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces query / parse failures as [`CommandError::Other`].
+    fn wal_segment_size(&mut self) -> Result<u64, CommandError>;
+
+    /// The current timeline id of the cluster.
+    ///
+    /// Mirrors `SELECT timeline_id FROM pg_control_checkpoint()`. After a
+    /// failover the timeline advances, so the WAL segment names a backup records
+    /// must carry the live timeline rather than a hardcoded `1`.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces query / parse failures as [`CommandError::Other`].
+    fn timeline(&mut self) -> Result<u32, CommandError>;
 }
 
 /// Build the `pg_backup_start` / `pg_start_backup` SQL for a given server
@@ -289,6 +313,37 @@ impl BackupControl for LibpqBackupControl {
             .map_err(|err| CommandError::Other(err.to_string()))?;
         // NULL (no WAL replayed yet) surfaces as `None` from `value`.
         Ok(result.value(0, 0))
+    }
+
+    fn wal_segment_size(&mut self) -> Result<u64, CommandError> {
+        // `current_setting('wal_segment_size')` returns a unit-suffixed string
+        // (e.g. "16MB"); read the raw byte count from pg_settings instead, where
+        // `setting * unit` is the size in the unit's base. pgBackRest derives the
+        // byte size the same way (setting times the documented byte multiplier).
+        let result = self
+            .conn
+            .query(
+                "select (setting::int8 * \
+                 case unit when '8kB' then 8192 when 'kB' then 1024 when 'MB' then 1048576 \
+                 when 'GB' then 1073741824 else 1 end)::text \
+                 from pg_catalog.pg_settings where name = 'wal_segment_size'",
+            )
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+        result
+            .value(0, 0)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .ok_or_else(|| CommandError::Other("could not read wal_segment_size from pg_settings".to_owned()))
+    }
+
+    fn timeline(&mut self) -> Result<u32, CommandError> {
+        let result = self
+            .conn
+            .query("select timeline_id::text from pg_catalog.pg_control_checkpoint()")
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+        result
+            .value(0, 0)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .ok_or_else(|| CommandError::Other("could not read timeline_id from pg_control_checkpoint()".to_owned()))
     }
 }
 
