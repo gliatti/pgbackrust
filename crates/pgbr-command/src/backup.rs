@@ -128,13 +128,12 @@ impl BackupType {
 /// Path prefixes (PG-data-relative, `/`-separated) excluded from a backup.
 ///
 /// `pg_wal` is archived separately; the remaining directories hold transient
-/// runtime state that must not be captured. `postmaster.pid` / `postmaster.opts`
-/// are matched as exact paths but live in the same list for simplicity — a
-/// trailing-`/`-free entry matches either the file itself or a directory
-/// prefix. Mirrors the standard pgBackRest exclusion set (minimal subset).
+/// runtime state that cannot be reused after recovery and so must not be
+/// captured. A trailing-`/`-free entry matches either the directory itself or
+/// any path beneath it. Mirrors pgBackRest's `manifestBuildInfo` directory
+/// exclusions (C ref: `src/info/manifest/manifest.c`, the
+/// `MANIFEST_TARGET_PGDATA` path skips).
 const EXCLUDE_PREFIXES: &[&str] = &[
-    "postmaster.pid",
-    "postmaster.opts",
     "pg_wal",
     "pg_replslot",
     "pg_dynshmem",
@@ -144,6 +143,46 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "pg_stat_tmp",
     "pg_subtrans",
 ];
+
+/// Exact PG-data **root-level** file names pgBackRest always excludes.
+///
+/// These are skipped only when the file sits directly in the data root (the
+/// path has no `/` separator), exactly as pgBackRest's `manifestBuildInfo`
+/// gates them on `manifestParentName == MANIFEST_TARGET_PGDATA`:
+///
+/// - `postmaster.pid` / `postmaster.opts` — running-process state that would
+///   confuse a restored cluster.
+/// - `recovery.signal` / `standby.signal` (PG >= 12) and `recovery.conf` /
+///   `recovery.done` (PG < 12) — recovery control files recreated by restore.
+/// - `postgresql.auto.conf.tmp` — temp file for the atomic auto.conf rewrite.
+/// - `backup_label` / `backup_label.old` — obsolete in-progress backup markers.
+/// - `backup_manifest` / `backup_manifest.tmp` (PG >= 13) — server-side backup
+///   manifests, unrelated to pgBackRest's own manifest.
+///
+/// The per-version gating in pgBackRest is intentionally not reproduced here:
+/// each name is excluded unconditionally, which is safe because none of these
+/// is a real file pgBackRest would ever want to capture on any version.
+const EXCLUDE_ROOT_FILES: &[&str] = &[
+    "postmaster.pid",
+    "postmaster.opts",
+    "recovery.signal",
+    "standby.signal",
+    "recovery.conf",
+    "recovery.done",
+    "postgresql.auto.conf.tmp",
+    "backup_label",
+    "backup_label.old",
+    "backup_manifest",
+    "backup_manifest.tmp",
+];
+
+/// Basename pgBackRest excludes wherever it appears in a db path.
+///
+/// `pg_internal.init` is recreated on startup, so it is skipped regardless of
+/// which directory holds it (e.g. `base/<db>/pg_internal.init`,
+/// `global/pg_internal.init`). pgBackRest also tolerates a stray temp variant
+/// `pg_internal.init.<pid>`; both forms are matched by [`is_pg_internal_init`].
+const PG_INTERNAL_INIT: &str = "pg_internal.init";
 
 /// Result of a successful [`backup_inner`], surfaced for tests / callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,15 +205,72 @@ fn backup_info_path(stanza: &str) -> PathBuf {
     PathBuf::from(format!("backup/{stanza}/backup.info"))
 }
 
-/// Whether a PG-data-relative path is excluded from the backup.
+/// Whether a PG-data-relative path is excluded from the backup by the
+/// **built-in** pgBackRest exclusion set (independent of any `--exclude`).
 ///
-/// A path is excluded when it equals an entry in [`EXCLUDE_PREFIXES`] or sits
-/// underneath one (i.e. the entry is a path component prefix). Comparison is on
-/// `/`-separated components so `pg_walk` is *not* excluded by `pg_wal`.
+/// A path is excluded when any of the following holds:
+///
+/// - it equals an entry in [`EXCLUDE_PREFIXES`] or sits underneath one (the
+///   entry is a `/`-separated path-component prefix), so `pg_walk` is *not*
+///   excluded by `pg_wal`;
+/// - it is a root-level file (no `/` in the path) whose name is in
+///   [`EXCLUDE_ROOT_FILES`]; or
+/// - its basename is `pg_internal.init` (or a `pg_internal.init.<digits>` temp
+///   variant) anywhere in the tree — see [`is_pg_internal_init`].
 fn is_excluded(rel: &str) -> bool {
-    EXCLUDE_PREFIXES
+    if EXCLUDE_PREFIXES
         .iter()
         .any(|prefix| rel == *prefix || rel.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/')))
+    {
+        return true;
+    }
+
+    // Root-level exact-name files: only excluded when directly in the data root
+    // (mirrors pgBackRest gating these on `manifestParentName == PGDATA`).
+    if !rel.contains('/') && EXCLUDE_ROOT_FILES.contains(&rel) {
+        return true;
+    }
+
+    // pg_internal.init (and its temp variants) anywhere in the tree.
+    let basename = rel.rsplit('/').next().unwrap_or(rel);
+    is_pg_internal_init(basename)
+}
+
+/// Whether a basename is `pg_internal.init` or a `pg_internal.init.<digits>`
+/// temp variant.
+///
+/// pgBackRest skips `pg_internal.init` (recreated on startup) and tolerates a
+/// stray temp file `pg_internal.init.<pid>`. C ref: the `PG_FILE_PGINTERNALINIT`
+/// check in `manifestBuildInfo`, which matches the bare name or the name
+/// followed by `\.[0-9]+`.
+fn is_pg_internal_init(basename: &str) -> bool {
+    match basename.strip_prefix(PG_INTERNAL_INIT) {
+        Some("") => true,
+        Some(rest) => {
+            // A `.<digits>` temp suffix: a leading dot then one-or-more digits.
+            rest.strip_prefix('.')
+                .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
+
+/// Whether a PG-data-relative path is excluded by a user-supplied `--exclude`
+/// entry.
+///
+/// pgBackRest's `--exclude` accepts paths relative to the PG data root. For this
+/// slice each entry is treated as such a relative path: `rel_path` is excluded
+/// when it equals an entry exactly, or sits underneath one (the entry names a
+/// directory whose entire subtree is excluded — i.e. `rel_path` starts with
+/// `<entry>/`). Matching is on whole `/`-separated path components, so an entry
+/// `mydir` excludes `mydir` and `mydir/file` but never `mydirx`. A trailing `/`
+/// on an entry is tolerated (normalised away) so `pg_log/` and `pg_log` behave
+/// identically. Empty entries never match.
+fn is_user_excluded(rel_path: &str, excludes: &[String]) -> bool {
+    excludes.iter().any(|raw| {
+        let entry = raw.strip_suffix('/').unwrap_or(raw);
+        !entry.is_empty() && (rel_path == entry || rel_path.strip_prefix(entry).is_some_and(|rest| rest.starts_with('/')))
+    })
 }
 
 /// `PostgreSQL` data-page size — the unit page-checksum validation operates on.
@@ -378,6 +474,15 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let transform = RepoTransform::from_options(config);
     let process_max = process_max(config);
     let checksum_page = checksum_page_enabled(config);
+    let excludes = excludes_from_config(config);
+
+    // Surface the applied user exclusions: pgBackRest records these in the
+    // manifest's `[backup:option]` metadata, but the `Manifest` struct here owns
+    // no exclude field (another concern), so for this slice the applied entries
+    // are logged and used only to filter the walk.
+    if !excludes.is_empty() {
+        println!("backup will exclude user path(s): {}", excludes.join(", "));
+    }
 
     // The diff label depends on the full it references, so it is computed inside
     // `backup_inner_with_workers` (which knows the full label); full labels are
@@ -392,12 +497,27 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         &transform,
         process_max,
         checksum_page,
+        &excludes,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
     );
     Ok(())
+}
+
+/// The user-supplied `--exclude` entries from the resolved config.
+///
+/// `exclude` is a `List` option (`("exclude", None)` → [`OptionValue::List`]).
+/// Blank entries are dropped here so an empty or whitespace-only `--exclude`
+/// never silently swallows the whole data directory; the remaining entries are
+/// matched by [`is_user_excluded`]. Returns an empty `Vec` when the option is
+/// absent or not a list.
+fn excludes_from_config(config: &LoadedConfig) -> Vec<String> {
+    match config.options.get(&("exclude".to_owned(), None)) {
+        Some(OptionValue::List(entries)) => entries.iter().filter(|e| !e.trim().is_empty()).cloned().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Number of parallel file-copy workers, from the resolved `process-max` option.
@@ -912,6 +1032,11 @@ struct BackupPlan {
 /// [`BackupPlan`], deciding diff/incr references on the main thread but deferring
 /// the actual file copies to [`run_copy_jobs`].
 ///
+/// Each entry is dropped when the built-in [`is_excluded`] set matches **or**
+/// when a user-supplied `--exclude` entry matches via [`is_user_excluded`]; the
+/// two are applied together, so `--exclude` extends (never replaces) the
+/// built-in set.
+///
 /// # Errors
 ///
 /// Propagates walk / read failures and any error from [`plan_file`].
@@ -922,6 +1047,7 @@ fn plan_backup(
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
     checksum_page: bool,
+    excludes: &[String],
 ) -> Result<BackupPlan, CommandError> {
     let mut plan = BackupPlan {
         referenced: Vec::new(),
@@ -932,7 +1058,7 @@ fn plan_backup(
     };
 
     for entry in walk(pg_storage, Path::new("."))? {
-        if is_excluded(&entry.rel) {
+        if is_excluded(&entry.rel) || is_user_excluded(&entry.rel, excludes) {
             continue;
         }
 
@@ -1060,6 +1186,7 @@ pub fn backup_inner_typed(
         transform,
         DEFAULT_PROCESS_MAX,
         false,
+        &[],
     )
 }
 
@@ -1080,6 +1207,10 @@ pub fn backup_inner_typed(
 /// checksum — is identical regardless of the order in which workers finish.
 /// `process_max == 1` reproduces the prior serial behaviour byte-for-byte.
 ///
+/// `excludes` are user-supplied `--exclude` entries (PG-data-relative paths)
+/// applied **in addition** to the built-in [`is_excluded`] set; pass `&[]` for
+/// no extra exclusions.
+///
 /// # Errors
 ///
 /// Same as [`backup_inner_typed`], plus a [`CommandError::Other`] if a copy
@@ -1095,6 +1226,7 @@ pub fn backup_inner_with_workers(
     transform: &RepoTransform,
     process_max: usize,
     checksum_page: bool,
+    excludes: &[String],
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -1124,6 +1256,7 @@ pub fn backup_inner_with_workers(
 
     // Walk the PG dir and classify every entry: referenced files (decided here,
     // not copied), copy jobs (dispatched to workers), directories, and links.
+    // User `--exclude` entries are applied alongside the built-in exclusions.
     let plan = plan_backup(
         pg_storage,
         &abs_repo_backup_root,
@@ -1131,6 +1264,7 @@ pub fn backup_inner_with_workers(
         prior_manifest.as_ref(),
         prior_label.as_deref(),
         checksum_page,
+        excludes,
     )?;
 
     // Fan the copy jobs out across the worker pool, then stitch each worker's
@@ -1471,6 +1605,195 @@ mod tests {
         assert!(!is_excluded("pg_walk"));
         assert!(!is_excluded("base/1/1259"));
         assert!(!is_excluded("postmaster.pidx"));
+    }
+
+    #[test]
+    fn is_excluded_covers_root_files_and_pg_internal_init() {
+        // Root-level recovery / backup-label / postmaster files are excluded only
+        // when they sit directly in the data root.
+        assert!(is_excluded("recovery.signal"));
+        assert!(is_excluded("standby.signal"));
+        assert!(is_excluded("recovery.conf"));
+        assert!(is_excluded("recovery.done"));
+        assert!(is_excluded("backup_label.old"));
+        assert!(is_excluded("backup_label"));
+        assert!(is_excluded("backup_manifest"));
+        assert!(is_excluded("backup_manifest.tmp"));
+        assert!(is_excluded("postgresql.auto.conf.tmp"));
+        assert!(is_excluded("postmaster.opts"));
+        assert!(is_excluded("postmaster.pid"));
+
+        // The same names *nested* under a subdir are NOT root files, so they are
+        // not excluded by the root-file rule (a relation named recovery.signal is
+        // implausible, but the gating must match pgBackRest's PGDATA-root check).
+        assert!(!is_excluded("base/1/recovery.signal"));
+        assert!(!is_excluded("subdir/backup_label"));
+
+        // tablespace_map is a REAL file pgBackRest backs up — never excluded.
+        assert!(!is_excluded("tablespace_map"));
+
+        // pg_internal.init is excluded wherever it appears (db paths), incl. the
+        // `.<pid>` temp variant; a non-numeric suffix is NOT the temp form.
+        assert!(is_excluded("pg_internal.init"));
+        assert!(is_excluded("base/1/pg_internal.init"));
+        assert!(is_excluded("global/pg_internal.init"));
+        assert!(is_excluded("base/16384/pg_internal.init.4242"));
+        assert!(!is_excluded("base/1/pg_internal.init.bak"));
+        assert!(!is_excluded("base/1/pg_internal.initial"));
+    }
+
+    #[test]
+    fn is_pg_internal_init_matches_bare_and_temp_variants() {
+        assert!(is_pg_internal_init("pg_internal.init"));
+        assert!(is_pg_internal_init("pg_internal.init.0"));
+        assert!(is_pg_internal_init("pg_internal.init.12345"));
+        // Not matches: a trailing dot with no digits, non-numeric suffix, or a
+        // longer name that merely begins with the literal.
+        assert!(!is_pg_internal_init("pg_internal.init."));
+        assert!(!is_pg_internal_init("pg_internal.init.x"));
+        assert!(!is_pg_internal_init("pg_internal.initial"));
+        assert!(!is_pg_internal_init("PG_VERSION"));
+    }
+
+    #[test]
+    fn is_user_excluded_exact_subtree_and_non_match() {
+        let excludes = vec!["mydir".to_owned(), "afile".to_owned()];
+        // Exact match.
+        assert!(is_user_excluded("mydir", &excludes));
+        assert!(is_user_excluded("afile", &excludes));
+        // Subtree match: anything under an excluded directory.
+        assert!(is_user_excluded("mydir/sub/leaf", &excludes));
+        assert!(is_user_excluded("mydir/file", &excludes));
+        // Non-match: a sibling sharing a prefix, or an unrelated path.
+        assert!(!is_user_excluded("mydirx", &excludes));
+        assert!(!is_user_excluded("afilex", &excludes));
+        assert!(!is_user_excluded("base/1/1259", &excludes));
+        // No excludes → nothing matches.
+        assert!(!is_user_excluded("mydir", &[]));
+    }
+
+    #[test]
+    fn is_user_excluded_tolerates_trailing_slash_and_empties() {
+        let excludes = vec!["pg_log/".to_owned(), String::new()];
+        // A trailing slash on the entry is normalised away.
+        assert!(is_user_excluded("pg_log", &excludes));
+        assert!(is_user_excluded("pg_log/server.log", &excludes));
+        // An empty entry never matches (would otherwise swallow everything).
+        assert!(!is_user_excluded("", &excludes));
+        assert!(!is_user_excluded("anything", &[String::new()]));
+    }
+
+    #[test]
+    fn excludes_from_config_reads_list_and_drops_blanks() {
+        let cfg = |opts: BTreeMap<(String, Option<u32>), OptionValue>| LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: opts,
+            params: Vec::new(),
+        };
+        // Absent → empty.
+        assert!(excludes_from_config(&cfg(BTreeMap::new())).is_empty());
+        // A List with a blank entry drops the blank, keeps the rest.
+        let mut opts = BTreeMap::new();
+        opts.insert(
+            ("exclude".to_owned(), None),
+            OptionValue::List(vec!["mydir".to_owned(), "  ".to_owned(), "afile".to_owned()]),
+        );
+        assert_eq!(excludes_from_config(&cfg(opts)), vec!["mydir".to_owned(), "afile".to_owned()]);
+    }
+
+    #[test]
+    fn backup_excludes_user_paths() {
+        // A backup with --exclude=["mydir","afile"] must omit those paths (and a
+        // subtree under mydir) from the manifest while siblings remain.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"keep this relation");
+        seed_file(&pg_s, "afile", b"user-excluded top-level file");
+        seed_file(&pg_s, "mydir/data", b"user-excluded dir content");
+        seed_file(&pg_s, "mydir/nested/deep", b"deep user-excluded content");
+        // A sibling that merely shares a prefix must NOT be excluded.
+        seed_file(&pg_s, "afilexyz", b"sibling kept");
+        seed_file(&pg_s, "mydirx/data", b"sibling dir kept");
+
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(
+            ("exclude".to_owned(), None),
+            OptionValue::List(vec!["mydir".to_owned(), "afile".to_owned()]),
+        );
+        let cfg = LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options,
+            params: Vec::new(),
+        };
+
+        backup(&cfg, &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let listed: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+
+        // User-excluded entries (and the mydir subtree) are absent.
+        assert!(!listed.contains(&"afile"), "afile must be excluded: {listed:?}");
+        assert!(
+            !listed.iter().any(|p| *p == "mydir" || p.starts_with("mydir/")),
+            "mydir subtree must be excluded: {listed:?}"
+        );
+        // Siblings sharing a prefix remain, as does the unrelated relation.
+        assert!(listed.contains(&"afilexyz"), "prefix-sibling file must remain: {listed:?}");
+        assert!(listed.contains(&"mydirx/data"), "prefix-sibling dir must remain: {listed:?}");
+        assert!(listed.contains(&"base/1/1259"), "unrelated relation must remain: {listed:?}");
+
+        // The excluded files were not physically copied either.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+        assert!(!backup_root.join("afile").exists(), "afile must not be copied");
+        assert!(!backup_root.join("mydir").exists(), "mydir must not be copied");
+    }
+
+    #[test]
+    fn backup_excludes_new_builtin_files() {
+        // The extended built-in exclusion set must skip pg_internal.init,
+        // recovery/standby signal files, backup_label.old and postmaster.opts
+        // even though they were seeded into the cluster.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"keep this relation");
+        seed_file(&pg_s, "global/pg_internal.init", b"shared internal init");
+        seed_file(&pg_s, "base/1/pg_internal.init", b"per-db internal init");
+        seed_file(&pg_s, "recovery.signal", b"");
+        seed_file(&pg_s, "standby.signal", b"");
+        seed_file(&pg_s, "recovery.conf", b"restore_command = ...");
+        seed_file(&pg_s, "backup_label.old", b"obsolete label");
+        seed_file(&pg_s, "postmaster.opts", b"opts");
+
+        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        for excluded in [
+            "global/pg_internal.init",
+            "base/1/pg_internal.init",
+            "recovery.signal",
+            "standby.signal",
+            "recovery.conf",
+            "backup_label.old",
+            "postmaster.opts",
+        ] {
+            assert!(
+                manifest.file(excluded).is_none(),
+                "{excluded} must be excluded from the manifest"
+            );
+            let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+            assert!(!backup_root.join(excluded).exists(), "{excluded} must not be copied");
+        }
+        // The real relation survives.
+        assert!(manifest.file("base/1/1259").is_some(), "real relation must be backed up");
     }
 
     #[test]
@@ -1933,6 +2256,7 @@ mod tests {
             &RepoTransform::identity(),
             1,
             false,
+            &[],
         )
         .expect("serial backup");
         backup_inner_with_workers(
@@ -1945,6 +2269,7 @@ mod tests {
             &RepoTransform::identity(),
             4,
             false,
+            &[],
         )
         .expect("parallel backup");
 
@@ -2005,6 +2330,7 @@ mod tests {
             &RepoTransform::identity(),
             4,
             false,
+            &[],
         )
         .expect("parallel backup");
 
@@ -2075,6 +2401,7 @@ mod tests {
                 &RepoTransform::identity(),
                 workers,
                 false,
+                &[],
             )
             .expect("full backup");
         };
@@ -2100,6 +2427,7 @@ mod tests {
             &RepoTransform::identity(),
             1,
             false,
+            &[],
         )
         .expect("serial diff");
         let diff4 = backup_inner_with_workers(
@@ -2112,6 +2440,7 @@ mod tests {
             &RepoTransform::identity(),
             4,
             false,
+            &[],
         )
         .expect("parallel diff");
         assert_eq!(diff1.label, diff4.label);
