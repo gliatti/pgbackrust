@@ -64,12 +64,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
+use pgbr_postgres::lsn::{WAL_SEGMENT_SIZE_DEFAULT, lsn_text_to_wal_segment, parse_lsn};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
+use crate::backup_control::{BackupControl, BackupServerInfo, BackupStopResult, LibpqBackupControl};
 use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encrypted_key};
 
 /// Default number of file-copy workers when no `process-max` is configured.
@@ -193,6 +195,29 @@ pub struct BackupOutcome {
     pub file_count: usize,
     /// Total size, in bytes, of the copied files.
     pub total_size: u64,
+    /// The backup-control bracket (start/stop LSN + WAL segments) when the
+    /// backup was driven through `pg_backup_start` / `pg_backup_stop`; `None`
+    /// for the DB-free file-copy-only path used by the unit tests.
+    pub bracket: Option<BackupBracket>,
+}
+
+/// The `PostgreSQL` backup-control bracket captured around the file copy: the
+/// start / stop LSNs and the WAL segment names they fall in.
+///
+/// pgBackRest records all four in the manifest and the `backup.info`
+/// `[backup:current]` entry (`backup-lsn-start` / `backup-lsn-stop` /
+/// `backup-archive-start` / `backup-archive-stop`) so expire / restore can
+/// reason about WAL retention and recovery start points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupBracket {
+    /// Textual start LSN returned by `pg_backup_start` (`"XXXXXXXX/YYYYYYYY"`).
+    pub lsn_start: String,
+    /// Textual stop LSN returned by `pg_backup_stop`.
+    pub lsn_stop: String,
+    /// WAL segment name containing the start LSN (`backup-archive-start`).
+    pub archive_start: String,
+    /// WAL segment name containing the stop LSN (`backup-archive-stop`).
+    pub archive_stop: String,
 }
 
 fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
@@ -506,14 +531,21 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
     Ok(())
 }
 
-/// `backup` — take a full backup of the active stanza (raw copy).
+/// `backup` — take a backup of the active stanza, driven through the
+/// `PostgreSQL` backup-control protocol when a DB connection is configured.
 ///
-/// Computes the backup label (`YYYYMMDD-HHMMSSF`) and start timestamp from
-/// [`SystemTime::now`], then delegates to [`backup_inner`].
+/// Computes the backup type / label / start timestamp and the resolved
+/// transform / worker count / exclusions, resolves the backup-control
+/// connection(s) per the `backup-standby` policy, then delegates to
+/// [`run_backup`], which brackets the file copy with
+/// `pg_backup_start` / `pg_backup_stop` (PG >= 15) or
+/// `pg_start_backup` / `pg_stop_backup` (PG < 15). When no DB source is
+/// configured the copy runs DB-free, exactly as before.
 ///
 /// # Errors
 ///
-/// See [`backup_inner`].
+/// See [`run_backup`]; plus connection failures and `backup-standby=y` with no
+/// reachable standby.
 #[allow(clippy::print_stdout)]
 pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
@@ -526,6 +558,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let process_max = process_max(config);
     let checksum_page = checksum_page_enabled(config);
     let excludes = excludes_from_config(config);
+    let start_fast = start_fast_enabled(config);
 
     // Surface the applied user exclusions: pgBackRest records these in the
     // manifest's `[backup:option]` metadata, but the `Manifest` struct here owns
@@ -535,10 +568,20 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         println!("backup will exclude user path(s): {}", excludes.join(", "));
     }
 
+    // Resolve the backup-control connections per the `backup-standby` policy:
+    // the *primary* connection drives pg_backup_start/stop, an optional *standby*
+    // connection is polled for replay before the file copy. When no DB source is
+    // configured the backup falls back to the DB-free file-copy path so a purely
+    // local repo-only invocation still works. C ref: backup.c's dbGet().
+    let ControlConnections {
+        mut primary,
+        mut standby,
+    } = resolve_control_connections(config, standby_mode(config))?;
+
     // The diff label depends on the full it references, so it is computed inside
-    // `backup_inner_with_workers` (which knows the full label); full labels are
-    // timestamp-derived up front. Pass `None` to let the inner function pick.
-    let outcome = backup_inner_with_workers(
+    // `run_backup` (which knows the full label); full labels are timestamp-derived
+    // up front. Pass `None` to let the inner function pick.
+    let outcome = run_backup(
         stanza,
         repo_storage,
         pg_storage,
@@ -549,12 +592,189 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         process_max,
         checksum_page,
         &excludes,
+        primary.as_mut().map(|c| c as &mut dyn BackupControl),
+        standby.as_mut().map(|c| c as &mut dyn BackupControl),
+        start_fast,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
     );
     Ok(())
+}
+
+/// The backup-control connections resolved per the `backup-standby` policy.
+struct ControlConnections {
+    /// Connection that drives `pg_backup_start` / `pg_backup_stop` — the primary
+    /// (not in recovery). `None` when no DB source is configured (DB-free path).
+    primary: Option<LibpqBackupControl>,
+    /// Optional in-recovery standby whose replay is polled before the file copy.
+    standby: Option<LibpqBackupControl>,
+}
+
+/// Open the backup-control connection(s) the `backup-standby` policy calls for.
+///
+/// The candidate clusters are `DATABASE_URL` (treated as `pg1`) plus every
+/// configured `pgN-host` / `pgN-socket-path` (`N` = 1..=8, pgBackRest's maximum).
+/// Each reachable candidate is probed with `pg_is_in_recovery()`:
+///
+/// - the first non-recovery cluster becomes the `primary` (runs start/stop);
+/// - the first in-recovery cluster becomes the `standby` (polled for replay).
+///
+/// Policy:
+///
+/// - [`StandbyMode::No`] — only the primary is used; no standby is opened.
+/// - [`StandbyMode::Prefer`] — a standby is used when one is reachable + in
+///   recovery, else the backup proceeds against the primary alone.
+/// - [`StandbyMode::Yes`] — a reachable in-recovery standby is **required**; its
+///   absence is a hard error.
+///
+/// When no DB source is configured at all, returns `{ primary: None, standby:
+/// None }` (the DB-free file-copy path); `backup-standby=y` with no DB source is
+/// an error, mirroring pgBackRest refusing a standby backup it cannot reach.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when a connection fails, when `backup-standby=y` but
+/// no standby is reachable, or when no primary is reachable for a DB-driven run.
+fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Result<ControlConnections, CommandError> {
+    /// Highest `pgN` index pgBackRest supports.
+    const MAX_PG_INDEX: u32 = 8;
+
+    // Gather candidate conninfos, deduplicated, primary (pg1 / DATABASE_URL)
+    // first so it is preferred as the primary when reachable + not in recovery.
+    let mut conninfos: Vec<String> = Vec::new();
+    if let Some(pg1) = derive_conninfo_with_url(config, std::env::var("DATABASE_URL").ok().as_deref()) {
+        conninfos.push(pg1);
+    }
+    for index in 2..=MAX_PG_INDEX {
+        if let Some(conninfo) = derive_conninfo_for_index(config, index)
+            && !conninfos.contains(&conninfo)
+        {
+            conninfos.push(conninfo);
+        }
+    }
+
+    // No DB configured at all: the DB-free path, unless a standby was demanded.
+    if conninfos.is_empty() {
+        if mode == StandbyMode::Yes {
+            return Err(CommandError::Other(
+                "backup-standby=y requires a reachable standby, but no PostgreSQL connection is configured".to_owned(),
+            ));
+        }
+        return Ok(ControlConnections {
+            primary: None,
+            standby: None,
+        });
+    }
+
+    let mut primary: Option<LibpqBackupControl> = None;
+    let mut standby: Option<LibpqBackupControl> = None;
+    for conninfo in &conninfos {
+        let mut control = LibpqBackupControl::open(conninfo)?;
+        let in_recovery = control.is_in_recovery()?;
+        if in_recovery {
+            if standby.is_none() && mode != StandbyMode::No {
+                standby = Some(control);
+            }
+        } else if primary.is_none() {
+            primary = Some(control);
+        }
+    }
+
+    if mode == StandbyMode::Yes && standby.is_none() {
+        return Err(CommandError::Other(
+            "backup-standby=y requires a reachable in-recovery standby, but none was found".to_owned(),
+        ));
+    }
+    if primary.is_none() {
+        return Err(CommandError::Other(
+            "no primary (non-recovery) PostgreSQL connection is reachable for backup".to_owned(),
+        ));
+    }
+
+    Ok(ControlConnections { primary, standby })
+}
+
+/// Whether the resolved `start-fast` option is set (forces an immediate
+/// checkpoint at `pg_backup_start`). `start-fast` is a `Boolean` defaulting to
+/// false; absent or non-boolean values resolve to false.
+fn start_fast_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("start-fast".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Resolve the `backup-standby` option to a [`StandbyMode`].
+///
+/// `backup-standby` is a `bool-like` string-id with allow-list `n` / `prefer` /
+/// `y` (default `n`). Absent / unrecognised values resolve to [`StandbyMode::No`].
+fn standby_mode(config: &LoadedConfig) -> StandbyMode {
+    match config.options.get(&("backup-standby".to_owned(), None)) {
+        Some(OptionValue::StringId(value)) if value == "y" => StandbyMode::Yes,
+        Some(OptionValue::StringId(value)) if value == "prefer" => StandbyMode::Prefer,
+        Some(OptionValue::Boolean(true)) => StandbyMode::Yes,
+        _ => StandbyMode::No,
+    }
+}
+
+/// The resolved `backup-standby` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandbyMode {
+    /// `n` — never read files from a standby; always back up the primary.
+    No,
+    /// `prefer` — use a reachable in-recovery standby if one exists, else the
+    /// primary.
+    Prefer,
+    /// `y` — require a standby; error if none is reachable / in recovery.
+    Yes,
+}
+
+/// Build a libpq conninfo string for the cluster indexed by `pg_index` (1-based,
+/// e.g. `2` → `pg2-*`), or `None` when no host / socket is configured for it.
+///
+/// Mirrors [`derive_conninfo_with_url`] but for an arbitrary `pgN` index, so the
+/// `backup-standby` path can connect to a second cluster. A cluster is treated
+/// as connectable only when a `pgN-host` or `pgN-socket-path` is configured (a
+/// bare local `pgN-path` is not enough to imply a live server).
+fn derive_conninfo_for_index(config: &LoadedConfig, pg_index: u32) -> Option<String> {
+    let opt = |name: &str| -> Option<String> {
+        match config.options.get(&(name.to_owned(), None)) {
+            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
+            Some(OptionValue::Integer(i)) => Some(i.to_string()),
+            _ => None,
+        }
+    };
+    let host = opt(&format!("pg{pg_index}-host")).or_else(|| opt(&format!("pg{pg_index}-socket-path")))?;
+    let mut parts: Vec<String> = vec![format!("host={host}")];
+    if let Some(p) = opt(&format!("pg{pg_index}-port")) {
+        parts.push(format!("port={p}"));
+    }
+    if let Some(db) = opt(&format!("pg{pg_index}-database")) {
+        parts.push(format!("dbname={db}"));
+    }
+    if let Some(user) = opt(&format!("pg{pg_index}-user")) {
+        parts.push(format!("user={user}"));
+    }
+    Some(parts.join(" "))
+}
+
+/// Build a libpq conninfo string for the primary cluster from the resolved
+/// configuration, or `None` when no DB source is configured.
+///
+/// `database_url` is the already-resolved `DATABASE_URL` (the env read stays in
+/// [`resolve_control_connections`] so this stays a pure, unit-testable helper).
+/// It wins when set; otherwise the connection is derived from the `pg1-*`
+/// options via [`derive_conninfo_for_index`]. Mirrors stanza.rs's
+/// `derive_conninfo`, kept here so backup is self-contained.
+fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -> Option<String> {
+    if let Some(url) = database_url
+        && !url.is_empty()
+    {
+        return Some(url.to_owned());
+    }
+    derive_conninfo_for_index(config, 1)
 }
 
 /// The user-supplied `--exclude` entries from the resolved config.
@@ -1279,6 +1499,70 @@ pub fn backup_inner_with_workers(
     checksum_page: bool,
     excludes: &[String],
 ) -> Result<BackupOutcome, CommandError> {
+    // No backup-control handle: the DB-free file-copy path the unit tests rely
+    // on. `start-fast` is irrelevant without a server, so it defaults to false.
+    run_backup(
+        stanza,
+        repo_storage,
+        pg_storage,
+        backup_type,
+        label,
+        timestamp_start,
+        transform,
+        process_max,
+        checksum_page,
+        excludes,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Core backup engine, optionally bracketed by the `PostgreSQL` backup-control
+/// protocol.
+///
+/// When `control` is `Some`, the copy is wrapped in a non-exclusive online
+/// backup on a single session: the server version + system identifier are
+/// validated against the stanza's `backup.info`, `pg_backup_start` (PG >= 15) /
+/// `pg_start_backup` (PG < 15) is called to get the start LSN, the data files
+/// are copied, then `pg_backup_stop` / `pg_stop_backup` is called to get the
+/// stop LSN and the `backup_label` / `tablespace_map` file contents (which are
+/// written into the backup root). The start / stop LSNs and their WAL segment
+/// names are recorded in the manifest's `[backup:current]` entry.
+///
+/// When `control` is `None` (the DB-free path) the copy runs exactly as before,
+/// no server interaction happens, and no LSN / archive fields are recorded.
+///
+/// `start_fast` is the resolved `start-fast` option, passed to `backup_start`.
+///
+/// `standby` is an optional second control on a *standby* (in-recovery) cluster.
+/// When present (a `backup-standby=y|prefer` run with a reachable standby), the
+/// data files are read from the standby's data directory (already wired into
+/// `pg_storage` by the caller) and, after `backup_start` runs on the primary
+/// `control`, the standby is polled until it has replayed past the start LSN —
+/// so the copied files include every change up to the start point.
+///
+/// # Errors
+///
+/// Same as [`backup_inner_with_workers`], plus [`CommandError::Other`] when the
+/// server's version / system id does not match the stanza, or when any
+/// backup-control query fails.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_backup(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+    backup_type: BackupType,
+    label: Option<&str>,
+    timestamp_start: i64,
+    transform: &RepoTransform,
+    process_max: usize,
+    checksum_page: bool,
+    excludes: &[String],
+    mut control: Option<&mut dyn BackupControl>,
+    mut standby: Option<&mut dyn BackupControl>,
+    start_fast: bool,
+) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
         return Err(CommandError::Other(
@@ -1287,6 +1571,14 @@ pub fn backup_inner_with_workers(
     }
 
     let mut info = InfoBackup::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+
+    // Validate the live cluster against the stanza before touching any files:
+    // a system-id / version mismatch means the configured PG is not the cluster
+    // this stanza was created for. C ref: backup.c's dbGet() / dbPgCheck().
+    let server_info = match control.as_mut() {
+        Some(control) => Some(validate_server_against_stanza(&mut **control, &info)?),
+        None => None,
+    };
 
     // For a diff/incr, resolve the prior backup and load its manifest so
     // unchanged files can be detected by (size, checksum).
@@ -1304,6 +1596,20 @@ pub fn backup_inner_with_workers(
     // later has a home, even for an improbably empty cluster).
     repo_storage.create_path(Path::new(&backup_root), true)?;
     let abs_repo_backup_root = absolute_path(repo_storage, Path::new(&backup_root))?;
+
+    // Begin the online backup (if a control connection is present). The start
+    // LSN is captured now; the copy then runs while the backup is open.
+    let start_lsn = match (control.as_mut(), server_info.as_ref()) {
+        (Some(control), Some(_)) => Some(control.backup_start(&label, start_fast)?),
+        _ => None,
+    };
+
+    // When backing up from a standby, the start ran on the primary but the files
+    // are read from the standby; the standby must have replayed past the start
+    // LSN before the copy so the captured files are consistent with it.
+    if let (Some(standby), Some(start_lsn)) = (standby.as_mut(), start_lsn.as_ref()) {
+        wait_for_standby_replay(&mut **standby, start_lsn)?;
+    }
 
     // Walk the PG dir and classify every entry: referenced files (decided here,
     // not copied), copy jobs (dispatched to workers), directories, and links.
@@ -1356,6 +1662,21 @@ pub fn backup_inner_with_workers(
     let file_count = files.len();
     let timestamp_stop = timestamp_start;
 
+    // Close the online backup (on the same session) and assemble the bracket.
+    // The stop also yields the `backup_label` / `tablespace_map` file contents,
+    // which are written into the backup root. The backup timeline is taken from
+    // the start LSN's WAL — for this slice (no streaming standby promotion) the
+    // start and stop share timeline 1; pgBackRest reads the real timeline from
+    // pg_control, deferred until the fuller pg_control decode lands.
+    let bracket = match (control.as_mut(), start_lsn) {
+        (Some(control), Some(start_lsn)) => {
+            let stop = control.backup_stop()?;
+            write_backup_label_files(repo_storage, &backup_root, &stop)?;
+            Some(build_bracket(&start_lsn, &stop)?)
+        }
+        _ => None,
+    };
+
     let manifest = Manifest {
         backup_label: label.clone(),
         backup_type: backup_type.as_str().to_owned(),
@@ -1387,6 +1708,19 @@ pub fn backup_inner_with_workers(
         metadata_encrypted_key(): transform.is_encrypted(),
         "db-id": info.db_id,
     });
+    // The on-disk version / system id recorded for restore parity. When the
+    // backup was DB-driven these come from the live server (already validated to
+    // match the stanza); otherwise they mirror the stanza's recorded identity.
+    entry["db-version"] = json!(info.db_version);
+    entry["db-system-id"] = json!(info.db_system_id);
+    // Record the backup-control bracket (start/stop LSN + WAL segments) when the
+    // backup was driven through pg_backup_start/stop.
+    if let Some(bracket) = bracket.as_ref() {
+        entry["backup-lsn-start"] = json!(bracket.lsn_start);
+        entry["backup-lsn-stop"] = json!(bracket.lsn_stop);
+        entry["backup-archive-start"] = json!(bracket.archive_start);
+        entry["backup-archive-stop"] = json!(bracket.archive_stop);
+    }
     // A diff/incr records the chain of backups its files depend on. The prior
     // backup is the head of that chain (the latest full for a diff, the latest
     // backup of any type for an incr).
@@ -1401,6 +1735,169 @@ pub fn backup_inner_with_workers(
         label,
         file_count,
         total_size,
+        bracket,
+    })
+}
+
+/// Validate a live server's identity against the stanza's `backup.info`.
+///
+/// The system identifier must match exactly (a mismatch means the configured PG
+/// is a *different* cluster), and the server's major-version label must equal
+/// the stanza's `db-version`. C ref: `dbPgCheck` in `src/command/backup/backup.c`,
+/// which raises `DbMismatchError` on either disagreement.
+///
+/// Returns the validated [`BackupServerInfo`] on success.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the server cannot be queried or its identity
+/// disagrees with the stanza.
+fn validate_server_against_stanza(control: &mut dyn BackupControl, info: &InfoBackup) -> Result<BackupServerInfo, CommandError> {
+    let server = control.server_info()?;
+    if server.system_identifier != info.db_system_id {
+        return Err(CommandError::Other(format!(
+            "backup database system-id {} does not match stanza db-system-id {}",
+            server.system_identifier, info.db_system_id
+        )));
+    }
+    let server_label = pgbr_postgres::version::SUPPORTED
+        .iter()
+        .find(|v| {
+            // PG < 10 keeps the `.x` minor in the label; PG >= 10 is the bare major.
+            let major = server.release_major();
+            if major == 9 {
+                v.label.starts_with("9.")
+            } else {
+                v.label == major.to_string()
+            }
+        })
+        .map(|v| v.label);
+    if let Some(server_label) = server_label
+        && server_label != info.db_version
+    {
+        return Err(CommandError::Other(format!(
+            "backup database version {} does not match stanza db-version {}",
+            server_label, info.db_version
+        )));
+    }
+    Ok(server)
+}
+
+/// Write the `backup_label` and (when non-empty) `tablespace_map` files
+/// returned by `pg_backup_stop` into the backup root.
+///
+/// pgBackRest stores these alongside the copied data so a restore can place
+/// `backup_label` at the data-root and re-create the tablespace symlinks from
+/// `tablespace_map`. An empty `spcmapfile` (a cluster with no tablespaces) is
+/// not written.
+///
+/// # Errors
+///
+/// [`CommandError::Storage`] / [`CommandError::Io`] on write failure.
+fn write_backup_label_files(repo_storage: &dyn Storage, backup_root: &str, stop: &BackupStopResult) -> Result<(), CommandError> {
+    write_repo_file(
+        repo_storage,
+        &format!("{backup_root}/backup_label"),
+        stop.label_file.as_bytes(),
+    )?;
+    if !stop.spcmap_file.is_empty() {
+        write_repo_file(
+            repo_storage,
+            &format!("{backup_root}/tablespace_map"),
+            stop.spcmap_file.as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to a repository-relative path via the storage backend.
+fn write_repo_file(repo_storage: &dyn Storage, rel: &str, bytes: &[u8]) -> Result<(), CommandError> {
+    let mut writer = repo_storage.open_write(Path::new(rel))?;
+    writer.write(bytes)?;
+    writer.flush()?;
+    writer.close()?;
+    Ok(())
+}
+
+/// Poll a standby's replay position until it has caught up to (or past) the
+/// backup `start_lsn`.
+///
+/// pgBackRest reads the standby's data files only after the standby has replayed
+/// the WAL up to the primary's backup start point; otherwise the copied files
+/// could predate the start LSN and the restore would be inconsistent. C ref:
+/// `backupStandbyInit` / the `pg_last_wal_replay_lsn()` loop in
+/// `src/command/backup/backup.c`.
+///
+/// The poll loops until the parsed replay LSN is `>= start_lsn`, sleeping briefly
+/// between attempts, with a bounded number of attempts so a wedged standby fails
+/// the backup rather than hanging forever.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the standby cannot be queried, returns an
+/// unparseable LSN, or does not catch up within the attempt budget.
+fn wait_for_standby_replay(standby: &mut dyn BackupControl, start_lsn: &str) -> Result<(), CommandError> {
+    /// Maximum number of replay-position polls before giving up.
+    const MAX_ATTEMPTS: u32 = 600;
+    /// Delay between polls.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let target =
+        parse_lsn(start_lsn).ok_or_else(|| CommandError::Other(format!("backup start returned an invalid LSN: {start_lsn}")))?;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if let Some(replay_text) = standby.replay_lsn()? {
+            let replayed = parse_lsn(&replay_text)
+                .ok_or_else(|| CommandError::Other(format!("standby replay returned an invalid LSN: {replay_text}")))?;
+            if replayed >= target {
+                return Ok(());
+            }
+        }
+        // Don't sleep after the final attempt — fall straight through to the error.
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    Err(CommandError::Other(format!(
+        "standby did not replay to backup start LSN {start_lsn} within {MAX_ATTEMPTS} attempts"
+    )))
+}
+
+/// Build a [`BackupBracket`] from the textual start LSN and the stop result.
+///
+/// Each LSN is mapped to the WAL segment that contains it on timeline 1 using
+/// the default 16 MiB segment size (the only size this slice models — the real
+/// timeline + `wal_segment_size` come from `pg_control`, deferred to the fuller
+/// decode). An unparseable LSN is a hard error: the server returned something
+/// that is not a `PostgreSQL` LSN.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when either LSN cannot be parsed.
+fn build_bracket(start_lsn: &str, stop: &BackupStopResult) -> Result<BackupBracket, CommandError> {
+    const TIMELINE: u32 = 1;
+    // Confirm both LSNs parse (the WAL-segment derivation needs valid hex halves).
+    if parse_lsn(start_lsn).is_none() {
+        return Err(CommandError::Other(format!(
+            "backup start returned an invalid LSN: {start_lsn}"
+        )));
+    }
+    if parse_lsn(&stop.lsn).is_none() {
+        return Err(CommandError::Other(format!(
+            "backup stop returned an invalid LSN: {}",
+            stop.lsn
+        )));
+    }
+    let archive_start = lsn_text_to_wal_segment(TIMELINE, start_lsn, WAL_SEGMENT_SIZE_DEFAULT)
+        .ok_or_else(|| CommandError::Other(format!("could not derive WAL segment for start LSN {start_lsn}")))?;
+    let archive_stop = lsn_text_to_wal_segment(TIMELINE, &stop.lsn, WAL_SEGMENT_SIZE_DEFAULT)
+        .ok_or_else(|| CommandError::Other(format!("could not derive WAL segment for stop LSN {}", stop.lsn)))?;
+    Ok(BackupBracket {
+        lsn_start: start_lsn.to_owned(),
+        lsn_stop: stop.lsn.clone(),
+        archive_start,
+        archive_stop,
     })
 }
 
@@ -2773,5 +3270,483 @@ mod tests {
             Some(true),
             "all-zero pages must validate as Some(true)"
         );
+    }
+
+    // ---- backup-control protocol (pg_backup_start/stop) --------------------
+
+    /// An in-memory [`BackupControl`] for the DB-free unit tests: it records the
+    /// calls it received and replays scripted LSNs / file contents, so the
+    /// control-driven backup path can be exercised end-to-end with no libpq.
+    #[derive(Debug, Default)]
+    struct FakeBackupControl {
+        /// Reported server version number / system identifier.
+        server_version_num: u32,
+        system_identifier: u64,
+        /// LSN `backup_start` returns.
+        start_lsn: String,
+        /// Stop LSN + label / spcmap files `backup_stop` returns.
+        stop: BackupStopResult,
+        /// Whether `is_in_recovery` reports a standby.
+        in_recovery: bool,
+        /// Sequence of replay LSNs `replay_lsn` returns (last value repeats).
+        replay_lsns: Vec<Option<String>>,
+        /// Call log, for asserting the protocol order / arguments.
+        calls: std::cell::RefCell<Vec<String>>,
+        /// Cursor into `replay_lsns`.
+        replay_cursor: std::cell::Cell<usize>,
+    }
+
+    impl FakeBackupControl {
+        /// A primary fake for a given PG version with scripted LSNs.
+        fn primary(server_version_num: u32, system_identifier: u64, start_lsn: &str, stop: BackupStopResult) -> Self {
+            Self {
+                server_version_num,
+                system_identifier,
+                start_lsn: start_lsn.to_owned(),
+                stop,
+                in_recovery: false,
+                replay_lsns: Vec::new(),
+                calls: std::cell::RefCell::new(Vec::new()),
+                replay_cursor: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl BackupControl for FakeBackupControl {
+        fn server_info(&mut self) -> Result<BackupServerInfo, CommandError> {
+            self.calls.borrow_mut().push("server_info".to_owned());
+            Ok(BackupServerInfo {
+                server_version_num: self.server_version_num,
+                system_identifier: self.system_identifier,
+            })
+        }
+
+        fn backup_start(&mut self, label: &str, fast: bool) -> Result<String, CommandError> {
+            self.calls.borrow_mut().push(format!("backup_start({label},{fast})"));
+            Ok(self.start_lsn.clone())
+        }
+
+        fn backup_stop(&mut self) -> Result<BackupStopResult, CommandError> {
+            self.calls.borrow_mut().push("backup_stop".to_owned());
+            Ok(self.stop.clone())
+        }
+
+        fn is_in_recovery(&mut self) -> Result<bool, CommandError> {
+            self.calls.borrow_mut().push("is_in_recovery".to_owned());
+            Ok(self.in_recovery)
+        }
+
+        fn replay_lsn(&mut self) -> Result<Option<String>, CommandError> {
+            self.calls.borrow_mut().push("replay_lsn".to_owned());
+            let idx = self.replay_cursor.get().min(self.replay_lsns.len().saturating_sub(1));
+            self.replay_cursor.set(self.replay_cursor.get() + 1);
+            Ok(self.replay_lsns.get(idx).cloned().flatten())
+        }
+    }
+
+    /// The `backup.info` identity the [`init_stanza`] helper writes (PG 14).
+    const STANZA_SYSTEM_ID: u64 = 6_873_049_345_984_568_091;
+
+    /// Run a control-driven backup through `run_backup` with a fake primary.
+    fn run_backup_with_fake(
+        repo_s: &Posix,
+        pg_s: &Posix,
+        control: &mut FakeBackupControl,
+        start_fast: bool,
+    ) -> Result<BackupOutcome, CommandError> {
+        run_backup(
+            "demo",
+            repo_s,
+            pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            1,
+            false,
+            &[],
+            Some(control as &mut dyn BackupControl),
+            None,
+            start_fast,
+        )
+    }
+
+    #[test]
+    fn control_driven_backup_brackets_copy_and_records_lsns() {
+        // A control-driven full backup must: validate the server, call
+        // backup_start, copy files, call backup_stop, write backup_label /
+        // tablespace_map, and record the start/stop LSN + WAL segments.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/16B3E40",
+            BackupStopResult {
+                lsn: "0/16B3F00".to_owned(),
+                label_file: "START WAL LOCATION: 0/16B3E40\n".to_owned(),
+                spcmap_file: "16400 /mnt/ts1\n".to_owned(),
+            },
+        );
+
+        let outcome = run_backup_with_fake(&repo_s, &pg_s, &mut control, true).expect("control-driven backup");
+
+        // The bracket is recorded with the right LSNs and WAL segments.
+        let bracket = outcome.bracket.expect("bracket present for a DB-driven backup");
+        assert_eq!(bracket.lsn_start, "0/16B3E40");
+        assert_eq!(bracket.lsn_stop, "0/16B3F00");
+        assert_eq!(bracket.archive_start, "000000010000000000000001");
+        assert_eq!(bracket.archive_stop, "000000010000000000000001");
+
+        // Protocol order: server_info, backup_start(label,fast=true), backup_stop.
+        let calls = control.calls.borrow().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "server_info".to_owned(),
+                format!("backup_start({LABEL},true)"),
+                "backup_stop".to_owned(),
+            ],
+            "protocol calls in order"
+        );
+
+        // backup_label + tablespace_map written into the backup root.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert_eq!(
+            std::fs::read_to_string(backup_root.join("backup_label")).unwrap(),
+            "START WAL LOCATION: 0/16B3E40\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_root.join("tablespace_map")).unwrap(),
+            "16400 /mnt/ts1\n"
+        );
+
+        // The data file was still copied.
+        assert!(backup_root.join("base/1/1259").exists(), "data file copied");
+
+        // backup.info records the LSN / archive fields and the live identity.
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let entry = info.current.get(LABEL).expect("backup entry");
+        assert_eq!(entry["backup-lsn-start"], json!("0/16B3E40"));
+        assert_eq!(entry["backup-lsn-stop"], json!("0/16B3F00"));
+        assert_eq!(entry["backup-archive-start"], json!("000000010000000000000001"));
+        assert_eq!(entry["backup-archive-stop"], json!("000000010000000000000001"));
+        assert_eq!(entry["db-version"], json!("14"));
+        assert_eq!(entry["db-system-id"], json!(STANZA_SYSTEM_ID));
+    }
+
+    #[test]
+    fn control_driven_backup_no_spcmap_skips_tablespace_map() {
+        // A cluster with no tablespaces returns an empty spcmapfile; the
+        // tablespace_map file must NOT be written, but backup_label still is.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/0",
+            BackupStopResult {
+                lsn: "0/30".to_owned(),
+                label_file: "backup label body\n".to_owned(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        run_backup_with_fake(&repo_s, &pg_s, &mut control, false).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert!(backup_root.join("backup_label").exists(), "backup_label written");
+        assert!(
+            !backup_root.join("tablespace_map").exists(),
+            "no tablespace_map when spcmapfile is empty"
+        );
+    }
+
+    #[test]
+    fn control_driven_backup_rejects_system_id_mismatch() {
+        // A server whose system identifier differs from the stanza is a hard
+        // error before any file is copied.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            999, // wrong system id
+            "0/0",
+            BackupStopResult {
+                lsn: "0/30".to_owned(),
+                label_file: String::new(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        let err = run_backup_with_fake(&repo_s, &pg_s, &mut control, false).expect_err("mismatch must error");
+        assert!(err.to_string().contains("does not match stanza db-system-id"), "got {err}");
+
+        // No backup directory contents were produced (validation failed first).
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert!(
+            !backup_root.join("base/1/1259").exists(),
+            "no file copied when validation fails"
+        );
+    }
+
+    #[test]
+    fn control_driven_backup_rejects_version_mismatch() {
+        // The stanza is PG 14; a PG 16 server must be rejected.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"x");
+
+        let mut control = FakeBackupControl::primary(
+            160_004, // PG 16 vs stanza's "14"
+            STANZA_SYSTEM_ID,
+            "0/0",
+            BackupStopResult {
+                lsn: "0/30".to_owned(),
+                label_file: String::new(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        let err = run_backup_with_fake(&repo_s, &pg_s, &mut control, false).expect_err("version mismatch must error");
+        assert!(err.to_string().contains("does not match stanza db-version"), "got {err}");
+    }
+
+    #[test]
+    fn control_driven_backup_rejects_invalid_start_lsn() {
+        // A server that returns a non-LSN string for the start fails the backup.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"x");
+
+        let mut control = FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "not-an-lsn",
+            BackupStopResult {
+                lsn: "0/30".to_owned(),
+                label_file: String::new(),
+                spcmap_file: String::new(),
+            },
+        );
+
+        let err = run_backup_with_fake(&repo_s, &pg_s, &mut control, false).expect_err("bad start LSN must error");
+        assert!(err.to_string().contains("invalid LSN"), "got {err}");
+    }
+
+    #[test]
+    fn standby_replay_wait_returns_when_caught_up() {
+        // The standby reports a replay LSN behind, then equal to, the start LSN;
+        // wait_for_standby_replay must return Ok once it reaches the target.
+        let mut standby = FakeBackupControl {
+            in_recovery: true,
+            replay_lsns: vec![Some("0/100".to_owned()), Some("0/150".to_owned()), Some("0/200".to_owned())],
+            ..FakeBackupControl::primary(
+                140_010,
+                STANZA_SYSTEM_ID,
+                "0/0",
+                BackupStopResult {
+                    lsn: "0/0".to_owned(),
+                    label_file: String::new(),
+                    spcmap_file: String::new(),
+                },
+            )
+        };
+        // Target 0/200 is reached on the third poll.
+        wait_for_standby_replay(&mut standby, "0/200").expect("standby catches up");
+        // At least three replay polls happened.
+        let replay_calls = standby.calls.borrow().iter().filter(|c| *c == "replay_lsn").count();
+        assert!(replay_calls >= 3, "expected >= 3 replay polls, got {replay_calls}");
+    }
+
+    #[test]
+    fn standby_replay_wait_rejects_invalid_lsn() {
+        let mut standby = FakeBackupControl {
+            in_recovery: true,
+            replay_lsns: vec![Some("garbage".to_owned())],
+            ..FakeBackupControl::primary(
+                140_010,
+                STANZA_SYSTEM_ID,
+                "0/0",
+                BackupStopResult {
+                    lsn: "0/0".to_owned(),
+                    label_file: String::new(),
+                    spcmap_file: String::new(),
+                },
+            )
+        };
+        let err = wait_for_standby_replay(&mut standby, "0/200").expect_err("invalid replay LSN");
+        assert!(err.to_string().contains("invalid LSN"), "got {err}");
+    }
+
+    #[test]
+    fn build_bracket_maps_lsns_to_wal_segments() {
+        let stop = BackupStopResult {
+            lsn: "0/2000000".to_owned(),
+            label_file: String::new(),
+            spcmap_file: String::new(),
+        };
+        let bracket = build_bracket("0/16B3E40", &stop).expect("bracket");
+        assert_eq!(bracket.archive_start, "000000010000000000000001");
+        // 0/2000000 = 0x02000000 / 16 MiB (0x01000000) = 2 -> ...00000002.
+        assert_eq!(bracket.archive_stop, "000000010000000000000002");
+    }
+
+    #[test]
+    fn start_fast_enabled_reads_boolean() {
+        let cfg = |value: Option<bool>| {
+            let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+            if let Some(v) = value {
+                options.insert(("start-fast".to_owned(), None), OptionValue::Boolean(v));
+            }
+            LoadedConfig {
+                command: "backup".to_owned(),
+                command_role: pgbr_config::ConfigCommandRole::Main,
+                stanza: Some("demo".to_owned()),
+                options,
+                params: Vec::new(),
+            }
+        };
+        assert!(!start_fast_enabled(&cfg(None)), "absent defaults to false");
+        assert!(!start_fast_enabled(&cfg(Some(false))));
+        assert!(start_fast_enabled(&cfg(Some(true))));
+    }
+
+    #[test]
+    fn standby_mode_reads_option() {
+        let cfg = |value: Option<&str>| {
+            let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+            if let Some(v) = value {
+                options.insert(("backup-standby".to_owned(), None), OptionValue::StringId(v.to_owned()));
+            }
+            LoadedConfig {
+                command: "backup".to_owned(),
+                command_role: pgbr_config::ConfigCommandRole::Main,
+                stanza: Some("demo".to_owned()),
+                options,
+                params: Vec::new(),
+            }
+        };
+        assert_eq!(standby_mode(&cfg(None)), StandbyMode::No, "absent defaults to No");
+        assert_eq!(standby_mode(&cfg(Some("n"))), StandbyMode::No);
+        assert_eq!(standby_mode(&cfg(Some("prefer"))), StandbyMode::Prefer);
+        assert_eq!(standby_mode(&cfg(Some("y"))), StandbyMode::Yes);
+    }
+
+    #[test]
+    fn derive_conninfo_for_index_builds_pgn() {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(
+            ("pg2-host".to_owned(), None),
+            OptionValue::String("standby.example".to_owned()),
+        );
+        options.insert(("pg2-port".to_owned(), None), OptionValue::Integer(5433));
+        options.insert(("pg2-database".to_owned(), None), OptionValue::String("postgres".to_owned()));
+        let cfg = LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options,
+            params: Vec::new(),
+        };
+        // pg1 has no host -> None; pg2 has a host -> a conninfo.
+        assert_eq!(derive_conninfo_for_index(&cfg, 1), None);
+        let conninfo = derive_conninfo_for_index(&cfg, 2).expect("pg2 conninfo");
+        assert!(conninfo.contains("host=standby.example"), "{conninfo}");
+        assert!(conninfo.contains("port=5433"), "{conninfo}");
+        assert!(conninfo.contains("dbname=postgres"), "{conninfo}");
+    }
+
+    #[test]
+    fn derive_conninfo_with_url_prefers_database_url() {
+        let cfg = LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: BTreeMap::new(),
+            params: Vec::new(),
+        };
+        // DATABASE_URL wins verbatim.
+        assert_eq!(
+            derive_conninfo_with_url(&cfg, Some("postgresql:///x")),
+            Some("postgresql:///x".to_owned())
+        );
+        // Empty URL + no pg1 host -> None.
+        assert_eq!(derive_conninfo_with_url(&cfg, Some("")), None);
+        assert_eq!(derive_conninfo_with_url(&cfg, None), None);
+    }
+
+    // Live-PostgreSQL backup through the libpq backup-control path. Skipped by
+    // default; run with `cargo test -p pgbr-command -- --include-ignored` and
+    // DATABASE_URL pointing at a reachable cluster. Documents the real contract.
+    #[test]
+    #[ignore = "requires a running PostgreSQL server (set DATABASE_URL)"]
+    fn control_driven_backup_against_real_database() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+
+        // Learn the live cluster's identity so we can seed a matching stanza.
+        let mut probe = LibpqBackupControl::open(&url).expect("open DATABASE_URL connection");
+        let server = probe.server_info().expect("server info");
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo_s = Posix::new(repo.path());
+        let pg_s = Posix::new(pg.path());
+
+        // Seed a stanza whose identity matches the live server.
+        repo_s.create_path(Path::new("backup/demo"), true).unwrap();
+        let major_string = server.release_major().to_string();
+        let label_major = if server.release_major() == 9 {
+            "9.6"
+        } else {
+            major_string.as_str()
+        };
+        let version_entry = pgbr_postgres::version::by_label(label_major).expect("known PG version");
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: server.system_identifier,
+            db_version: version_entry.label.to_owned(),
+            db_catalog_version: version_entry.catalog_version_no,
+            db_control_version: version_entry.pg_control_version,
+            current: BTreeMap::new(),
+            history: BTreeMap::new(),
+        };
+        info.save(&repo_s, &backup_info_path("demo")).unwrap();
+        seed_file(&pg_s, "base/1/1259", b"relation contents for the live backup");
+
+        let mut control = LibpqBackupControl::open(&url).expect("control connection");
+        let outcome = run_backup(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            1,
+            false,
+            &[],
+            Some(&mut control as &mut dyn BackupControl),
+            None,
+            true,
+        )
+        .expect("live control-driven backup");
+
+        let bracket = outcome.bracket.expect("bracket from live PG");
+        assert!(pgbr_postgres::lsn::parse_lsn(&bracket.lsn_start).is_some());
+        assert!(pgbr_postgres::lsn::parse_lsn(&bracket.lsn_stop).is_some());
+        // backup_label must have been returned and written.
+        let backup_root = repo.path().join(format!("backup/demo/{LABEL}"));
+        assert!(backup_root.join("backup_label").exists(), "live backup_label written");
     }
 }

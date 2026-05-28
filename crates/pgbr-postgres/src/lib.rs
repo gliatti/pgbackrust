@@ -23,6 +23,10 @@
 //! - [`mod@page`]: the FNV-1a-based 16-bit data-page checksum `PostgreSQL`
 //!   stores in `pd_checksum`, used by backup's `--checksum-page` validation
 //!   ([`pg_checksum_page`], [`stored_checksum`], [`page_checksum_valid`]).
+//! - [`mod@lsn`]: parse a textual `PostgreSQL` LSN (`"XXXXXXXX/YYYYYYYY"`) and
+//!   derive the 24-hex-digit WAL segment name that contains it
+//!   ([`parse_lsn`], [`lsn_to_string`], [`lsn_to_wal_segment`]). Used by the
+//!   backup command to record `backup-archive-start` / `backup-archive-stop`.
 //! - [`mod@tablespace`]: parser for the `PG_<version>_<catalog>` version
 //!   subdirectory `PostgreSQL` creates inside a tablespace location
 //!   ([`parse_tablespace_dir_name`], [`identify_tablespace_dir_name`]).
@@ -30,6 +34,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod control;
+pub mod lsn;
 pub mod page;
 pub mod tablespace;
 pub mod version;
@@ -38,6 +43,7 @@ pub use control::{
     DbState, PgControlData, PgControlError, PgControlHeader, decode_pg_control_data, decode_pg_control_header, header_version,
     identify, read_pg_control_data, read_pg_control_header,
 };
+pub use lsn::{WAL_SEGMENT_SIZE_DEFAULT, lsn_text_to_wal_segment, lsn_to_string, lsn_to_wal_segment, parse_lsn};
 pub use page::{page_checksum_valid, pg_checksum_page, stored_checksum};
 pub use tablespace::{TablespaceDirName, identify_tablespace_dir_name, parse_tablespace_dir_name};
 pub use version::{
