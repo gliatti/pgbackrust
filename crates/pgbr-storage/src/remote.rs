@@ -17,16 +17,30 @@
 //!   [`pgbr_protocol::transport::RequestHandler`] by mapping each `storage-*`
 //!   request onto a wrapped local [`Storage`] (e.g. [`crate::Posix`]).
 //!
-//! ## Transfer model (scope of this slice)
+//! ## Transfer model: chunked streaming
 //!
-//! File payloads are transferred **whole-file (non-chunked)**: `open_read`
-//! issues `storage-read` and the worker returns the entire file's bytes in the
-//! response, which [`RemoteStorage`] hands back as an in-memory
-//! [`pgbr_io::MemRead`]; `open_write` returns a buffering writer that holds all
-//! bytes in memory and, on `close`, sends them in a single `storage-write`
-//! request. Chunked / streaming transfer (the C `protocolStorageRead` block
-//! protocol) is a deliberate follow-up — large files will materialise fully in
-//! memory on both ends until then.
+//! File payloads are transferred **chunked**, not whole-file — this supersedes
+//! the earlier `storage-read` / `storage-write` whole-file transfer so large
+//! files no longer buffer entirely in memory on either end. Each transfer is at
+//! most [`CHUNK_SIZE`] (64 KiB) bytes of payload per protocol round-trip,
+//! mirroring the C `protocolStorageRead` / `protocolStorageWrite` block
+//! protocol in `src/storage/remote/`.
+//!
+//! - **Read** ([`RemoteStorage::open_read`]) returns a streaming reader that
+//!   issues `storage-read-chunk` requests with `{ path, offset, len }`,
+//!   receiving up to `len` bytes per request and advancing its offset. A short
+//!   or empty chunk signals EOF. The worker keeps a single open reader per path
+//!   and serves the requested range sequentially.
+//! - **Write** ([`RemoteStorage::open_write`]) returns a streaming writer that
+//!   sends `storage-write-open { path }` on first use, then one
+//!   `storage-write-chunk { path, bytes }` per buffered `CHUNK_SIZE` block, and
+//!   `storage-write-close { path }` on `close` (which finalises and fsyncs the
+//!   file on the worker via the local `Storage`'s own `close`).
+//!
+//! The legacy whole-file `storage-read` / `storage-write` commands are gone;
+//! all other `storage-*` commands (exists / info / list / remove / rename /
+//! create-path / remove-path / create-symlink) are unchanged and still answer
+//! in a single round-trip.
 //!
 //! ## Wire shapes
 //!
@@ -35,12 +49,13 @@
 //! payloads use the [`StorageInfoDto`] / [`StorageKindDto`] serde mirrors of
 //! [`StorageInfo`] / [`StorageKind`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use pgbr_io::{IoError, IoRead, IoWrite, MemRead};
+use pgbr_io::{IoError, IoRead, IoWrite};
 use pgbr_protocol::transport::RequestHandler;
 use pgbr_protocol::{ErrResponse, OkResponse, ProtocolClient, ProtocolError, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -48,7 +63,16 @@ use serde_json::{Value, json};
 
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
-/// Protocol command names. Each [`Storage`] method maps to exactly one.
+/// Maximum payload bytes carried by a single chunked read/write round-trip.
+///
+/// 64 KiB matches [`pgbr_io::copy`]'s buffer and the C side's default block
+/// size, balancing per-request overhead against memory use — a large file is
+/// transferred as a stream of `CHUNK_SIZE`-bounded blocks rather than one giant
+/// in-memory payload.
+pub const CHUNK_SIZE: usize = 64 * 1024;
+
+/// Protocol command names. Most [`Storage`] methods map to exactly one; file
+/// transfer is split across the `*-chunk` / `*-open` / `*-close` commands.
 pub mod command {
     /// `Storage::exists` — params: `[path]`; out: `bool`.
     pub const EXISTS: &str = "storage-exists";
@@ -56,10 +80,18 @@ pub mod command {
     pub const INFO: &str = "storage-info";
     /// `Storage::list` — params: `[path]`; out: `[StorageInfoDto, ...]`.
     pub const LIST: &str = "storage-list";
-    /// `Storage::open_read` — params: `[path]`; out: `{ "data": base64 }`.
-    pub const READ: &str = "storage-read";
-    /// `Storage::open_write` (on close) — params: `[path, base64]`; out: `{}`.
-    pub const WRITE: &str = "storage-write";
+    /// One chunk of a streaming read — params: `[path, offset, len]`;
+    /// out: `{ "data": base64 }` carrying up to `len` bytes. A short or empty
+    /// `data` field signals EOF. See [`super::CHUNK_SIZE`].
+    pub const READ_CHUNK: &str = "storage-read-chunk";
+    /// Begin a streaming write — params: `[path]`; out: `{}`. Truncates /
+    /// creates the target via the worker's `Storage::open_write`.
+    pub const WRITE_OPEN: &str = "storage-write-open";
+    /// One chunk of a streaming write — params: `[path, base64]`; out: `{}`.
+    pub const WRITE_CHUNK: &str = "storage-write-chunk";
+    /// Finish a streaming write — params: `[path]`; out: `{}`. Closes (and
+    /// fsyncs) the target via the worker's writer `close`.
+    pub const WRITE_CLOSE: &str = "storage-write-close";
     /// `Storage::remove` — params: `[path, error_on_missing]`; out: `{}`.
     pub const REMOVE: &str = "storage-remove";
     /// `Storage::rename` — params: `[source, target]`; out: `{}`.
@@ -251,23 +283,21 @@ impl<R: IoRead + Send + 'static, W: IoWrite + Send + 'static> Storage for Remote
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        // Whole-file transfer: the worker returns the entire file's bytes,
-        // which we serve from memory. Chunked streaming is a follow-up.
-        let out = self.execute(path, command::READ, vec![path_param(path)])?;
-        let encoded = out
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend(path, "storage-read: missing base64 'data' field"))?;
-        let bytes = BASE64
-            .decode(encoded)
-            .map_err(|e| backend(path, &format!("storage-read: bad base64: {e}")))?;
-        Ok(Box::new(MemRead::new(bytes)))
+        // Chunked streaming: the reader pulls up to CHUNK_SIZE bytes per
+        // `storage-read-chunk` request and stops on a short/empty chunk. The
+        // worker validates existence lazily on the first chunk, so probe it
+        // here with a single `info` so a missing file surfaces as an error from
+        // `open_read` (matching the local backends' eager-open contract).
+        self.info(path)?;
+        Ok(Box::new(RemoteRead::new(Arc::clone(&self.client), path)))
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        // Whole-file transfer: buffer all writes; flush them as a single
-        // `storage-write` on `close`. Chunked streaming is a follow-up.
-        Ok(Box::new(RemoteWrite::new(Arc::clone(&self.client), path)))
+        // Chunked streaming: send `storage-write-open` now (so a create/truncate
+        // failure surfaces from `open_write`), then stream `storage-write-chunk`
+        // blocks, finishing with `storage-write-close` on `close`.
+        let writer = RemoteWrite::open(Arc::clone(&self.client), path)?;
+        Ok(Box::new(writer))
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
@@ -304,9 +334,81 @@ impl<R: IoRead + Send + 'static, W: IoWrite + Send + 'static> Storage for Remote
     }
 }
 
-/// Buffering writer returned by [`RemoteStorage::open_write`]. Accumulates all
-/// written bytes and, on `close`, sends a single `storage-write` request
-/// carrying the path and the base64-encoded payload.
+/// Streaming reader returned by [`RemoteStorage::open_read`].
+///
+/// Each `read` pulls up to [`CHUNK_SIZE`] bytes from the worker via a
+/// `storage-read-chunk` request carrying the current `offset` and the
+/// requested `len`, advancing the offset by however many bytes come back. A
+/// short or empty chunk marks EOF; once EOF is seen the reader keeps returning
+/// `0`. A small leftover buffer absorbs the case where the caller's `buf` is
+/// smaller than what a chunk request returned (the reader always asks for at
+/// most the smaller of `buf.len()` and `CHUNK_SIZE`, so in practice the chunk
+/// fits, but the leftover keeps the contract robust).
+///
+/// Holds a clone of the shared client handle (not a borrow of the storage) so
+/// it is `'static` and satisfies the `Box<dyn IoRead>` return type.
+struct RemoteRead<R: IoRead, W: IoWrite> {
+    client: SharedClient<R, W>,
+    path: PathBuf,
+    offset: u64,
+    eof: bool,
+}
+
+impl<R: IoRead, W: IoWrite> RemoteRead<R, W> {
+    fn new(client: SharedClient<R, W>, path: &Path) -> Self {
+        Self {
+            client,
+            path: path.to_path_buf(),
+            offset: 0,
+            eof: false,
+        }
+    }
+}
+
+impl<R: IoRead, W: IoWrite> IoRead for RemoteRead<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        if self.eof || buf.is_empty() {
+            return Ok(0);
+        }
+        let len = buf.len().min(CHUNK_SIZE);
+        let out = execute_shared(
+            &self.client,
+            &self.path,
+            command::READ_CHUNK,
+            vec![path_param(&self.path), json!(self.offset), json!(len)],
+        )
+        .map_err(|e| IoError::Backend(format!("storage-read-chunk: {e}")))?;
+        let encoded = out
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IoError::Backend("storage-read-chunk: missing base64 'data' field".to_owned()))?;
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|e| IoError::Backend(format!("storage-read-chunk: bad base64: {e}")))?;
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        self.offset += n as u64;
+        // A chunk shorter than what we asked for means the file is exhausted.
+        // (`n < len` covers both the empty-chunk and short-tail cases; an exact
+        // CHUNK_SIZE file then takes one more round-trip that returns empty.)
+        if bytes.len() < len {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+
+    fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+/// Streaming writer returned by [`RemoteStorage::open_write`].
+///
+/// Construction sends `storage-write-open` so the target is created/truncated
+/// eagerly. Each `write` buffers bytes and flushes a `storage-write-chunk`
+/// whenever the buffer reaches [`CHUNK_SIZE`]; `close` flushes any tail and
+/// sends `storage-write-close`, which finalises (and fsyncs) the file on the
+/// worker. Large payloads therefore never materialise whole on either end.
 ///
 /// Holds a clone of the shared client handle (not a borrow of the storage) so
 /// it is `'static` and satisfies the `Box<dyn IoWrite>` return type.
@@ -318,13 +420,33 @@ struct RemoteWrite<R: IoRead, W: IoWrite> {
 }
 
 impl<R: IoRead, W: IoWrite> RemoteWrite<R, W> {
-    fn new(client: SharedClient<R, W>, path: &Path) -> Self {
-        Self {
+    /// Open a streaming write, sending `storage-write-open` up front.
+    fn open(client: SharedClient<R, W>, path: &Path) -> Result<Self, StorageError> {
+        execute_shared(&client, path, command::WRITE_OPEN, vec![path_param(path)])?;
+        Ok(Self {
             client,
             path: path.to_path_buf(),
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(CHUNK_SIZE),
             closed: false,
+        })
+    }
+
+    /// Send the currently buffered bytes as one `storage-write-chunk` and clear
+    /// the buffer. A no-op when the buffer is empty.
+    fn send_buffer(&mut self) -> Result<(), IoError> {
+        if self.buffer.is_empty() {
+            return Ok(());
         }
+        let encoded = BASE64.encode(&self.buffer);
+        execute_shared(
+            &self.client,
+            &self.path,
+            command::WRITE_CHUNK,
+            vec![path_param(&self.path), Value::String(encoded)],
+        )
+        .map_err(|e| IoError::Backend(format!("storage-write-chunk: {e}")))?;
+        self.buffer.clear();
+        Ok(())
     }
 }
 
@@ -334,6 +456,20 @@ impl<R: IoRead, W: IoWrite> IoWrite for RemoteWrite<R, W> {
             return Err(IoError::Closed);
         }
         self.buffer.extend_from_slice(buf);
+        // Drain full CHUNK_SIZE blocks as they accumulate so neither this
+        // writer nor the wire holds more than ~CHUNK_SIZE at a time.
+        while self.buffer.len() >= CHUNK_SIZE {
+            let rest = self.buffer.split_off(CHUNK_SIZE);
+            let chunk = std::mem::replace(&mut self.buffer, rest);
+            let encoded = BASE64.encode(&chunk);
+            execute_shared(
+                &self.client,
+                &self.path,
+                command::WRITE_CHUNK,
+                vec![path_param(&self.path), Value::String(encoded)],
+            )
+            .map_err(|e| IoError::Backend(format!("storage-write-chunk: {e}")))?;
+        }
         Ok(())
     }
 
@@ -341,23 +477,18 @@ impl<R: IoRead, W: IoWrite> IoWrite for RemoteWrite<R, W> {
         if self.closed {
             return Err(IoError::Closed);
         }
-        // Nothing to do: the payload is only transmitted on close (whole-file).
-        Ok(())
+        self.send_buffer()
     }
 
     fn close(&mut self) -> Result<(), IoError> {
         if self.closed {
             return Ok(());
         }
+        // Flush the tail (anything below a full CHUNK_SIZE) before finalising.
+        self.send_buffer()?;
         self.closed = true;
-        let encoded = BASE64.encode(&self.buffer);
-        execute_shared(
-            &self.client,
-            &self.path,
-            command::WRITE,
-            vec![path_param(&self.path), Value::String(encoded)],
-        )
-        .map_err(|e| IoError::Backend(format!("storage-write: {e}")))?;
+        execute_shared(&self.client, &self.path, command::WRITE_CLOSE, vec![path_param(&self.path)])
+            .map_err(|e| IoError::Backend(format!("storage-write-close: {e}")))?;
         Ok(())
     }
 }
@@ -366,16 +497,40 @@ impl<R: IoRead, W: IoWrite> IoWrite for RemoteWrite<R, W> {
 // Worker side: StorageRequestHandler
 // ---------------------------------------------------------------------------
 
+/// An open streaming read on the worker: the local reader plus the byte offset
+/// it is currently positioned at, so successive `storage-read-chunk` requests
+/// (which the client issues with monotonically increasing offsets) are served
+/// from the same handle without reopening per chunk.
+struct OpenRead {
+    reader: Box<dyn IoRead>,
+    /// Absolute offset of the next byte the `reader` will yield.
+    position: u64,
+}
+
 /// Worker-side [`RequestHandler`] that answers `storage-*` requests against a
 /// wrapped local [`Storage`].
+///
+/// File transfer is chunked (see the module docs): the handler keeps one open
+/// reader per in-flight `storage-read-chunk` path and one open writer per
+/// in-flight `storage-write-*` path, finalising each on the matching `close`.
 pub struct StorageRequestHandler<S: Storage> {
     storage: S,
+    /// Open readers keyed by the path being streamed, with their current
+    /// offset. Populated lazily on the first `storage-read-chunk` for a path.
+    reads: HashMap<PathBuf, OpenRead>,
+    /// Open writers keyed by the path being streamed. Populated by
+    /// `storage-write-open` and finalised / removed by `storage-write-close`.
+    writes: HashMap<PathBuf, Box<dyn IoWrite>>,
 }
 
 impl<S: Storage> StorageRequestHandler<S> {
     /// Wrap a local storage backend (e.g. [`crate::Posix`]) to serve requests.
-    pub const fn new(storage: S) -> Self {
-        Self { storage }
+    pub fn new(storage: S) -> Self {
+        Self {
+            storage,
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+        }
     }
 
     /// Borrow the wrapped storage.
@@ -383,10 +538,65 @@ impl<S: Storage> StorageRequestHandler<S> {
         &self.storage
     }
 
+    /// Serve one `storage-read-chunk`: read up to `len` bytes starting at
+    /// `offset` from the open reader for `path`, opening it on first use.
+    fn read_chunk(&mut self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+        // Open the reader lazily on the first chunk for this path, then take a
+        // mutable borrow of the entry for the rest of the call.
+        let open = match self.reads.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let reader = self.storage.open_read(path)?;
+                e.insert(OpenRead { reader, position: 0 })
+            }
+        };
+
+        // If the requested offset is behind the current position we cannot
+        // rewind a forward-only reader, so reopen and start over; if it is
+        // ahead, skip the gap. In normal sequential use offset == position and
+        // neither branch fires.
+        if offset < open.position {
+            let reader = self.storage.open_read(path)?;
+            *open = OpenRead { reader, position: 0 };
+        }
+        while open.position < offset {
+            // Clamp the skip distance to CHUNK_SIZE (a `usize`) so the cap
+            // always fits a `usize` even on a 32-bit target.
+            let gap = usize::try_from((offset - open.position).min(CHUNK_SIZE as u64)).unwrap_or(CHUNK_SIZE);
+            let mut skip = vec![0u8; gap];
+            let n = open.reader.read(&mut skip)?;
+            if n == 0 {
+                // Reached EOF before reaching the requested offset.
+                return Ok(Vec::new());
+            }
+            open.position += n as u64;
+        }
+
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        // Fill up to `len` bytes (one underlying read may return short).
+        while filled < len {
+            let n = open.reader.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        open.position += filled as u64;
+        buf.truncate(filled);
+
+        // Drop the handle once exhausted so a re-read of the same path opens a
+        // fresh reader rather than serving a stale EOF.
+        if filled < len {
+            self.reads.remove(path);
+        }
+        Ok(buf)
+    }
+
     /// Dispatch one request, returning a `Result` so the `?` operator can be
     /// used freely; [`RequestHandler::handle`] maps the error into an
     /// [`ErrResponse`].
-    fn dispatch(&self, req: &Request) -> Result<OkResponse, StorageError> {
+    fn dispatch(&mut self, req: &Request) -> Result<OkResponse, StorageError> {
         match req.cmd.as_str() {
             command::EXISTS => {
                 let path = param_path(req, 0)?;
@@ -406,17 +616,36 @@ impl<S: Storage> StorageRequestHandler<S> {
                 let dtos: Vec<StorageInfoDto> = entries.iter().map(StorageInfoDto::from).collect();
                 Ok(ok(serde_json::to_value(dtos).map_err(|e| json_err(&e))?))
             }
-            command::READ => {
+            command::READ_CHUNK => {
                 let path = param_path(req, 0)?;
-                let mut reader = self.storage.open_read(&path)?;
-                let bytes = reader.read_all()?;
+                let offset = param_u64(req, 1, &path)?;
+                let len = param_usize(req, 2, &path)?;
+                let bytes = self.read_chunk(&path, offset, len)?;
                 Ok(ok(json!({ "data": BASE64.encode(&bytes) })))
             }
-            command::WRITE => {
+            command::WRITE_OPEN => {
+                let path = param_path(req, 0)?;
+                // Open (create/truncate) and stash the writer for this path.
+                let writer = self.storage.open_write(&path)?;
+                self.writes.insert(path, writer);
+                Ok(ok_empty())
+            }
+            command::WRITE_CHUNK => {
                 let path = param_path(req, 0)?;
                 let bytes = param_bytes(req, 1, &path)?;
-                let mut writer = self.storage.open_write(&path)?;
+                let writer = self
+                    .writes
+                    .get_mut(&path)
+                    .ok_or_else(|| backend(&path, "storage-write-chunk: no open write for path"))?;
                 writer.write(&bytes)?;
+                Ok(ok_empty())
+            }
+            command::WRITE_CLOSE => {
+                let path = param_path(req, 0)?;
+                let mut writer = self
+                    .writes
+                    .remove(&path)
+                    .ok_or_else(|| backend(&path, "storage-write-close: no open write for path"))?;
                 writer.close()?;
                 Ok(ok_empty())
             }
@@ -514,6 +743,20 @@ fn param_bool(req: &Request, index: usize, path: &Path) -> Result<bool, StorageE
         .get(index)
         .and_then(Value::as_bool)
         .ok_or_else(|| backend(path, &format!("{}: missing bool param #{index}", req.cmd)))
+}
+
+/// Extract the `index`-th param as a `u64` (a byte offset on the wire).
+fn param_u64(req: &Request, index: usize, path: &Path) -> Result<u64, StorageError> {
+    req.param
+        .get(index)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| backend(path, &format!("{}: missing u64 param #{index}", req.cmd)))
+}
+
+/// Extract the `index`-th param as a `usize` (a byte length on the wire).
+fn param_usize(req: &Request, index: usize, path: &Path) -> Result<usize, StorageError> {
+    let value = param_u64(req, index, path)?;
+    usize::try_from(value).map_err(|_| backend(path, &format!("{}: length param #{index} out of range", req.cmd)))
 }
 
 /// Extract the `index`-th param as base64-decoded bytes.
@@ -735,5 +978,103 @@ mod tests {
             let back: StorageKind = dto.into();
             assert_eq!(kind, back);
         }
+    }
+
+    /// A deterministic-but-non-trivial byte pattern of `len` bytes, so a
+    /// transfer that drops, duplicates, or misorders a chunk fails loudly.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    #[test]
+    fn remote_chunked_read_large_file() {
+        // A file several CHUNK_SIZE blocks long round-trips byte-for-byte
+        // through the chunked `open_read` path.
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("big-read.bin");
+        let payload = pattern(CHUNK_SIZE * 3 + 1234);
+
+        // Seed via the backing Posix directly so we exercise the read path alone.
+        write_all(&posix, path, &payload);
+
+        let got = read_all(&remote, path);
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_chunked_write_large_file() {
+        // Writing a multi-chunk payload through `open_write` lands byte-for-byte
+        // in the backing Posix store.
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("big-write.bin");
+        let payload = pattern(CHUNK_SIZE * 4 + 77);
+
+        // Drive several writes whose sizes straddle chunk boundaries so the
+        // CHUNK_SIZE-draining logic in `write` is exercised (partial buffer,
+        // a write that overflows one block, and a write spanning many blocks).
+        {
+            let mut w = remote.open_write(path).unwrap();
+            let mut off = 0;
+            // Write sizes that straddle chunk boundaries: a sub-chunk write, a
+            // write that overflows one block, then a write spanning several.
+            for step in [100usize, CHUNK_SIZE - 50, CHUNK_SIZE * 2 + 10] {
+                let step = step.min(payload.len() - off);
+                w.write(&payload[off..off + step]).unwrap();
+                off += step;
+            }
+            // Flush the remainder so the whole payload is written, then finalise.
+            if off < payload.len() {
+                w.write(&payload[off..]).unwrap();
+            }
+            w.close().unwrap();
+        }
+
+        // The bytes landed verbatim in the backing store...
+        assert_eq!(read_all(&posix, path), payload);
+        // ...and reading back through the proxy yields the same bytes.
+        assert_eq!(read_all(&remote, path), payload);
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_chunked_read_exact_chunk_boundary() {
+        // A file whose size is an exact multiple of CHUNK_SIZE must terminate
+        // correctly: no off-by-one truncation and no infinite loop when the
+        // final full chunk is followed by an empty one.
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("boundary.bin");
+        let payload = pattern(CHUNK_SIZE * 2);
+        write_all(&posix, path, &payload);
+
+        // Read in CHUNK_SIZE-sized buffers so each `read` maps to exactly one
+        // chunk request, landing the EOF detection right on the boundary.
+        let mut reader = remote.open_read(path).unwrap();
+        let mut got = Vec::with_capacity(payload.len());
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut reads = 0;
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            reads += 1;
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            // Guard against a runaway loop independent of the EOF assertion.
+            assert!(reads <= 8, "read did not terminate at the chunk boundary");
+        }
+        assert!(reader.eof());
+        assert_eq!(got, payload);
+
+        // Drop the streaming reader (it holds a clone of the shared client) so
+        // `close` can reclaim sole ownership of the protocol client.
+        drop(reader);
+        remote.close().unwrap();
+        server.join().unwrap();
     }
 }
