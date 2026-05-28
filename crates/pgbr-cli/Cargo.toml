@@ -21,6 +21,11 @@ pgbr-storage = { path = "../pgbr-storage" }
 serde_yml = "0.0.12"
 
 [dev-dependencies]
+# Used by the cargo-native e2e test (tests/e2e.rs) to seed a synthetic PG data
+# dir with a real pg_control header and to read back the on-disk info/manifest
+# files the command stack writes.
+pgbr-info = { path = "../pgbr-info" }
+pgbr-postgres = { path = "../pgbr-postgres" }
 tempfile = "3"
 
 [lints]

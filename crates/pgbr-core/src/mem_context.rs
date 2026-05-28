@@ -1,29 +1,18 @@
-//! Memory-context stack-state algorithms shared with the C `memContext.h` macros.
+//! Memory-context stack-state algorithms and storage.
 //!
-//! Migration phase: 32A (sub-issue of #36). This module owns both the **algorithmic** layer of
-//! the mem-context stack (`switch`, `switch_back`, `keep`, `discard`, `current`, `prior`,
-//! `clean`, plus the `push_new` helper used by the still-in-C `memContextNew`) and the
-//! **storage** for the 128-entry stack array, the cursor variables, and the DEBUG sequence
-//! counter.
+//! This module owns both the **algorithmic** layer of the mem-context stack (`switch`,
+//! `switch_back`, `keep`, `discard`, `current`, `prior`, `clean`, plus the `push_new` helper used
+//! by [`mem_context_new`]) and the **storage** for the 128-entry stack array
+//! ([`MEM_CONTEXT_STACK`]), the cursor variables ([`MEM_CONTEXT_CURRENT_STACK_IDX`],
+//! [`MEM_CONTEXT_MAX_STACK_IDX`]), and the audit sequence counter ([`MEM_CONTEXT_SEQUENCE`]).
 //!
-//! The state lives in this crate (and therefore inside `libpgbr_ffi.a`) so the FFI library is
-//! self-contained — every test binary that links `libpgbr_ffi.a` resolves all `pgbr_mem_context_*`
-//! symbols without needing `src/common/memContext.c` in its compile list. The error and
-//! `error-retry` test binaries, which never call mem-context functions but pull in `pgbr_ffi.a`
-//! for `pgbr_stack_trace_*`, would otherwise fail at link with `undefined reference to
-//! memContextStack`.
+//! Slot zero of the stack holds the address of the top context ([`TOP_CONTEXT`]). [`init_top`]
+//! primes that slot, and [`top_setup`] initialises the top context's bitfields; both must run once
+//! before the first allocation.
 //!
-//! Symbols are exported with their C names (`memContextStack`, `memContextCurrentStackIdx`,
-//! `memContextMaxStackIdx`, `memContextSequence`) so `src/common/memContext.c` can `extern`
-//! them and the `ASSERT_ALLOC_MANY_VALID` macro keeps stringifying as
-//! `memContextStack[memContextCurrentStackIdx]`. The test suite, which `#include`s
-//! `memContext.c` directly and reads `memContextStack[…]` plus `memContext->name` style fields,
-//! keeps compiling — only the storage **owner** moved.
-//!
-//! Slot zero of `memContextStack` must hold the address of the C-side static `contextTop`. Rust
-//! cannot statically initialise that pointer because `&contextTop` is not a Rust constant; the
-//! `pgbr_mem_context_init_top` hook (called from a `__attribute__((constructor))` in
-//! `memContext.c`) writes the pointer before `main` runs.
+//! The layout originally mirrored the C `struct MemContext` byte-for-byte so the Rust and C halves
+//! could share the same malloc'd allocations. The C tree has since been removed; the algorithms
+//! and the `#[repr(C)]` layout are retained as-is.
 
 use core::ffi::c_char;
 use core::ffi::c_void;
@@ -56,128 +45,77 @@ pub const STACK_TYPE_SWITCH: i32 = 0;
 /// to.
 pub const STACK_TYPE_NEW: i32 = 1;
 
-// ─── Tree-structure mirrors (32B) ──────────────────────────────────────────────────────────────
+// ─── Tree-structure mirrors ──────────────────────────────────────────────────────────────────────
 //
-// The C side keeps the bitfield-packed `struct MemContext` in `src/common/memContext.c` because
-// the test (`test/src/test.c` `#include`s the file directly) reads `memContext->name`,
-// `memContext->active`, etc. The Rust mirror below MUST agree byte-for-byte with the C struct so
-// the still-in-C `memContextNew` and the Rust `mem_context_*` algorithms can share malloc'd
-// allocations.
-//
-// 32B targets the DEBUG layout (the only flavour test.pl exercises). The C compiler asserts
-// `sizeof(struct MemContext) == 32` on 64-bit DEBUG and `24` on 32-bit DEBUG — see the
-// `_Static_assert` matrix at the top of `src/common/memContext.c`. A non-DEBUG production build
-// has a different (smaller) `MemContext` layout; the Rust mirror does not currently track it,
-// and `mem_context_new` / `mem_context_free` would mismatch in that build. A follow-up sub-issue
-// will add a build.rs reading the meson `c-debug` env var to switch layouts; for now the
-// pgbackrest binary already gates the DEBUG/non-DEBUG builds via meson_options.txt and the
-// test.pl harness only runs DEBUG.
+// `MemContext` and its satellite structs use `#[repr(C)]` with a GCC-SysV-compatible bitfield
+// layout. The layout matches what the original C `struct MemContext` produced on 64-bit
+// (`sizeof == 32`) and 32-bit (`sizeof == 24`) — see the size assertions below — so the
+// allocation math in `mem_context_new` / `mem_context_free_release_recurse` stays correct.
 
 /// Bitfield-packed flags region of `MemContext`.
 ///
 /// GCC's System V ABI packs consecutive bitfields LSB-first into a single 32-bit storage unit
-/// when the total bit count fits. The DEBUG layout uses 26 bits (with `active`); the non-DEBUG
-/// layout uses 25 (no `active`). Bit positions for the **non**-`active` fields shift by one
-/// between the two layouts, so the helper constants are `cfg`-gated.
+/// when the total bit count fits. The layout uses 26 bits.
 ///
-/// LSB-first bit layout (matches GCC SysV ABI):
+/// LSB-first bit layout (matches `GCC` `SysV` ABI):
 ///
-/// | bits (DEBUG) | bits (release) | field                  |
-/// |--------------|----------------|------------------------|
-/// | 0            | n/a            | `active` (DEBUG only)  |
-/// | 1-2          | 0-1            | `child_qty`            |
-/// | 3            | 2              | `child_initialized`    |
-/// | 4-5          | 3-4            | `alloc_qty`            |
-/// | 6            | 5              | `alloc_initialized`    |
-/// | 7-8          | 6-7            | `callback_qty`         |
-/// | 9            | 8              | `callback_initialized` |
-/// | 10-25        | 9-24           | `alloc_extra`          |
-#[cfg(c_debug)]
+/// | bits  | field                  |
+/// |-------|------------------------|
+/// | 0     | `active`               |
+/// | 1-2   | `child_qty`            |
+/// | 3     | `child_initialized`    |
+/// | 4-5   | `alloc_qty`            |
+/// | 6     | `alloc_initialized`    |
+/// | 7-8   | `callback_qty`         |
+/// | 9     | `callback_initialized` |
+/// | 10-25 | `alloc_extra`          |
 const FLAG_ACTIVE_SHIFT: u32 = 0;
-#[cfg(c_debug)]
 const FLAG_ACTIVE_MASK: u32 = 0x1;
-#[cfg(c_debug)]
 const FLAG_CHILD_QTY_SHIFT: u32 = 1;
-#[cfg(not(c_debug))]
-const FLAG_CHILD_QTY_SHIFT: u32 = 0;
 const FLAG_CHILD_QTY_MASK: u32 = 0x3;
-#[cfg(c_debug)]
 const FLAG_CHILD_INIT_SHIFT: u32 = 3;
-#[cfg(not(c_debug))]
-const FLAG_CHILD_INIT_SHIFT: u32 = 2;
 const FLAG_CHILD_INIT_MASK: u32 = 0x1;
-#[cfg(c_debug)]
 const FLAG_ALLOC_QTY_SHIFT: u32 = 4;
-#[cfg(not(c_debug))]
-const FLAG_ALLOC_QTY_SHIFT: u32 = 3;
 const FLAG_ALLOC_QTY_MASK: u32 = 0x3;
-#[cfg(c_debug)]
 const FLAG_ALLOC_INIT_SHIFT: u32 = 6;
-#[cfg(not(c_debug))]
-const FLAG_ALLOC_INIT_SHIFT: u32 = 5;
 const FLAG_ALLOC_INIT_MASK: u32 = 0x1;
-#[cfg(c_debug)]
 const FLAG_CALLBACK_QTY_SHIFT: u32 = 7;
-#[cfg(not(c_debug))]
-const FLAG_CALLBACK_QTY_SHIFT: u32 = 6;
 const FLAG_CALLBACK_QTY_MASK: u32 = 0x3;
-#[cfg(c_debug)]
 const FLAG_CALLBACK_INIT_SHIFT: u32 = 9;
-#[cfg(not(c_debug))]
-const FLAG_CALLBACK_INIT_SHIFT: u32 = 8;
 const FLAG_CALLBACK_INIT_MASK: u32 = 0x1;
-#[cfg(c_debug)]
 const FLAG_ALLOC_EXTRA_SHIFT: u32 = 10;
-#[cfg(not(c_debug))]
-const FLAG_ALLOC_EXTRA_SHIFT: u32 = 9;
 const FLAG_ALLOC_EXTRA_MASK: u32 = 0xFFFF;
 
-/// Byte-identical Rust mirror of the C `struct MemContext`.
+/// `#[repr(C)]` mem-context header.
 ///
-/// `c-debug` feature gates the `name` / `sequence_new` fields and the `active` bit slot to
-/// match the C `#ifdef DEBUG` blocks. Sizes:
-///   * 64-bit DEBUG: 32 bytes (`8 name + 8 seq + 4 flags + 4 parent_idx + 8 parent`).
-///   * 32-bit DEBUG: 24 bytes (`u64` is 4-aligned on 32-bit Linux: `4+8+4+4+4`).
-///   * 64-bit release: 16 bytes (`4 flags + 4 parent_idx + 8 parent`).
-///   * 32-bit release: 12 bytes.
+/// Carries the audit `name` / `sequence_new` fields and an `active` bit slot. Sizes:
+///   * 64-bit: 32 bytes (`8 name + 8 seq + 4 flags + 4 parent_idx + 8 parent`).
+///   * 32-bit: 24 bytes (`u64` is 4-aligned on 32-bit Linux: `4+8+4+4+4`).
 #[repr(C)]
 pub struct MemContext {
-    #[cfg(c_debug)]
     pub name: *const c_char,
-    #[cfg(c_debug)]
     pub sequence_new: u64,
     pub flags: u32,
     pub context_parent_idx: u32,
     pub context_parent: *mut Self,
 }
 
-/// Compile-time assertion that the Rust mirror matches the test-pinned C `sizeof`.
+/// Compile-time assertion that the layout matches the expected `sizeof`.
 const _: () = {
-    #[cfg(all(target_pointer_width = "64", c_debug))]
+    #[cfg(target_pointer_width = "64")]
     assert!(
         core::mem::size_of::<MemContext>() == 32,
-        "MemContext must be 32 bytes on 64-bit DEBUG"
+        "MemContext must be 32 bytes on 64-bit"
     );
-    #[cfg(all(target_pointer_width = "32", c_debug))]
+    #[cfg(target_pointer_width = "32")]
     assert!(
         core::mem::size_of::<MemContext>() == 24,
-        "MemContext must be 24 bytes on 32-bit DEBUG"
-    );
-    #[cfg(all(target_pointer_width = "64", not(c_debug)))]
-    assert!(
-        core::mem::size_of::<MemContext>() == 16,
-        "MemContext must be 16 bytes on 64-bit release"
-    );
-    #[cfg(all(target_pointer_width = "32", not(c_debug)))]
-    assert!(
-        core::mem::size_of::<MemContext>() == 12,
-        "MemContext must be 12 bytes on 32-bit release"
+        "MemContext must be 24 bytes on 32-bit"
     );
 };
 
-// Some accessors take `&self` / `&mut self` even when one cfg branch ignores both inputs (the
-// non-DEBUG `active` accessor returns a constant). Clippy complains; suppress at the impl level
-// so the public API stays uniform across cfg variants.
+// The setters take `&mut self` and the const-ness lint (nursery) would otherwise fire on the
+// bitfield helpers; suppress at the impl level so the accessor API stays uniform.
 #[allow(
     clippy::unused_self,
     clippy::needless_pass_by_ref_mut,
@@ -185,24 +123,15 @@ const _: () = {
     unused_variables
 )]
 impl MemContext {
-    /// `true` while the context is in active use; cleared by `memContextCallbackRecurse` before
-    /// the callback fires. DEBUG-only on the C side; release builds always return `true` from
-    /// this accessor (the bit does not exist in the layout).
+    /// `true` while the context is in active use; cleared by [`mem_context_callback_recurse`]
+    /// before the callback fires.
     #[must_use]
     pub const fn active(&self) -> bool {
-        #[cfg(c_debug)]
-        {
-            (self.flags >> FLAG_ACTIVE_SHIFT) & FLAG_ACTIVE_MASK != 0
-        }
-        #[cfg(not(c_debug))]
-        {
-            true
-        }
+        (self.flags >> FLAG_ACTIVE_SHIFT) & FLAG_ACTIVE_MASK != 0
     }
 
-    /// Set the active bit. No-op on non-DEBUG builds where the bit does not exist.
+    /// Set the active bit.
     pub fn set_active(&mut self, value: bool) {
-        #[cfg(c_debug)]
         Self::set_bits(&mut self.flags, FLAG_ACTIVE_SHIFT, FLAG_ACTIVE_MASK, u32::from(value));
     }
 
@@ -411,21 +340,16 @@ const SIZE_POSSIBLE: [[[usize; 2]; 3]; 3] = [
     ],
 ];
 
-// libc allocators. `pgbr_mem_context_*` allocations come from the same heap as the C
-// `memAllocInternal` so the C and Rust paths can share buffers byte-for-byte. On null return we
-// panic; the FFI guard maps the panic to `ErrorType::Unknown` for the C caller. The legacy C
-// `memAllocInternal` test (`TEST_ERROR(memAllocInternal((size_t)5629499534213120), MemoryError,
-// …)` at memContextTest.c:43) calls the static helper directly and is unaffected — that path
-// stays in C and is exercised independently. The Rust side panics defensively because in
-// practice `memContextNewP` / `memNew` allocations succeed.
+// libc allocators. Tree-internal allocations (`mem_context_new` and friends) go straight to libc
+// malloc/realloc/free. On null return these helpers panic; the no-panic `*_or_null` variants
+// below are used on the public allocation path so a `MemoryError` can be surfaced instead.
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
 }
 
-/// Allocate `size` bytes via libc malloc. Panics on null return; the FFI panic guard surfaces
-/// the failure to the C caller as `ErrorType::Unknown`.
+/// Allocate `size` bytes via libc malloc. Panics on null return.
 unsafe fn mem_alloc(size: usize) -> *mut c_void {
     // SAFETY: libc malloc is always callable with any size; null return is the failure
     // indicator we explicitly check for.
@@ -493,10 +417,9 @@ unsafe fn mem_realloc_ptr_array<T>(old: *mut *mut T, old_count: usize, new_count
 // reparents an existing context, and `mem_context_size` (DEBUG-only on the C side) sums the
 // allocation totals for audit reporting.
 //
-// All readers of bitfield-packed fields go through the `MemContext::*` accessors, which honour
-// the `cfg(c_debug)` shifts. The C `__attribute__((constructor))` in `memContext.c` aborts the
-// process at load time if `pgbr_mem_context_struct_size()` disagrees with `sizeof(struct
-// MemContext)`, so reaching this code already guarantees the layouts match.
+// All readers of bitfield-packed fields go through the `MemContext::*` accessors, which encode
+// the documented shift/mask positions. The `const _: ()` size assertions above guarantee the
+// layout matches what the allocation math expects.
 //
 // Clippy allowances:
 //   * `cast_ptr_alignment` — these algorithms reach into a single malloc'd block via a `*mut u8`
@@ -598,17 +521,14 @@ unsafe fn mem_context_new_index(this: *mut MemContext, child: *mut MemContextChi
 
 /// Allocate and initialise a new `MemContext` whose parent is the current context.
 ///
-/// Mirrors the legacy `memContextNew`. The C wrapper still owns the parameter validation
-/// (ASSERTs) and the `errorTryDepth()` lookup. On return the context is registered in the
-/// parent's child list and a `New` entry is pushed on the mem-context stack so an error unwind
-/// will free the partially-built context.
+/// Mirrors the legacy `memContextNew`. On return the context is registered in the parent's child
+/// list and a `New` entry is pushed on the mem-context stack so an error unwind will free the
+/// partially-built context.
 ///
 /// # Safety
 ///
-/// `name` must be either a valid NUL-terminated C string with the lifetime of the new context
-/// (when `cfg(c_debug)` is on) or any value when `cfg(c_debug)` is off (the field doesn't
-/// exist). `try_depth` is the current `errorTryDepth()`. The current context (slot
-/// `memContextCurrentStackIdx`) must have `child_qty != MEM_QTY_NONE`.
+/// `name` must be a valid NUL-terminated C string with the lifetime of the new context. The
+/// current context (slot `MEM_CONTEXT_CURRENT_STACK_IDX`) must have `child_qty != MEM_QTY_NONE`.
 #[allow(
     clippy::cast_ptr_alignment,
     clippy::expect_used,
@@ -623,8 +543,6 @@ pub unsafe fn mem_context_new(
     alloc_extra_param: u16,
     try_depth: u32,
 ) -> *mut MemContext {
-    let _ = name;
-
     // Pad allocExtra so trailing optional regions stay aligned.
     let mut alloc_extra = alloc_extra_param as usize;
     let align = core::mem::align_of::<*mut c_void>();
@@ -637,7 +555,7 @@ pub unsafe fn mem_context_new(
     let callback_qty = callback_qty_param;
 
     // SAFETY: see module-level note. We only touch the new allocation and the parent's child
-    // list (read via the same accessors that `cfg(c_debug)` keeps in sync).
+    // list (read via the `MemContext::*` accessors).
     unsafe {
         let context_current = current().cast::<MemContext>();
 
@@ -650,9 +568,7 @@ pub unsafe fn mem_context_new(
         core::ptr::write(
             this,
             MemContext {
-                #[cfg(c_debug)]
                 name,
-                #[cfg(c_debug)]
                 sequence_new: next_sequence(),
                 flags: 0,
                 context_parent_idx: 0,
@@ -793,8 +709,7 @@ pub unsafe fn mem_context_free_release_recurse(this: *mut MemContext) -> *mut Me
     unsafe {
         let top = top_context();
 
-        // DEBUG: cannot free the current context (top is special — it can be reset).
-        #[cfg(c_debug)]
+        // Cannot free the current context (top is special — it can be reset).
         if this.cast::<c_void>() == current() && this.cast::<c_void>() != top {
             return this;
         }
@@ -917,9 +832,8 @@ pub unsafe fn mem_context_move(this: *mut MemContext, parent_new: *mut MemContex
 
 /// Sum the allocation footprint of `this` and the subtree below it.
 ///
-/// Mirrors `memContextSize`, which the C side wraps in `#ifdef DEBUG`. Always-defined here
-/// because the layout-mirror constants compile in both flavours; the C wrapper still guards the
-/// call on `#ifdef DEBUG` so non-DEBUG builds do not pay the recursion cost.
+/// Mirrors `memContextSize`. Used for audit reporting; the caller decides when the recursion
+/// cost is worth paying.
 ///
 /// # Safety
 ///
@@ -1002,15 +916,13 @@ pub fn top_context() -> *mut c_void {
     unsafe { entry_at(0).mem_context }
 }
 
-// ─── 32D: top context owned by Rust ────────────────────────────────────────────────────────────
+// ─── Top context ─────────────────────────────────────────────────────────────────────────────────
 //
-// Before 32D the top context lived in C as `static struct MemContextTop contextTop`. 32D drops
-// the C struct definitions, so the top context moves here and the C side reaches it via
-// `pgbr_mem_context_top()`. Rust's const-init cannot set bitfield bits via the
-// non-const `MemContext::set_*` methods, so the bits get initialised once at process start by
-// `top_setup()` (called from the C `__attribute__((constructor))` below).
+// The top context is the root of the mem-context tree. Rust's const-init cannot set the bitfield
+// bits via the non-const `MemContext::set_*` methods, so the bits get initialised once at process
+// start by [`top_setup`].
 
-/// Same layout as the legacy C `struct MemContextTop`.
+/// Layout of the top context: a [`MemContext`] header followed by its child and alloc lists.
 ///
 /// A `MemContext` followed by a `MemContextChildMany` and a `MemContextAllocMany`. Lives as a
 /// process-wide `static mut` so `&TOP_CONTEXT` is the same pointer for every caller.
@@ -1027,9 +939,7 @@ pub struct MemContextTop {
 const fn make_top() -> MemContextTop {
     MemContextTop {
         mem_context: MemContext {
-            #[cfg(c_debug)]
             name: TOP_NAME.as_ptr(),
-            #[cfg(c_debug)]
             sequence_new: 0,
             flags: 0,
             context_parent_idx: 0,
@@ -1048,25 +958,24 @@ const fn make_top() -> MemContextTop {
     }
 }
 
-#[cfg(c_debug)]
+// `c_char` is `i8` on this target, so the `u8 -> c_char` byte casts trip
+// `cast_possible_wrap`; the values are plain ASCII (< 128) so the cast is exact.
+#[allow(clippy::cast_possible_wrap)]
 static TOP_NAME: [c_char; 4] = [b'T' as c_char, b'O' as c_char, b'P' as c_char, 0];
 
-/// Process-wide top context. Equivalent to the legacy C `static struct MemContextTop contextTop`.
-#[unsafe(no_mangle)]
+/// Process-wide top context, the root of the mem-context tree.
 pub static mut TOP_CONTEXT: MemContextTop = make_top();
 
-/// Initialise the bitfields on `TOP_CONTEXT` and prime `memContextStack[0]` with its address.
+/// Initialise the bitfields on [`TOP_CONTEXT`] and prime `MEM_CONTEXT_STACK[0]` with its address.
 ///
-/// Called once from the C `__attribute__((constructor))` in `memContext.c`. The setters are not
-/// `const`, so we apply them to a stack-local `MemContext` and then copy the resulting `flags`
-/// word into the static via `core::ptr::write` (avoiding `&mut` to a `static mut`).
+/// Must be called once before the first allocation. The setters are not `const`, so we apply them
+/// to a stack-local `MemContext` and then copy the resulting `flags` word into the static via
+/// `core::ptr::write` (avoiding `&mut` to a `static mut`).
 pub fn top_setup() {
-    // SAFETY: process-singleton. Single-threaded init guaranteed by the constructor attribute.
+    // SAFETY: process-singleton; the caller guarantees this runs once during single-threaded init.
     unsafe {
         let mut tmp = MemContext {
-            #[cfg(c_debug)]
             name: TOP_NAME.as_ptr(),
-            #[cfg(c_debug)]
             sequence_new: 0,
             flags: 0,
             context_parent_idx: 0,
@@ -1361,12 +1270,11 @@ pub unsafe fn mem_alloc_valid(alloc: *mut MemContextAlloc) -> bool {
     }
 }
 
-// ─── Audit (DEBUG-only) ────────────────────────────────────────────────────────────────────────
+// ─── Audit ─────────────────────────────────────────────────────────────────────────────────────
 //
-// The audit is only useful when `name` / `sequence_new` are present on `MemContext`, which only
-// happens with `cfg(c_debug)`. The C wrapper guards each call site with `#ifdef DEBUG` so the
-// FFI shims never fire in non-DEBUG builds; the cfg gate here keeps the symbols off the
-// non-DEBUG archive entirely.
+// The audit walks the context tree using the `name` / `sequence_new` fields to detect newly
+// created children and verify their return types. Callers invoke it only where the cost is
+// warranted.
 
 /// Mirror of the C `MemContextAuditState` struct. 64-bit layout: `8 mem_context` +
 /// `1 return_type_any + 7 padding` + `8 sequence_context_new` = 24 bytes.
@@ -1377,7 +1285,6 @@ pub struct MemContextAuditState {
     pub sequence_context_new: u64,
 }
 
-#[cfg(c_debug)]
 const _: () = {
     #[cfg(target_pointer_width = "64")]
     assert!(core::mem::size_of::<MemContextAuditState>() == 24);
@@ -1390,7 +1297,6 @@ const _: () = {
 /// # Safety
 ///
 /// `state` must be a valid `MemContextAuditState *` whose `mem_context` is live.
-#[cfg(c_debug)]
 #[allow(clippy::cast_ptr_alignment)]
 pub unsafe fn mem_context_audit_begin(state: *mut MemContextAuditState) {
     // SAFETY: caller upholds the validity invariants.
@@ -1427,7 +1333,11 @@ pub unsafe fn mem_context_audit_begin(state: *mut MemContextAuditState) {
 /// # Safety
 ///
 /// Both pointers must be valid NUL-terminated C strings.
-#[cfg(c_debug)]
+// ASCII byte literals (`:`, ` `, `*`, all < 128) cast exactly into `c_char`; the
+// `cast_possible_wrap` lint flags the signedness change harmlessly. The nursery
+// `const fn` suggestion is declined — this walks raw pointers and is only ever
+// called at runtime.
+#[allow(clippy::cast_possible_wrap, clippy::missing_const_for_fn)]
 unsafe fn audit_name_match(actual: *const c_char, expected: *const c_char) -> bool {
     // SAFETY: caller upholds NUL-termination.
     unsafe {
@@ -1474,16 +1384,16 @@ impl AuditEndResult {
     };
 }
 
-/// Walk the children created since the matching [`mem_context_audit_begin`] call and check that
-/// any whose name matches `return_type` is unique. Mirrors `memContextAuditEnd`. The C wrapper
-/// rethrows `kind != 0` as `AssertError`.
+/// Walk the children created since the matching [`mem_context_audit_begin`] call.
+///
+/// Checks that any whose name matches `return_type` is unique. Mirrors
+/// `memContextAuditEnd`. The C wrapper rethrows `kind != 0` as `AssertError`.
 ///
 /// # Safety
 ///
 /// `state` must be a valid `MemContextAuditState *` produced by `mem_context_audit_begin`.
 /// `return_type` must be a valid NUL-terminated C string.
-#[cfg(c_debug)]
-#[allow(clippy::cast_ptr_alignment)]
+#[allow(clippy::cast_ptr_alignment, clippy::must_use_candidate)]
 pub unsafe fn mem_context_audit_end(state: *const MemContextAuditState, return_type: *const c_char) -> AuditEndResult {
     // SAFETY: caller upholds the validity invariants.
     unsafe {
@@ -1550,7 +1460,6 @@ pub unsafe fn mem_context_audit_end(state: *const MemContextAuditState, return_t
 ///
 /// `alloc_extra` must be a pointer returned by [`mem_context_alloc_extra`] of a live context.
 /// `name` must be a NUL-terminated C string with a lifetime that outlives the context.
-#[cfg(c_debug)]
 pub unsafe fn mem_context_audit_alloc_extra_name(alloc_extra: *mut c_void, name: *const c_char) -> *mut c_void {
     // SAFETY: caller upholds the validity invariants.
     unsafe {
@@ -1560,19 +1469,16 @@ pub unsafe fn mem_context_audit_alloc_extra_name(alloc_extra: *mut c_void, name:
     }
 }
 
-// ─── Stack (32A) ───────────────────────────────────────────────────────────────────────────────
+// ─── Stack ─────────────────────────────────────────────────────────────────────────────────────
 
-/// Mirror of `struct MemContextStack` defined in `src/common/memContext.c`.
+/// One entry in the mem-context stack.
 ///
-/// Layout-compatible: `MemContext *` (pointer, 8 bytes on 64-bit / 4 on 32-bit) + `enum` (treated
-/// as `int` by GCC/clang on the supported targets, 4 bytes) + `unsigned int` (4 bytes). 64-bit
-/// total = 16 bytes; 32-bit total = 12 bytes.
+/// `#[repr(C)]`: `MemContext *` (8 bytes on 64-bit / 4 on 32-bit) + `i32` (4 bytes) + `u32`
+/// (4 bytes). 64-bit total = 16 bytes; 32-bit total = 12 bytes.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct MemContextStackEntry {
-    /// Opaque `MemContext *` — the bitfield-packed struct definition lives in
-    /// `src/common/memContext.c` and is mirrored to Rust in 32B. 32A only ever shuffles raw
-    /// pointers around.
+    /// The `MemContext *` for this entry. The stack only ever shuffles raw pointers around.
     pub mem_context: *mut c_void,
     /// `STACK_TYPE_SWITCH` or `STACK_TYPE_NEW`.
     pub type_: i32,
@@ -1590,48 +1496,30 @@ const ZERO_ENTRY: MemContextStackEntry = MemContextStackEntry {
 
 /// 128-entry call-stack of mem-context pushes/switches.
 ///
-/// Slot 0 holds the top context (initialised by the C-side `__attribute__((constructor))`
-/// `pgbr_mem_context_init_top_ctor`); slots 1..=127 fill on `switch` / `push_new`. Exported
-/// under the legacy C symbol name so `src/common/memContext.c` can keep the
-/// `extern struct MemContextStack memContextStack[…]` declaration the test depends on.
-#[unsafe(no_mangle)]
-pub static mut memContextStack: [MemContextStackEntry; MEM_CONTEXT_STACK_MAX] = [ZERO_ENTRY; MEM_CONTEXT_STACK_MAX];
+/// Slot 0 holds the top context (primed by [`init_top`]); slots 1..=127 fill on `switch` /
+/// `push_new`.
+pub static mut MEM_CONTEXT_STACK: [MemContextStackEntry; MEM_CONTEXT_STACK_MAX] = [ZERO_ENTRY; MEM_CONTEXT_STACK_MAX];
 
-/// Cursor for the current allocation context. Mirrors `memContextCurrentStackIdx` from the
-/// legacy C.
-#[unsafe(no_mangle)]
-pub static mut memContextCurrentStackIdx: u32 = 0;
+/// Cursor for the current allocation context.
+pub static mut MEM_CONTEXT_CURRENT_STACK_IDX: u32 = 0;
 
-/// Cursor for the highest used stack slot, including pending `New` entries. Mirrors
-/// `memContextMaxStackIdx` from the legacy C.
-#[unsafe(no_mangle)]
-pub static mut memContextMaxStackIdx: u32 = 0;
+/// Cursor for the highest used stack slot, including pending `New` entries.
+pub static mut MEM_CONTEXT_MAX_STACK_IDX: u32 = 0;
 
-/// Audit sequence counter.
+/// Audit sequence counter, bumped by [`next_sequence`] when [`mem_context_new`] stamps a new
+/// context.
+pub static mut MEM_CONTEXT_SEQUENCE: u64 = 0;
+
+/// Callback passed to [`discard`] / [`clean`] so they can free a popped `MemContext *`.
 ///
-/// Bumped by [`next_sequence`] when the still-in-C `memContextNew` stamps a new context (DEBUG
-/// only). 32A defines the counter unconditionally so the production build does not need a
-/// separate flavour of this crate; the 8 bytes of unused storage in non-DEBUG is negligible.
-#[unsafe(no_mangle)]
-pub static mut memContextSequence: u64 = 0;
-
-/// Callback the C side passes to [`discard`] / [`clean`] so this module can free a popped
-/// `MemContext *`.
-///
-/// Avoids a hard link-time dependency on `memContextFree` (which lives in
-/// `src/common/memContext.c`). Tests that pull in `libpgbr_ffi.a` for `pgbr_stack_trace_*` only
-/// — `error`, `error-retry` — would otherwise fail at link with
-/// `undefined reference to memContextFree`.
+/// The indirection lets callers that never create contexts use the stack without pulling in the
+/// free path.
 pub type FreeCallback = unsafe extern "C" fn(*mut c_void);
 
-/// Sets `memContextStack[0].mem_context` to the C-side `&contextTop`.
+/// Sets `MEM_CONTEXT_STACK[0].mem_context` to the top context's address.
 ///
-/// Called from `__attribute__((constructor))` in `src/common/memContext.c` before `main` runs
-/// so the legacy invariant "slot 0 always points at TOP" survives the storage move from C to
-/// Rust.
-///
-/// `pgbr-ffi::pgbr_mem_context_init_top` re-exports this function with the C-visible name so
-/// cbindgen surfaces it in `pgbr_ffi.h`.
+/// Must run once before the first allocation so the invariant "slot 0 always points at TOP"
+/// holds.
 ///
 /// # Safety
 ///
@@ -1642,7 +1530,7 @@ pub unsafe fn init_top(top: *mut c_void) {
     // SAFETY: see module-level note. We only touch slot 0 and the cursors, which are owned by
     // this module.
     unsafe {
-        let base = (&raw mut memContextStack).cast::<MemContextStackEntry>();
+        let base = (&raw mut MEM_CONTEXT_STACK).cast::<MemContextStackEntry>();
         core::ptr::write(
             base,
             MemContextStackEntry {
@@ -1657,20 +1545,20 @@ pub unsafe fn init_top(top: *mut c_void) {
 #[inline]
 unsafe fn current_idx() -> u32 {
     // SAFETY: see module-level note.
-    unsafe { core::ptr::read(&raw const memContextCurrentStackIdx) }
+    unsafe { core::ptr::read(&raw const MEM_CONTEXT_CURRENT_STACK_IDX) }
 }
 
 #[inline]
 unsafe fn max_idx() -> u32 {
     // SAFETY: see module-level note.
-    unsafe { core::ptr::read(&raw const memContextMaxStackIdx) }
+    unsafe { core::ptr::read(&raw const MEM_CONTEXT_MAX_STACK_IDX) }
 }
 
 #[inline]
 unsafe fn entry_at(idx: u32) -> MemContextStackEntry {
     // SAFETY: see module-level note. Caller asserts `idx < MEM_CONTEXT_STACK_MAX`.
     unsafe {
-        let base = (&raw const memContextStack).cast::<MemContextStackEntry>();
+        let base = (&raw const MEM_CONTEXT_STACK).cast::<MemContextStackEntry>();
         core::ptr::read(base.add(idx as usize))
     }
 }
@@ -1679,7 +1567,7 @@ unsafe fn entry_at(idx: u32) -> MemContextStackEntry {
 unsafe fn write_entry(idx: u32, entry: MemContextStackEntry) {
     // SAFETY: see module-level note. Caller asserts `idx < MEM_CONTEXT_STACK_MAX`.
     unsafe {
-        let base = (&raw mut memContextStack).cast::<MemContextStackEntry>();
+        let base = (&raw mut MEM_CONTEXT_STACK).cast::<MemContextStackEntry>();
         core::ptr::write(base.add(idx as usize), entry);
     }
 }
@@ -1687,29 +1575,26 @@ unsafe fn write_entry(idx: u32, entry: MemContextStackEntry) {
 #[inline]
 unsafe fn set_current_idx(value: u32) {
     // SAFETY: see module-level note.
-    unsafe { core::ptr::write(&raw mut memContextCurrentStackIdx, value) };
+    unsafe { core::ptr::write(&raw mut MEM_CONTEXT_CURRENT_STACK_IDX, value) };
 }
 
 #[inline]
 unsafe fn set_max_idx(value: u32) {
     // SAFETY: see module-level note.
-    unsafe { core::ptr::write(&raw mut memContextMaxStackIdx, value) };
+    unsafe { core::ptr::write(&raw mut MEM_CONTEXT_MAX_STACK_IDX, value) };
 }
 
 /// Outcome of a `switch_back` / `keep` / `discard` call when the stack-top type is wrong.
 ///
-/// The C wrapper translates `Err(_)` into a `THROW_FMT(AssertError, ..., name)` so the existing
-/// diagnostic format stays byte-identical. The `mem_context` pointer is the offending top-of-
-/// stack context whose `name` (DEBUG-only field) the C side reads to format the message — Rust
-/// hands back the pointer rather than the formatted string so the bitfield-mirror work is fully
-/// deferred to 32B.
+/// The carried `mem_context` pointer is the offending top-of-stack context; the caller reads its
+/// `name` field to format an `AssertError` diagnostic.
 #[derive(Debug, Clone, Copy)]
 pub enum StackTopMismatch {
-    /// `switch_back` saw a stack-top of type `New` instead of `Switch`. The C diagnostic reads
+    /// `switch_back` saw a stack-top of type `New` instead of `Switch`. Diagnostic:
     /// "current context expected but new context '%s' found".
     ExpectedSwitchFoundNew { mem_context: *mut c_void },
-    /// `keep` or `discard` saw a stack-top of type `Switch` instead of `New`. The C diagnostic
-    /// reads "new context expected but current context '%s' found".
+    /// `keep` or `discard` saw a stack-top of type `Switch` instead of `New`. Diagnostic:
+    /// "new context expected but current context '%s' found".
     ExpectedNewFoundSwitch { mem_context: *mut c_void },
 }
 
@@ -1930,8 +1815,8 @@ pub unsafe fn clean(try_depth_floor: u32, fatal: bool, free: FreeCallback) {
 pub fn next_sequence() -> u64 {
     // SAFETY: see module-level note.
     unsafe {
-        let next = core::ptr::read(&raw const memContextSequence) + 1;
-        core::ptr::write(&raw mut memContextSequence, next);
+        let next = core::ptr::read(&raw const MEM_CONTEXT_SEQUENCE) + 1;
+        core::ptr::write(&raw mut MEM_CONTEXT_SEQUENCE, next);
         next
     }
 }
@@ -2001,7 +1886,7 @@ mod tests {
             // Reset the stack via the public init hook so we exercise the same code path the
             // C-side `__attribute__((constructor))` uses in the integrated build.
             init_top(0x1000usize as *mut c_void);
-            let base = (&raw mut memContextStack).cast::<MemContextStackEntry>();
+            let base = (&raw mut MEM_CONTEXT_STACK).cast::<MemContextStackEntry>();
             for idx in 1..MEM_CONTEXT_STACK_MAX {
                 core::ptr::write(
                     base.add(idx),
@@ -2012,9 +1897,9 @@ mod tests {
                     },
                 );
             }
-            core::ptr::write(&raw mut memContextCurrentStackIdx, 0);
-            core::ptr::write(&raw mut memContextMaxStackIdx, 0);
-            core::ptr::write(&raw mut memContextSequence, 0);
+            core::ptr::write(&raw mut MEM_CONTEXT_CURRENT_STACK_IDX, 0);
+            core::ptr::write(&raw mut MEM_CONTEXT_MAX_STACK_IDX, 0);
+            core::ptr::write(&raw mut MEM_CONTEXT_SEQUENCE, 0);
         }
         FREE_CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         guard

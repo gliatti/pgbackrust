@@ -494,9 +494,9 @@ fn validate_value(
 }
 
 /// Whether `value` is permitted by the option's allow-list. For `size`/`time`
-/// options the allow-list entries are human-readable strings (`"1MiB"`) while
-/// the resolved value is a canonical byte/second count, so both sides are
-/// parsed into integers and compared numerically. Every other type compares
+/// options the allow-list entries are human-readable strings (`"1MiB"` / `"1m"`)
+/// while the resolved value is a canonical byte/millisecond count, so both sides
+/// are parsed into integers and compared numerically. Every other type compares
 /// the canonical string form (`value_str`) directly.
 fn allow_list_contains(option_type: OptionType, allowed_strs: &[String], value: &OptionValue, value_str: &str) -> bool {
     match (option_type, value) {

@@ -8,12 +8,6 @@ repository.workspace = true
 
 [lib]
 
-[features]
-# Enable when the C side compiles with `#define DEBUG`. Adds the DEBUG-only `name`,
-# `sequence_new`, and `active` fields to the `MemContext` mirror so the Rust struct stays
-# byte-identical with the C bitfield layout.
-c-debug = []
-
 [dependencies]
 # `log::format` reuses the printf-style formatter and typed `Arg` variants from
 # `pgbr-error::format` so logInternalFmt's args-blob round-trip mirrors the

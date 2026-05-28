@@ -785,6 +785,8 @@ dependencies = [
  "pgbr-build",
  "pgbr-command",
  "pgbr-config",
+ "pgbr-info",
+ "pgbr-postgres",
  "pgbr-storage",
  "serde_yml",
  "tempfile",

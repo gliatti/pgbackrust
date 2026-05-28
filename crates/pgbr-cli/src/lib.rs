@@ -290,7 +290,7 @@ fn format_value(value: &OptionValue) -> String {
         OptionValue::Boolean(b) => b.to_string(),
         OptionValue::Integer(n) => n.to_string(),
         OptionValue::Size(n) => format!("{n} (bytes)"),
-        OptionValue::Time(n) => format!("{n} (seconds)"),
+        OptionValue::Time(n) => format!("{n} (ms)"),
         OptionValue::Path(s) | OptionValue::String(s) | OptionValue::StringId(s) => s.clone(),
         OptionValue::List(items) => format!("[{}]", items.join(", ")),
         OptionValue::Hash(map) => {

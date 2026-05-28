@@ -25,18 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang lld \
     && rm -rf /var/lib/apt/lists/*
 
-# Build uncrustify 0.72.0 from source — Debian 13 ships 0.78.1 which interprets several legacy
-# `true`/`false` options as numbers and silently changes formatting decisions, breaking
-# `test.pl --code-format-check`. The project's `test/uncrustify.cfg` header is pinned to
-# `Uncrustify-0.72.0_f`; honour that pin so format checks stay deterministic.
-RUN curl -fsSL https://github.com/uncrustify/uncrustify/archive/refs/tags/uncrustify-0.72.0.tar.gz \
-        | tar -xzC /tmp \
-    && cmake -S /tmp/uncrustify-uncrustify-0.72.0 -B /tmp/uncrustify-uncrustify-0.72.0/build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /tmp/uncrustify-uncrustify-0.72.0/build --parallel $(nproc) \
-    && cmake --install /tmp/uncrustify-uncrustify-0.72.0/build \
-    && rm -rf /tmp/uncrustify-uncrustify-0.72.0 \
-    && uncrustify --version
-
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
             -c rustfmt -c clippy \

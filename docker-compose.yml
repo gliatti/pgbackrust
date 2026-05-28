@@ -28,19 +28,6 @@ services:
       RUSTUP_HOME: /rustup
     entrypoint: ["cargo"]
 
-  test-pl:
-    image: pgbackrust-dev:latest
-    working_dir: /work
-    volumes:
-      - .:/work/pgbackrust
-      - cargo-registry:/cargo/registry
-      - cargo-git:/cargo/git
-      - rust-target:/work/target
-    environment:
-      CARGO_HOME: /cargo
-      RUSTUP_HOME: /rustup
-    entrypoint: ["pgbackrust/test/test.pl"]
-
 volumes:
   cargo-registry:
   cargo-git:

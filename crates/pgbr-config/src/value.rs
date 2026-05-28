@@ -11,7 +11,13 @@
 //!   multiplier is a power of 1024 in every case (the C parser also accepts
 //!   the SI shorthand `k`, `m`, `g`, … as 1024-based aliases). Fractional
 //!   values are rejected.
-//! - **Time**: integer in seconds. No suffixes.
+//! - **Time**: number with an optional unit suffix, stored internally as
+//!   **milliseconds** (matching pgBackRest, whose `allow-range` lower bounds
+//!   like `100ms` prove the canonical unit is ms). Suffixes: `ms` (`×1`),
+//!   `s` (`×1000`), `m` (`×60_000`), `h` (`×3_600_000`), `d` (`×86_400_000`); a
+//!   bare number with no suffix is **seconds** (`×1000`). The numeric part is
+//!   parsed as `f64` so fractional values (`1.5h`) work; the result is rounded
+//!   to a `u64` millisecond count.
 //! - **String**, **Path**, **`StringId`**: kept as-is.
 //! - **List**: comma-separated.
 //! - **Hash**: `key=value` pairs.
@@ -28,7 +34,7 @@ pub enum OptionValue {
     Integer(i64),
     /// Size in bytes.
     Size(u64),
-    /// Time in seconds.
+    /// Time in milliseconds.
     Time(u64),
     Path(String),
     String(String),
@@ -181,12 +187,71 @@ fn parse_size(raw: &str) -> Result<u64, ValueError> {
         .ok_or_else(|| ValueError::SizeOverflow { raw: raw.to_owned() })
 }
 
+/// Parse a time value into milliseconds.
+///
+/// The numeric part is parsed as `f64` (so `1.5h` works) and multiplied by the
+/// suffix's millisecond factor: `ms` is `×1`, `s` is `×1000`, `m` is `×60_000`,
+/// `h` is `×3_600_000`, `d` is `×86_400_000`. A bare number with no suffix is
+/// seconds (`×1000`), matching pgBackRest. The product is rounded to the nearest
+/// `u64` millisecond; a negative, non-finite, or out-of-`u64`-range result is
+/// rejected.
+// The `u64::MAX as f64` bound comparison loses precision (acceptable — it only
+// rejects astronomically large inputs), and the final `millis as u64` truncates
+// the already-rounded, range-checked, non-negative `f64`. Both are guarded above.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_time(raw: &str) -> Result<u64, ValueError> {
-    raw.trim().parse::<u64>().map_err(|err| ValueError::Invalid {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ValueError::Invalid {
+            option_type: OptionType::Time,
+            raw: raw.to_owned(),
+            reason: "empty".to_owned(),
+        });
+    }
+
+    // Split into a numeric prefix (digits, sign, decimal point, exponent) and a
+    // unit suffix. Mirrors `parse_size`, but keeps `.`/`e`/`E`/`+` so the f64
+    // parse below accepts fractional and scientific forms.
+    let split_at = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit() && !matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+        .map_or(trimmed.len(), |(i, _)| i);
+    let (num_part, suffix) = trimmed.split_at(split_at);
+
+    let value: f64 = num_part.parse::<f64>().map_err(|err| ValueError::Invalid {
         option_type: OptionType::Time,
         raw: raw.to_owned(),
-        reason: err.to_string(),
-    })
+        reason: format!("invalid number: {err}"),
+    })?;
+
+    // Milliseconds per unit. A bare number (empty suffix) is seconds.
+    let multiplier: f64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "ms" => 1.0,
+        "" | "s" => 1_000.0,
+        "m" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        other => {
+            return Err(ValueError::Invalid {
+                option_type: OptionType::Time,
+                raw: raw.to_owned(),
+                reason: format!("unknown time suffix `{other}`"),
+            });
+        }
+    };
+
+    let millis = (value * multiplier).round();
+    if !millis.is_finite() || millis < 0.0 || millis > u64::MAX as f64 {
+        return Err(ValueError::Invalid {
+            option_type: OptionType::Time,
+            raw: raw.to_owned(),
+            reason: "out of range".to_owned(),
+        });
+    }
+
+    // `millis` is finite, non-negative, and <= u64::MAX, so the cast is exact
+    // enough for a millisecond count (sub-ms precision is already rounded away).
+    Ok(millis as u64)
 }
 
 fn parse_path(raw: &str) -> Result<String, ValueError> {
@@ -316,9 +381,37 @@ mod tests {
     }
 
     #[test]
-    fn time_accepts_seconds_only() {
-        assert_eq!(parse_value(OptionType::Time, "60").unwrap(), OptionValue::Time(60));
-        assert!(parse_value(OptionType::Time, "60s").is_err());
+    fn time_parses_to_milliseconds_with_suffixes() {
+        // Bare number = seconds (pgBackRest convention); explicit unit suffixes
+        // map to milliseconds. Internal unit is ms.
+        let cases = [
+            ("60", 60_000_u64),  // bare = seconds
+            ("60s", 60_000),     // s = ×1000
+            ("1m", 60_000),      // m = ×60_000
+            ("100ms", 100),      // ms = ×1
+            ("1h", 3_600_000),   // h = ×3_600_000
+            ("1d", 86_400_000),  // d = ×86_400_000
+            ("0", 0),            // zero is valid
+            ("1.5h", 5_400_000), // fractional values round to ms
+            ("100ms ", 100),     // trailing whitespace tolerated
+            ("1d", 86_400_000),  // allow-range upper bounds like 1d/7d work
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_value(OptionType::Time, raw).unwrap(),
+                OptionValue::Time(expected),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_rejects_unknown_suffix_and_empty() {
+        assert!(parse_value(OptionType::Time, "1x").is_err());
+        assert!(parse_value(OptionType::Time, "").is_err());
+        assert!(parse_value(OptionType::Time, "abc").is_err());
+        // A negative value is not a valid time.
+        assert!(parse_value(OptionType::Time, "-5s").is_err());
     }
 
     #[test]
