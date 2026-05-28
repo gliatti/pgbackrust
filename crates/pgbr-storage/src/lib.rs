@@ -174,4 +174,23 @@ pub trait Storage: Send + Sync {
     /// Returns [`StorageError::NotFound`] if the directory is missing and `error_on_missing`
     /// is `true`; other variants for permission / backend / non-empty failures.
     fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), StorageError>;
+
+    /// Create a symbolic link at `link_path` pointing at `target`.
+    ///
+    /// Symlinks only make sense on a real filesystem, so this has a default
+    /// implementation that returns a [`StorageError::Backend`] "symlinks not
+    /// supported" error. Filesystem backends (e.g. [`Posix`]) override it; object
+    /// stores and other non-filesystem backends keep the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] from the default implementation. Overriding
+    /// backends return [`StorageError`] variants for permission / backend failures or
+    /// [`StorageError::AlreadyExists`] when `link_path` already exists.
+    fn create_symlink(&self, link_path: &Path, _target: &Path) -> Result<(), StorageError> {
+        Err(StorageError::Backend {
+            path: link_path.to_path_buf(),
+            message: "symlinks not supported by this backend".to_owned(),
+        })
+    }
 }
