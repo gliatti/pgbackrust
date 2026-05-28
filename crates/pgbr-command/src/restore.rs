@@ -31,6 +31,19 @@
 //! ([`CommandError::Other`]): restoring corrupt data silently is worse than
 //! failing the restore.
 //!
+//! # Manifest references (differential restore)
+//!
+//! A differential backup records files unchanged since its base full backup
+//! with `reference: Some(<full label>)` instead of re-copying their bytes. When
+//! restore encounters such a file it reads the bytes from the *referenced*
+//! backup's directory (`backup/<stanza>/<reference label>/<path><suffix>`)
+//! rather than the restored backup's own dir. The referenced backup's transform
+//! (compress / cipher) is read from its own `[backup:current]` entry in
+//! `backup.info`, so each file is reversed with exactly the transform it was
+//! written under. The final plaintext is SHA-1-checked the same way regardless
+//! of which backup supplied the bytes. Files with `reference: None` restore from
+//! the restored backup's own dir, exactly as before.
+//!
 //! # Delta restore (`--delta`)
 //!
 //! When `--delta` is set, each manifest file is checked against what is already
@@ -203,8 +216,13 @@ fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut Vec<PathBuf>) ->
 ///
 /// The returned metadata entry carries the compress-type / encrypted flag the
 /// backup recorded, which [`restore_inner`] feeds to
-/// [`RepoTransform::from_metadata`].
-fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Result<(String, serde_json::Value), CommandError> {
+/// [`RepoTransform::from_metadata`]. The whole [`InfoBackup`] is returned too so
+/// referenced backups' transforms can be resolved during reference restore.
+fn select_backup(
+    config: &LoadedConfig,
+    repo: &dyn Storage,
+    stanza: &str,
+) -> Result<(String, serde_json::Value, InfoBackup), CommandError> {
     let info = InfoBackup::load(repo, &backup_info_path(stanza)).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
             path: backup_info_path(stanza),
@@ -214,7 +232,8 @@ fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Res
 
     if let Some(label) = requested_set(config) {
         if let Some(entry) = info.current.get(label) {
-            return Ok((label.to_owned(), entry.clone()));
+            let entry = entry.clone();
+            return Ok((label.to_owned(), entry, info));
         }
         return Err(CommandError::Other(format!(
             "backup set {label} is not present in the repository"
@@ -223,11 +242,12 @@ fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Res
 
     // `BTreeMap` keys iterate in ascending order, so the last one is the
     // lexicographically-greatest (and therefore most recent) label.
-    info.current
-        .iter()
-        .next_back()
-        .map(|(label, entry)| (label.clone(), entry.clone()))
-        .ok_or_else(|| CommandError::Other("no backups to restore".to_owned()))
+    let Some((label, entry)) = info.current.iter().next_back() else {
+        return Err(CommandError::Other("no backups to restore".to_owned()));
+    };
+    let label = label.clone();
+    let entry = entry.clone();
+    Ok((label, entry, info))
 }
 
 /// Read one backup file from the repository, reverse the backup `transform`
@@ -286,11 +306,11 @@ fn copy_file(
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
     let delta = delta_enabled(config);
-    let (label, metadata) = select_backup(config, repo, stanza)?;
+    let (label, metadata, info) = select_backup(config, repo, stanza)?;
 
-    // The transform the backup applied — read from the recorded metadata, with
-    // the resolved options supplying the cipher password (never stored in the
-    // repo) and any value the metadata omits.
+    // The transform the restored backup applied — read from the recorded
+    // metadata, with the resolved options supplying the cipher password (never
+    // stored in the repo) and any value the metadata omits.
     let transform = RepoTransform::from_metadata(&metadata, config);
 
     let manifest = Manifest::load(repo, &manifest_path(stanza, &label)).map_err(|err| match err {
@@ -320,10 +340,26 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             continue;
         }
 
+        // A referenced file's bytes live in an earlier backup (differential
+        // restore). Resolve which backup supplies the bytes and the transform
+        // they were written under: the restored backup uses `transform`; a
+        // referenced backup uses the transform recorded in *its* `backup.info`
+        // entry (the cipher password still comes from the restore options).
+        let (src_label, src_transform) = match file.reference.as_deref() {
+            None => (label.as_str(), transform.clone()),
+            Some(reference) => {
+                let reference_transform = info
+                    .current
+                    .get(reference)
+                    .map_or_else(|| transform.clone(), |entry| RepoTransform::from_metadata(entry, config));
+                (reference, reference_transform)
+            }
+        };
+
         // The repo file carries the compression suffix; the PG-target file does not.
-        let repo_rel = format!("{}{}", file.path, transform.repo_suffix());
-        let src = backup_file_path(stanza, &label, &repo_rel);
-        let actual = copy_file(repo, pg, &src, &dst, &transform)?;
+        let repo_rel = format!("{}{}", file.path, src_transform.repo_suffix());
+        let src = backup_file_path(stanza, src_label, &repo_rel);
+        let actual = copy_file(repo, pg, &src, &dst, &src_transform)?;
 
         // Zero-length files carry no checksum; nothing to compare.
         if let Some(expected) = file.checksum.as_deref()
@@ -538,6 +574,7 @@ mod tests {
                 timestamp: 1_704_110_400,
                 checksum: checksum.clone(),
                 checksum_page: None,
+                reference: None,
             })
             .collect();
 
@@ -996,6 +1033,7 @@ mod tests {
             timestamp: 1_704_110_400,
             checksum: Some(sha1_hex(bytes)),
             checksum_page: None,
+            reference: None,
         };
 
         // Missing target: does not match.
@@ -1034,6 +1072,7 @@ mod tests {
             timestamp: 1_704_110_400,
             checksum: None,
             checksum_page: None,
+            reference: None,
         };
         seed_pg_file(&pg_s, "pg_data/empty", b"");
         assert!(
@@ -1255,5 +1294,106 @@ mod tests {
             };
             assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
         }
+    }
+
+    #[test]
+    fn backup_then_diff_then_restore_round_trip() {
+        // END TO END: full backup, modify one file, diff backup (which
+        // references the unchanged files from the full), then restore the DIFF
+        // into a fresh target. Every file — referenced-from-full and
+        // changed-in-diff — must be present and correct. This proves reference
+        // resolution works across two backup directories.
+        use crate::backup::{BackupType, backup_inner_typed};
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let full_label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+
+        // Seed and take a full backup (gz, to exercise the transform too).
+        let unchanged = b"PG_VERSION-like file unchanged across the diff";
+        let original = b"original relation data 1259, original relation data 1259";
+        seed_pg_file(&pg_src_s, "PG_VERSION", unchanged);
+        seed_pg_file(&pg_src_s, "base/1/1259", original);
+
+        let transform = RepoTransform {
+            compress_type: CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+        backup_inner_typed(
+            stanza,
+            &repo_s,
+            &pg_src_s,
+            BackupType::Full,
+            Some(full_label),
+            1_704_110_400,
+            &transform,
+        )
+        .expect("full backup");
+
+        // Modify one file; the diff should copy it and reference the unchanged one.
+        let modified = b"MODIFIED relation data 1259 with completely new contents now";
+        seed_pg_file(&pg_src_s, "base/1/1259", modified);
+
+        let diff =
+            backup_inner_typed(stanza, &repo_s, &pg_src_s, BackupType::Diff, None, 1_704_196_800, &transform).expect("diff backup");
+        let diff_label = diff.label;
+        assert_eq!(diff_label, format!("{full_label}_20240102-120000D"));
+
+        // The unchanged file's bytes live ONLY in the full backup dir.
+        assert!(
+            repo_dir
+                .path()
+                .join(format!("backup/{stanza}/{full_label}/PG_VERSION.gz"))
+                .exists(),
+            "unchanged bytes must live in the full backup dir"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(format!("backup/{stanza}/{diff_label}/PG_VERSION.gz"))
+                .exists(),
+            "unchanged file must not be duplicated in the diff dir"
+        );
+
+        // Restore the DIFF into a fresh target. No options needed: each file's
+        // transform is read from its source backup's recorded metadata.
+        let outcome = restore_inner(
+            &restore_cfg(stanza, vec![(("set", None), OptionValue::String(diff_label.clone()))]),
+            &repo_s,
+            &pg_dst_s,
+        )
+        .expect("restore diff");
+        assert_eq!(outcome.label, diff_label);
+        assert_eq!(outcome.files_restored, 2, "both files must be restored");
+
+        // The referenced (from-full) file restores to its full-backup contents.
+        let restored_unchanged = {
+            let mut r = pg_dst_s.open_read(Path::new("PG_VERSION")).expect("open restored PG_VERSION");
+            r.read_all().expect("read restored PG_VERSION")
+        };
+        assert_eq!(
+            restored_unchanged.as_slice(),
+            unchanged,
+            "referenced file must match the full backup"
+        );
+
+        // The changed (in-diff) file restores to its modified contents.
+        let restored_changed = {
+            let mut r = pg_dst_s.open_read(Path::new("base/1/1259")).expect("open restored 1259");
+            r.read_all().expect("read restored 1259")
+        };
+        assert_eq!(
+            restored_changed.as_slice(),
+            modified,
+            "changed file must match the diff backup"
+        );
     }
 }

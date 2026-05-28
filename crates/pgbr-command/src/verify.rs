@@ -398,6 +398,7 @@ mod tests {
             timestamp: 1_704_110_400,
             checksum,
             checksum_page: None,
+            reference: None,
         }
     }
 

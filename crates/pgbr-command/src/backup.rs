@@ -16,22 +16,42 @@
 //! With `compress-type=none` and no cipher the transform is the identity and
 //! files are copied verbatim with an empty suffix, exactly as before.
 //!
+//! # Differential backups (`--type=diff`)
+//!
+//! A differential backup captures only the files that changed since the latest
+//! **full** backup; files that are unchanged are recorded with a *reference* to
+//! that full backup instead of being re-copied. [`backup_inner_typed`] drives
+//! both paths:
+//!
+//! - `full` — every non-excluded file is copied, every [`ManifestFile`] carries
+//!   `reference: None`. Identical to the prior behaviour.
+//! - `diff` — the latest full backup is located in `backup.info`, its manifest
+//!   loaded, and each current PG file compared (size + plaintext SHA-1) against
+//!   the full's entry. An unchanged file is recorded with
+//!   `reference: Some(<full label>)` and **not** copied into the diff dir; a
+//!   changed or new file is copied as usual with `reference: None`. The diff's
+//!   label is `<full label>_<YYYYMMDD-HHMMSS>D` and its `backup.info` entry
+//!   records `backup-type: "diff"` plus `backup-reference: [<full label>]`.
+//!
 //! Deliberately out of scope for this slice (follow-ups):
 //!
-//! - **Incremental / differential backups.** Only `full` is produced; there is
-//!   no prior-backup reference or delta computation.
+//! - **Incremental backups (`incr`).** Only `full` and `diff` are produced; a
+//!   diff always references the latest full directly, never an intermediate
+//!   backup chain.
 //! - **Symlink target resolution.** The `Storage` trait has no link-target
 //!   accessor yet, so [`ManifestLink`] entries are recorded with an empty
 //!   `destination`. See the `// TODO: resolve link target` note in [`walk`].
 //!
-//! The real work lives in [`backup_inner`], which takes the backup label and
-//! start timestamp as parameters so tests can pin them; the public [`backup`]
-//! entry point derives both from [`SystemTime::now`].
+//! The real work lives in [`backup_inner_typed`], which takes the backup type,
+//! label, and start timestamp as parameters so tests can pin them;
+//! [`backup_inner`] is a thin full-backup wrapper, and the public [`backup`]
+//! entry point derives the type from the resolved options and the timestamp
+//! from [`SystemTime::now`].
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pgbr_config::LoadedConfig;
+use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
 use pgbr_storage::{Storage, StorageInfo, StorageKind};
@@ -42,6 +62,44 @@ use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encryp
 
 /// Backup type recorded for a full backup.
 const BACKUP_TYPE_FULL: &str = "full";
+/// Backup type recorded for a differential backup.
+const BACKUP_TYPE_DIFF: &str = "diff";
+
+/// Which kind of backup [`backup_inner_typed`] should produce.
+///
+/// `incr` is intentionally absent from this slice (see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupType {
+    /// A full backup: every file is copied.
+    Full,
+    /// A differential backup against the latest full: unchanged files are
+    /// referenced rather than re-copied.
+    Diff,
+}
+
+impl BackupType {
+    /// The `backup-type` string recorded in `backup.info` / `backup.manifest`.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => BACKUP_TYPE_FULL,
+            Self::Diff => BACKUP_TYPE_DIFF,
+        }
+    }
+
+    /// Map the resolved `--type` option (`StringId`) to a [`BackupType`].
+    ///
+    /// Defaults to [`BackupType::Full`] when the option is absent. `incr` maps to
+    /// [`BackupType::Full`] for now — incremental backups are out of scope for
+    /// this slice, so an `incr` request degrades to a full rather than silently
+    /// behaving like a diff (which would reference the latest full as if it were
+    /// the parent).
+    fn from_options(config: &LoadedConfig) -> Self {
+        match config.options.get(&("type".to_owned(), None)) {
+            Some(OptionValue::StringId(value)) if value == BACKUP_TYPE_DIFF => Self::Diff,
+            _ => Self::Full,
+        }
+    }
+}
 
 /// Path prefixes (PG-data-relative, `/`-separated) excluded from a backup.
 ///
@@ -158,12 +216,23 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
 #[allow(clippy::print_stdout)]
 pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    let backup_type = BackupType::from_options(config);
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
-    let label = full_backup_label(timestamp_start);
     let transform = RepoTransform::from_options(config);
 
-    let outcome = backup_inner(stanza, repo_storage, pg_storage, &label, timestamp_start, &transform)?;
+    // The diff label depends on the full it references, so it is computed inside
+    // `backup_inner_typed` (which knows the full label); full labels are
+    // timestamp-derived up front. Pass `None` to let the inner function pick.
+    let outcome = backup_inner_typed(
+        stanza,
+        repo_storage,
+        pg_storage,
+        backup_type,
+        None,
+        timestamp_start,
+        &transform,
+    )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
@@ -178,6 +247,117 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
 fn full_backup_label(timestamp: i64) -> String {
     let (year, month, day, hour, minute, second) = unix_to_civil(timestamp);
     format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}F")
+}
+
+/// Format a differential-backup label from the referenced full's label and the
+/// diff's start timestamp: `<full label>_<YYYYMMDD-HHMMSS>D`.
+fn diff_backup_label(full_label: &str, timestamp: i64) -> String {
+    let (year, month, day, hour, minute, second) = unix_to_civil(timestamp);
+    format!("{full_label}_{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}D")
+}
+
+/// Derive the label for a backup from its type and (for a diff) the full backup
+/// it references. `full_label` is `Some` whenever `backup_type` is
+/// [`BackupType::Diff`] (the caller resolves it before calling).
+fn derive_label(backup_type: BackupType, full_label: Option<&str>, timestamp: i64) -> String {
+    match backup_type {
+        BackupType::Full => full_backup_label(timestamp),
+        BackupType::Diff => diff_backup_label(full_label.unwrap_or_default(), timestamp),
+    }
+}
+
+/// Outcome of capturing one file into a backup: the manifest entry plus the
+/// number of bytes physically written to the repo (`0` for a referenced file).
+struct CapturedFile {
+    file: ManifestFile,
+    repo_bytes: u64,
+}
+
+/// Capture one PG-data file into the backup, returning its [`ManifestFile`].
+///
+/// The plaintext SHA-1 + size are recorded regardless of how (or whether) the
+/// bytes land in the repo. For a diff (`full_manifest` is `Some`), a file whose
+/// size **and** checksum match the full backup's entry is recorded with
+/// `reference: Some(full_label)` and **not** copied; otherwise the plaintext is
+/// run through `transform` and written to
+/// `<backup_root>/<rel><suffix>` with `reference: None`.
+fn capture_file(
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+    entry: &WalkEntry,
+    backup_root: &str,
+    transform: &RepoTransform,
+    full_manifest: Option<&Manifest>,
+    full_label: Option<&str>,
+) -> Result<CapturedFile, CommandError> {
+    let src = PathBuf::from(&entry.rel);
+    let mut reader = pg_storage.open_read(&src)?;
+    let bytes = reader.read_all()?;
+
+    // Checksum and size are taken over the PLAINTEXT, independent of how the
+    // bytes are stored in the repo (pgBackRest semantics).
+    let mut sha1 = Sha1::new();
+    let mut sink = Vec::new();
+    sha1.process(&bytes, &mut sink)?;
+    let checksum = sha1.digest_hex();
+
+    let base = ManifestFile {
+        path: entry.rel.clone(),
+        size: entry.info.size,
+        timestamp: entry.info.modified.unwrap_or(0),
+        checksum: Some(checksum.clone()),
+        checksum_page: None,
+        reference: None,
+    };
+
+    // For a diff: when the full backup holds this file with the same size AND
+    // checksum, the file is unchanged — record a reference to the full and do
+    // NOT copy the bytes into the diff dir.
+    if let Some(full_manifest) = full_manifest
+        && let Some(prior) = full_manifest.file(&entry.rel)
+        && prior.size == entry.info.size
+        && prior.checksum.as_deref() == Some(checksum.as_str())
+    {
+        return Ok(CapturedFile {
+            file: ManifestFile {
+                reference: full_label.map(ToOwned::to_owned),
+                ..base
+            },
+            repo_bytes: 0,
+        });
+    }
+
+    // Full backup, or a changed / new file in a diff: copy it. Compress-then-
+    // encrypt the plaintext into the repo bytes; the identity transform returns
+    // the bytes unchanged. The repo filename carries the compression suffix;
+    // encryption does not change it.
+    let repo_bytes = transform.apply_forward(&bytes)?;
+    let dest = PathBuf::from(format!("{backup_root}/{}{}", entry.rel, transform.repo_suffix()));
+    if let Some(parent) = dest.parent() {
+        repo_storage.create_path(parent, true)?;
+    }
+    let mut writer = repo_storage.open_write(&dest)?;
+    writer.write(&repo_bytes)?;
+    writer.flush()?;
+    writer.close()?;
+
+    Ok(CapturedFile {
+        file: base,
+        repo_bytes: repo_bytes.len() as u64,
+    })
+}
+
+/// Find the label of the latest full backup recorded in `backup.info`.
+///
+/// "Latest" is the lexicographically-greatest label whose `backup-type` is
+/// `full` — pgBackRest full labels sort chronologically. Returns `None` when no
+/// full backup exists.
+fn latest_full_label(info: &InfoBackup) -> Option<String> {
+    info.current
+        .iter()
+        .rev()
+        .find(|(_, entry)| entry.get("backup-type").and_then(serde_json::Value::as_str) == Some(BACKUP_TYPE_FULL))
+        .map(|(label, _)| label.clone())
 }
 
 /// Convert a Unix timestamp (seconds, UTC) to `(year, month, day, hour, minute,
@@ -214,36 +394,76 @@ fn unix_to_civil(timestamp: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// Take a full backup with a caller-supplied `label`, `timestamp_start`, and
-/// repo `transform` (compression + encryption).
+/// Take a **full** backup with a caller-supplied `label`.
 ///
-/// Steps:
-///
-/// 1. Load `backup/<stanza>/backup.info` (error if the stanza is uninitialised).
-/// 2. Recursively walk the PG data dir via `pg_storage`, applying
-///    [`EXCLUDE_PREFIXES`].
-/// 3. For each non-excluded file: compute the **plaintext** SHA-1 + size
-///    (recorded in the [`Manifest`]), run the plaintext through
-///    `transform.forward_chain()` (compress then encrypt), and write the
-///    transformed bytes to `backup/<stanza>/<label>/<relpath><suffix>`.
-/// 4. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
-///    (with an empty destination — see module docs).
-/// 5. Save `backup.manifest`, then add a `[backup:current]` entry to
-///    `backup.info` — including the applied compress-type and encrypted flag —
-///    and save it.
+/// Thin wrapper over [`backup_inner_typed`] kept for the existing call sites /
+/// tests that only ever produced full backups (`timestamp_start` and
+/// `transform` are forwarded unchanged).
 ///
 /// # Errors
 ///
-/// - [`CommandError::Other`] if the stanza is not initialised, or if
-///   `backup.info` / `backup.manifest` cannot be read or written.
-/// - [`CommandError::Io`] if a filter in the transform chain fails.
-/// - [`CommandError::Storage`] / [`CommandError::Io`] for repository / PG-data
-///   read/write failures.
+/// See [`backup_inner_typed`].
 pub fn backup_inner(
     stanza: &str,
     repo_storage: &dyn Storage,
     pg_storage: &dyn Storage,
     label: &str,
+    timestamp_start: i64,
+    transform: &RepoTransform,
+) -> Result<BackupOutcome, CommandError> {
+    backup_inner_typed(
+        stanza,
+        repo_storage,
+        pg_storage,
+        BackupType::Full,
+        Some(label),
+        timestamp_start,
+        transform,
+    )
+}
+
+/// Take a backup of the given `backup_type`.
+///
+/// `timestamp_start` and `transform` (compression + encryption) are
+/// caller-supplied. `label` pins the backup label for tests; when `None` it is
+/// derived — a full backup from the timestamp (`<ts>F`), a diff from the
+/// referenced full plus the timestamp (`<full>_<ts>D`).
+///
+/// Steps:
+///
+/// 1. Load `backup/<stanza>/backup.info` (error if the stanza is uninitialised).
+/// 2. For a diff: locate the latest full backup and load its `backup.manifest`
+///    (error if there is no prior full).
+/// 3. Recursively walk the PG data dir via `pg_storage`, applying
+///    [`EXCLUDE_PREFIXES`].
+/// 4. For each non-excluded file: compute the **plaintext** SHA-1 + size
+///    (recorded in the [`Manifest`]). For a diff, if the full's manifest holds
+///    an entry with the same size **and** checksum, record the file with
+///    `reference: Some(<full label>)` and skip copying; otherwise (full backup,
+///    or a changed / new file) run the plaintext through
+///    `transform.forward_chain()` (compress then encrypt), write the transformed
+///    bytes to `backup/<stanza>/<label>/<relpath><suffix>`, and record
+///    `reference: None`.
+/// 5. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
+///    (with an empty destination — see module docs).
+/// 6. Save `backup.manifest`, then add a `[backup:current]` entry to
+///    `backup.info` — including the applied compress-type, encrypted flag, and
+///    (for a diff) the `backup-reference` chain — and save it.
+///
+/// # Errors
+///
+/// - [`CommandError::Other`] if the stanza is not initialised, if a diff is
+///   requested with no prior full backup, or if `backup.info` /
+///   `backup.manifest` cannot be read or written.
+/// - [`CommandError::Io`] if a filter in the transform chain fails.
+/// - [`CommandError::Storage`] / [`CommandError::Io`] for repository / PG-data
+///   read/write failures.
+pub fn backup_inner_typed(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+    backup_type: BackupType,
+    label: Option<&str>,
     timestamp_start: i64,
     transform: &RepoTransform,
 ) -> Result<BackupOutcome, CommandError> {
@@ -255,6 +475,27 @@ pub fn backup_inner(
     }
 
     let mut info = InfoBackup::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+
+    // For a diff, resolve the full backup it references and load its manifest so
+    // unchanged files can be detected by (size, checksum).
+    let (full_label, full_manifest) = match backup_type {
+        BackupType::Full => (None, None),
+        BackupType::Diff => {
+            let full_label = latest_full_label(&info)
+                .ok_or_else(|| CommandError::Other("differential backup requires a prior full backup".to_owned()))?;
+            let full_manifest = Manifest::load(
+                repo_storage,
+                &PathBuf::from(format!("backup/{stanza}/{full_label}/backup.manifest")),
+            )
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+            (Some(full_label), Some(full_manifest))
+        }
+    };
+
+    let label = label.map_or_else(
+        || derive_label(backup_type, full_label.as_deref(), timestamp_start),
+        ToOwned::to_owned,
+    );
 
     let backup_root = format!("backup/{stanza}/{label}");
 
@@ -271,41 +512,18 @@ pub fn backup_inner(
 
         match entry.info.kind {
             StorageKind::File => {
-                let src = PathBuf::from(&entry.rel);
-                let mut reader = pg_storage.open_read(&src)?;
-                let bytes = reader.read_all()?;
-
-                // Checksum and size are taken over the PLAINTEXT, independent
-                // of how the bytes are stored in the repo (pgBackRest semantics).
-                let mut sha1 = Sha1::new();
-                let mut sink = Vec::new();
-                sha1.process(&bytes, &mut sink)?;
-                let checksum = sha1.digest_hex();
-
-                // Compress-then-encrypt the plaintext into the repo bytes. With
-                // the identity transform this returns the bytes unchanged.
-                let repo_bytes = transform.apply_forward(&bytes)?;
-
-                // The repo filename carries the compression suffix; encryption
-                // does not change it.
-                let dest = PathBuf::from(format!("{backup_root}/{}{}", entry.rel, transform.repo_suffix()));
-                if let Some(parent) = dest.parent() {
-                    repo_storage.create_path(parent, true)?;
-                }
-                let mut writer = repo_storage.open_write(&dest)?;
-                writer.write(&repo_bytes)?;
-                writer.flush()?;
-                writer.close()?;
-
-                total_size += entry.info.size;
-                repo_size += repo_bytes.len() as u64;
-                files.push(ManifestFile {
-                    path: entry.rel,
-                    size: entry.info.size,
-                    timestamp: entry.info.modified.unwrap_or(0),
-                    checksum: Some(checksum),
-                    checksum_page: None,
-                });
+                let captured = capture_file(
+                    repo_storage,
+                    pg_storage,
+                    &entry,
+                    &backup_root,
+                    transform,
+                    full_manifest.as_ref(),
+                    full_label.as_deref(),
+                )?;
+                total_size += captured.file.size;
+                repo_size += captured.repo_bytes;
+                files.push(captured.file);
             }
             StorageKind::Path => {
                 paths.push(ManifestPath { path: entry.rel });
@@ -328,8 +546,8 @@ pub fn backup_inner(
     let timestamp_stop = timestamp_start;
 
     let manifest = Manifest {
-        backup_label: label.to_owned(),
-        backup_type: BACKUP_TYPE_FULL.to_owned(),
+        backup_label: label.clone(),
+        backup_type: backup_type.as_str().to_owned(),
         timestamp_start,
         timestamp_stop,
         db_version: info.db_version.clone(),
@@ -346,26 +564,29 @@ pub fn backup_inner(
         .save(repo_storage, &PathBuf::from(format!("{backup_root}/backup.manifest")))
         .map_err(|err| CommandError::Other(err.to_string()))?;
 
-    info.current.insert(
-        label.to_owned(),
-        json!({
-            "backup-type": BACKUP_TYPE_FULL,
-            "backup-timestamp-start": timestamp_start,
-            "backup-timestamp-stop": timestamp_stop,
-            "backup-info-size": total_size,
-            "backup-info-repo-size": repo_size,
-            // Record the applied transform so restore can reverse it without
-            // relying on the restore command's own compress/cipher options.
-            metadata_compress_type_key(): transform.compress_type.as_str_id(),
-            metadata_encrypted_key(): transform.is_encrypted(),
-            "db-id": info.db_id,
-        }),
-    );
+    let mut entry = json!({
+        "backup-type": backup_type.as_str(),
+        "backup-timestamp-start": timestamp_start,
+        "backup-timestamp-stop": timestamp_stop,
+        "backup-info-size": total_size,
+        "backup-info-repo-size": repo_size,
+        // Record the applied transform so restore can reverse it without
+        // relying on the restore command's own compress/cipher options.
+        metadata_compress_type_key(): transform.compress_type.as_str_id(),
+        metadata_encrypted_key(): transform.is_encrypted(),
+        "db-id": info.db_id,
+    });
+    // A diff records the chain of backups its files depend on. This slice always
+    // references the latest full directly, so the chain is a single label.
+    if let Some(full_label) = full_label.as_ref() {
+        entry["backup-reference"] = json!([full_label]);
+    }
+    info.current.insert(label.clone(), entry);
     info.save(repo_storage, &info_path)
         .map_err(|err| CommandError::Other(err.to_string()))?;
 
     Ok(BackupOutcome {
-        label: label.to_owned(),
+        label,
         file_count,
         total_size,
     })
@@ -662,5 +883,170 @@ mod tests {
         let entry = info.current.get(LABEL).expect("label entry");
         assert_eq!(entry["backup-info-compress-type"], json!("gz"));
         assert_eq!(entry["backup-info-encrypted"], json!(false));
+    }
+
+    // ---- differential backups ----------------------------------------------
+
+    /// A backup config carrying `--type=<value>` (and a stanza).
+    fn typed_cfg(stanza: &str, backup_type: &str) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId(backup_type.to_owned()));
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backup_type_from_options_maps_type() {
+        // Default (absent) and incr both degrade to full; only diff is a diff.
+        let mut diff = BTreeMap::new();
+        diff.insert(("type".to_owned(), None), OptionValue::StringId("diff".to_owned()));
+        let mut incr = BTreeMap::new();
+        incr.insert(("type".to_owned(), None), OptionValue::StringId("incr".to_owned()));
+        let cfg = |opts: BTreeMap<(String, Option<u32>), OptionValue>| LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: opts,
+            params: Vec::new(),
+        };
+        assert_eq!(BackupType::from_options(&cfg(BTreeMap::new())), BackupType::Full);
+        assert_eq!(BackupType::from_options(&cfg(diff)), BackupType::Diff);
+        assert_eq!(BackupType::from_options(&cfg(incr)), BackupType::Full);
+    }
+
+    #[test]
+    fn diff_requires_prior_full() {
+        // A diff with no prior full backup in backup.info is a hard error.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        let err = backup_inner_typed(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Diff,
+            None,
+            1_704_196_800,
+            &RepoTransform::identity(),
+        )
+        .expect_err("diff without a full must error");
+        match err {
+            CommandError::Other(msg) => assert_eq!(msg, "differential backup requires a prior full backup"),
+            other => panic!("expected Other(requires prior full), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_references_unchanged_files() {
+        // Seed a full backup, then take a diff where one file is unchanged and
+        // one is modified. The unchanged file must be recorded with a reference
+        // to the full and NOT copied into the diff dir; the changed file must be
+        // copied with reference None.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+
+        let unchanged = b"this file does not change between backups";
+        let original = b"original contents of the file that will change";
+        seed_file(&pg_s, "base/1/unchanged", unchanged);
+        seed_file(&pg_s, "base/1/changed", original);
+
+        // Full backup.
+        let full = backup_inner_typed(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+        )
+        .expect("full backup");
+        assert_eq!(full.label, LABEL);
+
+        // Modify one file; leave the other untouched.
+        let modified = b"MODIFIED contents that are completely different now";
+        seed_file(&pg_s, "base/1/changed", modified);
+
+        // Differential backup (label derived: <full>_<ts>D).
+        let diff = backup_inner_typed(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Diff,
+            None,
+            1_704_196_800,
+            &RepoTransform::identity(),
+        )
+        .expect("diff backup");
+        assert_eq!(diff.label, format!("{LABEL}_20240102-120000D"));
+
+        let diff_label = diff.label;
+        let manifest =
+            Manifest::load(&repo_s, Path::new(&format!("backup/demo/{diff_label}/backup.manifest"))).expect("load diff manifest");
+        assert_eq!(manifest.backup_type, "diff");
+
+        // Unchanged file: referenced to the full, not copied.
+        let unchanged_entry = manifest.file("base/1/unchanged").expect("unchanged in manifest");
+        assert_eq!(unchanged_entry.reference.as_deref(), Some(LABEL));
+        assert_eq!(unchanged_entry.checksum.as_deref(), Some(sha1_hex(unchanged).as_str()));
+        let diff_root = repo_dir.path().join(format!("backup/demo/{diff_label}"));
+        assert!(
+            !diff_root.join("base/1/unchanged").exists(),
+            "unchanged file must NOT be copied into the diff dir"
+        );
+
+        // Changed file: copied, no reference.
+        let changed_entry = manifest.file("base/1/changed").expect("changed in manifest");
+        assert_eq!(changed_entry.reference, None);
+        assert_eq!(changed_entry.checksum.as_deref(), Some(sha1_hex(modified).as_str()));
+        assert!(
+            diff_root.join("base/1/changed").exists(),
+            "changed file must be copied into the diff dir"
+        );
+        assert_eq!(std::fs::read(diff_root.join("base/1/changed")).unwrap(), modified);
+
+        // backup.info records the diff type and a backup-reference chain.
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let entry = info.current.get(&diff_label).expect("diff entry in backup.info");
+        assert_eq!(entry["backup-type"], json!("diff"));
+        assert_eq!(entry["backup-reference"], json!([LABEL]));
+    }
+
+    #[test]
+    fn full_backup_unchanged() {
+        // No-regression: a default (full) backup via the public entry point
+        // copies every file with no references.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("full backup");
+
+        // The full label is timestamp-derived; find the single backup recorded.
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        assert_eq!(info.current.len(), 1, "exactly one backup recorded");
+        let (label, entry) = info.current.iter().next().unwrap();
+        assert_eq!(entry["backup-type"], json!("full"));
+        assert!(
+            entry.get("backup-reference").is_none(),
+            "a full backup has no reference chain"
+        );
+
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("load manifest");
+        assert!(
+            manifest.files.iter().all(|f| f.reference.is_none()),
+            "every file in a full backup must be reference-free"
+        );
+        // Every recorded file is physically present in the backup dir.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+        for file in &manifest.files {
+            assert!(backup_root.join(&file.path).exists(), "full backup must copy {}", file.path);
+        }
     }
 }
