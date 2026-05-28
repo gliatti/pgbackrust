@@ -340,6 +340,155 @@ fn retention_full(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
     }
 }
 
+/// How `repo-retention-full` is interpreted: a count of full backups (default)
+/// or a time window in days. C ref: `repo-retention-full-type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionFullType {
+    /// `repo-retention-full` is a number of full backups to keep.
+    Count,
+    /// `repo-retention-full` is a number of days; fulls older than the window
+    /// expire (but at least one full is always kept).
+    Time,
+}
+
+/// `repo-retention-full-type` lookup (`count` default, or `time`).
+fn retention_full_type(config: &LoadedConfig) -> RetentionFullType {
+    match config.options.get(&("repo-retention-full-type".to_owned(), None)) {
+        Some(OptionValue::String(s) | OptionValue::StringId(s)) if s.eq_ignore_ascii_case("time") => RetentionFullType::Time,
+        _ => RetentionFullType::Count,
+    }
+}
+
+/// `repo-retention-diff` lookup — the number of differential backups to keep.
+/// Missing / non-positive is reported as `None` (no diff-specific expiry). A
+/// non-integer value is an error.
+fn retention_diff(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
+    match config.options.get(&("repo-retention-diff".to_owned(), None)) {
+        None => Ok(None),
+        Some(OptionValue::Integer(n)) => {
+            if *n <= 0 {
+                Ok(None)
+            } else {
+                u32::try_from(*n)
+                    .map(Some)
+                    .map_err(|_| CommandError::Other(format!("repo-retention-diff out of range: {n}")))
+            }
+        }
+        Some(other) => Err(CommandError::Other(format!(
+            "repo-retention-diff must be an integer, got {other:?}"
+        ))),
+    }
+}
+
+/// `repo-retention-history` lookup — days of `backup.history` metadata to keep.
+/// Missing / non-positive → `None` (history kept indefinitely).
+fn retention_history(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
+    match config.options.get(&("repo-retention-history".to_owned(), None)) {
+        None => Ok(None),
+        Some(OptionValue::Integer(n)) if *n <= 0 => Ok(None),
+        Some(OptionValue::Integer(n)) => u32::try_from(*n)
+            .map(Some)
+            .map_err(|_| CommandError::Other(format!("repo-retention-history out of range: {n}"))),
+        Some(other) => Err(CommandError::Other(format!(
+            "repo-retention-history must be an integer, got {other:?}"
+        ))),
+    }
+}
+
+/// Decide which entries the full-retention policy keeps, given the entries
+/// sorted oldest-first. Returns `(keep_label, cutoff_full_ts)` where
+/// `cutoff_full_ts` is the timestamp of the oldest *retained* full (used to keep
+/// the diff/incr chain hanging off it). Pure so both count- and time-based
+/// retention are unit-testable with a fixed `now_secs`.
+///
+/// - `Count`: keep the newest `keep_full` full backups.
+/// - `Time`: keep fulls whose `timestamp-stop` is within `keep_full` days of
+///   `now_secs`, always retaining at least the most recent full.
+fn full_retention_keep(
+    entries: &[(String, serde_json::Value)],
+    keep_full: u32,
+    full_type: RetentionFullType,
+    now_secs: i64,
+) -> (Vec<bool>, Option<i64>) {
+    let mut keep_label = vec![false; entries.len()];
+    if keep_full == 0 {
+        return (keep_label, None);
+    }
+    let full_idxs: Vec<usize> = (0..entries.len()).filter(|&i| backup_type(&entries[i].1) == "full").collect();
+    let mut last_full_ts: Option<i64> = None;
+    match full_type {
+        RetentionFullType::Count => {
+            // Newest `keep_full` fulls (full_idxs is oldest-first, take from the end).
+            let keep_from = full_idxs.len().saturating_sub(keep_full as usize);
+            for &idx in &full_idxs[keep_from..] {
+                keep_label[idx] = true;
+                let ts = timestamp_stop(&entries[idx].1);
+                last_full_ts = Some(last_full_ts.map_or(ts, |c| c.min(ts)));
+            }
+        }
+        RetentionFullType::Time => {
+            let cutoff = now_secs - i64::from(keep_full) * 86_400;
+            for &idx in &full_idxs {
+                if timestamp_stop(&entries[idx].1) >= cutoff {
+                    keep_label[idx] = true;
+                    let ts = timestamp_stop(&entries[idx].1);
+                    last_full_ts = Some(last_full_ts.map_or(ts, |c| c.min(ts)));
+                }
+            }
+            // Always keep at least the most recent full.
+            if last_full_ts.is_none()
+                && let Some(&newest) = full_idxs.last()
+            {
+                keep_label[newest] = true;
+                last_full_ts = Some(timestamp_stop(&entries[newest].1));
+            }
+        }
+    }
+    (keep_label, last_full_ts)
+}
+
+/// Apply `repo-retention-diff` to an already-full-retained `keep_label`: among
+/// the diffs currently kept, retain only the newest `keep_diff`; older diffs and
+/// every incr that depends on them are dropped (`keep_label` set to `false`).
+/// `entries` is oldest-first. Pure and unit-tested.
+fn apply_diff_retention(entries: &[(String, serde_json::Value)], keep_label: &mut [bool], keep_diff: u32) {
+    // Kept diffs, newest-first.
+    let mut kept_diffs: Vec<usize> = (0..entries.len())
+        .filter(|&i| keep_label[i] && backup_type(&entries[i].1) == "diff")
+        .collect();
+    kept_diffs.sort_by(|&a, &b| {
+        timestamp_stop(&entries[b].1)
+            .cmp(&timestamp_stop(&entries[a].1))
+            .then_with(|| entries[b].0.cmp(&entries[a].0))
+    });
+    if kept_diffs.len() <= keep_diff as usize {
+        return;
+    }
+    // Diffs beyond the retention count are expired, along with their dependent
+    // incrs (an incr depends on a diff if the diff is in its reference chain).
+    let drop_diff_labels: std::collections::BTreeSet<&str> = kept_diffs[keep_diff as usize..]
+        .iter()
+        .map(|&i| entries[i].0.as_str())
+        .collect();
+    for i in 0..entries.len() {
+        if !keep_label[i] {
+            continue;
+        }
+        let label = entries[i].0.as_str();
+        let ty = backup_type(&entries[i].1);
+        // A diff beyond the retention count, or an incr that depends on one,
+        // is dropped.
+        let dropped_diff = ty == "diff" && drop_diff_labels.contains(label);
+        let dependent_incr = ty == "incr"
+            && backup_references(&entries[i].1)
+                .iter()
+                .any(|r| drop_diff_labels.contains(r.as_str()));
+        if dropped_diff || dependent_incr {
+            keep_label[i] = false;
+        }
+    }
+}
+
 /// `repo-retention-archive` lookup. Missing option is reported as `None`
 /// (archive expiry is skipped entirely). A non-positive or non-integer
 /// value is reported as `None` / `Other` respectively — a zero/negative
@@ -985,23 +1134,15 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
             .then_with(|| a_label.cmp(b_label))
     });
 
-    // Walk newest-first across full backups, marking the most recent
-    // `keep_full` for retention.
-    let mut full_kept: usize = 0;
-    let mut keep_label: Vec<bool> = vec![false; entries.len()];
-    let cutoff_full_ts: Option<i64> = if keep_full == 0 {
-        None
-    } else {
-        let mut last_full_ts: Option<i64> = None;
-        for idx in (0..entries.len()).rev() {
-            if backup_type(&entries[idx].1) == "full" && full_kept < keep_full as usize {
-                keep_label[idx] = true;
-                full_kept += 1;
-                last_full_ts = Some(timestamp_stop(&entries[idx].1));
-            }
-        }
-        last_full_ts
-    };
+    // Full-backup retention: count-based (newest N fulls) or time-based (fulls
+    // within N days), per `repo-retention-full-type`.
+    let now_secs = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+    .unwrap_or(i64::MAX);
+    let (mut keep_label, cutoff_full_ts) = full_retention_keep(&entries, keep_full, retention_full_type(config), now_secs);
 
     // Every diff/incr backup whose timestamp is at least the oldest
     // retained full's timestamp is kept; everything older expires (its
@@ -1012,6 +1153,13 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
                 keep_label[idx] = true;
             }
         }
+    }
+
+    // Differential retention: among the diffs still kept, retain only the newest
+    // `repo-retention-diff`; older diffs and their dependent incrs expire even
+    // though their full survives.
+    if let Some(keep_diff) = retention_diff(config)? {
+        apply_diff_retention(&entries, &mut keep_label, keep_diff);
     }
 
     let mut expired_labels: Vec<String> = Vec::new();
@@ -1051,11 +1199,64 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         None => Vec::new(),
     };
 
+    // History retention: prune backup.history manifest copies older than
+    // `repo-retention-history` days.
+    if let Some(keep_history_days) = retention_history(config)? {
+        expire_history(repo, stanza, keep_history_days, now_secs)?;
+    }
+
     Ok(ExpireSummary {
         expired_labels,
         kept_labels,
         expired_archive_segments,
     })
+}
+
+/// Epoch seconds (UTC midnight) for the `YYYYMMDD` date prefix of a backup
+/// label, or `None` if the prefix is not 8 digits. Uses a civil-date→days
+/// conversion (Howard Hinnant's algorithm) so no timezone database is needed.
+fn label_date_epoch(label: &str) -> Option<i64> {
+    let date: &str = label.get(0..8)?;
+    if !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = date.get(0..4)?.parse().ok()?;
+    let m: i64 = date.get(4..6)?.parse().ok()?;
+    let d: i64 = date.get(6..8)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400)
+}
+
+/// Remove `backup.history` manifest copies whose backup label predates
+/// `now_secs - keep_days*86400`. The history lives at
+/// `backup/<stanza>/backup.history/<YYYY>/<label>.manifest*`; this lists the
+/// subtree and drops leaf files for too-old labels (empty year dirs are left —
+/// harmless). Idempotent on a missing history dir.
+fn expire_history(repo: &dyn Storage, stanza: &str, keep_days: u32, now_secs: i64) -> Result<(), CommandError> {
+    let history_root = PathBuf::from(format!("backup/{stanza}/backup.history"));
+    let cutoff = now_secs - i64::from(keep_days) * 86_400;
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(repo, &history_root, &mut files)?;
+    for file in files {
+        let leaf = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if let Some(label_ts) = label_date_epoch(leaf)
+            && label_ts < cutoff
+        {
+            match repo.remove(&file, false) {
+                Ok(()) | Err(StorageError::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collect the `[backup:current]` JSON entries for the anchor backups named
@@ -1123,8 +1324,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ArchiveIdPlan, ArchiveRange, ArchiveRetentionType, BackupForArchive, ExpireSummary, compute_archive_plan, expire_inner,
-        segment_in_ranges,
+        ArchiveIdPlan, ArchiveRange, ArchiveRetentionType, BackupForArchive, ExpireSummary, RetentionFullType,
+        apply_diff_retention, compute_archive_plan, expire_inner, full_retention_keep, label_date_epoch, segment_in_ranges,
     };
 
     fn cfg(stanza: Option<&str>, retention_full: Option<i64>) -> LoadedConfig {
@@ -1475,6 +1676,160 @@ mod tests {
         let err = expire_inner(&cfg_oldest(Some("demo")), &repo).expect_err("single full refused");
         assert!(format!("{err}").contains("only full backup"));
         assert!(backup_dir_exists(&repo, "demo", "20260101F"));
+    }
+
+    /// `cfg` with repo-retention-full plus repo-retention-diff.
+    fn cfg_diff(stanza: Option<&str>, retention_full: i64, retention_diff: i64) -> LoadedConfig {
+        let mut cfg = cfg(stanza, Some(retention_full));
+        cfg.options
+            .insert(("repo-retention-diff".to_owned(), None), OptionValue::Integer(retention_diff));
+        cfg
+    }
+
+    fn entry_json(label: &str, ts: i64, ty: &str, refs: &[&str]) -> serde_json::Value {
+        json!({
+            "backup-label": label,
+            "backup-timestamp-stop": ts,
+            "backup-type": ty,
+            "backup-reference": refs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn retention_diff_keeps_newest_n_diffs() {
+        let (_dir, repo) = empty_repo();
+        // One full + three diffs. retention-full=1, retention-diff=2 keeps the
+        // two newest diffs (D2, D3); the oldest diff (D1) expires.
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260101F_20260103D", 300, "diff", &["20260101F"]),
+                ("20260101F_20260104D", 400, "diff", &["20260101F"]),
+            ],
+        );
+        let summary = expire_inner(&cfg_diff(Some("demo"), 1, 2), &repo).expect("expire diff");
+        assert_eq!(summary.expired_labels, vec!["20260101F_20260102D".to_owned()]);
+        assert!(summary.kept_labels.contains(&"20260101F".to_owned()));
+        assert!(summary.kept_labels.contains(&"20260101F_20260103D".to_owned()));
+        assert!(summary.kept_labels.contains(&"20260101F_20260104D".to_owned()));
+    }
+
+    #[test]
+    fn retention_diff_also_expires_dependent_incrs() {
+        let (_dir, repo) = empty_repo();
+        // I1 hangs off D1; expiring D1 (beyond retention-diff=2) must take I1 too.
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                (
+                    "20260101F_20260102D_20260102I",
+                    250,
+                    "incr",
+                    &["20260101F", "20260101F_20260102D"],
+                ),
+                ("20260101F_20260103D", 300, "diff", &["20260101F"]),
+                ("20260101F_20260104D", 400, "diff", &["20260101F"]),
+            ],
+        );
+        let summary = expire_inner(&cfg_diff(Some("demo"), 1, 2), &repo).expect("expire diff+incr");
+        assert_eq!(
+            summary.expired_labels,
+            vec!["20260101F_20260102D".to_owned(), "20260101F_20260102D_20260102I".to_owned()]
+        );
+    }
+
+    #[test]
+    fn full_retention_keep_count_keeps_newest_two() {
+        // Oldest-first: F1(100) F2(200) F3(300). Count=2 keeps F2, F3.
+        let entries = vec![
+            ("F1".to_owned(), entry_json("F1", 100, "full", &[])),
+            ("F2".to_owned(), entry_json("F2", 200, "full", &[])),
+            ("F3".to_owned(), entry_json("F3", 300, "full", &[])),
+        ];
+        let (keep, cutoff) = full_retention_keep(&entries, 2, RetentionFullType::Count, 1_000);
+        assert_eq!(keep, vec![false, true, true]);
+        assert_eq!(cutoff, Some(200), "oldest retained full is F2");
+    }
+
+    #[test]
+    fn full_retention_keep_time_keeps_within_window_and_newest() {
+        // now = 1_000_000. day=86_400. F_old far outside a 1-day window, F_new inside.
+        let now = 1_000_000;
+        let entries = vec![
+            ("Fold".to_owned(), entry_json("Fold", now - 10 * 86_400, "full", &[])),
+            ("Fnew".to_owned(), entry_json("Fnew", now - 1, "full", &[])),
+        ];
+        let (keep, _cutoff) = full_retention_keep(&entries, 1, RetentionFullType::Time, now);
+        assert_eq!(keep, vec![false, true], "only the full within 1 day is kept");
+
+        // When ALL fulls are older than the window, the newest is still retained.
+        let entries2 = vec![
+            ("Fa".to_owned(), entry_json("Fa", now - 30 * 86_400, "full", &[])),
+            ("Fb".to_owned(), entry_json("Fb", now - 20 * 86_400, "full", &[])),
+        ];
+        let (keep2, _c2) = full_retention_keep(&entries2, 1, RetentionFullType::Time, now);
+        assert_eq!(keep2, vec![false, true], "newest full always kept");
+    }
+
+    #[test]
+    fn apply_diff_retention_drops_old_kept_diffs() {
+        // All kept; two diffs; keep_diff=1 drops the older diff (index 1).
+        let entries = vec![
+            ("F".to_owned(), entry_json("F", 100, "full", &[])),
+            ("D1".to_owned(), entry_json("D1", 200, "diff", &["F"])),
+            ("D2".to_owned(), entry_json("D2", 300, "diff", &["F"])),
+        ];
+        let mut keep = vec![true, true, true];
+        apply_diff_retention(&entries, &mut keep, 1);
+        assert_eq!(keep, vec![true, false, true], "older diff D1 dropped, newest D2 kept");
+    }
+
+    #[test]
+    fn label_date_epoch_parses_and_rejects() {
+        // 1970-01-01 is epoch 0; 1970-01-02 is one day later.
+        assert_eq!(label_date_epoch("19700101-000000F"), Some(0));
+        assert_eq!(label_date_epoch("19700102-000000F"), Some(86_400));
+        assert_eq!(label_date_epoch("20260101-100000F"), Some(1_767_225_600));
+        assert_eq!(label_date_epoch("nope"), None);
+        assert_eq!(label_date_epoch("2026XX01-000000F"), None);
+    }
+
+    #[test]
+    fn expire_history_prunes_old_label_manifests() {
+        let (_dir, repo) = empty_repo();
+        // now = 2017-07-14 (epoch 1_500_000_000): cutoff (now - 1 day) sits between
+        // the 1990 label (pruned) and the 2030 label (kept).
+        let now = 1_500_000_000_i64;
+        // Seed two history manifest copies under backup.history/<year>/.
+        for (year, label) in [("1990", "19900101-000000F"), ("2030", "20300101-000000F")] {
+            let dir = format!("backup/demo/backup.history/{year}");
+            repo.create_path(Path::new(&dir), true).expect("mkdir history year");
+            let mut w = repo
+                .open_write(Path::new(&format!("{dir}/{label}.manifest.gz")))
+                .expect("open history manifest");
+            w.write(b"m").expect("write");
+            w.close().expect("close");
+        }
+        // Keep 1 day of history relative to `now` (2030 is in the future of `now`,
+        // 1990 is far in the past) → 1990 pruned, 2030 kept.
+        super::expire_history(&repo, "demo", 1, now).expect("expire history");
+        assert!(
+            !repo
+                .exists(Path::new("backup/demo/backup.history/1990/19900101-000000F.manifest.gz"))
+                .unwrap(),
+            "old history manifest pruned"
+        );
+        assert!(
+            repo.exists(Path::new("backup/demo/backup.history/2030/20300101-000000F.manifest.gz"))
+                .unwrap(),
+            "recent history manifest kept"
+        );
     }
 
     /// Build + seed `backup.info` with full per-backup detail, including the
