@@ -26,6 +26,9 @@ serde_yml = "0.0.12"
 # files the command stack writes.
 pgbr-info = { path = "../pgbr-info" }
 pgbr-postgres = { path = "../pgbr-postgres" }
+# Used by the storage_helper tests to round-trip a file through the constructed
+# Posix backend via the IoWrite trait.
+pgbr-io = { path = "../pgbr-io" }
 tempfile = "3"
 
 [lints]
