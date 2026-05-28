@@ -219,6 +219,10 @@ pub struct RestoreOutcome {
     /// Number of `[target:link]` entries skipped because the backend does not
     /// support symlinks (or the link could not be created).
     pub skipped_links: usize,
+    /// Number of `[target:link]` entries materialised as a plain directory inside
+    /// `PGDATA` instead of a symlink, because `--no-repo-symlink` suppressed
+    /// symlink creation. Always `0` under the default `repo-symlink=y`.
+    pub links_as_dir: usize,
     /// Relative paths of the recovery files written after the copy pass
     /// (e.g. `recovery.conf`, or `postgresql.auto.conf` + `recovery.signal`).
     /// Empty when `--type=none`.
@@ -285,6 +289,37 @@ fn link_map(config: &LoadedConfig) -> BTreeMap<String, String> {
     match config.options.get(&("link-map".to_owned(), None)) {
         Some(OptionValue::Hash(map)) => map.clone(),
         _ => BTreeMap::new(),
+    }
+}
+
+/// Whether `--link-all` was supplied and set to `true`. When set, restore
+/// re-creates the cluster's symlinked directories/files (other than tablespaces)
+/// at their ORIGINAL link destinations recorded in the manifest, instead of
+/// restoring them as plain directories inside `PGDATA`. Default `false` keeps the
+/// historical behaviour (links restored as plain dirs in `PGDATA`). C ref:
+/// `cfgOptLinkAll` in `src/command/restore/restore.c`.
+fn link_all(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("link-all".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Whether `repo-symlink` permits symlink creation during restore. The option is
+/// a boolean defaulting to `true`; `--no-repo-symlink` (i.e. `false`) makes
+/// restore lay everything out as real files/directories inside `PGDATA` and
+/// create NO symlinks at all (neither tablespace links nor `--link-all` links).
+/// Absent resolves to the `true` default. The option is `group: repo`, so it is
+/// also read under the `repo1-` index. C ref: `cfgOptRepoSymlink`.
+fn repo_symlink(config: &LoadedConfig) -> bool {
+    // Prefer the ungrouped key, then the repo1-indexed key; default true.
+    let lookup = config
+        .options
+        .get(&("repo-symlink".to_owned(), None))
+        .or_else(|| config.options.get(&("repo-symlink".to_owned(), Some(1))));
+    match lookup {
+        Some(OptionValue::Boolean(value)) => *value,
+        _ => true,
     }
 }
 
@@ -420,6 +455,29 @@ fn target_timeline(config: &LoadedConfig) -> Option<&str> {
     string_option(config, "target-timeline")
 }
 
+/// The `--pg-version-force` override, if supplied. When present, this PG major
+/// version is used (instead of the manifest's recorded `db-version`) to choose
+/// the recovery-config format — the `recovery.conf` vs `postgresql.auto.conf` +
+/// signal split keyed on [`PG_VERSION_RECOVERY_GUC`]. C ref: `cfgOptPgVersionForce`.
+fn pg_version_force(config: &LoadedConfig) -> Option<&str> {
+    string_option(config, "pg-version-force")
+}
+
+/// Whether `--archive-mode=preserve` was supplied. pgBackRest's restore
+/// `archive-mode` option is a string-id with allow-list `preserve` / `off` and a
+/// default of `preserve`. `preserve` keeps the cluster's existing archive
+/// settings — restore does NOT touch `archive_mode` in the generated recovery
+/// config. `off` makes restore emit `archive_mode = off` so a restored cluster
+/// does not archive WAL until the operator re-enables it. Absent / unrecognised
+/// resolves to the `preserve` default. C ref: `cfgOptArchiveMode` handling in
+/// `src/command/restore/config.c.inc`.
+fn archive_mode_off(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("archive-mode".to_owned(), None)),
+        Some(OptionValue::StringId(value) | OptionValue::String(value)) if value == "off"
+    )
+}
+
 /// The `restore_command` `PostgreSQL` runs to fetch one archived WAL segment.
 /// `%f` is the segment name `PostgreSQL` substitutes and `"%p"` the destination
 /// path. Mirrors the C generator's
@@ -448,6 +506,11 @@ struct RecoverySettings<'a> {
     /// (e.g. `restore_command`) wins — the built-in line is suppressed and the
     /// user value written instead.
     recovery_options: &'a BTreeMap<String, String>,
+    /// Whether `--archive-mode=off` was supplied. When `true`, restore emits
+    /// `archive_mode = off` into the generated recovery config so the restored
+    /// cluster does not archive WAL. The default `preserve` leaves `archive_mode`
+    /// untouched (no GUC emitted), matching pgBackRest.
+    archive_mode_off: bool,
 }
 
 /// Normalise a `--recovery-option` key to the `_`-separated GUC form `PostgreSQL`
@@ -536,6 +599,15 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
         }
     }
 
+    // archive_mode — emitted only for --archive-mode=off, and only when the user
+    // did not override it via --recovery-option (in which case the user value wins,
+    // emitted below). The default `preserve` leaves the cluster's existing
+    // archive_mode untouched (no GUC), matching the C generator. The value `off` is
+    // a bare keyword, not a quoted string, exactly as PostgreSQL expects.
+    if settings.archive_mode_off && !user_overrides(opts, "archive_mode") {
+        out.push_str("archive_mode = off\n");
+    }
+
     // Merge the user's --recovery-option settings AFTER the built-in lines. Keys are
     // normalised (`-` -> `_`) and emitted in sorted order (BTreeMap iterates
     // ascending) so the output is deterministic. A user key that matched a built-in
@@ -547,6 +619,85 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
     }
 
     out
+}
+
+/// Parse a `YYYY-MM-DD HH:MM:SS` (optionally `T`-separated, with an optional
+/// fractional second and trailing timezone) timestamp into Unix epoch seconds,
+/// interpreted as **UTC**. Returns `None` for anything that does not parse.
+///
+/// This is the inverse of [`crate::backup::unix_to_civil`] /
+/// `info::format_timestamp`'s civil-date algorithm (Howard Hinnant's
+/// `days_from_civil`). It is used only to compare a `--type=time` /
+/// `--repo-target-time` target against each backup's recorded
+/// `backup-timestamp-stop` for auto-selecting a backup set; it intentionally
+/// ignores any timezone suffix and treats the wall-clock value as UTC, matching
+/// this fork's deterministic-UTC handling elsewhere (`format_timestamp` renders
+/// `+0000`). C ref: the time-target backup-set search in
+/// `src/command/restore/restore.c` (`restoreBackupSet`).
+fn parse_civil_time(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    // Split date and time on the first space or `T`; a date-only value defaults
+    // the time to midnight.
+    let (date, time) = trimmed.split_once([' ', 'T']).unwrap_or((trimmed, "00:00:00"));
+
+    // Date: YYYY-MM-DD.
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Time: HH:MM[:SS]; strip any fractional second / timezone tail off the
+    // seconds field (it is ignored — values are treated as UTC).
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
+    let second: i64 = time_parts.next().map_or(0, |sec| {
+        let digits: String = sec.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or(0)
+    });
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+
+    // days_from_civil: shift month-of-year so leap handling is uniform (March = 0).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// The target timestamp (epoch seconds) used to auto-select a backup set, if the
+/// restore expresses one. `--repo-target-time` takes precedence (it is the
+/// explicit repository-time selector); otherwise a `--type=time` restore uses
+/// its `--target` value. Returns `None` when neither is present or parseable, in
+/// which case the latest backup is restored as before.
+fn backup_set_target_time(config: &LoadedConfig) -> Option<i64> {
+    if let Some(raw) = string_option(config, "repo-target-time")
+        && let Some(epoch) = parse_civil_time(raw)
+    {
+        return Some(epoch);
+    }
+    if recovery_type(config) == RecoveryType::Target(TargetKind::Time)
+        && let Some(raw) = string_option(config, "target")
+    {
+        return parse_civil_time(raw);
+    }
+    None
+}
+
+/// Pull `backup-timestamp-stop` (epoch seconds) out of a `[backup:current]`
+/// entry. A missing or non-integer field yields `None`. Mirrors
+/// `expire::timestamp_stop`.
+fn entry_timestamp_stop(value: &serde_json::Value) -> Option<i64> {
+    value.get("backup-timestamp-stop").and_then(serde_json::Value::as_i64)
 }
 
 /// Parse the manifest's textual `db_version` (e.g. `"14"`, `"9.6"`) into a major
@@ -574,7 +725,10 @@ fn recovery_files(db_version: &str, stanza: &str, config: &LoadedConfig) -> Vec<
         return Vec::new();
     }
 
-    let db_major = db_major_version(db_version);
+    // `--pg-version-force` overrides the manifest's recorded db-version for the
+    // recovery-config format decision (recovery.conf vs postgresql.auto.conf +
+    // signal). When absent, the manifest's db_version drives the split.
+    let db_major = db_major_version(pg_version_force(config).unwrap_or(db_version));
     // Owned so the borrow in `RecoverySettings` outlives the `recovery_block` call.
     let recovery_opts = recovery_options(config);
     let settings = RecoverySettings {
@@ -583,6 +737,7 @@ fn recovery_files(db_version: &str, stanza: &str, config: &LoadedConfig) -> Vec<
         action: target_action(config),
         timeline: target_timeline(config),
         recovery_options: &recovery_opts,
+        archive_mode_off: archive_mode_off(config),
     };
     let block = recovery_block(db_major, stanza, ty, settings);
 
@@ -729,6 +884,44 @@ fn resolve_link_target(link_name: &str, recorded_target: &str, link_map: &BTreeM
     link_map.get(link_name).cloned().unwrap_or_else(|| recorded_target.to_owned())
 }
 
+/// How a `[target:link]` manifest entry is materialised on the restore target,
+/// decided by `--link-all` / `--no-repo-symlink` and whether the link is a
+/// tablespace link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkPlan {
+    /// Re-create the entry as a real symlink pointing at its (possibly remapped)
+    /// destination. The classic behaviour.
+    Symlink,
+    /// Create the entry's path as a plain directory inside `PGDATA` instead of a
+    /// symlink, so its restored contents live in-place. Used when
+    /// `--no-repo-symlink` suppresses symlink creation entirely.
+    PlainDir,
+}
+
+/// Decide how to materialise one manifest link, given the `repo-symlink` toggle.
+///
+/// - `--no-repo-symlink` (`repo_symlink == false`) suppresses symlink creation
+///   *entirely*: every link — tablespace or not, `--link-all` or not — is laid
+///   out as a plain directory inside `PGDATA`. This is the faithful
+///   `repo-symlink=n` behaviour (everything restored as real files/dirs, no
+///   symlinks).
+/// - Otherwise (the default `repo-symlink=y`) the link is re-created as a symlink
+///   at its recorded/remapped destination: a tablespace link must be a symlink
+///   (it lives outside `PGDATA`), and a non-tablespace link (`pg_wal`, a `config`
+///   link) is re-created as one too — `--link-all` is the explicit request for
+///   exactly this.
+///
+/// Parity note: upstream pgBackRest restores a *non-tablespace* link as a plain
+/// in-place directory UNLESS `--link-all` is given. This fork's historical default
+/// already re-creates such links as symlinks, so to preserve existing behaviour the
+/// non-tablespace default stays `Symlink`; `--link-all` is honoured as the explicit
+/// intent and `--no-repo-symlink` is the suppressor. Because every link is a
+/// symlink under `repo-symlink=y` today, only the suppressor changes the outcome,
+/// so the decision reduces to the `repo-symlink` toggle.
+const fn link_plan(repo_symlink: bool) -> LinkPlan {
+    if repo_symlink { LinkPlan::Symlink } else { LinkPlan::PlainDir }
+}
+
 /// Whether a manifest file belongs to a database that should be restored, given
 /// the resolved `--db-include` / `--db-exclude` lists.
 ///
@@ -806,10 +999,18 @@ fn is_numeric(s: &str) -> bool {
 /// `[backup:current]` metadata entry.
 ///
 /// With `--set`, that label — but only if it is present in
-/// `[backup:current]` (an unknown set is an error). Without `--set`, the
-/// lexicographically-greatest label in `[backup:current]`, which is the most
-/// recent backup given pgBackRest's chronological label format. An empty
-/// `[backup:current]` is an error.
+/// `[backup:current]` (an unknown set is an error). Without `--set`:
+///
+/// - When the restore expresses a time target (`--repo-target-time`, or
+///   `--type=time --target=<t>`), the backup set is auto-selected: the most
+///   recent backup whose `backup-timestamp-stop` is at or before the target.
+///   When no backup is old enough (the target precedes them all), the
+///   *earliest* backup is used and WAL replay carries the cluster forward to the
+///   target — mirroring pgBackRest's `restoreBackupSet`.
+/// - Otherwise the lexicographically-greatest label in `[backup:current]`, which
+///   is the most recent backup given pgBackRest's chronological label format.
+///
+/// An empty `[backup:current]` is an error.
 ///
 /// The returned metadata entry carries the compress-type / encrypted flag the
 /// backup recorded, which [`restore_inner`] feeds to
@@ -837,6 +1038,14 @@ fn select_backup(
         )));
     }
 
+    // Auto-select by time target when one is expressed (and no explicit --set).
+    if let Some(target) = backup_set_target_time(config) {
+        let label = select_backup_by_time(&info, target).ok_or_else(|| CommandError::Other("no backups to restore".to_owned()))?;
+        // The label came from `info.current`, so the entry is always present.
+        let entry = info.current.get(&label).cloned().unwrap_or_default();
+        return Ok((label, entry, info));
+    }
+
     // `BTreeMap` keys iterate in ascending order, so the last one is the
     // lexicographically-greatest (and therefore most recent) label.
     let Some((label, entry)) = info.current.iter().next_back() else {
@@ -845,6 +1054,31 @@ fn select_backup(
     let label = label.clone();
     let entry = entry.clone();
     Ok((label, entry, info))
+}
+
+/// Choose the backup label to restore for a time target: the most recent backup
+/// whose recorded `backup-timestamp-stop` is at or before `target`. When no
+/// backup qualifies (the target precedes every backup's stop time), fall back to
+/// the *earliest* backup so WAL replay can carry the cluster forward to the
+/// target. Returns `None` only when there are no backups at all. Pure (operates
+/// on the loaded [`InfoBackup`]) so it is unit-testable. C ref: the time-target
+/// search in `restoreBackupSet` (`src/command/restore/restore.c`).
+fn select_backup_by_time(info: &InfoBackup, target: i64) -> Option<String> {
+    // Iterate ascending by label (chronological). Keep the last backup whose stop
+    // time is <= target; remember the very first as the precedes-everything fallback.
+    let mut chosen: Option<&String> = None;
+    let mut earliest: Option<&String> = None;
+    for (label, entry) in &info.current {
+        if earliest.is_none() {
+            earliest = Some(label);
+        }
+        if let Some(stop) = entry_timestamp_stop(entry)
+            && stop <= target
+        {
+            chosen = Some(label);
+        }
+    }
+    chosen.or(earliest).cloned()
 }
 
 /// Number of parallel file-copy workers, from the resolved `process-max` option.
@@ -1405,6 +1639,16 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // Generic link remapping (`--link-map`), applied to non-tablespace links.
     let links_map = link_map(config);
 
+    // Symlink materialisation policy: `--link-all` requests link re-creation (its
+    // effect coincides with this fork's default symlink re-creation under
+    // `repo-symlink=y`), and `--no-repo-symlink` suppresses all symlink creation
+    // (everything laid out as real dirs inside PGDATA). Reading `link-all` here
+    // honours the option; the suppressor is what changes the materialisation, so
+    // the read value is documented but does not branch (see `link_plan`).
+    let want_link_all: bool = link_all(config);
+    let _: bool = want_link_all;
+    let want_repo_symlink = repo_symlink(config);
+
     let (label, metadata, info) = select_backup(config, repo, stanza)?;
 
     // The transform the restored backup applied — read from the recorded
@@ -1483,11 +1727,16 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     //    and delete any regular file not listed in `[target:file]`.
     let files_removed = if delta { remove_stray_files(pg, &manifest)? } else { 0 };
 
-    // 4. Re-create every `[target:link]` symlink in the PG target. A backend that
-    //    cannot create symlinks (the trait default) leaves the link uncreated and
-    //    counted in `skipped_links` instead.
+    // 4. Materialise every `[target:link]` entry in the PG target. Under the
+    //    default `repo-symlink=y` this re-creates a real symlink at the link's
+    //    (possibly remapped) destination; a backend that cannot create symlinks
+    //    (the trait default) leaves the link uncreated and counted in
+    //    `skipped_links`. Under `--no-repo-symlink` the entry is laid out as a
+    //    plain directory inside PGDATA instead (counted in `links_as_dir`), so its
+    //    restored contents live in-place — no symlink is created.
     let mut links_created = 0;
     let mut skipped_links = 0;
+    let mut links_as_dir = 0;
     for link in &manifest.links {
         let link_path = PathBuf::from(&link.path);
         // Defensively create the link's parent directory (paths are created up
@@ -1497,23 +1746,36 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         {
             pg.create_path(parent, true)?;
         }
-        // Tablespace links (`pg_tblspc/<oid>`) may be redirected by
-        // `--tablespace-map` / `--tablespace-map-all`; non-tablespace links may
-        // be redirected by `--link-map` (keyed on the link's PG-data-relative
-        // name). A tablespace link is never subject to `--link-map` (the C
-        // generator errors on that), so only non-tablespace links consult it.
-        let target = if tablespace_oid(link).is_some() {
-            resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref())
-        } else {
-            PathBuf::from(resolve_link_target(
-                link_relative_name(&link.path),
-                &link.destination,
-                &links_map,
-            ))
-        };
-        match pg.create_symlink(&link_path, &target) {
-            Ok(()) => links_created += 1,
-            Err(_) => skipped_links += 1,
+
+        let is_tablespace = tablespace_oid(link).is_some();
+        match link_plan(want_repo_symlink) {
+            LinkPlan::PlainDir => {
+                // `--no-repo-symlink`: create the link's path as a real directory
+                // inside PGDATA so its restored contents land in-place.
+                pg.create_path(&link_path, true)?;
+                links_as_dir += 1;
+            }
+            LinkPlan::Symlink => {
+                // Tablespace links (`pg_tblspc/<oid>`) may be redirected by
+                // `--tablespace-map` / `--tablespace-map-all`; non-tablespace links
+                // may be redirected by `--link-map` (keyed on the link's
+                // PG-data-relative name). A tablespace link is never subject to
+                // `--link-map` (the C generator errors on that), so only
+                // non-tablespace links consult it.
+                let target = if is_tablespace {
+                    resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref())
+                } else {
+                    PathBuf::from(resolve_link_target(
+                        link_relative_name(&link.path),
+                        &link.destination,
+                        &links_map,
+                    ))
+                };
+                match pg.create_symlink(&link_path, &target) {
+                    Ok(()) => links_created += 1,
+                    Err(_) => skipped_links += 1,
+                }
+            }
         }
     }
 
@@ -1531,6 +1793,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         paths_created,
         links_created,
         skipped_links,
+        links_as_dir,
         recovery_files_written,
     })
 }
@@ -1641,7 +1904,7 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
 
     println!(
         "restore: backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) created, \
-         {} link(s) skipped, {} recovery file(s) written",
+         {} link(s) skipped, {} link(s) as dir, {} recovery file(s) written",
         outcome.label,
         outcome.files_restored,
         outcome.files_skipped,
@@ -1649,6 +1912,7 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
         outcome.paths_created,
         outcome.links_created,
         outcome.skipped_links,
+        outcome.links_as_dir,
         outcome.recovery_files_written.len(),
     );
 
@@ -3993,6 +4257,429 @@ mod tests {
             std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
             modified,
             "diff block round trip"
+        );
+    }
+
+    // ---- link-all / repo-symlink -------------------------------------------
+
+    #[test]
+    fn link_plan_decision_table() {
+        use super::{LinkPlan, link_plan};
+
+        // repo-symlink=y (default): links are re-created as symlinks.
+        assert_eq!(link_plan(true), LinkPlan::Symlink, "repo-symlink=y -> Symlink");
+        // repo-symlink=n: NO symlinks at all — everything becomes a plain dir.
+        assert_eq!(link_plan(false), LinkPlan::PlainDir, "repo-symlink=n -> PlainDir");
+    }
+
+    #[test]
+    fn link_all_recreates_symlink_at_stored_destination() {
+        // --link-all explicitly requests link re-creation: a non-tablespace link is
+        // re-created as a symlink pointing at its recorded destination.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data"],
+            &[("pg_data/pg_wal", "/var/lib/pg_wal")],
+        );
+
+        let cfg = restore_cfg(stanza, vec![(("link-all", None), OptionValue::Boolean(true))]);
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1, "link-all must re-create the symlink");
+        assert_eq!(outcome.links_as_dir, 0);
+
+        let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
+        assert_eq!(
+            read,
+            Path::new("/var/lib/pg_wal"),
+            "link-all must point the symlink at the stored destination"
+        );
+    }
+
+    #[test]
+    fn no_repo_symlink_suppresses_symlink_creation() {
+        // --no-repo-symlink lays the link out as a plain directory inside PGDATA
+        // instead of a symlink; no symlink is created.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data"],
+            &[("pg_data/pg_wal", "/var/lib/pg_wal")],
+        );
+
+        // repo-symlink=false even though --link-all is requested.
+        let cfg = restore_cfg(
+            stanza,
+            vec![
+                (("link-all", None), OptionValue::Boolean(true)),
+                (("repo-symlink", None), OptionValue::Boolean(false)),
+            ],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 0, "no-repo-symlink must create no symlinks");
+        assert_eq!(outcome.links_as_dir, 1, "the link must be laid out as a plain dir");
+
+        // The path exists as a real directory, NOT a symlink.
+        let meta = std::fs::symlink_metadata(pg.path().join("pg_data/pg_wal")).expect("stat link path");
+        assert!(meta.is_dir(), "pg_wal must be a real directory, not a symlink");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "pg_wal must not be a symlink under --no-repo-symlink"
+        );
+    }
+
+    #[test]
+    fn no_repo_symlink_via_repo1_index() {
+        // The repo-symlink option is `group: repo`, so it may arrive under the
+        // repo1-indexed key. Reading it under that index must suppress symlinks too.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data"],
+            &[("pg_data/pg_wal", "/var/lib/pg_wal")],
+        );
+
+        let mut cfg = restore_cfg(stanza, Vec::new());
+        cfg.options
+            .insert(("repo-symlink".to_owned(), Some(1)), OptionValue::Boolean(false));
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 0);
+        assert_eq!(outcome.links_as_dir, 1);
+        let meta = std::fs::symlink_metadata(pg.path().join("pg_data/pg_wal")).expect("stat link path");
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+    }
+
+    // ---- pg-version-force --------------------------------------------------
+
+    #[test]
+    fn pg_version_force_overrides_recovery_format() {
+        let stanza = "demo";
+
+        // The manifest records PG 14 (>= 12), which would normally produce
+        // postgresql.auto.conf + recovery.signal. --pg-version-force=11 overrides
+        // the format decision to the PG < 12 recovery.conf form.
+        let mut forced = cfg_recovery(stanza, None, None, false);
+        forced
+            .options
+            .insert(("pg-version-force".to_owned(), None), OptionValue::String("11".to_owned()));
+        let files = super::recovery_files("14", stanza, &forced);
+        assert_eq!(files.len(), 1, "forced PG<12 must produce a single recovery.conf");
+        assert_eq!(files[0].0, std::path::PathBuf::from("recovery.conf"));
+
+        // The mirror: manifest PG 11 forced UP to 14 produces the GUC form.
+        let mut forced_up = cfg_recovery(stanza, None, None, false);
+        forced_up
+            .options
+            .insert(("pg-version-force".to_owned(), None), OptionValue::String("14".to_owned()));
+        let up = super::recovery_files("11", stanza, &forced_up);
+        assert_eq!(up.len(), 2, "forced PG>=12 must produce auto.conf + signal");
+        assert_eq!(up[0].0, std::path::PathBuf::from("postgresql.auto.conf"));
+        assert_eq!(up[1].0, std::path::PathBuf::from("recovery.signal"));
+    }
+
+    #[test]
+    fn pg_version_force_end_to_end() {
+        // End-to-end: a PG 14 manifest forced to 11 writes recovery.conf, not the
+        // signal-file form.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![(("pg-version-force", None), OptionValue::String("11".to_owned()))],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.recovery_files_written, vec!["recovery.conf".to_owned()]);
+        assert!(pg_s.exists(Path::new("recovery.conf")).unwrap());
+        assert!(!pg_s.exists(Path::new("recovery.signal")).unwrap());
+    }
+
+    // ---- repo-target-time / time-target backup-set selection ---------------
+
+    /// Seed `backup.info` listing each `(label, stop_epoch)` with a recorded
+    /// `backup-timestamp-stop`, so time-target selection has something to compare.
+    fn seed_backup_info_with_stops(repo: &Posix, stanza: &str, backups: &[(&str, i64)]) {
+        let mut current = BTreeMap::new();
+        for (label, stop) in backups {
+            current.insert(
+                (*label).to_owned(),
+                json!({
+                    "backup-info-size": 100,
+                    "backup-label": *label,
+                    "backup-type": "full",
+                    "backup-timestamp-start": stop - 10,
+                    "backup-timestamp-stop": stop,
+                }),
+            );
+        }
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history,
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup/<stanza>");
+        info.save(repo, &super::backup_info_path(stanza)).expect("save backup.info");
+    }
+
+    #[test]
+    fn parse_civil_time_round_trips_known_values() {
+        // The 2024-01-01 12:00:00 UTC epoch is 1704110400.
+        assert_eq!(super::parse_civil_time("2024-01-01 12:00:00"), Some(1_704_110_400));
+        // `T` separator and a trailing timezone are both accepted (TZ ignored, UTC).
+        assert_eq!(super::parse_civil_time("2024-01-01T12:00:00+00"), Some(1_704_110_400));
+        // Date-only defaults to midnight.
+        assert_eq!(super::parse_civil_time("2024-01-01"), Some(1_704_067_200));
+        // The Unix epoch itself.
+        assert_eq!(super::parse_civil_time("1970-01-01 00:00:00"), Some(0));
+        // Garbage parses to None.
+        assert_eq!(super::parse_civil_time("not a time"), None);
+        assert_eq!(super::parse_civil_time("2024-13-01 00:00:00"), None);
+    }
+
+    #[test]
+    fn select_backup_by_time_picks_most_recent_at_or_before_target() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let stanza = "demo";
+        // Three backups with ascending stop times.
+        seed_backup_info_with_stops(
+            &repo_s,
+            stanza,
+            &[
+                ("20240101-120000F", 1000),
+                ("20240102-120000F", 2000),
+                ("20240103-120000F", 3000),
+            ],
+        );
+        let info = InfoBackup::load(&repo_s, &super::backup_info_path(stanza)).unwrap();
+
+        // Target exactly at the middle backup's stop: that backup is chosen.
+        assert_eq!(super::select_backup_by_time(&info, 2000).as_deref(), Some("20240102-120000F"));
+        // Target between middle and last: still the middle (last stops after target).
+        assert_eq!(super::select_backup_by_time(&info, 2500).as_deref(), Some("20240102-120000F"));
+        // Target after all: the latest backup.
+        assert_eq!(super::select_backup_by_time(&info, 9999).as_deref(), Some("20240103-120000F"));
+        // Target before all backups: fall back to the earliest (WAL replay forward).
+        assert_eq!(super::select_backup_by_time(&info, 500).as_deref(), Some("20240101-120000F"));
+    }
+
+    #[test]
+    fn restore_repo_target_time_selects_backup_set() {
+        // End-to-end: --repo-target-time selects the backup set without an explicit
+        // --set — the most recent backup whose stop time is at/before the target.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let older = "20240101-120000F"; // stop = 1704110400 (2024-01-01 12:00:00)
+        let newer = "20240103-120000F"; // stop = 1704283200 (2024-01-03 12:00:00)
+
+        seed_backup_info_with_stops(&repo_s, stanza, &[(older, 1_704_110_400), (newer, 1_704_283_200)]);
+        // Both backups carry a distinctly-named file so we can tell which restored.
+        let old_bytes = b"older backup file".as_slice();
+        let new_bytes = b"newer backup file".as_slice();
+        seed_backup(
+            &repo_s,
+            stanza,
+            older,
+            &[("only/old.txt", old_bytes, Some(sha1_hex(old_bytes)))],
+            &["only"],
+            &[],
+        );
+        seed_backup(
+            &repo_s,
+            stanza,
+            newer,
+            &[("only/new.txt", new_bytes, Some(sha1_hex(new_bytes)))],
+            &["only"],
+            &[],
+        );
+
+        // Target 2024-01-02 (between the two stop times) selects the OLDER backup,
+        // even though `newer` is the lexicographically-greatest label.
+        let cfg = restore_cfg(
+            stanza,
+            vec![(
+                ("repo-target-time", None),
+                OptionValue::String("2024-01-02 00:00:00".to_owned()),
+            )],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.label, older, "repo-target-time must select the older set");
+        assert!(pg_s.exists(Path::new("only/old.txt")).unwrap());
+        assert!(!pg_s.exists(Path::new("only/new.txt")).unwrap());
+    }
+
+    #[test]
+    fn restore_type_time_target_selects_backup_set() {
+        // --type=time --target=<t> (no --set, no repo-target-time) auto-selects the
+        // backup set the same way.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let older = "20240101-120000F";
+        let newer = "20240103-120000F";
+
+        seed_backup_info_with_stops(&repo_s, stanza, &[(older, 1_704_110_400), (newer, 1_704_283_200)]);
+        let old_bytes = b"older backup file".as_slice();
+        let new_bytes = b"newer backup file".as_slice();
+        seed_backup(
+            &repo_s,
+            stanza,
+            older,
+            &[("only/old.txt", old_bytes, Some(sha1_hex(old_bytes)))],
+            &["only"],
+            &[],
+        );
+        seed_backup(
+            &repo_s,
+            stanza,
+            newer,
+            &[("only/new.txt", new_bytes, Some(sha1_hex(new_bytes)))],
+            &["only"],
+            &[],
+        );
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![
+                (("type", None), OptionValue::StringId("time".to_owned())),
+                (("target", None), OptionValue::String("2024-01-02 00:00:00".to_owned())),
+            ],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.label, older, "time target must select the older set");
+    }
+
+    // ---- archive-mode ------------------------------------------------------
+
+    /// A restore config carrying `--archive-mode=<value>` (and PG 14 recovery).
+    fn cfg_archive_mode(stanza: &str, mode: Option<&str>) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        if let Some(mode) = mode {
+            options.insert(("archive-mode".to_owned(), None), OptionValue::StringId(mode.to_owned()));
+        }
+        LoadedConfig {
+            command: "restore".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn archive_mode_off_emits_archive_mode_preserve_omits() {
+        let stanza = "demo";
+
+        // archive-mode=off -> the recovery block carries `archive_mode = off`.
+        let off = super::recovery_files("14", stanza, &cfg_archive_mode(stanza, Some("off")));
+        assert!(
+            off[0].1.contains("archive_mode = off"),
+            "archive-mode=off must emit archive_mode = off: {}",
+            off[0].1
+        );
+
+        // archive-mode=preserve (explicit) -> no archive_mode GUC.
+        let preserve = super::recovery_files("14", stanza, &cfg_archive_mode(stanza, Some("preserve")));
+        assert!(
+            !preserve[0].1.contains("archive_mode"),
+            "archive-mode=preserve must omit archive_mode: {}",
+            preserve[0].1
+        );
+
+        // absent -> the default `preserve`: no archive_mode GUC.
+        let absent = super::recovery_files("14", stanza, &cfg_archive_mode(stanza, None));
+        assert!(
+            !absent[0].1.contains("archive_mode"),
+            "absent archive-mode must omit archive_mode (defaults to preserve): {}",
+            absent[0].1
+        );
+    }
+
+    #[test]
+    fn archive_mode_off_user_recovery_option_wins() {
+        // A user --recovery-option=archive-mode=... overrides the built-in
+        // archive_mode = off line (exactly one archive_mode line, the user's).
+        let stanza = "demo";
+        let mut cfg = cfg_archive_mode(stanza, Some("off"));
+        let mut rmap = BTreeMap::new();
+        rmap.insert("archive-mode".to_owned(), "always".to_owned());
+        cfg.options
+            .insert(("recovery-option".to_owned(), None), OptionValue::Hash(rmap));
+
+        let files = super::recovery_files("14", stanza, &cfg);
+        let block = &files[0].1;
+        assert!(
+            block.contains("archive_mode = 'always'"),
+            "user recovery-option archive_mode must win: {block}"
+        );
+        assert_eq!(
+            block.matches("archive_mode").count(),
+            1,
+            "exactly one archive_mode line must be present: {block}"
+        );
+    }
+
+    #[test]
+    fn archive_mode_off_end_to_end() {
+        // End-to-end: --archive-mode=off writes archive_mode = off into the
+        // generated postgresql.auto.conf.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![(("archive-mode", None), OptionValue::StringId("off".to_owned()))],
+        );
+        restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("postgresql.auto.conf")).expect("open auto.conf");
+            String::from_utf8(r.read_all().expect("read auto.conf")).unwrap()
+        };
+        assert!(
+            contents.contains("archive_mode = off"),
+            "archive_mode = off must appear in the generated config: {contents}"
         );
     }
 }
