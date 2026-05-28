@@ -450,7 +450,7 @@ fn validate_value(
     if let Some(allowed) = usage.allow_list.as_ref().or(opt.allow_list.as_ref()) {
         let allowed_strs: Vec<String> = allowed.iter().filter_map(value_to_match_str).collect();
         if let Some(value_str) = option_value_to_match_str(value)
-            && !allowed_strs.iter().any(|a| a == &value_str)
+            && !allow_list_contains(opt.option_type, &allowed_strs, value, &value_str)
         {
             return Err(LoadError::NotInAllowList {
                 option: option_name.to_owned(),
@@ -491,6 +491,24 @@ fn validate_value(
         }
     }
     Ok(())
+}
+
+/// Whether `value` is permitted by the option's allow-list. For `size`/`time`
+/// options the allow-list entries are human-readable strings (`"1MiB"`) while
+/// the resolved value is a canonical byte/second count, so both sides are
+/// parsed into integers and compared numerically. Every other type compares
+/// the canonical string form (`value_str`) directly.
+fn allow_list_contains(option_type: OptionType, allowed_strs: &[String], value: &OptionValue, value_str: &str) -> bool {
+    match (option_type, value) {
+        (OptionType::Size | OptionType::Time, OptionValue::Size(n) | OptionValue::Time(n)) => allowed_strs
+            .iter()
+            .filter_map(|s| match parse_value(option_type, s) {
+                Ok(OptionValue::Size(a) | OptionValue::Time(a)) => Some(a),
+                _ => None,
+            })
+            .any(|a| a == *n),
+        _ => allowed_strs.iter().any(|a| a == value_str),
+    }
 }
 
 fn value_to_match_str(v: &serde_yml::Value) -> Option<String> {
@@ -1400,6 +1418,68 @@ option:
         let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
         assert!(!r.options.contains_key(&("compress-type".into(), None)));
         assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(6));
+    }
+
+    #[test]
+    fn size_allow_list_matches_default_by_canonical_bytes() {
+        // Regression: a `size` option whose default (1MiB) is in the
+        // allow-list must validate. The allow-list entries are human strings
+        // ("1MiB") while the resolved value is a byte count, so the comparison
+        // parses both sides to bytes instead of comparing string forms.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  buffer-size:
+    type: size
+    default: 1MiB
+    allow-list:
+      - 512KiB
+      - 1MiB
+      - 2MiB
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(1024 * 1024));
+    }
+
+    #[test]
+    fn size_allow_list_rejects_value_not_in_list() {
+        // A CLI value outside the allow-list still errors after the numeric
+        // comparison fix (3MiB is not among 512KiB / 1MiB / 2MiB).
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  buffer-size:
+    type: size
+    default: 1MiB
+    allow-list:
+      - 512KiB
+      - 1MiB
+      - 2MiB
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--buffer-size=3MiB"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        assert!(matches!(err, LoadError::NotInAllowList { .. }));
     }
 
     #[test]

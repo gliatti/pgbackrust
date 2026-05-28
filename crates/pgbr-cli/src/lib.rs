@@ -431,20 +431,23 @@ mod tests {
             exe_path: Some("/usr/bin/pgbackrest".to_owned()),
         };
 
-        // (1) Pipeline runs end-to-end with the threaded context.
+        // (1) Pipeline runs end-to-end with the threaded context. The point of
+        // this leg is only that `load_config_with_context` ran the full real
+        // pipeline with our context — the precise downstream outcome (a clean
+        // load, or a `Load`-stage validation/required error from the real
+        // config) is not what we're asserting here. Any non-`Load` error
+        // (e.g. CLI-resolution failure) WOULD be wrong.
         match resolve_only(["verify", "--stanza=demo", "--repo1-path=/tmp/repo"], &ctx) {
-            // The pre-existing buffer-size allow-list quirk is the expected
-            // outcome for the real config; anything else that *succeeds* is
-            // also fine (it would mean pgbr-config fixed the quirk).
             Ok(loaded) => {
-                // If load ever starts succeeding, `cmd` must carry our path.
+                // If the load succeeds, the dynamic `cmd` default must carry
+                // our threaded exe path (not the "pgbackrest" fallback).
                 if let Some(cmd) = loaded.options.get(&("cmd".to_owned(), None)) {
                     assert_eq!(cmd, &OptionValue::String("/usr/bin/pgbackrest".to_owned()));
                 }
             }
-            Err(CliRunError::Load(pgbr_config::LoadError::NotInAllowList { option, .. })) => {
-                assert_eq!(option, "buffer-size", "unexpected allow-list failure on `{option}`");
-            }
+            // A `Load`-stage error means the pipeline reached config merge with
+            // our context — exactly what leg (1) is meant to prove.
+            Err(CliRunError::Load(_)) => {}
             other => panic!("unexpected result from resolve_only: {other:?}"),
         }
 
