@@ -61,8 +61,6 @@ fn format_number(n: &serde_yml::Number) -> Result<String, serde_yml::Error> {
 mod tests {
     use super::*;
 
-    const FIXTURE_PATH: &str = "../../src/build/postgres/postgres.yaml";
-
     #[test]
     fn parses_int_and_float_mix() {
         let parsed = parse_postgres("version:\n  - 9.6\n  - 10\n  - 11\n").unwrap();
@@ -77,8 +75,7 @@ mod tests {
 
     #[test]
     fn parses_repository_fixture() {
-        let yaml = std::fs::read_to_string(FIXTURE_PATH).unwrap_or_else(|err| panic!("read {FIXTURE_PATH}: {err}"));
-        let parsed = parse_postgres(&yaml).unwrap();
+        let parsed = parse_postgres(crate::inputs::POSTGRES_YAML).unwrap();
 
         // Sanity: the file lists at least 9.6 through 18 today. Pin the first
         // and last; let the middle move with future PG releases without

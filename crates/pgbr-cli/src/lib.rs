@@ -16,11 +16,9 @@ use pgbr_config::{
     load_config_with_context, parse_cli, parse_ini, resolve_cli,
 };
 
-/// Hard-coded copy of `src/build/config/config.yaml`. Embeds the schema at
-/// compile time so the binary does not have to ship the YAML file alongside
-/// itself. Updated whenever the upstream `config.yaml` changes (re-run
-/// `cargo build` to pick up a new copy).
-const CONFIG_YAML: &str = include_str!("../../../src/build/config/config.yaml");
+/// The pgBackRest schema (`config.yaml`), embedded at compile time by
+/// `pgbr-build` so the binary carries it without a runtime file dependency.
+const CONFIG_YAML: &str = pgbr_build::inputs::CONFIG_YAML;
 
 /// Default path to `pgbackrest.conf` if `--config` is not supplied.
 const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrest/pgbackrest.conf";

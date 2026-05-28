@@ -558,11 +558,8 @@ mod tests {
     use super::*;
     use pgbr_build::config::parse_config;
 
-    const FIXTURE_PATH: &str = "../../src/build/config/config.yaml";
-
     fn load_fixture() -> Cfg {
-        let yaml = std::fs::read_to_string(FIXTURE_PATH).unwrap_or_else(|err| panic!("read {FIXTURE_PATH}: {err}"));
-        let parsed = parse_config(&yaml).unwrap_or_else(|err| panic!("parse: {err}"));
+        let parsed = parse_config(pgbr_build::inputs::CONFIG_YAML).unwrap_or_else(|err| panic!("parse: {err}"));
         compile(&parsed).unwrap_or_else(|err| panic!("compile: {err}"))
     }
 

@@ -502,10 +502,6 @@ fn optional_attr(elem: &BytesStart<'_>, attr: &str) -> Result<Option<String>, He
 mod tests {
     use super::*;
 
-    /// Path to the real help.xml shipped with the repository, relative to the
-    /// crate root. Used by the fixture-backed integration test below.
-    const FIXTURE_PATH: &str = "../../src/build/help/help.xml";
-
     #[test]
     fn parses_minimal_doc() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -634,9 +630,8 @@ mod tests {
 
     #[test]
     fn parses_repository_fixture() {
-        let xml =
-            std::fs::read_to_string(FIXTURE_PATH).unwrap_or_else(|err| panic!("failed to read fixture {FIXTURE_PATH}: {err}"));
-        let help = parse_help(&xml).expect("repository fixture must parse");
+        let xml = crate::inputs::HELP_XML;
+        let help = parse_help(xml).expect("repository fixture must parse");
 
         // Thresholds reflect the actual help.xml shipped with this commit
         // (9 config sections, 23 commands, 40 command-options). They are

@@ -412,10 +412,8 @@ fn parse_kv_line(line: &str) -> Option<(usize, &str, &str)> {
 mod tests {
     use super::*;
 
-    const FIXTURE_PATH: &str = "../../src/build/config/config.yaml";
-
     fn load_fixture() -> String {
-        std::fs::read_to_string(FIXTURE_PATH).unwrap_or_else(|err| panic!("read {FIXTURE_PATH}: {err}"))
+        crate::inputs::CONFIG_YAML.to_owned()
     }
 
     #[test]

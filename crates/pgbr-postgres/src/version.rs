@@ -131,29 +131,21 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Source of truth: every label declared by the C build's
-    /// `src/build/postgres/postgres.yaml` must have a matching entry here.
-    /// This is the keystone test that prevents the registry from drifting
-    /// when the YAML adds a new PG major.
+    /// Source of truth: every label declared by `postgres.yaml` (embedded via
+    /// `pgbr_build::inputs`) must have a matching entry here. This is the
+    /// keystone test that prevents the registry from drifting when the YAML
+    /// adds a new PG major.
     #[test]
     fn every_postgres_yaml_version_has_an_interface() {
-        // crates/pgbr-postgres/src -> ../../src/build/postgres/postgres.yaml
-        let yaml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("src")
-            .join("build")
-            .join("postgres")
-            .join("postgres.yaml");
-        let yaml = std::fs::read_to_string(&yaml_path).unwrap_or_else(|e| panic!("read {}: {}", yaml_path.display(), e));
-        let parsed = pgbr_build::parse_postgres(&yaml).unwrap_or_else(|e| panic!("parse postgres.yaml: {e}"));
+        let parsed =
+            pgbr_build::parse_postgres(pgbr_build::inputs::POSTGRES_YAML).unwrap_or_else(|e| panic!("parse postgres.yaml: {e}"));
 
         assert!(!parsed.versions.is_empty(), "postgres.yaml had no versions");
         for label in &parsed.versions {
             assert!(
                 by_label(label).is_some(),
                 "postgres.yaml lists `{label}` but pgbr_postgres::version::SUPPORTED has no entry — \
-                 add it to SUPPORTED with values from src/postgres/interface/version.vendor.h",
+                 add it to SUPPORTED with the upstream catversion/pg_control values",
             );
         }
     }

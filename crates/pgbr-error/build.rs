@@ -5,7 +5,7 @@
 
 //! Build script for `pgbr-error`.
 //!
-//! Reads `src/build/error/error.yaml` (the C-side source of truth for error codes) and emits a
+//! Reads `crates/pgbr-build/inputs/error.yaml` (the source of truth for error codes) and emits a
 //! Rust module `error_types.rs` into `OUT_DIR`. The generated module exposes an `ErrorType` enum
 //! with the same numeric discriminants as the C `errorType*` codes plus lookups by code/name and
 //! a parent-chain `extends` walk that mirrors the C `errorTypeExtends` semantics.
@@ -33,13 +33,9 @@ struct Entry {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let yaml_path = manifest_dir
-        .join("..")
-        .join("..")
-        .join("src")
-        .join("build")
-        .join("error")
-        .join("error.yaml");
+    // The error-code source of truth lives with the other build inputs in the
+    // sibling `pgbr-build` crate (`crates/pgbr-build/inputs/error.yaml`).
+    let yaml_path = manifest_dir.join("..").join("pgbr-build").join("inputs").join("error.yaml");
 
     println!("cargo:rerun-if-changed={}", yaml_path.display());
     println!("cargo:rerun-if-changed=build.rs");
@@ -146,7 +142,7 @@ fn validate_parents(entries: &[Entry]) {
 fn emit_module(out: &mut fs::File, entries: &[Entry]) {
     writeln!(
         out,
-        "// Auto-generated from src/build/error/error.yaml by crates/pgbr-error/build.rs. Do not edit by hand."
+        "// Auto-generated from crates/pgbr-build/inputs/error.yaml by crates/pgbr-error/build.rs. Do not edit by hand."
     )
     .unwrap();
     writeln!(out).unwrap();

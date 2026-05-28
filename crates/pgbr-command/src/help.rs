@@ -1,30 +1,16 @@
 //! `help` command.
 //!
 //! C reference: `src/command/help/help.c`, which renders text from the
-//! generated `help.auto.c.inc` (compiled from `src/build/help/help.xml`).
-//! The Rust port reads the same XML source through
-//! [`pgbr_build::parse_help`] at runtime and writes a minimal listing or
-//! summary to stdout.
-
-use std::fs;
-use std::path::PathBuf;
+//! generated `help.auto.c.inc`. The Rust port parses the `help.xml` source
+//! embedded by `pgbr-build` (no runtime file dependency) via
+//! [`pgbr_build::parse_help`] and writes a minimal listing or summary to
+//! stdout.
 
 use crate::CommandError;
 
-/// Where the on-disk `help.xml` lives, relative to the repository root.
-const HELP_XML_RELATIVE: &str = "src/build/help/help.xml";
-
-/// Resolve the path to `help.xml`. The C build embeds the file at compile
-/// time; until `pgbr-build` does the same, fall back to reading it from the
-/// working directory.
-fn help_xml_path() -> PathBuf {
-    PathBuf::from(HELP_XML_RELATIVE)
-}
-
 fn load_help() -> Result<pgbr_build::Help, CommandError> {
-    let path = help_xml_path();
-    let xml = fs::read_to_string(&path).map_err(|e| CommandError::Other(format!("cannot read {}: {e}", path.display())))?;
-    pgbr_build::parse_help(&xml).map_err(|e| CommandError::Other(format!("cannot parse {}: {e}", path.display())))
+    pgbr_build::parse_help(pgbr_build::inputs::HELP_XML)
+        .map_err(|e| CommandError::Other(format!("cannot parse embedded help.xml: {e}")))
 }
 
 /// Print either the full command list (no params) or a one-command summary

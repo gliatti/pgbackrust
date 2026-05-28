@@ -7,18 +7,18 @@
 
 //! Build-time inputs for the pgBackRest Rust rewrite.
 //!
-//! Parses the four hand-written input files under `src/build/` (`config.yaml`,
-//! `error.yaml`, `help.xml`, `postgres.yaml`) into typed Rust structures consumed
-//! by `pgbr-config`, `pgbr-postgres`, etc.
+//! Parses the four hand-written definition files (`config.yaml`, `error.yaml`,
+//! `help.xml`, `postgres.yaml`) into typed Rust structures consumed by
+//! `pgbr-config`, `pgbr-postgres`, etc.
 //!
-//! This crate runs in parallel with the existing C generator at `src/build/`.
-//! The C generator keeps emitting `*.auto.h` / `*.auto.c.inc` for the C build
-//! during the transition; this crate produces the same information as Rust types
-//! for the Rust port to consume.
+//! The canonical copies of those files live under `crates/pgbr-build/inputs/`
+//! and are embedded at compile time via [`mod@inputs`], so consumers share one
+//! source of truth with no runtime file dependency.
 
 pub mod config;
 pub mod error;
 pub mod help;
+pub mod inputs;
 pub mod postgres;
 
 pub use crate::config::{Config, parse_config};

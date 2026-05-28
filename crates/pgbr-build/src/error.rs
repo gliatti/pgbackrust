@@ -65,10 +65,8 @@ pub fn parse_errors(yaml: &str) -> Result<Vec<ErrorDef>, serde_yml::Error> {
 mod tests {
     use super::*;
 
-    const FIXTURE_PATH: &str = "../../src/build/error/error.yaml";
-
     fn load_fixture() -> String {
-        std::fs::read_to_string(FIXTURE_PATH).unwrap_or_else(|err| panic!("read {FIXTURE_PATH}: {err}"))
+        crate::inputs::ERROR_YAML.to_owned()
     }
 
     #[test]
