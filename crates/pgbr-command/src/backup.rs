@@ -64,11 +64,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
+use pgbr_protocol::message::{OkResponse, Request, Response};
+use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
 use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encrypted_key};
+
+/// Default number of file-copy workers when no `process-max` is configured.
+///
+/// `backup_inner_typed` has no access to the resolved config (its signature is
+/// fixed), so it uses a single worker — reproducing the prior serial behaviour
+/// byte-for-byte. The public [`backup`] entry point reads `process-max` from the
+/// configuration and routes through [`backup_inner_with_workers`] to fan out.
+const DEFAULT_PROCESS_MAX: usize = 1;
 
 /// Backup type recorded for a full backup.
 const BACKUP_TYPE_FULL: &str = "full";
@@ -234,11 +244,12 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
     let transform = RepoTransform::from_options(config);
+    let process_max = process_max(config);
 
     // The diff label depends on the full it references, so it is computed inside
-    // `backup_inner_typed` (which knows the full label); full labels are
+    // `backup_inner_with_workers` (which knows the full label); full labels are
     // timestamp-derived up front. Pass `None` to let the inner function pick.
-    let outcome = backup_inner_typed(
+    let outcome = backup_inner_with_workers(
         stanza,
         repo_storage,
         pg_storage,
@@ -246,12 +257,25 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         None,
         timestamp_start,
         &transform,
+        process_max,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
     );
     Ok(())
+}
+
+/// Number of parallel file-copy workers, from the resolved `process-max` option.
+///
+/// `process-max` is an `Integer` (default 1). Values `<= 0` clamp to one worker
+/// so the copy phase always makes progress; the dispatcher additionally caps the
+/// thread count at the number of files to copy.
+fn process_max(config: &LoadedConfig) -> usize {
+    match config.options.get(&("process-max".to_owned(), None)) {
+        Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
+    }
 }
 
 /// Format a full-backup label `YYYYMMDD-HHMMSSF` from a Unix timestamp.
@@ -298,90 +322,146 @@ fn derive_label(backup_type: BackupType, prior_label: Option<&str>, timestamp: i
     }
 }
 
-/// Outcome of capturing one file into a backup: the manifest entry plus the
-/// number of bytes physically written to the repo (`0` for a referenced file).
-struct CapturedFile {
-    file: ManifestFile,
+/// One file the copy phase must physically write into the backup.
+///
+/// Produced on the main thread by [`plan_file`] (which has already decided the
+/// file is *not* a reference) and consumed by a worker thread, which reads
+/// `abs_src`, runs the plaintext through the forward transform chain, and writes
+/// the result to `abs_dest`. The fields are all owned so the job can cross the
+/// thread boundary the parallel dispatcher imposes; `rel` correlates the worker's
+/// result back to the planned [`ManifestFile`] skeleton.
+#[derive(Debug, Clone)]
+struct CopyJob {
+    /// PG-data-relative path, used as the dispatcher correlation key.
+    rel: String,
+    /// Absolute source path of the file on disk (from `StorageInfo::path`).
+    abs_src: PathBuf,
+    /// Absolute destination path in the repo, suffix included.
+    abs_dest: PathBuf,
+}
+
+/// What a worker reports back for one [`CopyJob`].
+#[derive(Debug, Clone)]
+struct CopyResult {
+    /// Plaintext SHA-1 (lowercase hex) of the source file.
+    checksum: String,
+    /// Number of bytes physically written to the repo (post-transform).
     repo_bytes: u64,
 }
 
-/// Capture one PG-data file into the backup, returning its [`ManifestFile`].
+/// Outcome of planning one PG-data file: either a finished (referenced) manifest
+/// entry that needs no copy, or a skeleton entry plus the copy job that will
+/// fill in its checksum once a worker has read the source.
+enum FilePlan {
+    /// File is unchanged vs the prior backup — recorded with a reference, not
+    /// copied. The [`ManifestFile`] is complete.
+    Referenced(ManifestFile),
+    /// File must be copied. The skeleton carries everything except the checksum
+    /// (filled from the worker's [`CopyResult`]); `job` describes the copy.
+    Copy { skeleton: ManifestFile, job: CopyJob },
+}
+
+/// Decide how to capture one PG-data file, **without** doing any copy I/O.
 ///
-/// The plaintext SHA-1 + size are recorded regardless of how (or whether) the
-/// bytes land in the repo. For a diff or incr (`prior_manifest` is `Some`), a
-/// file whose size **and** checksum match the prior backup's entry is unchanged:
-/// it is recorded with a reference to the backup that **physically holds** the
-/// bytes and **not** copied. The physical holder is the prior backup itself when
-/// the prior copied the file, or — when the prior's own entry is a reference —
-/// the backup the prior points at (resolving the chain to its physical holder so
-/// restore never has to chase multiple hops). Otherwise the plaintext is run
-/// through `transform` and written to `<backup_root>/<rel><suffix>` with
-/// `reference: None`.
-fn capture_file(
-    repo_storage: &dyn Storage,
+/// For a diff or incr (`prior_manifest` is `Some`), a file whose size **and**
+/// checksum match the prior backup's entry is unchanged: it is recorded with a
+/// reference to the backup that **physically holds** the bytes (resolving the
+/// prior's own reference, if any, so restore never chases a multi-hop chain) and
+/// not copied. Detecting "unchanged" requires the plaintext checksum, so an
+/// unchanged-candidate file is read and hashed here on the main thread; this
+/// mirrors the C `manifestBuild` pass, which likewise decides references before
+/// handing copy work to the parallel workers.
+///
+/// Any file that is new or changed (and every file in a full backup) yields a
+/// [`FilePlan::Copy`] whose worker re-reads the source and computes the checksum
+/// itself, so the bytes are read off disk exactly once on the copy path.
+fn plan_file(
     pg_storage: &dyn Storage,
     entry: &WalkEntry,
-    backup_root: &str,
+    abs_repo_backup_root: &Path,
     transform: &RepoTransform,
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
-) -> Result<CapturedFile, CommandError> {
-    let src = PathBuf::from(&entry.rel);
-    let mut reader = pg_storage.open_read(&src)?;
-    let bytes = reader.read_all()?;
-
-    // Checksum and size are taken over the PLAINTEXT, independent of how the
-    // bytes are stored in the repo (pgBackRest semantics).
-    let mut sha1 = Sha1::new();
-    let mut sink = Vec::new();
-    sha1.process(&bytes, &mut sink)?;
-    let checksum = sha1.digest_hex();
-
-    let base = ManifestFile {
+) -> Result<FilePlan, CommandError> {
+    let skeleton = ManifestFile {
         path: entry.rel.clone(),
         size: entry.info.size,
         timestamp: entry.info.modified.unwrap_or(0),
-        checksum: Some(checksum.clone()),
+        checksum: None,
         checksum_page: None,
         reference: None,
     };
 
-    // For a diff/incr: when the prior backup holds this file unchanged (same
-    // size AND checksum), record a reference to the backup that physically holds
-    // the bytes and do NOT copy them. If the prior's own entry is a reference,
-    // the bytes live in *that* backup, so resolve through it; otherwise the prior
-    // itself holds them.
+    // For a diff/incr: when the prior backup *might* hold this file unchanged
+    // (same recorded size), hash the plaintext and compare checksums. A match
+    // records a reference to the backup that physically holds the bytes and skips
+    // the copy entirely. A size mismatch can never be unchanged, so it falls
+    // through to the copy path without paying for a hash here.
     if let Some(prior_manifest) = prior_manifest
         && let Some(prior_file) = prior_manifest.file(&entry.rel)
         && prior_file.size == entry.info.size
-        && prior_file.checksum.as_deref() == Some(checksum.as_str())
     {
-        let holder = prior_file.reference.clone().or_else(|| prior_label.map(ToOwned::to_owned));
-        return Ok(CapturedFile {
-            file: ManifestFile {
+        let mut reader = pg_storage.open_read(&PathBuf::from(&entry.rel))?;
+        let bytes = reader.read_all()?;
+        let checksum = plaintext_sha1(&bytes)?;
+        if prior_file.checksum.as_deref() == Some(checksum.as_str()) {
+            let holder = prior_file.reference.clone().or_else(|| prior_label.map(ToOwned::to_owned));
+            return Ok(FilePlan::Referenced(ManifestFile {
+                checksum: Some(checksum),
                 reference: holder,
-                ..base
-            },
-            repo_bytes: 0,
-        });
+                ..skeleton
+            }));
+        }
     }
 
-    // Full backup, or a changed / new file in a diff: copy it. Compress-then-
-    // encrypt the plaintext into the repo bytes; the identity transform returns
-    // the bytes unchanged. The repo filename carries the compression suffix;
-    // encryption does not change it.
+    // Full backup, or a new / changed file in a diff / incr: copy it. The repo
+    // filename carries the compression suffix; encryption does not change it.
+    let abs_dest = abs_repo_backup_root.join(format!("{}{}", entry.rel, transform.repo_suffix()));
+    Ok(FilePlan::Copy {
+        skeleton,
+        job: CopyJob {
+            rel: entry.rel.clone(),
+            abs_src: entry.info.path.clone(),
+            abs_dest,
+        },
+    })
+}
+
+/// Compute the plaintext SHA-1 (lowercase hex) of `bytes`.
+///
+/// pgBackRest records the *uncompressed* checksum regardless of how the bytes
+/// are stored in the repo, so this is taken over the plaintext on both the
+/// reference-detection (main thread) and copy (worker) paths.
+fn plaintext_sha1(bytes: &[u8]) -> Result<String, CommandError> {
+    let mut sha1 = Sha1::new();
+    let mut sink = Vec::new();
+    sha1.process(bytes, &mut sink)?;
+    Ok(sha1.digest_hex())
+}
+
+/// Copy one file into the repo: read `abs_src`, compress-then-encrypt the
+/// plaintext into the repo bytes (the identity transform passes them through),
+/// create the destination's parent directory, and write `abs_dest`. Returns the
+/// plaintext checksum + the number of repo bytes written.
+///
+/// This is the per-file unit of work run on a dispatcher worker thread. It does
+/// all of its I/O through `std::fs` against absolute paths, so it needs no
+/// `Storage` handle and no borrow from the caller — only the owned `transform`
+/// captured by the worker closure.
+fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, CommandError> {
+    let bytes = std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+
+    let checksum = plaintext_sha1(&bytes)?;
+
     let repo_bytes = transform.apply_forward(&bytes)?;
-    let dest = PathBuf::from(format!("{backup_root}/{}{}", entry.rel, transform.repo_suffix()));
-    if let Some(parent) = dest.parent() {
-        repo_storage.create_path(parent, true)?;
+    if let Some(parent) = job.abs_dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
     }
-    let mut writer = repo_storage.open_write(&dest)?;
-    writer.write(&repo_bytes)?;
-    writer.flush()?;
-    writer.close()?;
+    std::fs::write(&job.abs_dest, &repo_bytes)
+        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dest.display())))?;
 
-    Ok(CapturedFile {
-        file: base,
+    Ok(CopyResult {
+        checksum,
         repo_bytes: repo_bytes.len() as u64,
     })
 }
@@ -471,6 +551,196 @@ pub fn backup_inner(
     )
 }
 
+/// Encode a [`CopyJob`] as a dispatcher [`Request`]: the job's `rel` path is the
+/// `cmd`, and the absolute source / destination paths ride in `param`.
+///
+/// The dispatcher's [`Job`]/[`Request`] shape (a command name plus a JSON
+/// `param` array) is the only channel through which per-file work reaches a
+/// worker, so the copy's inputs are serialised into it here and decoded back in
+/// [`request_to_copy_job`]. The shared, owned `RepoTransform` is captured by the
+/// worker closure rather than sent per job.
+fn copy_job_to_request(job: &CopyJob) -> Request {
+    Request {
+        cmd: job.rel.clone(),
+        param: vec![json!(job.abs_src.to_string_lossy()), json!(job.abs_dest.to_string_lossy())],
+    }
+}
+
+/// Decode a [`Request`] produced by [`copy_job_to_request`] back into a
+/// [`CopyJob`] inside a worker.
+fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
+    let abs_src = request
+        .param
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "copy job missing source path".to_owned())?;
+    let abs_dest = request
+        .param
+        .get(1)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "copy job missing destination path".to_owned())?;
+    Ok(CopyJob {
+        rel: request.cmd.clone(),
+        abs_src: PathBuf::from(abs_src),
+        abs_dest: PathBuf::from(abs_dest),
+    })
+}
+
+/// Run every [`CopyJob`] across `worker_count` workers via the in-process
+/// dispatcher, returning each job's [`CopyResult`] keyed by its `rel` path.
+///
+/// Each worker re-decodes its job, reads the source, applies the (cloned, owned)
+/// forward transform, and writes the repo file; its `(checksum, repo_bytes)`
+/// outcome is serialised into the response `out` and collected here. The first
+/// failing job surfaces as an `Err` (the dispatcher isolates panics into errors
+/// too), so a copy failure fails the whole backup just as the serial path did.
+///
+/// `worker_count == 1` runs a single worker — byte-for-byte the prior serial
+/// behaviour. Results come back in completion order; the caller correlates them
+/// by key and re-sorts the manifest, so order does not affect the output.
+fn run_copy_jobs(
+    jobs: &[CopyJob],
+    transform: &RepoTransform,
+    worker_count: usize,
+) -> Result<Vec<(String, CopyResult)>, CommandError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let dispatcher_jobs: Vec<Job> = jobs
+        .iter()
+        .map(|job| Job {
+            key: job.rel.clone(),
+            request: copy_job_to_request(job),
+        })
+        .collect();
+
+    // The dispatcher demands a `Send + Sync + 'static` worker, so the closure
+    // can only borrow owned data: an owned clone of the transform (cheap) and
+    // whatever rides in each `Request`. No `Storage` handle crosses the boundary
+    // — workers do their I/O through `std::fs` against the absolute paths in the
+    // request, so nothing borrowed from this stack frame escapes.
+    let worker_transform = transform.clone();
+    let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
+        let job = request_to_copy_job(request)?;
+        let copied = copy_file(&job, &worker_transform).map_err(|err| err.to_string())?;
+        Ok(Response::Ok(OkResponse {
+            out: Some(json!({ "checksum": copied.checksum, "repoBytes": copied.repo_bytes })),
+        }))
+    });
+
+    let mut out = Vec::with_capacity(results.len());
+    for job_result in results {
+        match job_result.result {
+            Ok(Response::Ok(OkResponse { out: Some(value) })) => {
+                let checksum = value
+                    .get("checksum")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| CommandError::Other(format!("copy of {} returned no checksum", job_result.key)))?
+                    .to_owned();
+                let repo_bytes = value
+                    .get("repoBytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| CommandError::Other(format!("copy of {} returned no repo size", job_result.key)))?;
+                out.push((job_result.key, CopyResult { checksum, repo_bytes }));
+            }
+            Ok(_) => {
+                return Err(CommandError::Other(format!(
+                    "copy of {} produced an unexpected empty response",
+                    job_result.key
+                )));
+            }
+            Err(message) => return Err(CommandError::Other(message)),
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the absolute on-disk path of `relative` within `storage`.
+///
+/// Used to anchor each copy job's destination at an absolute path so the workers
+/// (which use `std::fs`, not the `Storage` handle) write to the right place. The
+/// directory must already exist; the caller creates the backup root first.
+fn absolute_path(storage: &dyn Storage, relative: &Path) -> Result<PathBuf, CommandError> {
+    Ok(storage.info(relative)?.path)
+}
+
+/// The classified result of walking the PG data dir: referenced files (decided
+/// without copying), the skeletons + jobs for files that must be copied, and the
+/// directory / symlink inventory.
+struct BackupPlan {
+    /// Files unchanged vs the prior backup — complete manifest entries, no copy.
+    referenced: Vec<ManifestFile>,
+    /// Skeletons for files that need copying; checksum is filled from the
+    /// matching [`CopyResult`]. Parallel to nothing — correlated by `path`.
+    copy_skeletons: Vec<ManifestFile>,
+    /// The copy jobs handed to the worker pool, one per [`Self::copy_skeletons`].
+    copy_jobs: Vec<CopyJob>,
+    /// Directory entries.
+    paths: Vec<ManifestPath>,
+    /// Symlink entries.
+    links: Vec<ManifestLink>,
+}
+
+/// Walk the PG data dir and classify every non-excluded entry into a
+/// [`BackupPlan`], deciding diff/incr references on the main thread but deferring
+/// the actual file copies to [`run_copy_jobs`].
+///
+/// # Errors
+///
+/// Propagates walk / read failures and any error from [`plan_file`].
+fn plan_backup(
+    pg_storage: &dyn Storage,
+    abs_repo_backup_root: &Path,
+    transform: &RepoTransform,
+    prior_manifest: Option<&Manifest>,
+    prior_label: Option<&str>,
+) -> Result<BackupPlan, CommandError> {
+    let mut plan = BackupPlan {
+        referenced: Vec::new(),
+        copy_skeletons: Vec::new(),
+        copy_jobs: Vec::new(),
+        paths: Vec::new(),
+        links: Vec::new(),
+    };
+
+    for entry in walk(pg_storage, Path::new("."))? {
+        if is_excluded(&entry.rel) {
+            continue;
+        }
+
+        match entry.info.kind {
+            StorageKind::File => match plan_file(
+                pg_storage,
+                &entry,
+                abs_repo_backup_root,
+                transform,
+                prior_manifest,
+                prior_label,
+            )? {
+                FilePlan::Referenced(file) => plan.referenced.push(file),
+                FilePlan::Copy { skeleton, job } => {
+                    plan.copy_skeletons.push(skeleton);
+                    plan.copy_jobs.push(job);
+                }
+            },
+            StorageKind::Path => plan.paths.push(ManifestPath { path: entry.rel }),
+            StorageKind::Link => {
+                // TODO: resolve link target once `Storage` exposes a
+                // link-target accessor; record an empty destination for now.
+                plan.links.push(ManifestLink {
+                    path: entry.rel,
+                    destination: String::new(),
+                });
+            }
+            // Sockets / FIFOs / devices are not part of a base backup.
+            StorageKind::Special => {}
+        }
+    }
+
+    Ok(plan)
+}
+
 /// Resolve the prior backup (label + loaded manifest) a diff/incr references.
 ///
 /// A diff's prior is the latest full backup; an incr's prior is the latest
@@ -552,6 +822,50 @@ pub fn backup_inner_typed(
     timestamp_start: i64,
     transform: &RepoTransform,
 ) -> Result<BackupOutcome, CommandError> {
+    backup_inner_with_workers(
+        stanza,
+        repo_storage,
+        pg_storage,
+        backup_type,
+        label,
+        timestamp_start,
+        transform,
+        DEFAULT_PROCESS_MAX,
+    )
+}
+
+/// Take a backup of the given `backup_type`, copying files across `process_max`
+/// parallel workers.
+///
+/// Identical to [`backup_inner_typed`] except the caller chooses the number of
+/// file-copy workers (`process-max`). The copy phase fans out across the
+/// in-process [`pgbr_protocol::parallel`] dispatcher: each non-referenced file
+/// becomes a [`CopyJob`] that a worker reads, transforms (compress + encrypt),
+/// and writes, returning its plaintext SHA-1 and repo size. Reference decisions
+/// for diff / incr backups stay on the main thread (they need the prior
+/// manifest), exactly as the C `manifestBuild` pass decides references before
+/// dispatching copy work.
+///
+/// The manifest's file / path / link lists are sorted by path before the
+/// manifest is assembled, so the on-disk `backup.manifest` — and therefore its
+/// checksum — is identical regardless of the order in which workers finish.
+/// `process_max == 1` reproduces the prior serial behaviour byte-for-byte.
+///
+/// # Errors
+///
+/// Same as [`backup_inner_typed`], plus a [`CommandError::Other`] if a copy
+/// worker fails (its error message is propagated and fails the whole backup).
+#[allow(clippy::too_many_arguments)]
+pub fn backup_inner_with_workers(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+    backup_type: BackupType,
+    label: Option<&str>,
+    timestamp_start: i64,
+    transform: &RepoTransform,
+    process_max: usize,
+) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
         return Err(CommandError::Other(
@@ -572,49 +886,49 @@ pub fn backup_inner_typed(
 
     let backup_root = format!("backup/{stanza}/{label}");
 
-    let mut files = Vec::new();
-    let mut paths = Vec::new();
-    let mut links = Vec::new();
-    let mut total_size: u64 = 0;
+    // The backup root must exist before planning copies so the workers' absolute
+    // destination paths anchor under a real directory (and so the manifest write
+    // later has a home, even for an improbably empty cluster).
+    repo_storage.create_path(Path::new(&backup_root), true)?;
+    let abs_repo_backup_root = absolute_path(repo_storage, Path::new(&backup_root))?;
+
+    // Walk the PG dir and classify every entry: referenced files (decided here,
+    // not copied), copy jobs (dispatched to workers), directories, and links.
+    let plan = plan_backup(
+        pg_storage,
+        &abs_repo_backup_root,
+        transform,
+        prior_manifest.as_ref(),
+        prior_label.as_deref(),
+    )?;
+
+    // Fan the copy jobs out across the worker pool, then stitch each worker's
+    // checksum + repo size back onto the matching skeleton by relative path.
+    let copy_results = run_copy_jobs(&plan.copy_jobs, transform, process_max)?;
+    let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
+
+    let mut files: Vec<ManifestFile> = plan.referenced;
     let mut repo_size: u64 = 0;
-
-    for entry in walk(pg_storage, Path::new("."))? {
-        if is_excluded(&entry.rel) {
-            continue;
-        }
-
-        match entry.info.kind {
-            StorageKind::File => {
-                let captured = capture_file(
-                    repo_storage,
-                    pg_storage,
-                    &entry,
-                    &backup_root,
-                    transform,
-                    prior_manifest.as_ref(),
-                    prior_label.as_deref(),
-                )?;
-                total_size += captured.file.size;
-                repo_size += captured.repo_bytes;
-                files.push(captured.file);
-            }
-            StorageKind::Path => {
-                paths.push(ManifestPath { path: entry.rel });
-            }
-            StorageKind::Link => {
-                // TODO: resolve link target once `Storage` exposes a
-                // link-target accessor; record an empty destination for now.
-                links.push(ManifestLink {
-                    path: entry.rel,
-                    destination: String::new(),
-                });
-            }
-            StorageKind::Special => {
-                // Sockets / FIFOs / devices are not part of a base backup.
-            }
-        }
+    for skeleton in plan.copy_skeletons {
+        let copied = result_by_rel
+            .remove(&skeleton.path)
+            .ok_or_else(|| CommandError::Other(format!("no copy result for {}", skeleton.path)))?;
+        repo_size += copied.repo_bytes;
+        files.push(ManifestFile {
+            checksum: Some(copied.checksum),
+            ..skeleton
+        });
     }
+    let mut paths = plan.paths;
+    let mut links = plan.links;
 
+    // Sort every manifest list by path so the on-disk manifest (and its
+    // checksum) is deterministic regardless of worker completion order.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    links.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
     let file_count = files.len();
     let timestamp_stop = timestamp_start;
 
@@ -630,9 +944,9 @@ pub fn backup_inner_typed(
         links,
     };
 
-    // Ensure the backup directory exists even for an (improbably) empty cluster
-    // so the manifest write below has a home.
-    repo_storage.create_path(Path::new(&backup_root), true)?;
+    // The backup root was created up front (before planning copies), so it
+    // exists even for an improbably empty cluster and the manifest write has a
+    // home.
     manifest
         .save(repo_storage, &PathBuf::from(format!("{backup_root}/backup.manifest")))
         .map_err(|err| CommandError::Other(err.to_string()))?;
@@ -1299,5 +1613,252 @@ mod tests {
         for file in &manifest.files {
             assert!(backup_root.join(&file.path).exists(), "full backup must copy {}", file.path);
         }
+    }
+
+    // ---- parallel file copy ------------------------------------------------
+
+    /// A comparable, order-independent view of a manifest's file entries:
+    /// `(path, size, checksum, reference)` tuples sorted by path. Used to assert
+    /// two backups produced identical manifests regardless of worker order.
+    fn manifest_file_tuples(manifest: &Manifest) -> Vec<(String, u64, Option<String>, Option<String>)> {
+        let mut tuples: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.size, f.checksum.clone(), f.reference.clone()))
+            .collect();
+        tuples.sort();
+        tuples
+    }
+
+    /// Seed a cluster with enough files that 4 workers actually have work to
+    /// spread, including a couple of nested directories.
+    fn seed_many_files(pg: &Posix, count: usize) {
+        seed_file(pg, "PG_VERSION", b"14\n");
+        seed_file(pg, "global/pg_control", b"\x01\x02\x03\x04");
+        for n in 0..count {
+            let content = format!("relation data for file number {n}, padded padded padded padded {n}");
+            seed_file(pg, &format!("base/1/{}", 1000 + n), content.as_bytes());
+        }
+    }
+
+    #[test]
+    fn backup_parallel_matches_serial() {
+        // A full backup of the same seeded data with process-max=1 and
+        // process-max=4 must yield identical manifests (files, sizes, checksums,
+        // references) and byte-identical repo contents — the parallel path only
+        // changes *how* the copy work is scheduled, never the result. Two repos
+        // are used so the runs do not interfere; the PG data is identical.
+        let pg_dir = tempfile::tempdir().expect("pg tempdir");
+        let pg_s = Posix::new(pg_dir.path());
+        seed_many_files(&pg_s, 12);
+
+        let repo1_dir = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2_dir = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = Posix::new(repo1_dir.path());
+        let repo2_s = Posix::new(repo2_dir.path());
+        init_stanza(&repo1_s, "demo");
+        init_stanza(&repo2_s, "demo");
+
+        backup_inner_with_workers(
+            "demo",
+            &repo1_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            1,
+        )
+        .expect("serial backup");
+        backup_inner_with_workers(
+            "demo",
+            &repo2_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            4,
+        )
+        .expect("parallel backup");
+
+        let manifest_path = format!("backup/demo/{LABEL}/backup.manifest");
+        let m1 = Manifest::load(&repo1_s, Path::new(&manifest_path)).expect("serial manifest");
+        let m4 = Manifest::load(&repo2_s, Path::new(&manifest_path)).expect("parallel manifest");
+
+        // Identical file inventory (path, size, checksum, reference).
+        assert_eq!(
+            manifest_file_tuples(&m1),
+            manifest_file_tuples(&m4),
+            "parallel and serial manifests must list identical files"
+        );
+
+        // The on-disk manifest bytes (and thus the backrest-checksum) must match
+        // exactly, proving the deterministic sort makes order irrelevant.
+        let bytes1 = std::fs::read(repo1_dir.path().join(&manifest_path)).unwrap();
+        let bytes4 = std::fs::read(repo2_dir.path().join(&manifest_path)).unwrap();
+        assert_eq!(bytes1, bytes4, "serialised backup.manifest must be byte-identical");
+
+        // Every copied repo file is byte-identical across the two runs.
+        for file in &m1.files {
+            let p1 = repo1_dir.path().join(format!("backup/demo/{LABEL}/{}", file.path));
+            let p4 = repo2_dir.path().join(format!("backup/demo/{LABEL}/{}", file.path));
+            assert_eq!(
+                std::fs::read(&p1).unwrap(),
+                std::fs::read(&p4).unwrap(),
+                "repo file {} differs",
+                file.path
+            );
+        }
+    }
+
+    #[test]
+    fn backup_process_max_4_uses_workers() {
+        // A backup with process-max=4 over several files succeeds, lists every
+        // expected file in the manifest with the correct plaintext checksum, and
+        // physically writes each one into the backup dir.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let mut expected: Vec<(String, Vec<u8>)> = Vec::new();
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+        expected.push(("PG_VERSION".to_owned(), b"14\n".to_vec()));
+        for n in 0..8 {
+            let rel = format!("base/1/{}", 2000 + n);
+            let content = format!("worker file {n} contents contents contents {n}").into_bytes();
+            seed_file(&pg_s, &rel, &content);
+            expected.push((rel, content));
+        }
+
+        backup_inner_with_workers(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+            4,
+        )
+        .expect("parallel backup");
+
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("manifest");
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        for (rel, content) in &expected {
+            let entry = manifest.file(rel).unwrap_or_else(|| panic!("{rel} must be in manifest"));
+            assert_eq!(
+                entry.checksum.as_deref(),
+                Some(sha1_hex(content).as_str()),
+                "checksum for {rel}"
+            );
+            assert_eq!(entry.reference, None, "full backup file {rel} must not be a reference");
+            assert_eq!(
+                std::fs::read(backup_root.join(rel)).unwrap(),
+                *content,
+                "repo bytes for {rel}"
+            );
+        }
+        // Manifest is sorted by path (deterministic regardless of completion order).
+        let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "manifest files must be sorted by path");
+    }
+
+    #[test]
+    fn process_max_reads_option_and_clamps() {
+        // process-max maps the Integer option to a worker count; absent /
+        // non-positive values clamp to a single worker.
+        let cfg = |value: Option<i64>| {
+            let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+            if let Some(v) = value {
+                options.insert(("process-max".to_owned(), None), OptionValue::Integer(v));
+            }
+            LoadedConfig {
+                command: "backup".to_owned(),
+                command_role: pgbr_config::ConfigCommandRole::Main,
+                stanza: Some("demo".to_owned()),
+                options,
+                params: Vec::new(),
+            }
+        };
+        assert_eq!(process_max(&cfg(None)), 1, "absent defaults to 1");
+        assert_eq!(process_max(&cfg(Some(0))), 1, "zero clamps to 1");
+        assert_eq!(process_max(&cfg(Some(-3))), 1, "negative clamps to 1");
+        assert_eq!(process_max(&cfg(Some(4))), 4);
+    }
+
+    #[test]
+    fn diff_parallel_matches_serial() {
+        // The parallel path must also reproduce diff backups identically: seed a
+        // full, change some files, then take a diff with 1 vs 4 workers into two
+        // repos and assert the diff manifests (references + checksums) match.
+        let pg_dir = tempfile::tempdir().expect("pg tempdir");
+        let pg_s = Posix::new(pg_dir.path());
+        seed_many_files(&pg_s, 10);
+
+        let run = |repo_s: &Posix, workers: usize| {
+            init_stanza(repo_s, "demo");
+            backup_inner_with_workers(
+                "demo",
+                repo_s,
+                &pg_s,
+                BackupType::Full,
+                Some(LABEL),
+                1_704_110_400,
+                &RepoTransform::identity(),
+                workers,
+            )
+            .expect("full backup");
+        };
+
+        let repo1_dir = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2_dir = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = Posix::new(repo1_dir.path());
+        let repo2_s = Posix::new(repo2_dir.path());
+        run(&repo1_s, 1);
+        run(&repo2_s, 4);
+
+        // Change a couple of files identically in both runs' shared PG dir.
+        seed_file(&pg_s, "base/1/1003", b"CHANGED for the diff, completely different bytes now");
+        seed_file(&pg_s, "base/1/1007", b"ALSO CHANGED, different length and content entirely!!");
+
+        let diff1 = backup_inner_with_workers(
+            "demo",
+            &repo1_s,
+            &pg_s,
+            BackupType::Diff,
+            None,
+            1_704_196_800,
+            &RepoTransform::identity(),
+            1,
+        )
+        .expect("serial diff");
+        let diff4 = backup_inner_with_workers(
+            "demo",
+            &repo2_s,
+            &pg_s,
+            BackupType::Diff,
+            None,
+            1_704_196_800,
+            &RepoTransform::identity(),
+            4,
+        )
+        .expect("parallel diff");
+        assert_eq!(diff1.label, diff4.label);
+
+        let manifest_path = format!("backup/demo/{}/backup.manifest", diff1.label);
+        let m1 = Manifest::load(&repo1_s, Path::new(&manifest_path)).expect("serial diff manifest");
+        let m4 = Manifest::load(&repo2_s, Path::new(&manifest_path)).expect("parallel diff manifest");
+        assert_eq!(
+            manifest_file_tuples(&m1),
+            manifest_file_tuples(&m4),
+            "parallel and serial diff manifests must list identical files (incl. references)"
+        );
+        // Some files must be referenced (unchanged) and some copied (changed).
+        assert!(
+            m1.files.iter().any(|f| f.reference.is_some()),
+            "diff must reference unchanged files"
+        );
+        assert!(m1.files.iter().any(|f| f.reference.is_none()), "diff must copy changed files");
     }
 }
