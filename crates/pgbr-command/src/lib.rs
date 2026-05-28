@@ -21,6 +21,7 @@ use std::fmt;
 pub mod annotate;
 pub mod archive;
 pub mod backup;
+pub mod backup_control;
 pub mod check;
 pub mod control;
 pub mod expire;
