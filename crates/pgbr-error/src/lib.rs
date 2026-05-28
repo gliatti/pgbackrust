@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Shared error model for the pgBackRust C->Rust migration.
 //!
 //! The crate exposes:

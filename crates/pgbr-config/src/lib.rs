@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Runtime configuration model for the pgBackRest Rust rewrite.
 //!
 //! This crate consumes the typed `pgbr_build::Config` produced from

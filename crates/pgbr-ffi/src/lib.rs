@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! `pgbr-ffi` is the C ABI surface consumed by the legacy C build during the C->Rust migration.
 //!
 //! Each phase moves an additional `extern "C"` shim into this crate. The header `pgbr_ffi.h` is

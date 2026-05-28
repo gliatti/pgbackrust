@@ -261,8 +261,7 @@ mod tests {
 
         let err = put_from(&cfg, &storage, &mut input).expect_err("missing parent must error");
         match err {
-            CommandError::Storage(pgbr_storage::StorageError::Backend { .. })
-            | CommandError::Storage(pgbr_storage::StorageError::NotFound { .. }) => {}
+            CommandError::Storage(pgbr_storage::StorageError::Backend { .. } | pgbr_storage::StorageError::NotFound { .. }) => {}
             other => panic!("expected Storage(Backend|NotFound), got {other:?}"),
         }
     }

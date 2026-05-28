@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 // `EmptyMap` represents YAML `{}` placeholders — semantically a map with
 // zero-sized values, which clippy::zero_sized_map_values flags as a candidate
 // for a BTreeSet. Switching to a set would lose the ability to deserialize

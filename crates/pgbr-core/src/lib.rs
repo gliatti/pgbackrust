@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Foundational types shared across the workspace.
 //!
 //! For now this crate exposes two read-only borrowed views over C-managed buffers, [`RefStr`]

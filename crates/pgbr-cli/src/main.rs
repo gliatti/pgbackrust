@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! `pgbackrest` binary entry point. Forwards argv (sans program name) to
 //! `pgbr_cli::run` and exits with the returned status code. Diagnostics
 //! are printed to stderr by the run path; this entry point only translates

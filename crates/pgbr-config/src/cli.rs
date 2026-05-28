@@ -537,7 +537,7 @@ option:
         let cfg = small_cfg();
         let input = parse_cli(["backup", "--buffer-size=2MiB", "--reset-buffer-size"]).unwrap();
         let r = resolve_cli(input, &cfg).unwrap();
-        assert!(r.options.get(&("buffer-size".to_owned(), None)).is_none());
+        assert!(!r.options.contains_key(&("buffer-size".to_owned(), None)));
         assert!(r.resets.contains(&("buffer-size".to_owned(), None)));
     }
 

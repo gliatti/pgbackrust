@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 // The encoders deliberately convert between signed and unsigned 8-bit integers when packing
 // nibbles together — every cast in this module is checked by the surrounding length / table-
 // lookup invariants, so the relevant lints are silenced rather than rewritten with .cast_*.

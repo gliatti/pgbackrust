@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Polymorphic storage backend interface for the pgBackRust C->Rust migration.
 //!
 //! Mirrors the C `Storage` abstraction in `src/storage/storage.h` — every command (backup,

@@ -398,8 +398,8 @@ mod tests {
         assert_eq!(s.backups.len(), 2);
 
         let labels: Vec<&str> = s.backups.iter().map(|b| b.label.as_str()).collect();
-        assert!(labels.iter().any(|l| *l == "20260101-100000F"));
-        assert!(labels.iter().any(|l| *l == "20260101-100000F_20260102-100000I"));
+        assert!(labels.contains(&"20260101-100000F"));
+        assert!(labels.contains(&"20260101-100000F_20260102-100000I"));
 
         let full = s.backups.iter().find(|b| b.label == "20260101-100000F").unwrap();
         assert_eq!(full.backup_type, "full");

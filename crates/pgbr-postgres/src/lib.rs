@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! `PostgreSQL`-specific helpers shared between the C and Rust sides of pgBackRust.
 //!
 //! Surfaces today:

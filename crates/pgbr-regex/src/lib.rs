@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! POSIX ERE-compatible regular expression handler used by the pgBackRust C codebase through the
 //! [`pgbr-ffi`](../pgbr_ffi/index.html) shim.
 //!

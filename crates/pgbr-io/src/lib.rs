@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! I/O abstractions used across the pgBackRest Rust rewrite.
 //!
 //! Mirrors the role of `src/common/io/` in the C tree: a buffer-oriented read

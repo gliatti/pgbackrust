@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Top-level entry point for the `pgbackrest` Rust binary.
 //!
 //! Wires `pgbr_build` (config schema), `pgbr_config` (CLI/INI/merge),

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Wire-format types for the pgBackRest local/remote protocol.
 //!
 //! pgBackRest's main process drives helper processes (local workers and

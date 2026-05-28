@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! On-disk pgBackRest metadata files: `archive.info`, `backup.info`, and `backup.manifest`.
 //!
 //! These files are INI-with-checksum documents that describe the state of a pgBackRest

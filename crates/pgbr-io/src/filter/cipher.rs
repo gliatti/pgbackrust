@@ -221,7 +221,9 @@ mod tests {
     fn round_trip_long_message() {
         // 100 KB of pseudo-random-ish bytes (a deterministic pattern keeps
         // the test reproducible without pulling in an RNG seed).
-        let plaintext: Vec<u8> = (0..100_000).map(|i| (i * 31 ^ 0xa5) as u8).collect();
+        let plaintext: Vec<u8> = (0..100_000_i32)
+            .map(|i| u8::try_from((i.wrapping_mul(31) ^ 0xa5) & 0xff).unwrap_or(0))
+            .collect();
         let recovered = roundtrip(&plaintext, b"correct horse battery staple");
         assert_eq!(recovered, plaintext);
     }

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! Per-command implementations for the pgBackRest Rust rewrite.
 //!
 //! This crate is the dispatcher layer: given a fully resolved
