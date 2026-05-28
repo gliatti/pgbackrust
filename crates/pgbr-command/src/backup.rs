@@ -177,6 +177,116 @@ fn is_excluded(rel: &str) -> bool {
         .any(|prefix| rel == *prefix || rel.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/')))
 }
 
+/// `PostgreSQL` data-page size — the unit page-checksum validation operates on.
+///
+/// Mirrors [`pgbr_postgres::page::BLCKSZ`] (8192). A relation file's bytes are
+/// validated one `PAGE_SIZE` slice at a time.
+const PAGE_SIZE: usize = pgbr_postgres::page::BLCKSZ;
+
+/// Whether a PG-data-relative path is a *relation file* eligible for
+/// page-checksum validation.
+///
+/// A relation file holds the heap / index / fork data `PostgreSQL` writes in
+/// `PAGE_SIZE`-aligned data pages, each carrying the `pd_checksum` header field
+/// that page-checksum validation verifies. pgBackRest validates the main, fsm
+/// and vm forks; this slice recognises a file as a relation segment when **all**
+/// of the following hold:
+///
+/// - it lives under `base/` (per-database relations), `global/` (shared
+///   catalogs), or a tablespace path `pg_tblspc/<oid>/PG_<ver>_<cat>/...`, and
+/// - its basename is a bare relfilenode — `<digits>` — optionally followed by a
+///   `.<digits>` segment number (e.g. `1259`, `16384.1`).
+///
+/// Fork suffixes (`_fsm`, `_vm`, `_init`) and non-numeric files (`PG_VERSION`,
+/// `pg_control`, `pg_filenode.map`, …) are **not** relation segments and return
+/// `false`, as do files anywhere outside the three relation roots
+/// (`pg_wal/...`, etc.).
+fn is_relation_file(rel_path: &str) -> bool {
+    let components: Vec<&str> = rel_path.split('/').collect();
+    let (root_ok, depth_ok) = match components.first().copied() {
+        // base/<db-oid>/<segment>
+        Some("base") => (true, components.len() == 3),
+        // global/<segment>
+        Some("global") => (true, components.len() == 2),
+        // pg_tblspc/<oid>/PG_<ver>_<cat>/<db-oid>/<segment>
+        Some("pg_tblspc") => {
+            let tblspc_shape = components.len() == 5
+                && components
+                    .get(2)
+                    .is_some_and(|name| pgbr_postgres::tablespace::parse_tablespace_dir_name(name).is_some());
+            (true, tblspc_shape)
+        }
+        _ => (false, false),
+    };
+    if !root_ok || !depth_ok {
+        return false;
+    }
+
+    let Some(basename) = components.last() else {
+        return false;
+    };
+    is_relation_segment_name(basename)
+}
+
+/// Whether a basename is a relation segment name: `<digits>` or
+/// `<digits>.<digits>`.
+///
+/// Both the relfilenode and (when present) the segment number must be
+/// non-empty all-ASCII-digit fields. This deliberately rejects fork suffixes
+/// (`1259_vm`), the `pg_filenode.map`, `PG_VERSION`, and anything else
+/// non-numeric.
+fn is_relation_segment_name(name: &str) -> bool {
+    let all_digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    match name.split_once('.') {
+        Some((node, segment)) => all_digits(node) && all_digits(segment),
+        None => all_digits(name),
+    }
+}
+
+/// Whether a single `PAGE_SIZE` page passes checksum validation.
+///
+/// An all-zero page is treated as valid (pgBackRest's empty-page handling: a
+/// freshly extended but never-written page is all zeroes and carries no
+/// meaningful checksum). Any other page is valid iff its stored `pd_checksum`
+/// matches the value [`pgbr_postgres::page::pg_checksum_page`] computes for the
+/// given `block_no`. A page whose length is not exactly `PAGE_SIZE` is treated
+/// as invalid (it cannot be a well-formed data page).
+fn is_valid_page(page: &[u8], block_no: u32) -> bool {
+    if page.iter().all(|&b| b == 0) {
+        return true;
+    }
+    pgbr_postgres::page::page_checksum_valid(page, block_no).unwrap_or(false)
+}
+
+/// Validate every page of a page-aligned relation file.
+///
+/// `bytes` must already be confirmed page-aligned (a multiple of `PAGE_SIZE`)
+/// by the caller. Returns the (possibly empty) list of block numbers whose
+/// stored checksum did not validate, in ascending order. An all-empty (or
+/// empty-`bytes`) file yields an empty list.
+fn validate_relation_pages(bytes: &[u8]) -> Vec<u32> {
+    let mut invalid = Vec::new();
+    for (idx, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
+        let block_no = u32::try_from(idx).unwrap_or(u32::MAX);
+        if !is_valid_page(page, block_no) {
+            invalid.push(block_no);
+        }
+    }
+    invalid
+}
+
+/// Emit a `WARN` line naming a relation file's invalid pages.
+///
+/// The `ManifestFile` records only a `checksum_page = Some(false)` bool — it
+/// has no invalid-page-list field (another concern owns that) — so the failing
+/// block numbers surface here on stderr, matching pgBackRest's
+/// `WARN: invalid page checksum(s) found in file ...` diagnostic.
+#[allow(clippy::print_stderr)]
+fn warn_invalid_pages(rel: &str, invalid_blocks: &[u32]) {
+    let blocks = invalid_blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    eprintln!("WARN: invalid page checksum(s) found in file {rel} at block(s) {blocks}");
+}
+
 /// One entry discovered by [`walk`]: its PG-data-relative path plus the
 /// `StorageInfo` the backend reported for it.
 struct WalkEntry {
@@ -245,6 +355,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
     let transform = RepoTransform::from_options(config);
     let process_max = process_max(config);
+    let checksum_page = checksum_page_enabled(config);
 
     // The diff label depends on the full it references, so it is computed inside
     // `backup_inner_with_workers` (which knows the full label); full labels are
@@ -258,6 +369,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         timestamp_start,
         &transform,
         process_max,
+        checksum_page,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -276,6 +388,20 @@ fn process_max(config: &LoadedConfig) -> usize {
         Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
         _ => 1,
     }
+}
+
+/// Whether `--checksum-page` page validation is enabled, from the resolved option.
+///
+/// `checksum-page` is a `Boolean`. For this slice the option is honoured as-is
+/// and defaults to `false` when absent (pgBackRest's true default ties this to
+/// whether the cluster has `data_checksums` enabled, which is resolved
+/// elsewhere). When on, eligible relation files have every page's stored
+/// checksum verified during the copy.
+fn checksum_page_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("checksum-page".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
 }
 
 /// Format a full-backup label `YYYYMMDD-HHMMSSF` from a Unix timestamp.
@@ -338,6 +464,10 @@ struct CopyJob {
     abs_src: PathBuf,
     /// Absolute destination path in the repo, suffix included.
     abs_dest: PathBuf,
+    /// Whether the worker should page-checksum-validate this file. Set only for
+    /// an eligible relation file when `--checksum-page` is on; the worker still
+    /// re-checks page alignment before validating.
+    validate_pages: bool,
 }
 
 /// What a worker reports back for one [`CopyJob`].
@@ -347,6 +477,14 @@ struct CopyResult {
     checksum: String,
     /// Number of bytes physically written to the repo (post-transform).
     repo_bytes: u64,
+    /// Page-checksum-validation outcome for this file: `None` when the file was
+    /// not validated (checksum-page off, not a relation file, or not
+    /// page-aligned); `Some(true)` when every page validated; `Some(false)` when
+    /// one or more pages failed. When `Some(false)`, `invalid_blocks` lists them.
+    checksum_page: Option<bool>,
+    /// Block numbers whose stored checksum failed validation (empty unless
+    /// `checksum_page == Some(false)`), used to emit a warning on the main thread.
+    invalid_blocks: Vec<u32>,
 }
 
 /// Outcome of planning one PG-data file: either a finished (referenced) manifest
@@ -382,6 +520,7 @@ fn plan_file(
     transform: &RepoTransform,
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
+    checksum_page: bool,
 ) -> Result<FilePlan, CommandError> {
     let skeleton = ManifestFile {
         path: entry.rel.clone(),
@@ -417,12 +556,17 @@ fn plan_file(
     // Full backup, or a new / changed file in a diff / incr: copy it. The repo
     // filename carries the compression suffix; encryption does not change it.
     let abs_dest = abs_repo_backup_root.join(format!("{}{}", entry.rel, transform.repo_suffix()));
+    // Page-checksum validation applies only when the option is on AND the file
+    // is an eligible relation file. The worker re-checks page alignment before
+    // validating (a non-page-aligned relation file is left unvalidated).
+    let validate_pages = checksum_page && is_relation_file(&entry.rel);
     Ok(FilePlan::Copy {
         skeleton,
         job: CopyJob {
             rel: entry.rel.clone(),
             abs_src: entry.info.path.clone(),
             abs_dest,
+            validate_pages,
         },
     })
 }
@@ -453,6 +597,18 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
 
     let checksum = plaintext_sha1(&bytes)?;
 
+    // Page-checksum validation runs on the same plaintext bytes the checksum is
+    // taken over, before the transform. A relation file is only validated when
+    // its size is an exact multiple of `PAGE_SIZE`; an unaligned file (or a
+    // non-relation file, which is never flagged) is left unvalidated
+    // (`checksum_page == None`).
+    let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
+        let invalid = validate_relation_pages(&bytes);
+        (Some(invalid.is_empty()), invalid)
+    } else {
+        (None, Vec::new())
+    };
+
     let repo_bytes = transform.apply_forward(&bytes)?;
     if let Some(parent) = job.abs_dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
@@ -463,6 +619,8 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
     Ok(CopyResult {
         checksum,
         repo_bytes: repo_bytes.len() as u64,
+        checksum_page,
+        invalid_blocks,
     })
 }
 
@@ -562,7 +720,11 @@ pub fn backup_inner(
 fn copy_job_to_request(job: &CopyJob) -> Request {
     Request {
         cmd: job.rel.clone(),
-        param: vec![json!(job.abs_src.to_string_lossy()), json!(job.abs_dest.to_string_lossy())],
+        param: vec![
+            json!(job.abs_src.to_string_lossy()),
+            json!(job.abs_dest.to_string_lossy()),
+            json!(job.validate_pages),
+        ],
     }
 }
 
@@ -579,10 +741,14 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
         .get(1)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "copy job missing destination path".to_owned())?;
+    // Older-shaped requests without the validate-pages flag default to false
+    // (no page-checksum validation), preserving the prior behaviour.
+    let validate_pages = request.param.get(2).and_then(serde_json::Value::as_bool).unwrap_or(false);
     Ok(CopyJob {
         rel: request.cmd.clone(),
         abs_src: PathBuf::from(abs_src),
         abs_dest: PathBuf::from(abs_dest),
+        validate_pages,
     })
 }
 
@@ -625,7 +791,14 @@ fn run_copy_jobs(
         let job = request_to_copy_job(request)?;
         let copied = copy_file(&job, &worker_transform).map_err(|err| err.to_string())?;
         Ok(Response::Ok(OkResponse {
-            out: Some(json!({ "checksum": copied.checksum, "repoBytes": copied.repo_bytes })),
+            out: Some(json!({
+                "checksum": copied.checksum,
+                "repoBytes": copied.repo_bytes,
+                // `checksum_page` is `Option<bool>`: serialises to `null` when the
+                // file was not validated, and the decoder maps `null` back to `None`.
+                "checksumPage": copied.checksum_page,
+                "invalidBlocks": copied.invalid_blocks,
+            })),
         }))
     });
 
@@ -642,7 +815,31 @@ fn run_copy_jobs(
                     .get("repoBytes")
                     .and_then(serde_json::Value::as_u64)
                     .ok_or_else(|| CommandError::Other(format!("copy of {} returned no repo size", job_result.key)))?;
-                out.push((job_result.key, CopyResult { checksum, repo_bytes }));
+                // `checksumPage` is absent/`null` (not validated) or a bool.
+                let checksum_page = match value.get("checksumPage") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(v.as_bool().ok_or_else(|| {
+                        CommandError::Other(format!("copy of {} returned a non-bool checksumPage", job_result.key))
+                    })?),
+                };
+                let invalid_blocks = value
+                    .get("invalidBlocks")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+                            .collect::<Vec<u32>>()
+                    })
+                    .unwrap_or_default();
+                out.push((
+                    job_result.key,
+                    CopyResult {
+                        checksum,
+                        repo_bytes,
+                        checksum_page,
+                        invalid_blocks,
+                    },
+                ));
             }
             Ok(_) => {
                 return Err(CommandError::Other(format!(
@@ -695,6 +892,7 @@ fn plan_backup(
     transform: &RepoTransform,
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
+    checksum_page: bool,
 ) -> Result<BackupPlan, CommandError> {
     let mut plan = BackupPlan {
         referenced: Vec::new(),
@@ -717,6 +915,7 @@ fn plan_backup(
                 transform,
                 prior_manifest,
                 prior_label,
+                checksum_page,
             )? {
                 FilePlan::Referenced(file) => plan.referenced.push(file),
                 FilePlan::Copy { skeleton, job } => {
@@ -831,6 +1030,7 @@ pub fn backup_inner_typed(
         timestamp_start,
         transform,
         DEFAULT_PROCESS_MAX,
+        false,
     )
 }
 
@@ -865,6 +1065,7 @@ pub fn backup_inner_with_workers(
     timestamp_start: i64,
     transform: &RepoTransform,
     process_max: usize,
+    checksum_page: bool,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -900,6 +1101,7 @@ pub fn backup_inner_with_workers(
         transform,
         prior_manifest.as_ref(),
         prior_label.as_deref(),
+        checksum_page,
     )?;
 
     // Fan the copy jobs out across the worker pool, then stitch each worker's
@@ -914,8 +1116,16 @@ pub fn backup_inner_with_workers(
             .remove(&skeleton.path)
             .ok_or_else(|| CommandError::Other(format!("no copy result for {}", skeleton.path)))?;
         repo_size += copied.repo_bytes;
+        // A file with one or more invalid pages records `checksum_page = Some(false)`
+        // and a warning naming the bad blocks (the `ManifestFile` has no invalid-page
+        // list field — another concern owns that — so the blocks surface only in the
+        // warning, exactly as the task scopes it).
+        if copied.checksum_page == Some(false) {
+            warn_invalid_pages(&skeleton.path, &copied.invalid_blocks);
+        }
         files.push(ManifestFile {
             checksum: Some(copied.checksum),
+            checksum_page: copied.checksum_page,
             ..skeleton
         });
     }
@@ -1668,6 +1878,7 @@ mod tests {
             1_704_110_400,
             &RepoTransform::identity(),
             1,
+            false,
         )
         .expect("serial backup");
         backup_inner_with_workers(
@@ -1679,6 +1890,7 @@ mod tests {
             1_704_110_400,
             &RepoTransform::identity(),
             4,
+            false,
         )
         .expect("parallel backup");
 
@@ -1738,6 +1950,7 @@ mod tests {
             1_704_110_400,
             &RepoTransform::identity(),
             4,
+            false,
         )
         .expect("parallel backup");
 
@@ -1807,6 +2020,7 @@ mod tests {
                 1_704_110_400,
                 &RepoTransform::identity(),
                 workers,
+                false,
             )
             .expect("full backup");
         };
@@ -1831,6 +2045,7 @@ mod tests {
             1_704_196_800,
             &RepoTransform::identity(),
             1,
+            false,
         )
         .expect("serial diff");
         let diff4 = backup_inner_with_workers(
@@ -1842,6 +2057,7 @@ mod tests {
             1_704_196_800,
             &RepoTransform::identity(),
             4,
+            false,
         )
         .expect("parallel diff");
         assert_eq!(diff1.label, diff4.label);
@@ -1860,5 +2076,223 @@ mod tests {
             "diff must reference unchanged files"
         );
         assert!(m1.files.iter().any(|f| f.reference.is_none()), "diff must copy changed files");
+    }
+
+    // ---- page-checksum validation (--checksum-page) ------------------------
+
+    use pgbr_postgres::page::{BLCKSZ, pg_checksum_page};
+
+    /// Build a single `BLCKSZ` data page with deterministic non-zero content and
+    /// a *correct* stored `pd_checksum` for `block_no`. The page is valid by
+    /// construction: its header checksum matches what `pg_checksum_page` derives.
+    fn valid_page(block_no: u32, fill: u8) -> Vec<u8> {
+        let mut page = vec![fill.max(1); BLCKSZ];
+        // Vary the body a little per block so distinct pages differ (no casts:
+        // write the block number's low bytes straight from its LE encoding).
+        page[16..20].copy_from_slice(&block_no.to_le_bytes());
+        // Zero the stored-checksum field, compute, then write it back (LE).
+        page[8] = 0;
+        page[9] = 0;
+        let cksum = pg_checksum_page(&page, block_no).expect("checksum");
+        page[8..10].copy_from_slice(&cksum.to_le_bytes());
+        page
+    }
+
+    /// Build a `count`-page relation file whose every page is valid.
+    fn valid_relation(count: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(usize::try_from(count).unwrap_or(0) * BLCKSZ);
+        for block_no in 0..count {
+            // Cycle the fill byte over a non-zero range without casting.
+            let fill = 0x40u8.wrapping_add(u8::try_from(block_no % 16).unwrap_or(0));
+            bytes.extend_from_slice(&valid_page(block_no, fill));
+        }
+        bytes
+    }
+
+    /// A backup config with `--checksum-page` enabled (and a stanza + type).
+    fn checksum_page_cfg(stanza: &str) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId("full".to_owned()));
+        options.insert(("checksum-page".to_owned(), None), OptionValue::Boolean(true));
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_relation_file_recognises_relation_segments() {
+        // Under base/<db>/<seg>: a bare relfilenode and a segment are relations.
+        assert!(is_relation_file("base/16384/1259"));
+        assert!(is_relation_file("base/1/1259"));
+        assert!(is_relation_file("base/16384/16385.1"));
+        // Under global/<seg>: shared catalogs.
+        assert!(is_relation_file("global/1259"));
+        assert!(is_relation_file("global/2659.3"));
+        // Under a tablespace path PG_<ver>_<cat>.
+        assert!(is_relation_file("pg_tblspc/16400/PG_14_202107181/16384/1259"));
+        assert!(is_relation_file("pg_tblspc/16400/PG_16_202307071/16384/16385.2"));
+    }
+
+    #[test]
+    fn is_relation_file_rejects_non_relations() {
+        // Fork suffixes are not bare relation segments.
+        assert!(!is_relation_file("base/16384/1259_fsm"));
+        assert!(!is_relation_file("base/16384/1259_vm"));
+        assert!(!is_relation_file("base/16384/1259_init"));
+        // Non-numeric files under base/global.
+        assert!(!is_relation_file("base/1/PG_VERSION"));
+        assert!(!is_relation_file("base/16384/pg_filenode.map"));
+        assert!(!is_relation_file("global/pg_control"));
+        assert!(!is_relation_file("global/pg_filenode.map"));
+        // Wrong depth: a relfilenode directly under base/ (missing the db oid).
+        assert!(!is_relation_file("base/1259"));
+        assert!(!is_relation_file("base/16384"));
+        // Outside the relation roots entirely.
+        assert!(!is_relation_file("PG_VERSION"));
+        assert!(!is_relation_file("pg_wal/000000010000000000000001"));
+        assert!(!is_relation_file("pg_xact/0000"));
+        // A tablespace path with a malformed PG_ dir name is not a relation.
+        assert!(!is_relation_file("pg_tblspc/16400/NOT_A_PG_DIR/16384/1259"));
+        // Empty / dotted edge cases.
+        assert!(!is_relation_file("base/1/.42"));
+        assert!(!is_relation_file("base/1/42."));
+    }
+
+    #[test]
+    fn is_valid_page_handles_zero_and_checksum() {
+        // All-zero page is valid (empty-page handling).
+        let zero = vec![0u8; BLCKSZ];
+        assert!(is_valid_page(&zero, 0));
+        // A correctly-checksummed page validates; corrupting it fails.
+        let good = valid_page(7, 0x55);
+        assert!(is_valid_page(&good, 7));
+        let mut bad = good.clone();
+        bad[8] ^= 0x01; // flip a stored-checksum bit
+        assert!(!is_valid_page(&bad, 7));
+        // A page validated against the wrong block number fails (transposed page).
+        assert!(!is_valid_page(&good, 8));
+    }
+
+    #[test]
+    fn backup_checksum_page_valid_records_some_true() {
+        // A relation file made of valid pages, backed up with checksum-page on,
+        // records checksum_page = Some(true). A non-relation file (PG_VERSION)
+        // is never validated, so it stays None.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let relation = valid_relation(3);
+        seed_file(&pg_s, "base/1/1259", &relation);
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+
+        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(true),
+            "all-valid relation pages must record checksum_page=Some(true)"
+        );
+        // Non-relation files are not validated.
+        let version = manifest.file("PG_VERSION").expect("PG_VERSION in manifest");
+        assert_eq!(version.checksum_page, None, "non-relation file must not be validated");
+    }
+
+    #[test]
+    fn backup_checksum_page_corrupt_records_some_false() {
+        // A relation file with one deliberately corrupted page checksum records
+        // checksum_page = Some(false). Build a 2-page file, corrupt block 1's
+        // stored checksum so it no longer matches.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let mut relation = valid_relation(2);
+        // Flip a bit in block 1's stored pd_checksum (offset BLCKSZ + 8).
+        relation[BLCKSZ + 8] ^= 0x01;
+        seed_file(&pg_s, "base/1/1259", &relation);
+
+        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(false),
+            "a corrupted page checksum must record checksum_page=Some(false)"
+        );
+        // The relation's plaintext checksum/size are still recorded.
+        assert_eq!(relfile.size, relation.len() as u64);
+        assert_eq!(relfile.checksum.as_deref(), Some(sha1_hex(&relation).as_str()));
+    }
+
+    #[test]
+    fn backup_checksum_page_off_leaves_none() {
+        // Without --checksum-page, even a valid relation file is not validated.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", &valid_relation(2));
+
+        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(relfile.checksum_page, None, "checksum-page off must leave checksum_page None");
+    }
+
+    #[test]
+    fn backup_checksum_page_skips_unaligned_relation() {
+        // A relation-named file whose size is NOT a multiple of BLCKSZ is left
+        // unvalidated (checksum_page None) even with the option on.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        // 100 bytes is not page-aligned.
+        seed_file(
+            &pg_s,
+            "base/1/1259",
+            b"not page aligned content of arbitrary length here .....",
+        );
+
+        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page, None,
+            "a non-page-aligned relation file must not be validated"
+        );
+    }
+
+    #[test]
+    fn backup_checksum_page_all_zero_pages_valid() {
+        // An all-zero, page-aligned relation file validates as Some(true)
+        // (empty-page handling).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", &vec![0u8; BLCKSZ * 2]);
+
+        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+        let relfile = manifest.file("base/1/1259").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(true),
+            "all-zero pages must validate as Some(true)"
+        );
     }
 }
