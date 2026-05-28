@@ -241,35 +241,102 @@ impl DbState {
 }
 
 /// Byte offsets of the version-specific `pg_control` fields pgBackRest
-/// reads, for `pg_control_version == 1300`.
+/// reads for one `ControlFileData` layout.
 ///
-/// `pg_control_version` 1300 is shared by `PostgreSQL` 13, 14, 15 and 16.
-/// The fields below sit at identical offsets across all four: `state`
-/// and `checkPoint` precede the embedded `CheckPoint` copy, and the
-/// `CheckPoint` struct is the same size (88 bytes) for the PG 12 and
-/// PG 14 layouts, so `blcksz` / `xlog_seg_size` land at the same place.
-///
-/// Offsets are taken from the `ControlFileData` struct in the C tree at
-/// `src/postgres/interface/version.vendor.h` (the `>= PG_VERSION_15` and
-/// `>= PG_VERSION_13` branches, which are field-identical here), itself
-/// vendored from upstream `src/include/catalog/pg_control.h`. They were
-/// verified with `offsetof` against a faithful reconstruction of the
-/// struct compiled for the x86-64 `SysV` ABI (8-byte max alignment,
-/// little-endian) — the platform pgBackRest targets.
-mod offsets_v1300 {
+/// `state` and `checkPoint` live ahead of the embedded variable-size
+/// `CheckPoint` copy and so are identical across every supported version;
+/// `block_size` (`blcksz`) and `wal_segment_size` (`xlog_seg_size`) sit
+/// after it and shift when the layout in between changes size.
+#[derive(Debug, Clone, Copy)]
+struct ControlOffsets {
     /// `DBState state` — `u32` (the C `DBState` enum is `int`-sized).
-    pub(super) const STATE: usize = 16;
+    state: usize,
     /// `XLogRecPtr checkPoint` — `u64` little-endian.
-    pub(super) const CHECK_POINT: usize = 32;
+    check_point: usize,
     /// `uint32 blcksz` — page size (`BLCKSZ`).
-    pub(super) const BLOCK_SIZE: usize = 216;
+    block_size: usize,
     /// `uint32 xlog_seg_size` — WAL segment size.
-    pub(super) const WAL_SEGMENT_SIZE: usize = 228;
-    /// One past the highest field this module reads, i.e. the minimum
+    wal_segment_size: usize,
+}
+
+impl ControlOffsets {
+    /// One past the highest field these offsets reach, i.e. the minimum
     /// buffer length needed to populate every field (`xlog_seg_size`
-    /// end = 228 + 4). Used by tests to size synthetic fixtures.
+    /// end = `wal_segment_size` + 4). Used by tests to size synthetic
+    /// fixtures.
     #[cfg(test)]
-    pub(super) const MIN_LEN: usize = WAL_SEGMENT_SIZE + 4;
+    const fn min_len(self) -> usize {
+        self.wal_segment_size + 4
+    }
+}
+
+/// `state` / `checkPoint` are at the same offsets for every supported
+/// `ControlFileData` layout: the 16-byte version header is followed by
+/// `DBState state` (offset 16), then `pg_time_t time` (8-byte aligned to
+/// offset 24), then `XLogRecPtr checkPoint` (offset 32). All fields that
+/// could move these — the variable-size `CheckPoint` copy and the
+/// `prevCheckPoint` pointer present on older layouts — come *after*
+/// `checkPoint`. Verified with `offsetof` for every `pg_control_version`
+/// (see the per-layout constants below).
+const STATE_OFFSET: usize = 16;
+const CHECK_POINT_OFFSET: usize = 32;
+
+/// Offsets for the "wide" `ControlFileData` layout, where `blcksz` lands
+/// at 216 and `xlog_seg_size` at 228.
+///
+/// Shared by `pg_control_version` 960 (PG 9.6), 1002 (PG 10), 1201
+/// (PG 12), 1300 (PG 13–16), 1700 (PG 17) and 1800 (PG 18). Although the
+/// intervening fields differ across these releases — the embedded
+/// `CheckPoint` copy is 80 bytes on 960/1002 vs 88 bytes on 1201+, and
+/// 960/1002 carry an extra `prevCheckPoint` `XLogRecPtr` plus
+/// `enableIntTimes`/`float4ByVal` bools that 1201+ drop — the net byte
+/// count up to `blcksz` happens to coincide at 216 for all of them.
+///
+/// Taken from the `ControlFileData` struct in the C tree at
+/// `src/postgres/interface/version.vendor.h` (the `>= PG_VERSION_18`,
+/// `>= PG_VERSION_17`, `>= PG_VERSION_13`, `>= PG_VERSION_12`,
+/// `>= PG_VERSION_10` and `>= PG_VERSION_96` branches), itself vendored
+/// from upstream `src/include/catalog/pg_control.h`. Verified with
+/// `offsetof` against the real vendored header compiled for the x86-64
+/// `SysV` ABI (8-byte max alignment, little-endian) — the platform
+/// pgBackRest targets — for each `PG_VERSION` in that set.
+const OFFSETS_WIDE: ControlOffsets = ControlOffsets {
+    state: STATE_OFFSET,
+    check_point: CHECK_POINT_OFFSET,
+    block_size: 216,
+    wal_segment_size: 228,
+};
+
+/// Offsets for the `pg_control_version == 1100` (PG 11) layout, where
+/// `blcksz` lands at 208 and `xlog_seg_size` at 220 — eight bytes earlier
+/// than [`OFFSETS_WIDE`].
+///
+/// PG 11 keeps the 80-byte `CheckPoint` copy and the `prevCheckPoint`
+/// `XLogRecPtr` of the 9.6/10 layout, but unlike those it has already
+/// dropped the `enableIntTimes` bool. That single removed byte (and its
+/// alignment padding) is what pulls `blcksz`/`xlog_seg_size` back by 8
+/// relative to [`OFFSETS_WIDE`].
+///
+/// Taken from the `>= PG_VERSION_11` `ControlFileData` branch in
+/// `src/postgres/interface/version.vendor.h`, verified with `offsetof`
+/// against the real vendored header compiled for the x86-64 `SysV` ABI.
+const OFFSETS_V1100: ControlOffsets = ControlOffsets {
+    state: STATE_OFFSET,
+    check_point: CHECK_POINT_OFFSET,
+    block_size: 208,
+    wal_segment_size: 220,
+};
+
+/// Resolve the [`ControlOffsets`] for a decoded `pg_control_version`, or
+/// `None` if no layout is known for it.
+const fn offsets_for(pg_control_version: u32) -> Option<ControlOffsets> {
+    match pg_control_version {
+        // Every supported version except PG 11 shares the wide layout.
+        960 | 1002 | 1201 | 1300 | 1700 | 1800 => Some(OFFSETS_WIDE),
+        // PG 11 alone shifts blcksz/xlog_seg_size back by 8 bytes.
+        1100 => Some(OFFSETS_V1100),
+        _ => None,
+    }
 }
 
 /// Fuller `pg_control` data beyond the version header. Fields pgBackRest
@@ -315,9 +382,13 @@ fn read_u64_at(bytes: &[u8], off: usize) -> Option<u64> {
 /// unknown-layout versions get `None` for those fields (the header is
 /// still returned — an unimplemented layout is not an error).
 ///
-/// Currently implements the layout for `pg_control_version == 1300`
-/// (`PostgreSQL` 13–16). If the buffer ends before a given field's
-/// offset that field is left `None` even for an implemented version.
+/// Implements the layout for every `pg_control_version` in
+/// [`crate::version::SUPPORTED`]: 960 (PG 9.6), 1002 (PG 10), 1100
+/// (PG 11), 1201 (PG 12), 1300 (PG 13–16), 1700 (PG 17) and 1800
+/// (PG 18). All share `state`/`checkpoint` offsets; PG 11 alone shifts
+/// `block_size`/`wal_segment_size` back by 8 bytes (see [`OFFSETS_V1100`]
+/// vs [`OFFSETS_WIDE`]). If the buffer ends before a given field's offset
+/// that field is left `None` even for an implemented version.
 ///
 /// # Errors
 ///
@@ -335,12 +406,11 @@ pub fn decode_pg_control_data(bytes: &[u8]) -> Result<PgControlData, PgControlEr
         wal_segment_size: None,
     };
 
-    if header.pg_control_version == 1300 {
-        use offsets_v1300 as o;
-        data.checkpoint = read_u64_at(bytes, o::CHECK_POINT);
-        data.state = read_u32_at(bytes, o::STATE).and_then(DbState::from_raw);
-        data.block_size = read_u32_at(bytes, o::BLOCK_SIZE);
-        data.wal_segment_size = read_u32_at(bytes, o::WAL_SEGMENT_SIZE);
+    if let Some(o) = offsets_for(header.pg_control_version) {
+        data.checkpoint = read_u64_at(bytes, o.check_point);
+        data.state = read_u32_at(bytes, o.state).and_then(DbState::from_raw);
+        data.block_size = read_u32_at(bytes, o.block_size);
+        data.wal_segment_size = read_u32_at(bytes, o.wal_segment_size);
     }
 
     Ok(data)
@@ -492,52 +562,125 @@ mod tests {
         crate::version::by_label(label).expect("label present in SUPPORTED")
     }
 
-    /// Build a synthetic `pg_control` buffer for a `pg_control_version
-    /// == 1300` cluster (PG 13–16), writing the extra fields at the
-    /// offsets [`decode_pg_control_data`] reads. This is a
-    /// self-consistency fixture: the writer mirrors the reader's offsets,
-    /// which proves internal consistency, not agreement with a real
-    /// `PostgreSQL` `pg_control` (verified separately via `offsetof` —
-    /// see the `offsets_v1300` doc comment).
-    fn synth_v1300(state: u32, checkpoint: u64, block_size: u32, wal_seg: u32) -> Vec<u8> {
-        let v = version("16");
-        let mut buf = vec![0u8; offsets_v1300::MIN_LEN];
+    /// Build a synthetic `pg_control` buffer for the cluster identified by
+    /// `label`, writing the extra fields at the offsets
+    /// [`decode_pg_control_data`] reads (resolved through
+    /// [`offsets_for`]). This is a self-consistency fixture: the writer
+    /// mirrors the reader's offsets, which proves internal consistency,
+    /// not agreement with a real `PostgreSQL` `pg_control` (verified
+    /// separately via `offsetof` — see the [`OFFSETS_WIDE`] /
+    /// [`OFFSETS_V1100`] doc comments).
+    fn synth_data(label: &str, state: u32, checkpoint: u64, block_size: u32, wal_seg: u32) -> Vec<u8> {
+        let v = version(label);
+        let o = offsets_for(v.pg_control_version).expect("label has an implemented layout");
+        let mut buf = vec![0u8; o.min_len()];
         buf[0..8].copy_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
         buf[8..12].copy_from_slice(&v.pg_control_version.to_le_bytes());
         buf[12..16].copy_from_slice(&v.catalog_version_no.to_le_bytes());
-        buf[offsets_v1300::STATE..offsets_v1300::STATE + 4].copy_from_slice(&state.to_le_bytes());
-        buf[offsets_v1300::CHECK_POINT..offsets_v1300::CHECK_POINT + 8].copy_from_slice(&checkpoint.to_le_bytes());
-        buf[offsets_v1300::BLOCK_SIZE..offsets_v1300::BLOCK_SIZE + 4].copy_from_slice(&block_size.to_le_bytes());
-        buf[offsets_v1300::WAL_SEGMENT_SIZE..offsets_v1300::WAL_SEGMENT_SIZE + 4].copy_from_slice(&wal_seg.to_le_bytes());
+        buf[o.state..o.state + 4].copy_from_slice(&state.to_le_bytes());
+        buf[o.check_point..o.check_point + 8].copy_from_slice(&checkpoint.to_le_bytes());
+        buf[o.block_size..o.block_size + 4].copy_from_slice(&block_size.to_le_bytes());
+        buf[o.wal_segment_size..o.wal_segment_size + 4].copy_from_slice(&wal_seg.to_le_bytes());
         buf
     }
 
-    #[test]
-    fn decode_data_falls_back_to_header_for_unknown_layout() {
-        // PG 18 (pg_control_version 1800) has no implemented extra-field
-        // layout yet, so only the header is populated.
-        let v = version("18");
-        let bytes = synth_header(v, 0xabcd_ef01_2345_6789);
-        let data = decode_pg_control_data(&bytes).expect("header decodes");
+    /// Decode a synthetic buffer for `label` and assert the written fields
+    /// round-trip. Drives the per-version self-consistency tests below.
+    fn assert_self_consistent(label: &str) {
+        let v = version(label);
+        let buf = synth_data(label, 6 /* DB_IN_PRODUCTION */, 0x1_2345_6789, 8192, 16 * 1024 * 1024);
+        let data = decode_pg_control_data(&buf).expect("supported layout decodes");
 
+        assert_eq!(
+            data.header.pg_control_version, v.pg_control_version,
+            "{label} pg_control_version"
+        );
+        assert_eq!(data.checkpoint, Some(0x1_2345_6789), "{label} checkpoint");
+        assert_eq!(data.state, Some(DbState::InProduction), "{label} state");
+        assert_eq!(data.block_size, Some(8192), "{label} block_size");
+        assert_eq!(data.wal_segment_size, Some(16 * 1024 * 1024), "{label} wal_segment_size");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v960() {
+        assert_self_consistent("9.6");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1002() {
+        assert_self_consistent("10");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1100() {
+        assert_self_consistent("11");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1201() {
+        assert_self_consistent("12");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1300() {
+        // pg_control_version 1300 covers PG 13–16; exercise the whole set.
+        for label in ["13", "14", "15", "16"] {
+            assert_self_consistent(label);
+        }
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1700() {
+        assert_self_consistent("17");
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1800() {
+        assert_self_consistent("18");
+    }
+
+    #[test]
+    fn every_supported_version_has_a_known_layout() {
+        // Sanity guard: the offset dispatch must cover every registry
+        // entry, so adding a PG major without offsets fails here.
+        for v in SUPPORTED {
+            assert!(
+                offsets_for(v.pg_control_version).is_some(),
+                "{} (pg_control_version {}) has no implemented layout",
+                v.label,
+                v.pg_control_version,
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_layout_yields_none_extras() {
+        // Every `pg_control_version` in SUPPORTED now has offsets, so the
+        // public `decode_pg_control_data` (which validates the
+        // version/catalog pair against SUPPORTED) can never reach the
+        // unknown-layout branch with a real buffer. The layout dispatch is
+        // [`offsets_for`]; assert it returns None for a fabricated
+        // `pg_control_version` outside the known set, which is exactly the
+        // signal `decode_pg_control_data` uses to leave the extra fields
+        // `None`.
+        for fabricated in [0_u32, 1, 1301, 1801, 9999, u32::MAX] {
+            assert!(
+                offsets_for(fabricated).is_none(),
+                "fabricated pg_control_version {fabricated} must have no implemented layout",
+            );
+        }
+
+        // And confirm the gate's observable effect end-to-end: a valid
+        // header whose buffer is too short to reach any offsets leaves the
+        // extra fields None — the same outcome an unknown layout produces.
+        let v = version("12");
+        let header_only = synth_header(v, 0xabcd_ef01_2345_6789);
+        let data = decode_pg_control_data(&header_only).expect("header-only decodes");
         assert_eq!(data.header.system_identifier, 0xabcd_ef01_2345_6789);
-        assert_eq!(data.header.pg_control_version, 1800);
         assert_eq!(data.checkpoint, None);
         assert_eq!(data.state, None);
         assert_eq!(data.block_size, None);
         assert_eq!(data.wal_segment_size, None);
-    }
-
-    #[test]
-    fn decode_data_reads_block_size_for_v1300() {
-        let buf = synth_v1300(6 /* DB_IN_PRODUCTION */, 0x1_2345_6789, 8192, 16 * 1024 * 1024);
-        let data = decode_pg_control_data(&buf).expect("v1300 decodes");
-
-        assert_eq!(data.header.pg_control_version, 1300);
-        assert_eq!(data.checkpoint, Some(0x1_2345_6789));
-        assert_eq!(data.state, Some(DbState::InProduction));
-        assert_eq!(data.block_size, Some(8192));
-        assert_eq!(data.wal_segment_size, Some(16 * 1024 * 1024));
     }
 
     #[test]
@@ -550,7 +693,7 @@ mod tests {
     #[test]
     fn decode_data_unknown_state_value_is_none() {
         // A v1300 buffer whose state byte holds a value outside 0..=6.
-        let buf = synth_v1300(42, 7, 8192, 8192);
+        let buf = synth_data("16", 42, 7, 8192, 8192);
         let data = decode_pg_control_data(&buf).expect("v1300 decodes");
         assert_eq!(data.state, None, "unrecognised DBState maps to None");
         // The other fields still decode normally.
@@ -573,8 +716,29 @@ mod tests {
     }
 
     #[test]
+    fn decode_data_v1100_offsets_differ_from_wide() {
+        // PG 11's blcksz/xlog_seg_size sit 8 bytes earlier than the wide
+        // layout. Writing at the v1100 offsets and reading back proves the
+        // dispatch picks the right (shifted) offsets for 1100.
+        let buf = synth_data("11", 1 /* DB_SHUTDOWNED */, 0xfeed, 8192, 32 * 1024 * 1024);
+        let data = decode_pg_control_data(&buf).expect("v1100 decodes");
+        assert_eq!(data.header.pg_control_version, 1100);
+        assert_eq!(data.state, Some(DbState::Shutdowned));
+        assert_eq!(data.checkpoint, Some(0xfeed));
+        assert_eq!(data.block_size, Some(8192));
+        assert_eq!(data.wal_segment_size, Some(32 * 1024 * 1024));
+
+        // The shifted offsets are genuinely different: reading a v1100
+        // buffer with the wide offsets must NOT find block_size where
+        // v1100 placed it (the wide block_size offset is 8 bytes past the
+        // v1100 one and lands on zero-fill here).
+        assert_eq!(OFFSETS_V1100.block_size + 8, OFFSETS_WIDE.block_size);
+        assert_eq!(read_u32_at(&buf, OFFSETS_WIDE.block_size), Some(0));
+    }
+
+    #[test]
     fn read_data_through_io_read_decodes_full_buffer() {
-        let buf = synth_v1300(1 /* DB_SHUTDOWNED */, 0xff00, 8192, 64 * 1024 * 1024);
+        let buf = synth_data("16", 1 /* DB_SHUTDOWNED */, 0xff00, 8192, 64 * 1024 * 1024);
         let mut reader = MemRead::new(buf);
         let data = read_pg_control_data(&mut reader).expect("read_pg_control_data");
 
