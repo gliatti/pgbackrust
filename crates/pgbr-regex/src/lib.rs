@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! POSIX ERE-compatible regular expression handler used by the pgBackRust C codebase through the
-//! [`pgbr-ffi`](../pgbr_ffi/index.html) shim.
+//! POSIX ERE-compatible regular expression handler for the pgBackRest Rust rewrite.
 //!
 //! The legacy C implementation in `src/common/regExp.c` wraps POSIX `regcomp`/`regexec` with
 //! `REG_EXTENDED`. The Rust replacement uses [`regex::bytes::Regex`] with Unicode disabled, which
