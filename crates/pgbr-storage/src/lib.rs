@@ -27,10 +27,12 @@ use std::path::{Path, PathBuf};
 
 use pgbr_io::{IoError, IoRead, IoWrite};
 
+pub mod azure;
 pub mod cifs;
 pub mod posix;
 pub mod s3;
 
+pub use crate::azure::{Azure, AzureConfig};
 pub use crate::cifs::Cifs;
 pub use crate::posix::Posix;
 pub use crate::s3::{S3, S3Config};

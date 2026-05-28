@@ -858,6 +858,7 @@ dependencies = [
 name = "pgbr-storage"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hmac",
  "pgbr-error",
  "pgbr-io",
