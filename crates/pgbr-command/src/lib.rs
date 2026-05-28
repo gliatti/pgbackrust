@@ -183,12 +183,15 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_implemented_path_for_restore() {
-        let cfg = fake_config("restore", Some("demo"), None);
+    fn not_yet_implemented_path_for_server() {
+        // `server` still needs a TLS transport; its dispatcher entry returns
+        // the generic `NotYetImplemented` (the tested protocol core lives in
+        // `server::serve` / `server::ping_exchange`).
+        let cfg = fake_config("server", None, None);
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("restore is not yet implemented");
+        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("server is not yet implemented");
         match err {
-            CommandError::NotYetImplemented { command } => assert_eq!(command, "restore"),
+            CommandError::NotYetImplemented { command } => assert_eq!(command, "server"),
             other => panic!("expected NotYetImplemented, got {other:?}"),
         }
     }
