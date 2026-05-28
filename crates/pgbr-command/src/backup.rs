@@ -1,19 +1,23 @@
-//! `backup` command — full backup, raw copy.
+//! `backup` command — full backup, with optional compression + encryption.
 //!
 //! C reference: `src/command/backup/backup.c`.
 //!
-//! This slice implements the **full** backup path with a **raw copy**: every
-//! non-excluded file in the PG data directory is read, SHA-1-checksummed, and
-//! written byte-for-byte into `backup/<stanza>/<label>/<relpath>` in the
-//! repository. A [`pgbr_info::Manifest`] inventories the result and a
-//! `[backup:current]` entry is appended to `backup.info`.
+//! This slice implements the **full** backup path: every non-excluded file in
+//! the PG data directory is read, its **plaintext** SHA-1 + size are computed
+//! (pgBackRest records the uncompressed checksum), the plaintext is run through
+//! the [`RepoTransform`] forward chain (compress then encrypt), and the
+//! transformed bytes are written to `backup/<stanza>/<label>/<relpath><suffix>`
+//! in the repository — where `<suffix>` is the compression extension
+//! (`.gz` / `.zst` / …, empty for no compression). A [`pgbr_info::Manifest`]
+//! inventories the result and a `[backup:current]` entry — carrying the applied
+//! compress-type / encrypted flag so restore can reverse the transform — is
+//! appended to `backup.info`.
+//!
+//! With `compress-type=none` and no cipher the transform is the identity and
+//! files are copied verbatim with an empty suffix, exactly as before.
 //!
 //! Deliberately out of scope for this slice (follow-ups):
 //!
-//! - **Compression / encryption.** Files are copied verbatim. Wiring the
-//!   `pgbr-compress` / `pgbr_io::Cipher` filter chain through the copy loop is
-//!   a follow-up; the bytes that flow through the SHA-1 filter today would
-//!   instead flow through a `FilterChain`.
 //! - **Incremental / differential backups.** Only `full` is produced; there is
 //!   no prior-backup reference or delta computation.
 //! - **Symlink target resolution.** The `Storage` trait has no link-target
@@ -34,6 +38,7 @@ use pgbr_storage::{Storage, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
+use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encrypted_key};
 
 /// Backup type recorded for a full backup.
 const BACKUP_TYPE_FULL: &str = "full";
@@ -156,8 +161,9 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
     let label = full_backup_label(timestamp_start);
+    let transform = RepoTransform::from_options(config);
 
-    let outcome = backup_inner(stanza, repo_storage, pg_storage, &label, timestamp_start)?;
+    let outcome = backup_inner(stanza, repo_storage, pg_storage, &label, timestamp_start, &transform)?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
@@ -208,24 +214,29 @@ fn unix_to_civil(timestamp: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// Take a full backup with a caller-supplied `label` and `timestamp_start`.
+/// Take a full backup with a caller-supplied `label`, `timestamp_start`, and
+/// repo `transform` (compression + encryption).
 ///
 /// Steps:
 ///
 /// 1. Load `backup/<stanza>/backup.info` (error if the stanza is uninitialised).
 /// 2. Recursively walk the PG data dir via `pg_storage`, applying
 ///    [`EXCLUDE_PREFIXES`].
-/// 3. Copy each non-excluded file raw into the backup directory, recording its
-///    size, mtime, and SHA-1 in a [`Manifest`].
+/// 3. For each non-excluded file: compute the **plaintext** SHA-1 + size
+///    (recorded in the [`Manifest`]), run the plaintext through
+///    `transform.forward_chain()` (compress then encrypt), and write the
+///    transformed bytes to `backup/<stanza>/<label>/<relpath><suffix>`.
 /// 4. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
 ///    (with an empty destination — see module docs).
 /// 5. Save `backup.manifest`, then add a `[backup:current]` entry to
-///    `backup.info` and save it.
+///    `backup.info` — including the applied compress-type and encrypted flag —
+///    and save it.
 ///
 /// # Errors
 ///
 /// - [`CommandError::Other`] if the stanza is not initialised, or if
 ///   `backup.info` / `backup.manifest` cannot be read or written.
+/// - [`CommandError::Io`] if a filter in the transform chain fails.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] for repository / PG-data
 ///   read/write failures.
 pub fn backup_inner(
@@ -234,6 +245,7 @@ pub fn backup_inner(
     pg_storage: &dyn Storage,
     label: &str,
     timestamp_start: i64,
+    transform: &RepoTransform,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -250,6 +262,7 @@ pub fn backup_inner(
     let mut paths = Vec::new();
     let mut links = Vec::new();
     let mut total_size: u64 = 0;
+    let mut repo_size: u64 = 0;
 
     for entry in walk(pg_storage, Path::new("."))? {
         if is_excluded(&entry.rel) {
@@ -262,21 +275,30 @@ pub fn backup_inner(
                 let mut reader = pg_storage.open_read(&src)?;
                 let bytes = reader.read_all()?;
 
+                // Checksum and size are taken over the PLAINTEXT, independent
+                // of how the bytes are stored in the repo (pgBackRest semantics).
                 let mut sha1 = Sha1::new();
                 let mut sink = Vec::new();
                 sha1.process(&bytes, &mut sink)?;
                 let checksum = sha1.digest_hex();
 
-                let dest = PathBuf::from(format!("{backup_root}/{}", entry.rel));
+                // Compress-then-encrypt the plaintext into the repo bytes. With
+                // the identity transform this returns the bytes unchanged.
+                let repo_bytes = transform.apply_forward(&bytes)?;
+
+                // The repo filename carries the compression suffix; encryption
+                // does not change it.
+                let dest = PathBuf::from(format!("{backup_root}/{}{}", entry.rel, transform.repo_suffix()));
                 if let Some(parent) = dest.parent() {
                     repo_storage.create_path(parent, true)?;
                 }
                 let mut writer = repo_storage.open_write(&dest)?;
-                writer.write(&bytes)?;
+                writer.write(&repo_bytes)?;
                 writer.flush()?;
                 writer.close()?;
 
                 total_size += entry.info.size;
+                repo_size += repo_bytes.len() as u64;
                 files.push(ManifestFile {
                     path: entry.rel,
                     size: entry.info.size,
@@ -331,7 +353,11 @@ pub fn backup_inner(
             "backup-timestamp-start": timestamp_start,
             "backup-timestamp-stop": timestamp_stop,
             "backup-info-size": total_size,
-            "backup-info-repo-size": total_size,
+            "backup-info-repo-size": repo_size,
+            // Record the applied transform so restore can reverse it without
+            // relying on the restore command's own compress/cipher options.
+            metadata_compress_type_key(): transform.compress_type.as_str_id(),
+            metadata_encrypted_key(): transform.is_encrypted(),
             "db-id": info.db_id,
         }),
     );
@@ -354,6 +380,7 @@ mod tests {
     use pgbr_storage::Posix;
 
     use super::*;
+    use crate::pipeline::{CompressType, RepoTransform};
 
     const LABEL: &str = "20240101-120000F";
 
@@ -420,7 +447,7 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        let outcome = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400).expect("backup");
+        let outcome = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
         assert_eq!(outcome.label, LABEL);
         assert_eq!(outcome.file_count, 4, "4 non-excluded files expected");
 
@@ -458,7 +485,7 @@ mod tests {
         let content = b"relation-data-1259";
         seed_file(&pg_s, "base/1/1259", content);
 
-        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400).expect("backup");
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
 
         let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
         let file = manifest.file("base/1/1259").expect("file in manifest");
@@ -472,7 +499,7 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400).expect("backup");
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
 
         let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
         assert!(manifest.file("postmaster.pid").is_none());
@@ -495,13 +522,16 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400).expect("backup");
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let entry = info.current.get(LABEL).expect("new label in [backup:current]");
         assert_eq!(entry["backup-type"], json!("full"));
         assert_eq!(entry["backup-timestamp-start"], json!(1_704_110_400));
         assert_eq!(entry["db-id"], json!(1));
+        // Identity transform records compress-type=none and not encrypted.
+        assert_eq!(entry["backup-info-compress-type"], json!("none"));
+        assert_eq!(entry["backup-info-encrypted"], json!(false));
     }
 
     #[test]
@@ -509,7 +539,8 @@ mod tests {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         seed_cluster(&pg_s);
 
-        let err = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400).expect_err("uninitialised stanza must error");
+        let err = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity())
+            .expect_err("uninitialised stanza must error");
         match err {
             CommandError::Other(msg) => assert_eq!(msg, "stanza not initialized; run stanza-create first"),
             other => panic!("expected Other(not initialized), got {other:?}"),
@@ -575,5 +606,61 @@ mod tests {
         assert_eq!(full_backup_label(1_704_110_400), "20240101-120000F");
         // Epoch.
         assert_eq!(full_backup_label(0), "19700101-000000F");
+    }
+
+    #[test]
+    fn backup_none_still_raw() {
+        // The identity transform must reproduce the prior raw-copy behaviour:
+        // repo files are byte-identical to the source and carry no suffix.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let content = b"relation-data-1259";
+        seed_file(&pg_s, "base/1/1259", content);
+
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        // No `.gz`/`.zst`/... suffix appended.
+        assert!(backup_root.join("base/1/1259").exists(), "raw file must keep its name");
+        assert!(!backup_root.join("base/1/1259.gz").exists());
+        // Byte-identical to the source.
+        assert_eq!(std::fs::read(backup_root.join("base/1/1259")).unwrap(), content);
+    }
+
+    #[test]
+    fn backup_gz_writes_suffixed_compressed_repo_file() {
+        // A gz transform writes `<rel>.gz` with bytes that differ from the
+        // plaintext, while the manifest still records the PLAINTEXT sha1+size.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let content = b"relation data that compresses, relation data that compresses, again";
+        seed_file(&pg_s, "base/1/1259", content);
+
+        let transform = RepoTransform {
+            compress_type: CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &transform).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        let repo_file = backup_root.join("base/1/1259.gz");
+        assert!(repo_file.exists(), "compressed repo file must carry the .gz suffix");
+        assert!(!backup_root.join("base/1/1259").exists(), "no un-suffixed file");
+        let repo_bytes = std::fs::read(&repo_file).unwrap();
+        assert_ne!(repo_bytes.as_slice(), content, "repo bytes must be compressed");
+
+        // Manifest records the PLAINTEXT checksum/size and the relpath WITHOUT
+        // the compression suffix.
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let file = manifest.file("base/1/1259").expect("file in manifest");
+        assert_eq!(file.checksum.as_deref(), Some(sha1_hex(content).as_str()));
+        assert_eq!(file.size, content.len() as u64);
+
+        // backup.info records the transform.
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let entry = info.current.get(LABEL).expect("label entry");
+        assert_eq!(entry["backup-info-compress-type"], json!("gz"));
+        assert_eq!(entry["backup-info-encrypted"], json!(false));
     }
 }

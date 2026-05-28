@@ -28,6 +28,7 @@ pub mod help;
 pub mod info;
 pub mod lock;
 pub mod manifest;
+pub mod pipeline;
 pub mod repo;
 pub mod restore;
 pub mod server;

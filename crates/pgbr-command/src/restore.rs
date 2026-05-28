@@ -1,11 +1,21 @@
 //! `restore` command — copy a backup into a PG data directory.
 //!
-//! C reference: `src/command/restore/restore.c`. This first slice covers the
-//! **raw copy** path: it re-creates every directory the manifest records, then
-//! copies every captured file from the repository's flat backup layout
-//! (`backup/<stanza>/<label>/<file.path>`) into the PG target, verifying each
-//! restored file's SHA-1 (via the [`pgbr_io::Sha1`] filter) against the value
-//! recorded in the manifest.
+//! C reference: `src/command/restore/restore.c`. This slice re-creates every
+//! directory the manifest records, then for every captured file reads it from
+//! the repository's flat backup layout
+//! (`backup/<stanza>/<label>/<file.path><suffix>`), reverses the backup's
+//! [`RepoTransform`] (decrypt then decompress), writes the recovered plaintext
+//! to the PG target, and verifies its SHA-1 (via the [`pgbr_io::Sha1`] filter)
+//! against the value recorded in the manifest. Because the manifest records
+//! the *plaintext* checksum, that single check validates the whole
+//! compress -> encrypt -> decrypt -> decompress round trip.
+//!
+//! The transform is read from the backup's recorded `backup.info` metadata
+//! (compress-type + encrypted flag), so restore reverses exactly what the
+//! backup applied — independent of the restore command's own compress/cipher
+//! options. The cipher *password* is never stored in the repo, so it is sourced
+//! from the resolved options. When the metadata is absent (e.g. an older
+//! backup), the transform falls back to the resolved options.
 //!
 //! Backup selection:
 //!
@@ -39,10 +49,11 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_info::{InfoBackup, InfoError, Manifest};
-use pgbr_io::{Filter, IoRead, IoWrite, Sha1};
+use pgbr_io::{Filter, IoRead, Sha1};
 use pgbr_storage::{Storage, StorageError};
 
 use crate::CommandError;
+use crate::pipeline::RepoTransform;
 
 /// Result of a [`restore_inner`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,14 +95,19 @@ fn requested_set(config: &LoadedConfig) -> Option<&str> {
     }
 }
 
-/// Resolve the single backup label to restore.
+/// Resolve the single backup to restore, returning its label and its
+/// `[backup:current]` metadata entry.
 ///
 /// With `--set`, that label — but only if it is present in
 /// `[backup:current]` (an unknown set is an error). Without `--set`, the
 /// lexicographically-greatest label in `[backup:current]`, which is the most
 /// recent backup given pgBackRest's chronological label format. An empty
 /// `[backup:current]` is an error.
-fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Result<String, CommandError> {
+///
+/// The returned metadata entry carries the compress-type / encrypted flag the
+/// backup recorded, which [`restore_inner`] feeds to
+/// [`RepoTransform::from_metadata`].
+fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Result<(String, serde_json::Value), CommandError> {
     let info = InfoBackup::load(repo, &backup_info_path(stanza)).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
             path: backup_info_path(stanza),
@@ -100,8 +116,8 @@ fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Res
     })?;
 
     if let Some(label) = requested_set(config) {
-        if info.current.contains_key(label) {
-            return Ok(label.to_owned());
+        if let Some(entry) = info.current.get(label) {
+            return Ok((label.to_owned(), entry.clone()));
         }
         return Err(CommandError::Other(format!(
             "backup set {label} is not present in the repository"
@@ -111,15 +127,25 @@ fn select_backup(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Res
     // `BTreeMap` keys iterate in ascending order, so the last one is the
     // lexicographically-greatest (and therefore most recent) label.
     info.current
-        .keys()
+        .iter()
         .next_back()
-        .cloned()
+        .map(|(label, entry)| (label.clone(), entry.clone()))
         .ok_or_else(|| CommandError::Other("no backups to restore".to_owned()))
 }
 
-/// Stream one backup file from the repository into the PG target, recomputing
-/// its SHA-1 along the way. Returns the digest of the bytes written.
-fn copy_file(repo: &dyn Storage, pg: &dyn Storage, src: &Path, dst: &Path) -> Result<String, CommandError> {
+/// Read one backup file from the repository, reverse the backup `transform`
+/// (decrypt then decompress) to recover the plaintext, write the plaintext into
+/// the PG target, and return the SHA-1 of the recovered plaintext.
+///
+/// `src` is the repo path *including* the compression suffix; `dst` is the
+/// plaintext PG-target path.
+fn copy_file(
+    repo: &dyn Storage,
+    pg: &dyn Storage,
+    src: &Path,
+    dst: &Path,
+    transform: &RepoTransform,
+) -> Result<String, CommandError> {
     // Make sure the destination's parent directory exists. Directories from
     // `[target:path]` are created up front, but defensively create the parent
     // here too so files in unlisted paths still land.
@@ -130,16 +156,20 @@ fn copy_file(repo: &dyn Storage, pg: &dyn Storage, src: &Path, dst: &Path) -> Re
     }
 
     let mut reader: Box<dyn IoRead> = repo.open_read(src)?;
-    let bytes = reader.read_all()?;
+    let repo_bytes = reader.read_all()?;
 
-    let mut writer: Box<dyn IoWrite> = pg.open_write(dst)?;
-    writer.write(&bytes)?;
+    // Reverse the transform: decrypt then decompress. With the identity
+    // transform this returns the bytes unchanged.
+    let plaintext = transform.apply_reverse(&repo_bytes)?;
+
+    let mut writer = pg.open_write(dst)?;
+    writer.write(&plaintext)?;
     writer.flush()?;
     writer.close()?;
 
     let mut sha = Sha1::new();
     let mut sink = Vec::new();
-    sha.process(&bytes, &mut sink)?;
+    sha.process(&plaintext, &mut sink)?;
     Ok(sha.digest_hex())
 }
 
@@ -158,7 +188,12 @@ fn copy_file(repo: &dyn Storage, pg: &dyn Storage, src: &Path, dst: &Path) -> Re
 ///   manifest.
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
-    let label = select_backup(config, repo, stanza)?;
+    let (label, metadata) = select_backup(config, repo, stanza)?;
+
+    // The transform the backup applied — read from the recorded metadata, with
+    // the resolved options supplying the cipher password (never stored in the
+    // repo) and any value the metadata omits.
+    let transform = RepoTransform::from_metadata(&metadata, config);
 
     let manifest = Manifest::load(repo, &manifest_path(stanza, &label)).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
@@ -174,12 +209,15 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         paths_created += 1;
     }
 
-    // 2. Copy every file, verifying its checksum on the way out.
+    // 2. Copy every file, reversing the transform and verifying its plaintext
+    //    checksum on the way out.
     let mut files_restored = 0;
     for file in &manifest.files {
-        let src = backup_file_path(stanza, &label, &file.path);
+        // The repo file carries the compression suffix; the PG-target file does not.
+        let repo_rel = format!("{}{}", file.path, transform.repo_suffix());
+        let src = backup_file_path(stanza, &label, &repo_rel);
         let dst = PathBuf::from(&file.path);
-        let actual = copy_file(repo, pg, &src, &dst)?;
+        let actual = copy_file(repo, pg, &src, &dst, &transform)?;
 
         // Zero-length files carry no checksum; nothing to compare.
         if let Some(expected) = file.checksum.as_deref()
@@ -597,5 +635,220 @@ mod tests {
 
         let outcome: RestoreOutcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
         assert_eq!(outcome.skipped_links, 1);
+    }
+
+    // ---- end-to-end backup -> restore round trips --------------------------
+
+    use crate::backup::backup_inner;
+    use crate::pipeline::{CompressType, RepoTransform};
+
+    /// Pre-create `backup.info` with an empty `[backup:current]` so `backup_inner`
+    /// can append its own entry — mirrors `backup::tests::init_stanza`.
+    fn init_stanza(repo: &Posix, stanza: &str) {
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current: BTreeMap::new(),
+            history,
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup/<stanza>");
+        info.save(repo, &super::backup_info_path(stanza)).expect("save backup.info");
+    }
+
+    /// Write `bytes` to a PG-data-relative path under `pg`, creating parents.
+    fn seed_pg_file(pg: &Posix, rel: &str, bytes: &[u8]) {
+        let path = std::path::PathBuf::from(rel);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            pg.create_path(parent, true).unwrap();
+        }
+        let mut w = pg.open_write(&path).unwrap();
+        w.write(bytes).unwrap();
+        w.flush().unwrap();
+        w.close().unwrap();
+    }
+
+    /// A restore config carrying the supplied options (compress/cipher).
+    fn restore_cfg(stanza: &str, options: Vec<((&str, Option<u32>), OptionValue)>) -> LoadedConfig {
+        let mut map: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        for ((name, idx), value) in options {
+            map.insert((name.to_owned(), idx), value);
+        }
+        LoadedConfig {
+            command: "restore".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options: map,
+            params: Vec::new(),
+        }
+    }
+
+    const FILES: &[(&str, &[u8])] = &[
+        ("PG_VERSION", b"14\n"),
+        ("base/1/1259", b"relation data 1259, relation data 1259, relation data 1259"),
+        (
+            "global/pg_control",
+            b"\x01\x02\x03\x04control file bytes that repeat repeat repeat",
+        ),
+    ];
+
+    #[test]
+    fn backup_then_restore_gz_round_trip() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+
+        let transform = RepoTransform {
+            compress_type: CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("backup");
+
+        // Repo files carry the .gz suffix.
+        for (rel, _) in FILES {
+            assert!(
+                repo_dir.path().join(format!("backup/{stanza}/{label}/{rel}.gz")).exists(),
+                "expected compressed repo file {rel}.gz"
+            );
+        }
+
+        // Restore reads the transform from backup.info — no compress options needed.
+        let outcome = restore_inner(&restore_cfg(stanza, Vec::new()), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.label, label);
+        assert_eq!(outcome.files_restored, FILES.len());
+
+        // Restored files match the originals byte-for-byte.
+        for (rel, bytes) in FILES {
+            let restored = {
+                let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored");
+                r.read_all().expect("read restored")
+            };
+            assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
+        }
+    }
+
+    #[test]
+    fn backup_then_restore_gz_cipher_round_trip() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+
+        // zst + AES-256-CBC.
+        let transform = RepoTransform {
+            compress_type: CompressType::Zst,
+            compress_level: 3,
+            cipher_pass: Some("backup-secret".to_owned()),
+        };
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("backup");
+
+        for (rel, bytes) in FILES {
+            let repo_path = repo_dir.path().join(format!("backup/{stanza}/{label}/{rel}.zst"));
+            assert!(repo_path.exists(), "expected encrypted+compressed repo file {rel}.zst");
+            let repo_bytes = std::fs::read(&repo_path).unwrap();
+            assert_ne!(
+                repo_bytes.as_slice(),
+                *bytes,
+                "repo bytes for {rel} must NOT equal the plaintext"
+            );
+            // Encrypted output carries the OpenSSL Salted__ header.
+            assert!(
+                repo_bytes.starts_with(b"Salted__"),
+                "encrypted repo file must be Salted__-framed"
+            );
+        }
+
+        // Restore must supply the cipher password (not stored in the repo); the
+        // compress-type comes from the recorded metadata.
+        let cfg = restore_cfg(
+            stanza,
+            vec![(("cipher-pass", None), OptionValue::String("backup-secret".to_owned()))],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.files_restored, FILES.len());
+
+        for (rel, bytes) in FILES {
+            let restored = {
+                let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored");
+                r.read_all().expect("read restored")
+            };
+            assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
+        }
+    }
+
+    #[test]
+    fn backup_then_restore_none_raw_round_trip() {
+        // The no-regression path: identity transform, no suffix, repo files
+        // byte-identical to source, restore recovers them verbatim.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        for (rel, bytes) in FILES {
+            let repo_path = repo_dir.path().join(format!("backup/{stanza}/{label}/{rel}"));
+            assert!(repo_path.exists(), "raw repo file {rel} must keep its name");
+            assert_eq!(
+                std::fs::read(&repo_path).unwrap().as_slice(),
+                *bytes,
+                "raw repo bytes for {rel}"
+            );
+        }
+
+        let outcome = restore_inner(&restore_cfg(stanza, Vec::new()), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.files_restored, FILES.len());
+        for (rel, bytes) in FILES {
+            let restored = {
+                let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored");
+                r.read_all().expect("read restored")
+            };
+            assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
+        }
     }
 }
