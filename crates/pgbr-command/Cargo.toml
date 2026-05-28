@@ -15,6 +15,7 @@ pgbr-error = { path = "../pgbr-error" }
 pgbr-info = { path = "../pgbr-info" }
 pgbr-io = { path = "../pgbr-io" }
 pgbr-postgres = { path = "../pgbr-postgres" }
+pgbr-protocol = { path = "../pgbr-protocol" }
 pgbr-storage = { path = "../pgbr-storage" }
 serde_json = "1"
 
