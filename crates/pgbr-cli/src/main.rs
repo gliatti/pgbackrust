@@ -12,8 +12,10 @@ fn main() {
     let exit = match pgbr_cli::run(args) {
         Ok(code) => code,
         Err(err) => {
+            // Diagnostic to stderr before translating the error category into
+            // its exit code (centralised in `CliRunError::exit_code`).
             eprintln!("pgbackrest: {err}");
-            1
+            err.exit_code()
         }
     };
     std::process::exit(exit);

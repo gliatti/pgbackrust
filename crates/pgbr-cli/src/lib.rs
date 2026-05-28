@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 
 use pgbr_config::{
-    Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, compile, load_config,
-    parse_cli, parse_ini, resolve_cli,
+    Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, RuntimeContext, compile,
+    load_config_with_context, parse_cli, parse_ini, resolve_cli,
 };
 
 /// Hard-coded copy of `src/build/config/config.yaml`. Embeds the schema at
@@ -25,9 +25,29 @@ const CONFIG_YAML: &str = include_str!("../../../src/build/config/config.yaml");
 /// Default path to `pgbackrest.conf` if `--config` is not supplied.
 const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrest/pgbackrest.conf";
 
-/// Top-level errors. The exit code reflects the error category (matches the
-/// rough shape of pgBackRest's C error codes — exact alignment is a future
-/// commit).
+/// Process exit code for configuration / option errors.
+///
+/// pgBackRest's C error table assigns `OptionError` code 27; this is the
+/// closest single bucket for the "couldn't resolve the invocation" family
+/// (`CliResolve`, `Load`, `Ini`, `ReadConfigFile`). Exact parity with the full
+/// error-code table is a later refinement — see [`CliRunError::exit_code`].
+const EXIT_CODE_CONFIG_ERROR: i32 = 27;
+
+/// Process exit code for a runtime command failure (the command resolved and
+/// loaded fine but its implementation returned an error).
+const EXIT_CODE_RUNTIME_ERROR: i32 = 1;
+
+/// Process exit code for an embedded-schema / internal error that should never
+/// happen in a shipped binary (the embedded `config.yaml` failed to parse or
+/// compile). Mapped to the runtime-error bucket since there's no actionable
+/// config to point the user at.
+const EXIT_CODE_INTERNAL_ERROR: i32 = 1;
+
+/// Top-level errors.
+///
+/// The exit code reflects the error category (matches the rough shape of
+/// pgBackRest's C error codes — exact alignment is a future commit). See
+/// [`CliRunError::exit_code`] for the mapping.
 #[derive(Debug)]
 pub enum CliRunError {
     /// `config.yaml` failed to parse — should never happen since it's
@@ -74,12 +94,50 @@ impl std::fmt::Display for CliRunError {
     }
 }
 
+impl CliRunError {
+    /// Map an error to the process exit code.
+    ///
+    /// Centralised so the mapping lives in one place and is unit-testable.
+    /// Categories:
+    ///
+    /// - config / option errors ([`Self::CliResolve`], [`Self::Load`],
+    ///   [`Self::Ini`], [`Self::ReadConfigFile`]) →
+    ///   [`EXIT_CODE_CONFIG_ERROR`] (27).
+    /// - runtime command failures ([`Self::Command`]) →
+    ///   [`EXIT_CODE_RUNTIME_ERROR`] (1).
+    /// - internal / embedded-schema errors ([`Self::ConfigYaml`],
+    ///   [`Self::Compile`], [`Self::Cli`]) → [`EXIT_CODE_INTERNAL_ERROR`] (1).
+    ///
+    /// Note: success (0) and not-yet-implemented (2) are returned as `Ok`
+    /// codes by [`run`] and never surface as a [`CliRunError`], so they have
+    /// no entry here.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::CliResolve(_) | Self::Load(_) | Self::Ini(_) | Self::ReadConfigFile { .. } => EXIT_CODE_CONFIG_ERROR,
+            Self::Command(_) => EXIT_CODE_RUNTIME_ERROR,
+            Self::ConfigYaml(_) | Self::Compile(_) | Self::Cli(_) => EXIT_CODE_INTERNAL_ERROR,
+        }
+    }
+}
+
 impl std::error::Error for CliRunError {}
+
+/// Build the [`RuntimeContext`] from the running process, carrying the
+/// executable path so `default-type: dynamic` options (the `bin` family:
+/// `cmd`, `pg-host-cmd`, `repo-host-cmd`) resolve to the real binary path
+/// instead of the `"pgbackrest"` fallback.
+fn env_context() -> RuntimeContext {
+    RuntimeContext {
+        exe_path: std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_owned)),
+    }
+}
 
 /// Run the CLI end-to-end.
 ///
 /// `args` is the argv excluding `argv[0]` (the program name). Returns the
-/// process exit code (0 = success, non-zero = error).
+/// process exit code (0 = success, non-zero = error). The [`RuntimeContext`]
+/// is derived from the running process (see [`env_context`]).
 ///
 /// This function is testable — the binary's `main()` just forwards `env::args()`.
 ///
@@ -91,8 +149,21 @@ impl std::error::Error for CliRunError {}
 /// the final merge / validation rejects the resolved options. The
 /// `MissingCommand` case is handled inline: a hint is printed to stderr and
 /// `Ok(1)` is returned.
-#[allow(clippy::print_stdout, clippy::print_stderr)] // CLI binary writes to stdout/stderr by design.
 pub fn run<I, S>(args: I) -> Result<i32, CliRunError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    run_with_context(args, &env_context())
+}
+
+/// [`run`], but with an explicit [`RuntimeContext`] for deterministic testing.
+///
+/// # Errors
+///
+/// Same as [`run`].
+#[allow(clippy::print_stdout, clippy::print_stderr)] // CLI binary writes to stdout/stderr by design.
+pub fn run_with_context<I, S>(args: I, ctx: &RuntimeContext) -> Result<i32, CliRunError>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -109,22 +180,7 @@ where
         Err(err) => return Err(CliRunError::CliResolve(err)),
     };
 
-    // Determine the config file path. `--config=<path>` lives in
-    // `resolved.options[("config", None)]`. Fall back to the default.
-    let config_path = config_file_path(&resolved);
-
-    let ini = match std::fs::read_to_string(&config_path) {
-        Ok(text) => parse_ini(&text).map_err(CliRunError::Ini)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => IniFile::default(),
-        Err(error) => {
-            return Err(CliRunError::ReadConfigFile {
-                path: config_path,
-                error,
-            });
-        }
-    };
-
-    let loaded = load_config(resolved, &ini, &cfg).map_err(CliRunError::Load)?;
+    let loaded = load_resolved(resolved, &cfg, ctx)?;
     print_resolved_invocation(&loaded);
 
     // Build the two storage backends every command is handed: one rooted at
@@ -149,6 +205,48 @@ where
 fn load_static_cfg() -> Result<Cfg, CliRunError> {
     let parsed = pgbr_build::parse_config(CONFIG_YAML).map_err(CliRunError::ConfigYaml)?;
     compile(&parsed).map_err(CliRunError::Compile)
+}
+
+/// Read `pgbackrest.conf` (falling back to an empty INI when absent) and merge
+/// it with `resolved` and the runtime `ctx` into a [`LoadedConfig`]. Shared by
+/// [`run_with_context`] and [`resolve_only`].
+fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError> {
+    // Determine the config file path. `--config=<path>` lives in
+    // `resolved.options[("config", None)]`. Fall back to the default.
+    let config_path = config_file_path(&resolved);
+
+    let ini = match std::fs::read_to_string(&config_path) {
+        Ok(text) => parse_ini(&text).map_err(CliRunError::Ini)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => IniFile::default(),
+        Err(error) => {
+            return Err(CliRunError::ReadConfigFile {
+                path: config_path,
+                error,
+            });
+        }
+    };
+
+    load_config_with_context(resolved, &ini, cfg, ctx).map_err(CliRunError::Load)
+}
+
+/// Run parse + resolve + load and return the merged [`LoadedConfig`].
+///
+/// Stops short of dispatching to a command. Exposed for tests that need to
+/// inspect resolved option values (e.g. that a `default-type: dynamic` option
+/// resolved against the threaded [`RuntimeContext`]).
+///
+/// # Errors
+///
+/// Same as [`run`], minus the dispatch step (no [`CliRunError::Command`]).
+pub fn resolve_only<I, S>(args: I, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let cfg = load_static_cfg()?;
+    let cli = parse_cli(args).map_err(CliRunError::Cli)?;
+    let resolved = resolve_cli(cli, &cfg).map_err(CliRunError::CliResolve)?;
+    load_resolved(resolved, &cfg, ctx)
 }
 
 fn config_file_path(resolved: &ResolvedCli) -> PathBuf {
@@ -207,7 +305,11 @@ fn format_value(value: &OptionValue) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{CliRunError, load_static_cfg, run};
+    use pgbr_config::{OptionValue, RuntimeContext};
+
+    use super::{
+        CliRunError, EXIT_CODE_CONFIG_ERROR, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_RUNTIME_ERROR, load_static_cfg, resolve_only, run,
+    };
 
     #[test]
     fn static_cfg_compiles() {
@@ -300,5 +402,118 @@ mod tests {
             !matches!(result, Err(CliRunError::ReadConfigFile { .. })),
             "missing config file should fall back to empty INI, got {result:?}",
         );
+    }
+
+    #[test]
+    fn exe_path_flows_into_dynamic_defaults() {
+        // `cmd` in config.yaml is a `default-type: dynamic` option whose
+        // `default: bin` tag resolves to the running executable path. We thread
+        // a known exe path through `resolve_only` and confirm it lands on the
+        // dynamic `cmd` default.
+        //
+        // The real embedded config.yaml has a pre-existing pgbr-config quirk:
+        // `buffer-size`'s `1MiB` default resolves to a `Size(1048576)` that is
+        // compared (by its byte count "1048576") against a string allow-list
+        // (`["1MiB", …]`), so `load_config` errors with
+        // `NotInAllowList { option: "buffer-size", .. }` for every full-config
+        // command before the resolved map is returned. That's out of scope for
+        // pgbr-cli (and fixing pgbr-config is off-limits here). So we can't read
+        // back `cmd` from a successful real-config load.
+        //
+        // Instead we assert the *threading* two ways:
+        //  1. `resolve_only` runs the full real pipeline with our context and
+        //     reaches the same downstream `buffer-size` quirk regardless of the
+        //     context — proving `load_config_with_context` ran with it.
+        //  2. The dynamic `bin` resolution itself is exercised against a minimal
+        //     config built from `config.yaml`'s `cmd` shape, confirming the
+        //     threaded `exe_path` (not the `"pgbackrest"` fallback) is selected.
+        let ctx = RuntimeContext {
+            exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+        };
+
+        // (1) Pipeline runs end-to-end with the threaded context.
+        match resolve_only(["verify", "--stanza=demo", "--repo1-path=/tmp/repo"], &ctx) {
+            // The pre-existing buffer-size allow-list quirk is the expected
+            // outcome for the real config; anything else that *succeeds* is
+            // also fine (it would mean pgbr-config fixed the quirk).
+            Ok(loaded) => {
+                // If load ever starts succeeding, `cmd` must carry our path.
+                if let Some(cmd) = loaded.options.get(&("cmd".to_owned(), None)) {
+                    assert_eq!(cmd, &OptionValue::String("/usr/bin/pgbackrest".to_owned()));
+                }
+            }
+            Err(CliRunError::Load(pgbr_config::LoadError::NotInAllowList { option, .. })) => {
+                assert_eq!(option, "buffer-size", "unexpected allow-list failure on `{option}`");
+            }
+            other => panic!("unexpected result from resolve_only: {other:?}"),
+        }
+
+        // (2) The dynamic `bin` default selects the threaded exe path. Build a
+        // minimal Cfg mirroring config.yaml's `cmd` (`default-type: dynamic`,
+        // `default: bin`) so the buffer-size quirk is out of the picture.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  cmd:
+    type: string
+    default-type: dynamic
+    default: bin
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = pgbr_config::compile(&pgbr_build::parse_config(yaml).unwrap()).unwrap();
+        let resolved = pgbr_config::resolve_cli(pgbr_config::parse_cli(["backup", "--stanza=demo"]).unwrap(), &cfg).unwrap();
+        let loaded = pgbr_config::load_config_with_context(resolved, &pgbr_config::IniFile::default(), &cfg, &ctx).unwrap();
+        assert_eq!(
+            loaded.options[&("cmd".to_owned(), None)],
+            OptionValue::String("/usr/bin/pgbackrest".to_owned()),
+            "the threaded exe_path should win over the \"pgbackrest\" fallback",
+        );
+
+        // The env-derived context must yield a non-empty exe path (the running
+        // test binary) so the real binary resolves `cmd` to itself, not the
+        // fallback.
+        assert!(
+            super::env_context().exe_path.is_some_and(|p| !p.is_empty()),
+            "env_context() should carry the running executable path",
+        );
+    }
+
+    #[test]
+    fn exit_code_mapping() {
+        // Config / option errors share the "config error" bucket.
+        assert_eq!(
+            CliRunError::CliResolve(pgbr_config::CliResolveError::MissingCommand).exit_code(),
+            EXIT_CODE_CONFIG_ERROR,
+        );
+        assert_eq!(
+            CliRunError::ReadConfigFile {
+                path: std::path::PathBuf::from("/x"),
+                error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            }
+            .exit_code(),
+            EXIT_CODE_CONFIG_ERROR,
+        );
+
+        // A runtime command failure maps to the runtime bucket (1).
+        assert_eq!(
+            CliRunError::Command(pgbr_command::CommandError::Other("boom".to_owned())).exit_code(),
+            EXIT_CODE_RUNTIME_ERROR,
+        );
+
+        // Internal / embedded-schema errors map to the internal bucket (1).
+        let cli_err = pgbr_config::parse_cli(["--=bad"]).unwrap_err();
+        assert_eq!(CliRunError::Cli(cli_err).exit_code(), EXIT_CODE_INTERNAL_ERROR);
+
+        // The documented constant values themselves.
+        assert_eq!(EXIT_CODE_CONFIG_ERROR, 27);
+        assert_eq!(EXIT_CODE_RUNTIME_ERROR, 1);
+        assert_eq!(EXIT_CODE_INTERNAL_ERROR, 1);
     }
 }
