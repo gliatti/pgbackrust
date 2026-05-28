@@ -31,6 +31,23 @@
 //! ([`CommandError::Other`]): restoring corrupt data silently is worse than
 //! failing the restore.
 //!
+//! # Parallel file copy (`process-max`)
+//!
+//! The per-file work — read the repo file, reverse its [`RepoTransform`]
+//! (decrypt then decompress), write the recovered plaintext to the PG target,
+//! and verify its SHA-1 — is distributed across `process-max` workers via the
+//! in-process [`pgbr_protocol::parallel`] dispatcher, mirroring `backup`. All
+//! the decision logic (backup selection, reference resolution, db-include /
+//! db-exclude filtering, delta matching, tablespace-target resolution, symlink
+//! re-creation, recovery config) stays on the main thread; only the actual
+//! file copies are dispatched. The [`Storage`] trait is not `Send`, so each job
+//! threads owned absolute [`PathBuf`]s plus a cloned [`RepoTransform`] into the
+//! worker, which does its I/O via `std::fs` against those absolute paths (the
+//! same pattern `backup` uses). The hard-fail SHA-1 check runs **per file in
+//! the worker**, so a corrupt file fails the whole restore regardless of which
+//! worker copied it. `process-max=1` reproduces the prior serial behaviour
+//! byte-for-byte. C reference: `src/protocol/parallel.c`.
+//!
 //! # Manifest references (differential restore)
 //!
 //! A differential backup records files unchanged since its base full backup
@@ -134,7 +151,9 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_info::{InfoBackup, InfoError, Manifest, ManifestFile, ManifestLink};
-use pgbr_io::{Filter, IoRead, Sha1};
+use pgbr_io::{Filter, Sha1};
+use pgbr_protocol::message::{OkResponse, Request, Response};
+use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 
 use crate::CommandError;
@@ -634,44 +653,179 @@ fn select_backup(
     Ok((label, entry, info))
 }
 
-/// Read one backup file from the repository, reverse the backup `transform`
-/// (decrypt then decompress) to recover the plaintext, write the plaintext into
-/// the PG target, and return the SHA-1 of the recovered plaintext.
+/// Number of parallel file-copy workers, from the resolved `process-max` option.
 ///
-/// `src` is the repo path *including* the compression suffix; `dst` is the
-/// plaintext PG-target path.
-fn copy_file(
-    repo: &dyn Storage,
-    pg: &dyn Storage,
-    src: &Path,
-    dst: &Path,
-    transform: &RepoTransform,
-) -> Result<String, CommandError> {
-    // Make sure the destination's parent directory exists. Directories from
-    // `[target:path]` are created up front, but defensively create the parent
-    // here too so files in unlisted paths still land.
-    if let Some(parent) = dst.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        pg.create_path(parent, true)?;
+/// `process-max` is an `Integer` (default 1). Values `< 1` clamp to one worker
+/// so the copy phase always makes progress; the dispatcher additionally caps the
+/// thread count at the number of files to copy. Mirrors `backup`'s helper.
+fn process_max(config: &LoadedConfig) -> usize {
+    match config.options.get(&("process-max".to_owned(), None)) {
+        Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
     }
+}
 
-    let mut reader: Box<dyn IoRead> = repo.open_read(src)?;
-    let repo_bytes = reader.read_all()?;
+/// One file the copy phase must physically restore into the PG target.
+///
+/// Produced on the main thread by [`restore_inner`] (which has already resolved
+/// references, db-include/exclude filtering, delta matching, and the backup the
+/// bytes live in) and consumed by a worker thread, which reads `abs_src`,
+/// reverses the transform, writes `abs_dst`, and verifies the SHA-1. The fields
+/// are all owned so the job can cross the thread boundary the parallel
+/// dispatcher imposes; `rel` correlates the worker's result back to the manifest
+/// file path. `expected_checksum` is the plaintext SHA-1 the manifest recorded
+/// (`None` for a zero-length file), checked in the worker so a corrupt file
+/// fails the whole restore regardless of which worker copied it.
+#[derive(Debug, Clone)]
+struct RestoreCopyJob {
+    /// Manifest file path, used as the dispatcher correlation key and in errors.
+    rel: String,
+    /// Absolute source path of the repo file (suffix included).
+    abs_src: PathBuf,
+    /// Absolute destination path in the PG target (plaintext, no suffix).
+    abs_dst: PathBuf,
+    /// The transform the source backup applied, to be reversed (decrypt then
+    /// decompress) into the recovered plaintext.
+    transform: RepoTransform,
+    /// Plaintext SHA-1 the manifest recorded, or `None` for a zero-length file.
+    expected_checksum: Option<String>,
+}
+
+/// Restore one file in a worker: read `abs_src` via `std::fs`, reverse the
+/// transform to recover the plaintext, create the destination's parent dir,
+/// write `abs_dst`, and verify the recovered plaintext's SHA-1 against the
+/// manifest's recorded checksum. Because the manifest records the *plaintext*
+/// checksum, that single check validates the whole
+/// compress -> encrypt -> decrypt -> decompress round trip.
+///
+/// This is the per-file unit of work run on a dispatcher worker thread. It does
+/// all of its I/O through `std::fs` against absolute paths, so it needs no
+/// `Storage` handle and nothing borrowed from the caller — only the owned
+/// `transform` carried in the job. A checksum mismatch is a hard error here, so
+/// the failing job fails the whole restore.
+fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
+    let repo_bytes =
+        std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
 
     // Reverse the transform: decrypt then decompress. With the identity
     // transform this returns the bytes unchanged.
-    let plaintext = transform.apply_reverse(&repo_bytes)?;
+    let plaintext = job.transform.apply_reverse(&repo_bytes)?;
 
-    let mut writer = pg.open_write(dst)?;
-    writer.write(&plaintext)?;
-    writer.flush()?;
-    writer.close()?;
+    if let Some(parent) = job.abs_dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+    }
+    std::fs::write(&job.abs_dst, &plaintext)
+        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dst.display())))?;
 
+    // Hard-fail SHA-1 check, per file, in the worker. Zero-length files carry no
+    // checksum; nothing to compare.
     let mut sha = Sha1::new();
     let mut sink = Vec::new();
     sha.process(&plaintext, &mut sink)?;
-    Ok(sha.digest_hex())
+    let actual = sha.digest_hex();
+    if let Some(expected) = job.expected_checksum.as_deref()
+        && actual != expected
+    {
+        return Err(CommandError::Other(format!("restore checksum mismatch for {}", job.rel)));
+    }
+
+    Ok(())
+}
+
+/// Encode a [`RestoreCopyJob`]'s correlation key into a dispatcher [`Request`].
+///
+/// The owned job (absolute paths, transform, expected checksum) is captured by
+/// the worker closure via a side table keyed on `rel`; only the key needs to
+/// ride in the request, so the request's `cmd` is the `rel` and `param` is empty.
+fn copy_request(job: &RestoreCopyJob) -> Request {
+    Request {
+        cmd: job.rel.clone(),
+        param: Vec::new(),
+    }
+}
+
+/// Run every [`RestoreCopyJob`] across `worker_count` workers via the in-process
+/// dispatcher. Returns `Ok(())` when every file restored and verified; the first
+/// failing job (read / write / transform / checksum-mismatch) surfaces as an
+/// `Err` and fails the whole restore, exactly as the serial path did.
+///
+/// Each worker looks its job up by `rel` in the shared (owned) job table, then
+/// reads the source, reverses the transform, writes the destination, and
+/// verifies the SHA-1. The dispatcher isolates a worker panic into an `Err`
+/// result too. `worker_count == 1` runs a single worker — byte-for-byte the
+/// prior serial behaviour.
+fn run_restore_jobs(jobs: Vec<RestoreCopyJob>, worker_count: usize) -> Result<(), CommandError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let dispatcher_jobs: Vec<Job> = jobs
+        .iter()
+        .map(|job| Job {
+            key: job.rel.clone(),
+            request: copy_request(job),
+        })
+        .collect();
+
+    // The dispatcher demands a `Send + Sync + 'static` worker, so the closure
+    // can only borrow owned data. Move the owned jobs into a lookup table keyed
+    // by `rel`; the worker fetches its job (which carries the cloned transform
+    // and absolute paths) and does its I/O through `std::fs`, so nothing
+    // borrowed from this stack frame escapes.
+    let table: std::collections::HashMap<String, RestoreCopyJob> = jobs.into_iter().map(|job| (job.rel.clone(), job)).collect();
+
+    let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
+        let job = table
+            .get(&request.cmd)
+            .ok_or_else(|| format!("no restore job for {}", request.cmd))?;
+        restore_file(job).map_err(|err| err.to_string())?;
+        Ok(Response::Ok(OkResponse { out: None }))
+    });
+
+    for job_result in results {
+        match job_result.result {
+            Ok(Response::Ok(_)) => {}
+            Ok(_) => {
+                return Err(CommandError::Other(format!(
+                    "restore of {} produced an unexpected response",
+                    job_result.key
+                )));
+            }
+            Err(message) => return Err(CommandError::Other(message)),
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the absolute on-disk path a worker should write the recovered
+/// plaintext to, for a PG-target-relative `rel` under `storage`.
+///
+/// A restore destination may not exist yet, so its absolute path is anchored on
+/// its parent directory: the parent is created (mirroring the serial path, which
+/// created the destination's parent in `copy_file` before writing) and its
+/// absolute path resolved via `storage.info`, then the file name is joined on.
+/// This anchors worker I/O at a real absolute path because the workers use
+/// `std::fs`, not the `Storage` handle.
+fn destination_absolute_path(storage: &dyn Storage, rel: &Path) -> Result<PathBuf, CommandError> {
+    // Directories from `[target:path]` are created up front, but a file can sit
+    // in an unlisted path, so create the parent defensively (as the serial
+    // `copy_file` did) and resolve its absolute path.
+    let abs_parent = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => {
+            storage.create_path(parent, true)?;
+            storage.info(parent)?.path
+        }
+        // No parent component (a file at the storage root): resolve the root via
+        // the current dir, which always exists.
+        None => storage.info(Path::new("."))?.path,
+    };
+
+    let name = rel
+        .file_name()
+        .ok_or_else(|| CommandError::Other(format!("cannot resolve absolute path for {}", rel.display())))?;
+    Ok(abs_parent.join(name))
 }
 
 /// Core restore pass. The thin [`restore`] entry point prints the outcome;
@@ -726,11 +880,15 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         paths_created += 1;
     }
 
-    // 2. Copy every file, reversing the transform and verifying its plaintext
-    //    checksum on the way out. Under `--delta`, a file whose target copy
-    //    already matches the manifest (same size + SHA-1) is skipped.
-    let mut files_restored = 0;
+    // 2. Plan every file copy on the main thread — reference resolution,
+    //    db-include/exclude filtering, delta matching, and source-backup /
+    //    transform selection all stay here, exactly as the serial path decided
+    //    them. Only the resulting read -> reverse-transform -> write -> verify
+    //    work is deferred to the workers. Under `--delta`, a file whose target
+    //    copy already matches the manifest (same size + SHA-1) is skipped and
+    //    never becomes a job.
     let mut files_skipped = 0;
+    let mut jobs: Vec<RestoreCopyJob> = Vec::new();
     for file in &manifest.files {
         let dst = PathBuf::from(&file.path);
 
@@ -761,20 +919,34 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             }
         };
 
-        // The repo file carries the compression suffix; the PG-target file does not.
+        // The repo file carries the compression suffix; the PG-target file does
+        // not. Resolve both ends to absolute paths now (on the main thread,
+        // which holds the `Storage` handles) so each worker can do its I/O via
+        // `std::fs` without a `Storage` borrow crossing the thread boundary. The
+        // repo source must exist (its absolute path comes straight from
+        // `Storage::info`, propagating `NotFound` exactly as the serial
+        // `open_read` did); the PG destination may not, so its parent dir is
+        // created and the absolute path anchored there.
         let repo_rel = format!("{}{}", file.path, src_transform.repo_suffix());
         let src = backup_file_path(stanza, src_label, &repo_rel);
-        let actual = copy_file(repo, pg, &src, &dst, &src_transform)?;
+        let abs_src = repo.info(&src)?.path;
+        let abs_dst = destination_absolute_path(pg, &dst)?;
 
-        // Zero-length files carry no checksum; nothing to compare.
-        if let Some(expected) = file.checksum.as_deref()
-            && actual != expected
-        {
-            return Err(CommandError::Other(format!("restore checksum mismatch for {}", file.path)));
-        }
-
-        files_restored += 1;
+        jobs.push(RestoreCopyJob {
+            rel: file.path.clone(),
+            abs_src,
+            abs_dst,
+            transform: src_transform,
+            expected_checksum: file.checksum.clone(),
+        });
     }
+
+    // Fan the copy jobs out across `process-max` workers. The hard-fail SHA-1
+    // check runs per file inside each worker, so a corrupt file still fails the
+    // whole restore; `process-max=1` runs a single worker (the prior serial
+    // path). The number of files planned for copy is the restore count.
+    let files_restored = jobs.len();
+    run_restore_jobs(jobs, process_max(config))?;
 
     // 3. Delta restore removes target files absent from the manifest so the
     //    target matches the backup exactly. Walk every restored directory root
@@ -2500,5 +2672,173 @@ mod tests {
             !pg_s.exists(Path::new("base/1/1259")).unwrap(),
             "excluded database must not be restored"
         );
+    }
+
+    // ---- parallel file copy (process-max) ----------------------------------
+
+    /// `process_max` reads the resolved `--process-max` integer, defaulting to a
+    /// single worker (the prior serial behaviour) when absent, non-integer, or
+    /// `< 1`.
+    #[test]
+    fn process_max_reads_option_with_serial_default() {
+        // Absent -> 1.
+        assert_eq!(super::process_max(&cfg(Some("demo"), None)), 1);
+
+        // Explicit values.
+        let four = restore_cfg("demo", vec![(("process-max", None), OptionValue::Integer(4))]);
+        assert_eq!(super::process_max(&four), 4);
+
+        // `< 1` clamps to a single worker so the copy phase always progresses.
+        let zero = restore_cfg("demo", vec![(("process-max", None), OptionValue::Integer(0))]);
+        assert_eq!(super::process_max(&zero), 1);
+        let neg = restore_cfg("demo", vec![(("process-max", None), OptionValue::Integer(-3))]);
+        assert_eq!(super::process_max(&neg), 1);
+
+        // A non-integer value falls back to the serial default.
+        let wrong = restore_cfg("demo", vec![(("process-max", None), OptionValue::String("nope".to_owned()))]);
+        assert_eq!(super::process_max(&wrong), 1);
+    }
+
+    /// A restore config selecting `label` with an explicit `--process-max`.
+    fn cfg_process_max(stanza: &str, label: &str, process_max: i64) -> LoadedConfig {
+        restore_cfg(
+            stanza,
+            vec![
+                (("set", None), OptionValue::String(label.to_owned())),
+                (("process-max", None), OptionValue::Integer(process_max)),
+            ],
+        )
+    }
+
+    /// Restore a multi-file (multi-directory, gz+cipher) backup once with
+    /// `process-max=1` and once with `process-max=4`; the two restored targets
+    /// must be byte-for-byte identical to each other and to the source — proving
+    /// the worker count never changes the output. Mirrors `backup`'s
+    /// `process-max=1` vs serial guarantee.
+    #[test]
+    fn restore_parallel_matches_serial() {
+        // Build one shared backup (gz + AES) the two restores both read from.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+
+        // A spread of files across several directories so the copy phase has
+        // real work to fan out across workers.
+        let files: &[(&str, &[u8])] = &[
+            ("PG_VERSION", b"14\n"),
+            ("base/1/1259", b"relation data 1259 relation data 1259 relation data 1259"),
+            (
+                "base/1/1260",
+                b"relation data 1260 padded out so it is worth compressing aaaaaa",
+            ),
+            (
+                "base/16384/2619",
+                b"another database's relation, repeated repeated repeated repeated",
+            ),
+            (
+                "global/pg_control",
+                b"\x01\x02\x03\x04 control file bytes that repeat repeat repeat repeat",
+            ),
+            ("pg_xact/0000", b"transaction status bytes 000000000000000000000000000000"),
+        ];
+        for (rel, bytes) in files {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+
+        let transform = RepoTransform {
+            compress_type: CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: Some("parallel-secret".to_owned()),
+        };
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("backup");
+
+        // Restore into two fresh targets: one serial, one with four workers.
+        let pg_serial = tempfile::tempdir().unwrap();
+        let pg_parallel = tempfile::tempdir().unwrap();
+        let pg_serial_s = Posix::new(pg_serial.path());
+        let pg_parallel_s = Posix::new(pg_parallel.path());
+
+        // The cipher password is supplied via options; the compress-type comes
+        // from the recorded metadata.
+        let cfg1 = restore_cfg(
+            stanza,
+            vec![
+                (("set", None), OptionValue::String(label.to_owned())),
+                (("process-max", None), OptionValue::Integer(1)),
+                (("cipher-pass", None), OptionValue::String("parallel-secret".to_owned())),
+            ],
+        );
+        let cfg4 = restore_cfg(
+            stanza,
+            vec![
+                (("set", None), OptionValue::String(label.to_owned())),
+                (("process-max", None), OptionValue::Integer(4)),
+                (("cipher-pass", None), OptionValue::String("parallel-secret".to_owned())),
+            ],
+        );
+
+        let serial = restore_inner(&cfg1, &repo_s, &pg_serial_s).expect("serial restore");
+        let parallel = restore_inner(&cfg4, &repo_s, &pg_parallel_s).expect("parallel restore");
+
+        // Same restore outcome regardless of worker count.
+        assert_eq!(serial.files_restored, files.len());
+        assert_eq!(parallel.files_restored, files.len());
+        assert_eq!(serial.files_restored, parallel.files_restored);
+
+        // Every restored file is byte-identical across the two restores AND to
+        // the original source.
+        for (rel, bytes) in files {
+            let from_serial = std::fs::read(pg_serial.path().join(rel)).expect("read serial restored");
+            let from_parallel = std::fs::read(pg_parallel.path().join(rel)).expect("read parallel restored");
+            assert_eq!(from_serial, *bytes, "serial restore mismatch for {rel}");
+            assert_eq!(
+                from_serial, from_parallel,
+                "serial and parallel restores must be byte-identical for {rel}"
+            );
+        }
+    }
+
+    /// A multi-file backup restores correctly with four workers: every file is
+    /// present, byte-for-byte correct, and the hard-fail checksum check (run per
+    /// file in the worker) passes.
+    #[test]
+    fn restore_process_max_4_round_trip() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        // Eight files across distinct directories — comfortably more than the
+        // four workers, so jobs queue and multiple workers pick them up.
+        let files: Vec<(String, Vec<u8>)> = (0..8)
+            .map(|n| {
+                let rel = format!("base/{}/relation_{n}", 1 + (n % 3));
+                let bytes = format!("relation {n} contents repeated repeated repeated repeated repeated")
+                    .repeat(3)
+                    .into_bytes();
+                (rel, bytes)
+            })
+            .collect();
+
+        let captured: Vec<(&str, &[u8], Option<String>)> = files
+            .iter()
+            .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice(), Some(sha1_hex(bytes))))
+            .collect();
+        let dirs: Vec<&str> = vec!["base", "base/1", "base/2", "base/3"];
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &captured, &dirs, &[]);
+
+        let outcome = restore_inner(&cfg_process_max(stanza, label, 4), &repo_s, &pg_s).expect("4-worker restore");
+        assert_eq!(outcome.files_restored, files.len(), "all files restored with 4 workers");
+
+        for (rel, bytes) in &files {
+            let restored = std::fs::read(pg.path().join(rel)).unwrap_or_else(|_| panic!("read restored {rel}"));
+            assert_eq!(&restored, bytes, "round trip mismatch for {rel}");
+        }
     }
 }
