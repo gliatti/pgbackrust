@@ -13,9 +13,17 @@
 //!    (`db-system-id` and `db-version`).
 //! 4. The repository must be writable — a probe file is written, read back,
 //!    compared, and removed.
+//! 5. The WAL archive must be functional — a small test object is written into
+//!    the stanza's current archive-id directory
+//!    (`archive/<stanza>/<archive-id>/`), read back, byte-compared, and then
+//!    removed. This mirrors the repo half of the C `checkArchive` WAL
+//!    push+get round trip.
 //!
-//! PG connectivity, `archive_command` validation, and the live WAL archive
-//! round-trip are deferred until `pgbr-db` is wired into the command layer.
+//! PG connectivity and `archive_command` validation (the part of the C
+//! `checkArchive` that pushes a WAL segment from a *live* cluster and waits for
+//! the async archiver to land it in the repo) are deferred until `pgbr-db` is
+//! wired into the command layer. The repo-side round trip implemented here
+//! does not require a live `PostgreSQL`.
 
 use std::path::PathBuf;
 
@@ -38,6 +46,12 @@ pub struct CheckReport {
     pub db_system_id: u64,
     /// Whether the repository write-probe round trip succeeded.
     pub repo_writable: bool,
+    /// The stanza's current archive-id (`<db-version>-<db-id>`, e.g. `14-1`),
+    /// taken from `archive.info`'s active `[db]` block.
+    pub archive_id: String,
+    /// Whether the WAL-archive round trip succeeded: a test object written into
+    /// `archive/<stanza>/<archive-id>/`, read back, byte-compared, and removed.
+    pub archive_ok: bool,
 }
 
 /// Repo-side `check`: confirm the stanza is initialized, the info files agree,
@@ -77,11 +91,21 @@ pub fn check_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<
     // 4. The repository must be writable: write -> read-back -> compare -> remove.
     let repo_writable = probe_repo_writable(repo_storage, stanza)?;
 
+    // 5. The WAL archive must be functional: write a test object into the
+    //    current archive-id directory, read it back, compare, and remove it.
+    //    The current archive-id is `<db-version>-<db-id>`, derived from the
+    //    active `[db]` block of `archive.info` (mirrors `infoArchiveId` /
+    //    `archiveId` in the C tree).
+    let archive_id = format!("{}-{}", archive.db_version, archive.db_id);
+    let archive_ok = probe_archive_round_trip(repo_storage, stanza, &archive_id)?;
+
     Ok(CheckReport {
         stanza: stanza.to_owned(),
         db_version: backup.db_version,
         db_system_id: backup.db_system_id,
         repo_writable,
+        archive_id,
+        archive_ok,
     })
 }
 
@@ -126,6 +150,57 @@ fn probe_repo_writable(repo_storage: &dyn Storage, stanza: &str) -> Result<bool,
     }
 }
 
+/// WAL-archive round trip: write a small test object into the stanza's current
+/// archive-id directory, read it back, byte-compare, then remove it. Returns
+/// `Ok(true)` only when the round trip matched.
+///
+/// This is the repo-side half of the C `checkArchive`: rather than asking a
+/// live cluster to push a WAL segment and waiting for the async archiver, it
+/// directly exercises the repository's `archive/<stanza>/<archive-id>/` subtree
+/// — the same path WAL segments land in — to confirm the archive store is
+/// readable and writable. The test object is named `<archive-id>.check-<pid>`
+/// so it cannot collide with a real WAL segment (which is a hex name) and is
+/// cleaned up even on read/compare failure.
+fn probe_archive_round_trip(repo_storage: &dyn Storage, stanza: &str, archive_id: &str) -> Result<bool, CommandError> {
+    let archive_dir = format!("archive/{stanza}/{archive_id}");
+    let test_name = format!("{archive_id}.check-{}", std::process::id());
+    let test_path = PathBuf::from(format!("{archive_dir}/{test_name}"));
+    let payload = format!("pgbackrest archive check for stanza '{stanza}' archive-id '{archive_id}'").into_bytes();
+
+    // Ensure the archive-id directory exists. On a freshly-created stanza that
+    // has never archived a segment the directory may be absent; `create_path`
+    // is a no-op when it already exists.
+    repo_storage.create_path(&PathBuf::from(&archive_dir), true)?;
+
+    // Write.
+    {
+        let mut writer: Box<dyn IoWrite> = repo_storage.open_write(&test_path)?;
+        writer.write(&payload)?;
+        writer.flush()?;
+        writer.close()?;
+    }
+
+    // Read back and compare. Always attempt removal afterwards so a comparison
+    // failure does not leak the test object.
+    let read_result: Result<Vec<u8>, CommandError> = (|| {
+        let mut reader: Box<dyn IoRead> = repo_storage.open_read(&test_path)?;
+        Ok(reader.read_all()?)
+    })();
+
+    let remove_result = repo_storage.remove(&test_path, true);
+
+    let read_back = read_result?;
+    remove_result?;
+
+    if read_back == payload {
+        Ok(true)
+    } else {
+        Err(CommandError::Other(format!(
+            "archive check for stanza '{stanza}' archive-id '{archive_id}' read back unexpected content"
+        )))
+    }
+}
+
 /// `check` — verify the configured repository is reachable and the stanza is
 /// initialized, then print the resulting [`CheckReport`].
 ///
@@ -139,8 +214,8 @@ fn probe_repo_writable(repo_storage: &dyn Storage, stanza: &str) -> Result<bool,
 pub fn check(config: &LoadedConfig, repo_storage: &dyn Storage, _pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let report = check_inner(config, repo_storage)?;
     println!(
-        "stanza '{}' check ok: db-version={} db-system-id={} repo-writable={}",
-        report.stanza, report.db_version, report.db_system_id, report.repo_writable
+        "stanza '{}' check ok: db-version={} db-system-id={} repo-writable={} archive-id={} archive-ok={}",
+        report.stanza, report.db_version, report.db_system_id, report.repo_writable, report.archive_id, report.archive_ok
     );
     Ok(())
 }
@@ -252,6 +327,9 @@ mod tests {
         assert_eq!(report.db_version, "14");
         assert_eq!(report.db_system_id, system_id);
         assert!(report.repo_writable, "repo should be reported writable");
+        // archive_info() seeds db_id = 1, so the archive-id is `<version>-1`.
+        assert_eq!(report.archive_id, "14-1");
+        assert!(report.archive_ok, "archive round trip should succeed");
     }
 
     #[test]
@@ -298,6 +376,74 @@ mod tests {
         assert!(
             matches!(storage.exists(&probe), Ok(false)),
             "probe file should not exist after check"
+        );
+    }
+
+    #[test]
+    fn check_archive_round_trip_ok() {
+        let (_dir, storage) = posix();
+        let system_id = 6_873_049_345_984_568_091;
+        // Use a non-default version so the archive-id is unambiguous (`15-1`).
+        seed_stanza(
+            &storage,
+            "demo",
+            &archive_info(system_id, "15"),
+            &backup_info(system_id, "15"),
+        );
+
+        let cfg = config_for(Some("demo"));
+        let report = check_inner(&cfg, &storage).expect("archive round trip should succeed");
+        assert_eq!(report.archive_id, "15-1");
+        assert!(report.archive_ok, "archive round trip should be reported ok");
+
+        // The test object must not survive in the archive-id directory.
+        let archive_id_dir = Path::new("archive").join("demo").join("15-1");
+        let entries = storage.list(&archive_id_dir).unwrap_or_default();
+        let leftover: Vec<_> = entries
+            .iter()
+            .filter_map(|e| e.path.file_name().and_then(|n| n.to_str()))
+            .filter(|name| name.contains(".check-"))
+            .collect();
+        assert!(leftover.is_empty(), "archive test object(s) left behind: {leftover:?}");
+
+        // The test object itself must be gone.
+        let test_obj = archive_id_dir.join(format!("15-1.check-{}", std::process::id()));
+        assert!(
+            matches!(storage.exists(&test_obj), Ok(false)),
+            "archive test object should not exist after check"
+        );
+    }
+
+    #[test]
+    fn check_archive_fails_when_archive_dir_unwritable() {
+        use pgbr_io::IoWrite;
+
+        let (_dir, storage) = posix();
+        let system_id = 99;
+        seed_stanza(
+            &storage,
+            "demo",
+            &archive_info(system_id, "16"),
+            &backup_info(system_id, "16"),
+        );
+
+        // Place a regular *file* exactly where the archive-id directory
+        // (`archive/demo/16-1`) needs to be created. `create_dir_all` then
+        // fails because a non-directory already occupies the path, so the
+        // archive round trip cannot proceed.
+        let blocker = Path::new("archive").join("demo").join("16-1");
+        {
+            let mut w = storage.open_write(&blocker).expect("write blocker file");
+            w.write(b"not a directory").expect("write blocker bytes");
+            w.flush().expect("flush blocker");
+            w.close().expect("close blocker");
+        }
+
+        let cfg = config_for(Some("demo"));
+        let err = check_inner(&cfg, &storage).expect_err("archive check must fail when the dir is unwritable");
+        assert!(
+            matches!(err, CommandError::Storage(_) | CommandError::Io(_)),
+            "expected a Storage/Io error, got {err:?}"
         );
     }
 }
