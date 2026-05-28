@@ -12,17 +12,22 @@
 //!   (`CATALOG_VERSION_NO`, `PG_CONTROL_VERSION`, `XLOG_BLCKSZ`, `BLCKSZ`)
 //!   for every supported `PostgreSQL` major version, with [`by_label`] and
 //!   [`by_catalog_version_no`] lookups.
-//! - [`mod@control`]: reader for the version-stable 16-byte prefix of
-//!   `<datadir>/global/pg_control`, decoding `system_identifier`,
-//!   `pg_control_version`, and `catalog_version_no` and cross-checking the
-//!   pair against [`mod@version`].
+//! - [`mod@control`]: reader for `<datadir>/global/pg_control`. Decodes
+//!   the version-stable 16-byte prefix (`system_identifier`,
+//!   `pg_control_version`, `catalog_version_no`, cross-checked against
+//!   [`mod@version`]) and, for the implemented layouts, the fuller
+//!   [`control::PgControlData`] (checkpoint LSN, [`control::DbState`],
+//!   page size, WAL segment size).
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod control;
 pub mod version;
 
-pub use control::{PgControlError, PgControlHeader, decode_pg_control_header, header_version, read_pg_control_header};
+pub use control::{
+    DbState, PgControlData, PgControlError, PgControlHeader, decode_pg_control_data, decode_pg_control_header, header_version,
+    read_pg_control_data, read_pg_control_header,
+};
 pub use version::{SUPPORTED, VersionInterface, by_catalog_version_no, by_label};
 
 const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;

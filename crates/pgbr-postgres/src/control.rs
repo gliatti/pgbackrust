@@ -16,6 +16,16 @@
 //!
 //! [`header_version`] resolves a decoded header back to the matching
 //! [`VersionInterface`] entry (or `None` if the catalog is unknown).
+//!
+//! Beyond the header, pgBackRest consumes a handful of further
+//! `pg_control` fields — the checkpoint LSN, the cluster [`DBState`], the
+//! page size (`BLCKSZ`) and the WAL segment size (`wal_segment_size`).
+//! These live at version-dependent offsets inside `ControlFileData`.
+//! [`decode_pg_control_data`] / [`read_pg_control_data`] decode the
+//! header and then, for the versions whose on-disk layout is known,
+//! read those extra fields from their documented byte offsets into a
+//! [`PgControlData`]. Versions whose layout isn't implemented return the
+//! header with `None` for the extra fields rather than erroring.
 
 use std::fmt;
 
@@ -186,6 +196,188 @@ pub fn header_version(header: &PgControlHeader) -> Option<&'static VersionInterf
     by_catalog_version_no(header.catalog_version_no).filter(|v| v.pg_control_version == header.pg_control_version)
 }
 
+/// Cluster status indicator stored in `pg_control` (`DBState`).
+///
+/// Mirrors the upstream `DBState` enum from `src/include/catalog/
+/// pg_control.h`, vendored in the C tree at
+/// `src/postgres/interface/version.vendor.h` (the enum is version-stable:
+/// changing it requires a `pg_control_version` bump). The numeric
+/// discriminants match the on-disk values written by `PostgreSQL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbState {
+    /// `DB_STARTUP` (0) — the cluster is starting up.
+    Startup,
+    /// `DB_SHUTDOWNED` (1) — cleanly shut down.
+    Shutdowned,
+    /// `DB_SHUTDOWNED_IN_RECOVERY` (2) — shut down while in recovery.
+    ShutdownedInRecovery,
+    /// `DB_SHUTDOWNING` (3) — in the process of shutting down.
+    Shutdowning,
+    /// `DB_IN_CRASH_RECOVERY` (4) — performing crash recovery.
+    InCrashRecovery,
+    /// `DB_IN_ARCHIVE_RECOVERY` (5) — performing archive recovery.
+    InArchiveRecovery,
+    /// `DB_IN_PRODUCTION` (6) — up and serving normally.
+    InProduction,
+}
+
+impl DbState {
+    /// Map the on-disk `u32` discriminant to a [`DbState`].
+    ///
+    /// Returns `None` for values outside the known 0..=6 range.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Startup),
+            1 => Some(Self::Shutdowned),
+            2 => Some(Self::ShutdownedInRecovery),
+            3 => Some(Self::Shutdowning),
+            4 => Some(Self::InCrashRecovery),
+            5 => Some(Self::InArchiveRecovery),
+            6 => Some(Self::InProduction),
+            _ => None,
+        }
+    }
+}
+
+/// Byte offsets of the version-specific `pg_control` fields pgBackRest
+/// reads, for `pg_control_version == 1300`.
+///
+/// `pg_control_version` 1300 is shared by `PostgreSQL` 13, 14, 15 and 16.
+/// The fields below sit at identical offsets across all four: `state`
+/// and `checkPoint` precede the embedded `CheckPoint` copy, and the
+/// `CheckPoint` struct is the same size (88 bytes) for the PG 12 and
+/// PG 14 layouts, so `blcksz` / `xlog_seg_size` land at the same place.
+///
+/// Offsets are taken from the `ControlFileData` struct in the C tree at
+/// `src/postgres/interface/version.vendor.h` (the `>= PG_VERSION_15` and
+/// `>= PG_VERSION_13` branches, which are field-identical here), itself
+/// vendored from upstream `src/include/catalog/pg_control.h`. They were
+/// verified with `offsetof` against a faithful reconstruction of the
+/// struct compiled for the x86-64 `SysV` ABI (8-byte max alignment,
+/// little-endian) — the platform pgBackRest targets.
+mod offsets_v1300 {
+    /// `DBState state` — `u32` (the C `DBState` enum is `int`-sized).
+    pub(super) const STATE: usize = 16;
+    /// `XLogRecPtr checkPoint` — `u64` little-endian.
+    pub(super) const CHECK_POINT: usize = 32;
+    /// `uint32 blcksz` — page size (`BLCKSZ`).
+    pub(super) const BLOCK_SIZE: usize = 216;
+    /// `uint32 xlog_seg_size` — WAL segment size.
+    pub(super) const WAL_SEGMENT_SIZE: usize = 228;
+    /// One past the highest field this module reads, i.e. the minimum
+    /// buffer length needed to populate every field (`xlog_seg_size`
+    /// end = 228 + 4). Used by tests to size synthetic fixtures.
+    #[cfg(test)]
+    pub(super) const MIN_LEN: usize = WAL_SEGMENT_SIZE + 4;
+}
+
+/// Fuller `pg_control` data beyond the version header. Fields pgBackRest
+/// consumes. Offsets are version-dependent; this slice supports the
+/// versions enumerated in [`decode_pg_control_data`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgControlData {
+    /// The version-stable header (`system_identifier`,
+    /// `pg_control_version`, `catalog_version_no`).
+    pub header: PgControlHeader,
+    /// Checkpoint LSN (`XLogRecPtr`). `None` if this version's offset
+    /// isn't known yet.
+    pub checkpoint: Option<u64>,
+    /// Cluster status (`DBState`). `None` if this version's offset isn't
+    /// known yet, or if the raw value isn't a recognised state.
+    pub state: Option<DbState>,
+    /// Page size in bytes (`BLCKSZ`). `None` if this version's offset
+    /// isn't known yet.
+    pub block_size: Option<u32>,
+    /// WAL segment size in bytes. `None` if this version's offset isn't
+    /// known yet.
+    pub wal_segment_size: Option<u32>,
+}
+
+/// Read a little-endian `u32` from `bytes` starting at `off`, or `None`
+/// if the slice doesn't reach `off + 4`.
+fn read_u32_at(bytes: &[u8], off: usize) -> Option<u32> {
+    bytes.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Read a little-endian `u64` from `bytes` starting at `off`, or `None`
+/// if the slice doesn't reach `off + 8`.
+fn read_u64_at(bytes: &[u8], off: usize) -> Option<u64> {
+    bytes
+        .get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+/// Decode a fuller [`PgControlData`] from the raw `pg_control` bytes.
+///
+/// Requires at least the version header. Version-specific fields are
+/// populated only for the PG versions whose layout is implemented;
+/// unknown-layout versions get `None` for those fields (the header is
+/// still returned — an unimplemented layout is not an error).
+///
+/// Currently implements the layout for `pg_control_version == 1300`
+/// (`PostgreSQL` 13–16). If the buffer ends before a given field's
+/// offset that field is left `None` even for an implemented version.
+///
+/// # Errors
+///
+/// Returns [`PgControlError`] for the same reasons as
+/// [`decode_pg_control_header`] (too short, unknown version, catalog
+/// mismatch).
+pub fn decode_pg_control_data(bytes: &[u8]) -> Result<PgControlData, PgControlError> {
+    let header = decode_pg_control_header(bytes)?;
+
+    let mut data = PgControlData {
+        header,
+        checkpoint: None,
+        state: None,
+        block_size: None,
+        wal_segment_size: None,
+    };
+
+    if header.pg_control_version == 1300 {
+        use offsets_v1300 as o;
+        data.checkpoint = read_u64_at(bytes, o::CHECK_POINT);
+        data.state = read_u32_at(bytes, o::STATE).and_then(DbState::from_raw);
+        data.block_size = read_u32_at(bytes, o::BLOCK_SIZE);
+        data.wal_segment_size = read_u32_at(bytes, o::WAL_SEGMENT_SIZE);
+    }
+
+    Ok(data)
+}
+
+/// Largest number of bytes [`read_pg_control_data`] pulls from a stream
+/// before decoding. Comfortably covers every implemented layout's
+/// highest field offset.
+const READ_DATA_CAP: usize = 512;
+
+/// Read a fuller [`PgControlData`] from an [`IoRead`] source.
+///
+/// Pulls up to [`READ_DATA_CAP`] bytes (stopping early at EOF), then
+/// defers to [`decode_pg_control_data`]. Reads fewer bytes than the cap
+/// when the source is shorter — a source carrying only the 16-byte
+/// header still decodes successfully, with `None` for the extra fields.
+///
+/// # Errors
+///
+/// See variants of [`PgControlError`]. A source shorter than the 16-byte
+/// header surfaces as [`PgControlError::TooShort`].
+pub fn read_pg_control_data<R: IoRead>(read: &mut R) -> Result<PgControlData, PgControlError> {
+    let mut buf = Vec::with_capacity(READ_DATA_CAP);
+    let mut chunk = [0u8; READ_DATA_CAP];
+
+    while buf.len() < READ_DATA_CAP {
+        let want = READ_DATA_CAP - buf.len();
+        let n = read.read(&mut chunk[..want])?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    decode_pg_control_data(&buf)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -293,5 +485,135 @@ mod tests {
                 catalog_version_no: u32::MAX,
             },
         );
+    }
+
+    /// Resolve the registry entry for a given label, panicking if absent.
+    fn version(label: &str) -> &'static VersionInterface {
+        crate::version::by_label(label).expect("label present in SUPPORTED")
+    }
+
+    /// Build a synthetic `pg_control` buffer for a `pg_control_version
+    /// == 1300` cluster (PG 13–16), writing the extra fields at the
+    /// offsets [`decode_pg_control_data`] reads. This is a
+    /// self-consistency fixture: the writer mirrors the reader's offsets,
+    /// which proves internal consistency, not agreement with a real
+    /// `PostgreSQL` `pg_control` (verified separately via `offsetof` —
+    /// see the `offsets_v1300` doc comment).
+    fn synth_v1300(state: u32, checkpoint: u64, block_size: u32, wal_seg: u32) -> Vec<u8> {
+        let v = version("16");
+        let mut buf = vec![0u8; offsets_v1300::MIN_LEN];
+        buf[0..8].copy_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
+        buf[8..12].copy_from_slice(&v.pg_control_version.to_le_bytes());
+        buf[12..16].copy_from_slice(&v.catalog_version_no.to_le_bytes());
+        buf[offsets_v1300::STATE..offsets_v1300::STATE + 4].copy_from_slice(&state.to_le_bytes());
+        buf[offsets_v1300::CHECK_POINT..offsets_v1300::CHECK_POINT + 8].copy_from_slice(&checkpoint.to_le_bytes());
+        buf[offsets_v1300::BLOCK_SIZE..offsets_v1300::BLOCK_SIZE + 4].copy_from_slice(&block_size.to_le_bytes());
+        buf[offsets_v1300::WAL_SEGMENT_SIZE..offsets_v1300::WAL_SEGMENT_SIZE + 4].copy_from_slice(&wal_seg.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn decode_data_falls_back_to_header_for_unknown_layout() {
+        // PG 18 (pg_control_version 1800) has no implemented extra-field
+        // layout yet, so only the header is populated.
+        let v = version("18");
+        let bytes = synth_header(v, 0xabcd_ef01_2345_6789);
+        let data = decode_pg_control_data(&bytes).expect("header decodes");
+
+        assert_eq!(data.header.system_identifier, 0xabcd_ef01_2345_6789);
+        assert_eq!(data.header.pg_control_version, 1800);
+        assert_eq!(data.checkpoint, None);
+        assert_eq!(data.state, None);
+        assert_eq!(data.block_size, None);
+        assert_eq!(data.wal_segment_size, None);
+    }
+
+    #[test]
+    fn decode_data_reads_block_size_for_v1300() {
+        let buf = synth_v1300(6 /* DB_IN_PRODUCTION */, 0x1_2345_6789, 8192, 16 * 1024 * 1024);
+        let data = decode_pg_control_data(&buf).expect("v1300 decodes");
+
+        assert_eq!(data.header.pg_control_version, 1300);
+        assert_eq!(data.checkpoint, Some(0x1_2345_6789));
+        assert_eq!(data.state, Some(DbState::InProduction));
+        assert_eq!(data.block_size, Some(8192));
+        assert_eq!(data.wal_segment_size, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn decode_data_too_short_errors() {
+        let bytes = [0u8; 8];
+        let err = decode_pg_control_data(&bytes).expect_err("too short must error");
+        assert_eq!(err, PgControlError::TooShort { read: 8 });
+    }
+
+    #[test]
+    fn decode_data_unknown_state_value_is_none() {
+        // A v1300 buffer whose state byte holds a value outside 0..=6.
+        let buf = synth_v1300(42, 7, 8192, 8192);
+        let data = decode_pg_control_data(&buf).expect("v1300 decodes");
+        assert_eq!(data.state, None, "unrecognised DBState maps to None");
+        // The other fields still decode normally.
+        assert_eq!(data.block_size, Some(8192));
+    }
+
+    #[test]
+    fn decode_data_v1300_truncated_after_header_leaves_extras_none() {
+        // A v1300 header with nothing past byte 16: the extra-field reads
+        // fall off the end of the slice and yield None without erroring.
+        let v = version("16");
+        let bytes = synth_header(v, 1);
+        let data = decode_pg_control_data(&bytes).expect("header-only v1300 decodes");
+
+        assert_eq!(data.header.pg_control_version, 1300);
+        assert_eq!(data.checkpoint, None);
+        assert_eq!(data.state, None);
+        assert_eq!(data.block_size, None);
+        assert_eq!(data.wal_segment_size, None);
+    }
+
+    #[test]
+    fn read_data_through_io_read_decodes_full_buffer() {
+        let buf = synth_v1300(1 /* DB_SHUTDOWNED */, 0xff00, 8192, 64 * 1024 * 1024);
+        let mut reader = MemRead::new(buf);
+        let data = read_pg_control_data(&mut reader).expect("read_pg_control_data");
+
+        assert_eq!(data.state, Some(DbState::Shutdowned));
+        assert_eq!(data.checkpoint, Some(0xff00));
+        assert_eq!(data.block_size, Some(8192));
+        assert_eq!(data.wal_segment_size, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn read_data_header_only_stream_yields_none_extras() {
+        let v = version("16");
+        let bytes = synth_header(v, 9).to_vec();
+        let mut reader = MemRead::new(bytes);
+        let data = read_pg_control_data(&mut reader).expect("header-only stream decodes");
+
+        assert_eq!(data.header.system_identifier, 9);
+        assert_eq!(data.block_size, None);
+    }
+
+    #[test]
+    fn read_data_short_stream_errors_too_short_via_decode() {
+        // The streaming path reads what's available (8 bytes), then the
+        // in-memory decode reports the typed TooShort.
+        let mut reader = MemRead::new(vec![0u8; 8]);
+        let err = read_pg_control_data(&mut reader).expect_err("short stream must error");
+        assert_eq!(err, PgControlError::TooShort { read: 8 });
+    }
+
+    #[test]
+    fn dbstate_from_raw_covers_all_variants() {
+        assert_eq!(DbState::from_raw(0), Some(DbState::Startup));
+        assert_eq!(DbState::from_raw(1), Some(DbState::Shutdowned));
+        assert_eq!(DbState::from_raw(2), Some(DbState::ShutdownedInRecovery));
+        assert_eq!(DbState::from_raw(3), Some(DbState::Shutdowning));
+        assert_eq!(DbState::from_raw(4), Some(DbState::InCrashRecovery));
+        assert_eq!(DbState::from_raw(5), Some(DbState::InArchiveRecovery));
+        assert_eq!(DbState::from_raw(6), Some(DbState::InProduction));
+        assert_eq!(DbState::from_raw(7), None);
+        assert_eq!(DbState::from_raw(u32::MAX), None);
     }
 }
