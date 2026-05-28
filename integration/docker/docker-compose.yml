@@ -53,6 +53,21 @@ services:
       - ../artifacts/ssh:/shared-ssh:ro
       - secondaire-data:/var/lib/postgresql/16/secondaire
 
+  # S3-compatible object store for the KB "Sauvegarde vers un dépôt S3"
+  # scenario (repo1-type=s3). Bucket is created by scenario 11.
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    container_name: pgbr-minio
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: pgbackrest
+      MINIO_ROOT_PASSWORD: pgbackrest-secret
+    networks:
+      - pgbr
+    volumes:
+      - minio-data:/data
+
 networks:
   pgbr:
     name: pgbr-net
@@ -61,3 +76,4 @@ volumes:
   depot-repo:
   principal-data:
   secondaire-data:
+  minio-data:
