@@ -304,6 +304,83 @@ pub fn serve<R: IoRead, W: IoWrite, H: RequestHandler>(
     }
 }
 
+/// The SSH client program pgBackRest invokes to reach a remote worker.
+/// Matches the default of pgBackRest's `cmd-ssh` option.
+pub const SSH_PROGRAM: &str = "ssh";
+
+/// The default worker program name spawned on the local or remote side.
+pub const PGBACKREST_PROGRAM: &str = "pgbackrest";
+
+/// Build the argument vector for launching a remote worker over SSH.
+///
+/// Models pgBackRest's `protocolRemoteParamSsh` (`src/protocol/helper.c`):
+/// a fixed block of hardening `-o` options, an optional `-p <port>`, the
+/// `[<user>@]<host>` destination, then the remote program followed by its
+/// arguments. The returned tuple is `("ssh", args)` where the program name
+/// is [`SSH_PROGRAM`]; pass it straight to [`ProcessClient::spawn`].
+///
+/// The `-o` block pins the connection to deterministic, non-interactive
+/// behaviour:
+/// - `LogLevel=error`, `Compression=no`, `PasswordAuthentication=no` —
+///   carried over verbatim from the C implementation, and
+/// - `StrictHostKeyChecking=accept-new` — accept a first-seen host key but
+///   still refuse a *changed* key, so the spawn never blocks on an
+///   interactive prompt while preserving man-in-the-middle protection.
+///
+/// `ssh_port` and `ssh_user` are emitted only when set, exactly as the C
+/// builder tests `cfgOptionIdxTest` / formats `user@host`. The arg vector is
+/// fully deterministic for a given input, which is what the unit tests pin.
+#[must_use]
+pub fn build_ssh_command(
+    host: &str,
+    ssh_port: Option<u16>,
+    ssh_user: Option<&str>,
+    remote_program: &str,
+    remote_args: &[String],
+) -> (String, Vec<String>) {
+    let mut args: Vec<String> = Vec::with_capacity(8 + 1 + remote_args.len());
+
+    // Fixed hardening options (mirror protocolRemoteParamSsh).
+    args.push("-o".to_owned());
+    args.push("LogLevel=error".to_owned());
+    args.push("-o".to_owned());
+    args.push("Compression=no".to_owned());
+    args.push("-o".to_owned());
+    args.push("PasswordAuthentication=no".to_owned());
+    args.push("-o".to_owned());
+    args.push("StrictHostKeyChecking=accept-new".to_owned());
+
+    // Optional port.
+    if let Some(port) = ssh_port {
+        args.push("-p".to_owned());
+        args.push(port.to_string());
+    }
+
+    // Destination: `user@host` when a user is set, otherwise bare `host`.
+    match ssh_user {
+        Some(user) => args.push(format!("{user}@{host}")),
+        None => args.push(host.to_owned()),
+    }
+
+    // Remote program then its arguments (the worker role + config flags the
+    // caller supplies, e.g. `--remote`).
+    args.push(remote_program.to_owned());
+    args.extend(remote_args.iter().cloned());
+
+    (SSH_PROGRAM.to_owned(), args)
+}
+
+/// Build the argument vector for launching a worker on the local host.
+///
+/// Models pgBackRest's `protocolLocalParam`: there is no SSH wrapper, just
+/// the `pgbackrest` program itself plus the role / config arguments the
+/// caller supplies (e.g. `["--local", ...]`). Returns `(program, role_args)`
+/// ready for [`ProcessClient::spawn`].
+#[must_use]
+pub fn build_local_command(program: &str, role_args: &[String]) -> (String, Vec<String>) {
+    (program.to_owned(), role_args.to_vec())
+}
+
 /// Spawns a child worker (`pgbackrest --remote` / `--local`) with piped
 /// stdin/stdout and exchanges protocol messages with it.
 ///
@@ -344,6 +421,44 @@ impl ProcessClient {
 
         let client = ProtocolClient::new(PipeRead::new(stdout), PipeWrite::new(stdin));
         Ok(Self { child, client })
+    }
+
+    /// Spawn a remote worker over SSH (`ssh [opts] [-p port] [user@]host
+    /// pgbackrest --remote ...`).
+    ///
+    /// Builds the SSH command line with [`build_ssh_command`] and delegates to
+    /// [`ProcessClient::spawn`], so the protocol then runs over the local
+    /// `ssh` process's piped stdin/stdout — the SSH client transparently
+    /// forwards them to the remote `pgbackrest` worker's stdin/stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Spawn`] if the `ssh` process cannot be spawned
+    /// or either pipe handle is unexpectedly missing.
+    pub fn spawn_ssh(
+        host: &str,
+        ssh_port: Option<u16>,
+        ssh_user: Option<&str>,
+        remote_program: &str,
+        remote_args: &[String],
+    ) -> Result<Self, ProtocolError> {
+        let (command, args) = build_ssh_command(host, ssh_port, ssh_user, remote_program, remote_args);
+        Self::spawn(&command, &args)
+    }
+
+    /// Spawn a local worker (`program role_args...`, e.g. `pgbackrest
+    /// --local ...`).
+    ///
+    /// Builds the command line with [`build_local_command`] and delegates to
+    /// [`ProcessClient::spawn`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Spawn`] if the process cannot be spawned or
+    /// either pipe handle is unexpectedly missing.
+    pub fn spawn_local(program: &str, args: &[String]) -> Result<Self, ProtocolError> {
+        let (command, args) = build_local_command(program, args);
+        Self::spawn(&command, &args)
     }
 
     /// Send `request` to the worker and return its [`OkResponse`].
@@ -611,6 +726,105 @@ mod tests {
         drop(writer);
         // Drain any trailing output so cat is never blocked writing to a full
         // pipe, then wait for it to exit cleanly.
+        let _ = reader.read_all();
+        let status = child.wait().expect("wait for cat");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn build_ssh_command_minimal() {
+        let (program, args) = build_ssh_command(
+            "repo1.example.com",
+            None,
+            None,
+            "pgbackrest",
+            &["--remote".to_owned(), "info".to_owned()],
+        );
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "LogLevel=error",
+                "-o",
+                "Compression=no",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "repo1.example.com",
+                "pgbackrest",
+                "--remote",
+                "info",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_command_with_port_and_user() {
+        let (program, args) = build_ssh_command(
+            "db1.example.com",
+            Some(2222),
+            Some("postgres"),
+            "pgbackrest",
+            &["--remote".to_owned()],
+        );
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "LogLevel=error",
+                "-o",
+                "Compression=no",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-p",
+                "2222",
+                "postgres@db1.example.com",
+                "pgbackrest",
+                "--remote",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_local_command_passes_args() {
+        let (program, args) = build_local_command("pgbackrest", &["--local".to_owned(), "--process=1".to_owned()]);
+        assert_eq!(program, "pgbackrest");
+        assert_eq!(args, vec!["--local", "--process=1"]);
+
+        // No args still yields just the program with an empty arg vector.
+        let (program, args) = build_local_command("/usr/bin/pgbackrest", &[]);
+        assert_eq!(program, "/usr/bin/pgbackrest");
+        assert!(args.is_empty());
+    }
+
+    /// `spawn_local` wires the command up through the same piped-stdio path as
+    /// [`ProcessClient::spawn`]. We point it at `/bin/cat` (an echo) and reuse
+    /// the manual-framing FD check from [`process_client_spawns_and_exchanges`]
+    /// to prove the local spawn path plumbs file descriptors end to end.
+    /// Unix-only: depends on `/bin/cat`.
+    #[test]
+    #[cfg_attr(not(unix), ignore)]
+    fn spawn_local_runs_echo() {
+        let proc = ProcessClient::spawn_local("/bin/cat", &[]).expect("spawn_local /bin/cat");
+        let ProcessClient { mut child, client } = proc;
+        let ProtocolClient { mut reader, mut writer } = client;
+
+        let request = Message::Request(Request {
+            cmd: "echoLocal".to_owned(),
+            param: vec![json!("payload")],
+        });
+        write_message(&mut writer, &request).unwrap();
+        writer.flush().unwrap();
+
+        let echoed = read_message(&mut reader).unwrap().unwrap();
+        assert_eq!(echoed, request);
+
+        drop(writer);
         let _ = reader.read_all();
         let status = child.wait().expect("wait for cat");
         assert!(status.success());

@@ -26,5 +26,6 @@ pub use crate::codec::{CodecError, read_message, write_message};
 pub use crate::message::{ErrResponse, Message, OkResponse, Request, Response};
 pub use crate::parallel::{Job, JobResult, ParallelExecutor};
 pub use crate::transport::{
-    EXIT_COMMAND, NOOP_COMMAND, PipeRead, PipeWrite, ProcessClient, ProtocolClient, ProtocolError, RequestHandler, serve,
+    EXIT_COMMAND, NOOP_COMMAND, PGBACKREST_PROGRAM, PipeRead, PipeWrite, ProcessClient, ProtocolClient, ProtocolError,
+    RequestHandler, SSH_PROGRAM, build_local_command, build_ssh_command, serve,
 };
