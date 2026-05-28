@@ -145,11 +145,7 @@ fn backup_references(value: &serde_json::Value) -> Vec<String> {
     value
         .get("backup-reference")
         .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>())
         .unwrap_or_default()
 }
 
@@ -164,7 +160,10 @@ fn set_option(config: &LoadedConfig) -> Option<String> {
 /// Whether `--oldest` was supplied (expire the oldest full backup set,
 /// bypassing the retention rules).
 fn oldest_option(config: &LoadedConfig) -> bool {
-    matches!(config.options.get(&("oldest".to_owned(), None)), Some(OptionValue::Boolean(true)))
+    matches!(
+        config.options.get(&("oldest".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
 }
 
 /// Forward transitive closure of dependents: every backup in `current` that
@@ -192,10 +191,7 @@ fn dependent_closure(current: &std::collections::BTreeMap<String, serde_json::Va
 }
 
 /// Count the full backups in `current` that are NOT in `expire`.
-fn remaining_full_count(
-    current: &std::collections::BTreeMap<String, serde_json::Value>,
-    expire: &[String],
-) -> usize {
+fn remaining_full_count(current: &std::collections::BTreeMap<String, serde_json::Value>, expire: &[String]) -> usize {
     let expire_set: std::collections::BTreeSet<&String> = expire.iter().collect();
     current
         .iter()
@@ -205,12 +201,7 @@ fn remaining_full_count(
 
 /// Remove the on-disk directories for `labels`, drop them from `info.current`,
 /// and persist `backup.info` when anything changed. Shared by both adhoc paths.
-fn remove_backups(
-    repo: &dyn Storage,
-    stanza: &str,
-    info: &mut InfoBackup,
-    labels: &[String],
-) -> Result<(), CommandError> {
+fn remove_backups(repo: &dyn Storage, stanza: &str, info: &mut InfoBackup, labels: &[String]) -> Result<(), CommandError> {
     for label in labels {
         let path = PathBuf::from(format!("backup/{stanza}/{label}"));
         match repo.remove_path(&path, true, false) {
@@ -276,12 +267,7 @@ fn expire_adhoc_set(
         )));
     }
 
-    let kept_labels: Vec<String> = info
-        .current
-        .keys()
-        .filter(|l| !expire.contains(*l))
-        .cloned()
-        .collect();
+    let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
     remove_backups(repo, stanza, info, &expire)?;
     let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
     Ok(ExpireSummary {
@@ -305,11 +291,7 @@ fn expire_adhoc_oldest(
         .current
         .iter()
         .filter(|(_, v)| backup_type(v) == "full")
-        .min_by(|(a_l, a_v), (b_l, b_v)| {
-            timestamp_stop(a_v)
-                .cmp(&timestamp_stop(b_v))
-                .then_with(|| a_l.cmp(b_l))
-        })
+        .min_by(|(a_l, a_v), (b_l, b_v)| timestamp_stop(a_v).cmp(&timestamp_stop(b_v)).then_with(|| a_l.cmp(b_l)))
         .map(|(label, _)| label.clone());
 
     let Some(oldest_full) = oldest_full else {
@@ -328,12 +310,7 @@ fn expire_adhoc_oldest(
     }
 
     let expire = dependent_closure(&info.current, std::slice::from_ref(&oldest_full));
-    let kept_labels: Vec<String> = info
-        .current
-        .keys()
-        .filter(|l| !expire.contains(*l))
-        .cloned()
-        .collect();
+    let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
     remove_backups(repo, stanza, info, &expire)?;
     let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
     Ok(ExpireSummary {
@@ -1352,7 +1329,8 @@ mod tests {
     /// `expire` config carrying `--set=<label>`.
     fn cfg_set(stanza: Option<&str>, set: &str) -> LoadedConfig {
         let mut cfg = cfg(stanza, None);
-        cfg.options.insert(("set".to_owned(), None), OptionValue::String(set.to_owned()));
+        cfg.options
+            .insert(("set".to_owned(), None), OptionValue::String(set.to_owned()));
         cfg
     }
 

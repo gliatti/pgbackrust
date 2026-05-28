@@ -22,9 +22,7 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_protocol::PGBACKREST_PROGRAM;
-use pgbr_storage::{
-    Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage,
-};
+use pgbr_storage::{Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage};
 
 use crate::CliRunError;
 use crate::remote_storage::RemoteProcessStorage;
@@ -261,14 +259,12 @@ fn build_gcs(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunError> {
 fn sftp_config_from(cfg: &LoadedConfig) -> Result<SftpConfig, CliRunError> {
     let host = require_string(cfg, "repo-sftp-host")?;
     let user = require_string(cfg, "repo-sftp-host-user")?;
-    let private_key = path_option(cfg, "repo-sftp-private-key-file").ok_or_else(|| {
-        CliRunError::StorageConfig("repo-type=sftp requires repo-sftp-private-key-file".to_owned())
-    })?;
+    let private_key = path_option(cfg, "repo-sftp-private-key-file")
+        .ok_or_else(|| CliRunError::StorageConfig("repo-type=sftp requires repo-sftp-private-key-file".to_owned()))?;
     let passphrase = string_option(cfg, "repo-sftp-private-key-passphrase");
     let port = match integer_option(cfg, "repo-sftp-host-port") {
         None => pgbr_storage::sftp::DEFAULT_PORT,
-        Some(n) => u16::try_from(n)
-            .map_err(|_| CliRunError::StorageConfig(format!("repo-sftp-host-port out of range: {n}")))?,
+        Some(n) => u16::try_from(n).map_err(|_| CliRunError::StorageConfig(format!("repo-sftp-host-port out of range: {n}")))?,
     };
     let base_path = path_option(cfg, "repo-path").unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_PATH));
     Ok(SftpConfig {
@@ -582,7 +578,11 @@ mod tests {
             "info",
             &[
                 ("repo-type", Some(1), OptionValue::StringId("sftp".to_owned())),
-                ("repo-sftp-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                (
+                    "repo-sftp-host",
+                    Some(1),
+                    OptionValue::String("backup.example.com".to_owned()),
+                ),
                 ("repo-sftp-host-user", Some(1), OptionValue::String("pgbackrest".to_owned())),
                 (
                     "repo-sftp-private-key-file",
@@ -633,7 +633,10 @@ mod tests {
     #[test]
     fn sftp_config_from_requires_host_user_and_key() {
         // Missing host.
-        let c1 = cfg("info", &[("repo-sftp-host-user", Some(1), OptionValue::String("u".to_owned()))]);
+        let c1 = cfg(
+            "info",
+            &[("repo-sftp-host-user", Some(1), OptionValue::String("u".to_owned()))],
+        );
         assert!(matches!(sftp_config_from(&c1), Err(CliRunError::StorageConfig(_))));
         // Missing private key.
         let c2 = cfg(

@@ -183,9 +183,8 @@ impl<'conn> ConnCheckDb<'conn> {
 
 impl CheckDb for ConnCheckDb<'_> {
     fn version(&mut self) -> Result<u32, CommandError> {
-        let raw = self.scalar(
-            "select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4::text",
-        )?;
+        let raw =
+            self.scalar("select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4::text")?;
         raw.trim()
             .parse::<u32>()
             .map_err(|_| CommandError::Other(format!("could not parse server_version_num {raw:?}")))
@@ -266,9 +265,7 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
 
     let opt = |name: &str| -> Option<String> {
         match config.options.get(&(name.to_owned(), None)) {
-            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => {
-                Some(s.clone())
-            }
+            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
             Some(OptionValue::Integer(i)) => Some(i.to_string()),
             _ => None,
         }
@@ -671,8 +668,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CheckDb, CommandError, archive_timeout, check_inner, check_pg, derive_conninfo_with_url,
-        pg_version_label_from_num, wait_for_segment, wal_function_names,
+        CheckDb, CommandError, archive_timeout, check_inner, check_pg, derive_conninfo_with_url, pg_version_label_from_num,
+        wait_for_segment, wal_function_names,
     };
 
     /// In-memory [`CheckDb`] driving the live-PG flow without a real server.
