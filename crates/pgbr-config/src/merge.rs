@@ -1,22 +1,23 @@
-//! Merge CLI input + `pgbackrest.conf` + option defaults into a final
-//! [`LoadedConfig`].
+//! Merge CLI input + `PGBACKREST_<OPTION>` env vars + `pgbackrest.conf` +
+//! option defaults into a final [`LoadedConfig`].
 //!
 //! Precedence, highest to lowest:
 //!
 //! 1. Explicit CLI argument (`--option=value`).
-//! 2. `[<stanza>:<command>]` section in the INI file.
-//! 3. `[<stanza>]` section.
-//! 4. `[global:<command>]` section.
-//! 5. `[global]` section.
-//! 6. Per-command override default (`option.<name>.command.<command>.default`).
-//! 7. Option default (`option.<name>.default`).
+//! 2. `PGBACKREST_<OPTION>` environment variable (see [`crate::env`]).
+//! 3. `[<stanza>:<command>]` section in the INI file.
+//! 4. `[<stanza>]` section.
+//! 5. `[global:<command>]` section.
+//! 6. `[global]` section.
+//! 7. Per-command override default (`option.<name>.command.<command>.default`).
+//! 8. Option default (`option.<name>.default`).
 //!
-//! `--reset-X` wipes the value at every level above defaults; the option
-//! still gets its default applied.
+//! `--reset-X` wipes the value at every level above defaults (env included);
+//! the option still gets its default applied.
 //!
 //! Indexed groups (`pg`, `repo`): the merge auto-discovers which group
 //! indices are configured by scanning for `<prefix><N>-` keys across every
-//! section, plus any indices that appear in the CLI input.
+//! section, plus any indices that appear in the CLI input or the env map.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -27,6 +28,11 @@ use crate::ini::{IniFile, IniSection};
 use crate::option::CfgOption;
 use crate::types::{ConfigCommandRole, DefaultType, OptionGroup, OptionType};
 use crate::value::{OptionValue, ValueError, parse_value};
+
+/// Raw `PGBACKREST_<OPTION>` env values keyed by `(option_name, group_index)`,
+/// as produced by [`crate::env::collect_env`]. Slotted into the merge between
+/// the CLI and the INI file.
+pub type EnvValues = BTreeMap<(String, Option<u32>), String>;
 
 /// The `default:` tag (used with `default-type: dynamic`) whose value is the
 /// running executable's path — i.e. `argv[0]`. In `config.yaml` the `cmd`,
@@ -229,12 +235,40 @@ pub fn load_config_with_context(
     cfg: &Cfg,
     ctx: &RuntimeContext,
 ) -> Result<LoadedConfig, LoadError> {
+    load_config_with_env(cli, &EnvValues::new(), ini, cfg, ctx)
+}
+
+/// Merge a [`ResolvedCli`], the `PGBACKREST_<OPTION>` environment values
+/// (`env`), an [`IniFile`], and the defaults from a compiled [`Cfg`] into a
+/// final [`LoadedConfig`].
+///
+/// This is the full five-source entry point. The env values sit between the
+/// CLI and the INI file in precedence (CLI > ENV > stanza:cmd > stanza >
+/// global:cmd > global > default). `env` holds raw strings keyed by
+/// `(option_name, group_index)` (build it with [`crate::env::collect_env`] /
+/// [`crate::env::env_values_from_process`]); each value is parsed via
+/// [`crate::value::parse_value`] exactly like an INI value. Pass an empty map
+/// to disable the env source — [`load_config_with_context`] and [`load_config`]
+/// do precisely that for backward compatibility.
+///
+/// # Errors
+///
+/// Returns [`LoadError`] when a CLI / env / INI value fails to parse, when a
+/// required option is missing, or when validation (allow-list, allow-range,
+/// depend) fails.
+pub fn load_config_with_env(
+    cli: ResolvedCli,
+    env: &EnvValues,
+    ini: &IniFile,
+    cfg: &Cfg,
+    ctx: &RuntimeContext,
+) -> Result<LoadedConfig, LoadError> {
     let stanza = extract_stanza(&cli);
     let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
 
-    // Discover indices for each grouped option from CLI + every INI section
-    // by scanning the raw keys.
-    let group_indices = discover_group_indices(&cli, ini, cfg);
+    // Discover indices for each grouped option from CLI + env + every INI
+    // section by scanning the raw keys.
+    let group_indices = discover_group_indices(&cli, env, ini, cfg);
 
     // Per-flavor sequence defaults are deferred to a second pass so the
     // flavor-source option (e.g. `compress-type`) is already resolved when
@@ -278,6 +312,12 @@ pub fn load_config_with_context(
             // Reset short-circuits everything except defaults.
             let resetted = cli.resets.contains(&key);
             let cli_value = cli.options.get(&key).cloned();
+            // Env sits below the CLI but above the INI file; reset wipes it too.
+            let env_value = if resetted {
+                None
+            } else {
+                lookup_env(name, idx, env, opt.option_type)?
+            };
             let ini_value = if resetted {
                 None
             } else {
@@ -285,11 +325,13 @@ pub fn load_config_with_context(
             };
             // Whether the value (if any) comes from an explicit source rather
             // than a default — drives depend gating below.
-            let is_explicit = cli_value.is_some() || ini_value.is_some();
+            let is_explicit = cli_value.is_some() || env_value.is_some() || ini_value.is_some();
             // A per-flavor sequence default is deferred to pass two so the
             // flavor source is resolved first; everything else resolves now.
             let mut deferred = false;
             let final_value = if let Some(v) = cli_value {
+                Some(v)
+            } else if let Some(v) = env_value {
                 Some(v)
             } else if let Some(v) = ini_value {
                 Some(v)
@@ -365,10 +407,17 @@ fn extract_stanza(cli: &ResolvedCli) -> Option<String> {
     })
 }
 
-fn discover_group_indices(cli: &ResolvedCli, ini: &IniFile, cfg: &Cfg) -> BTreeMap<String, BTreeSet<u32>> {
+fn discover_group_indices(cli: &ResolvedCli, env: &EnvValues, ini: &IniFile, cfg: &Cfg) -> BTreeMap<String, BTreeSet<u32>> {
     let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
 
     for (name, idx) in cli.options.keys().chain(cli.resets.iter()) {
+        if let Some(i) = idx {
+            out.entry(name.clone()).or_default().insert(*i);
+        }
+    }
+
+    // Env values are already decoded to `(option_name, group_index)` keys.
+    for (name, idx) in env.keys() {
         if let Some(i) = idx {
             out.entry(name.clone()).or_default().insert(*i);
         }
@@ -404,6 +453,27 @@ fn decode_grouped_key(raw_key: &str, cfg: &Cfg) -> Option<(String, u32)> {
         }
     }
     None
+}
+
+/// Resolve the `PGBACKREST_<OPTION>` env value for `(option_name, group_index)`
+/// from the pre-collected `env` map, parsing the raw string as `option_type`
+/// (just like [`lookup_ini`]). Returns `None` when no env var was set for this
+/// key.
+fn lookup_env(
+    option_name: &str,
+    group_index: Option<u32>,
+    env: &EnvValues,
+    option_type: OptionType,
+) -> Result<Option<OptionValue>, LoadError> {
+    let Some(raw) = env.get(&(option_name.to_owned(), group_index)) else {
+        return Ok(None);
+    };
+    let value = parse_value(option_type, raw).map_err(|error| LoadError::ValueParse {
+        option: option_name.to_owned(),
+        group_index,
+        error,
+    })?;
+    Ok(Some(value))
 }
 
 fn lookup_ini(
@@ -903,6 +973,18 @@ option:
         let resolved = resolve_cli(cli, &cfg).map_err(|e| e.to_string())?;
         let ini = crate::ini::parse_ini(ini_text).map_err(|e| e.to_string())?;
         load_config(resolved, &ini, &cfg).map_err(|e| e.to_string())
+    }
+
+    /// Like [`load`] but threads a `PGBACKREST_<OPTION>` environment through an
+    /// injected lookup, exercising the full five-source merge.
+    fn load_with_env(cli_args: &[&str], env: &[(&str, &str)], ini_text: &str) -> Result<LoadedConfig, String> {
+        let cfg = small_cfg();
+        let cli = parse_cli(cli_args.iter().map(|s| (*s).to_owned())).map_err(|e| e.to_string())?;
+        let resolved = resolve_cli(cli, &cfg).map_err(|e| e.to_string())?;
+        let ini = crate::ini::parse_ini(ini_text).map_err(|e| e.to_string())?;
+        let env_map: BTreeMap<&str, &str> = env.iter().copied().collect();
+        let env_values = crate::env::collect_env(&cfg, |name| env_map.get(name).map(|v| (*v).to_owned()));
+        load_config_with_env(resolved, &env_values, &ini, &cfg, &RuntimeContext::default()).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -1656,5 +1738,67 @@ option:
             r.options[&("repo-path".into(), Some(1))],
             OptionValue::Path("/var/lib/pgbackrest".into())
         );
+    }
+
+    // ---- PGBACKREST_<OPTION> environment source ----------------------------
+
+    #[test]
+    fn env_overrides_ini_and_default() {
+        // buffer-size: env beats the [global] INI value; log-level-file: env
+        // beats the option default. pg-path comes from the CLI (required).
+        let r = load_with_env(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &[("PGBACKREST_BUFFER_SIZE", "4MiB"), ("PGBACKREST_LOG_LEVEL_FILE", "debug")],
+            "[global]\nbuffer-size=2MiB\n",
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(4 * 1024 * 1024));
+        assert_eq!(
+            r.options[&("log-level-file".into(), None)],
+            OptionValue::StringId("debug".into())
+        );
+    }
+
+    #[test]
+    fn cli_overrides_env() {
+        // CLI buffer-size wins over the env var, which would otherwise win.
+        let r = load_with_env(
+            &["backup", "--stanza=demo", "--pg1-path=/data", "--buffer-size=8MiB"],
+            &[("PGBACKREST_BUFFER_SIZE", "4MiB")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn env_grouped_index_and_boolean() {
+        // A grouped env var (PGBACKREST_PG1_PATH) decodes to (pg-path, 1), and a
+        // boolean env value uses the y/n spelling.
+        let r = load_with_env(
+            &["backup", "--stanza=demo"],
+            &[("PGBACKREST_PG1_PATH", "/env/pg"), ("PGBACKREST_ONLINE", "n")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(r.options[&("pg-path".into(), Some(1))], OptionValue::Path("/env/pg".into()));
+        assert_eq!(r.options[&("online".into(), None)], OptionValue::Boolean(false));
+    }
+
+    #[test]
+    fn empty_env_map_matches_plain_load_config() {
+        // load_config (empty env) and load_config_with_env (empty env) agree.
+        let plain = load(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            "[global]\nbuffer-size=2MiB\n",
+        )
+        .unwrap();
+        let with_empty_env = load_with_env(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &[],
+            "[global]\nbuffer-size=2MiB\n",
+        )
+        .unwrap();
+        assert_eq!(plain, with_empty_env);
     }
 }
