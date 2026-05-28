@@ -798,7 +798,10 @@ fn start_fast_enabled(config: &LoadedConfig) -> bool {
 /// for `archive-check` / `archive-mode-check` / `page-header-check`): unset or
 /// non-boolean resolves to `true`; only an explicit `false` disables it.
 fn boolean_default_true(config: &LoadedConfig, name: &str) -> bool {
-    !matches!(config.options.get(&(name.to_owned(), None)), Some(OptionValue::Boolean(false)))
+    !matches!(
+        config.options.get(&(name.to_owned(), None)),
+        Some(OptionValue::Boolean(false))
+    )
 }
 
 /// Whether `archive-check` is enabled (default true). When on, a DB-driven
@@ -827,9 +830,7 @@ fn page_header_check_enabled(config: &LoadedConfig) -> bool {
 fn archive_timeout(config: &LoadedConfig) -> std::time::Duration {
     match config.options.get(&("archive-timeout".to_owned(), None)) {
         Some(OptionValue::Time(ms)) => std::time::Duration::from_millis(*ms),
-        Some(OptionValue::Integer(secs)) if *secs >= 0 => {
-            std::time::Duration::from_secs(u64::try_from(*secs).unwrap_or(60))
-        }
+        Some(OptionValue::Integer(secs)) if *secs >= 0 => std::time::Duration::from_secs(u64::try_from(*secs).unwrap_or(60)),
         _ => std::time::Duration::from_secs(60),
     }
 }
@@ -2224,7 +2225,9 @@ fn run_backup(
     // restored to consistency without it. Done after the bracket (which yields
     // the segment range) and before archive-copy (which also needs them present).
     // C ref: backupArchiveCheckCopy() in src/command/backup/backup.c.
-    if integrity.archive_check && let Some(bracket) = bracket.as_ref() {
+    if integrity.archive_check
+        && let Some(bracket) = bracket.as_ref()
+    {
         wait_for_required_wal(repo_storage, stanza, bracket, integrity.archive_timeout, WAL_POLL_INTERVAL)?;
     }
 
@@ -5137,8 +5140,8 @@ mod tests {
             page_header_check: false,
             archive_timeout: std::time::Duration::from_millis(10),
         };
-        let err = run_backup_with_integrity(&repo_s, &pg_s, &mut control, integrity)
-            .expect_err("archive_mode off must fail the backup");
+        let err =
+            run_backup_with_integrity(&repo_s, &pg_s, &mut control, integrity).expect_err("archive_mode off must fail the backup");
         assert!(err.to_string().contains("archive_mode must be enabled"), "msg was {err}");
     }
 

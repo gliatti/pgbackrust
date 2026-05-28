@@ -300,9 +300,10 @@ fn spool_out_backlog_bytes(spool: &dyn Storage, stanza: &str) -> u64 {
     entries
         .iter()
         .filter(|info| {
-            info.path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                !name.ends_with(STATUS_EXT_OK) && !name.ends_with(STATUS_EXT_ERROR)
-            })
+            info.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.ends_with(STATUS_EXT_OK) && !name.ends_with(STATUS_EXT_ERROR))
         })
         .map(|info| info.size)
         .sum()
@@ -489,7 +490,14 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
             option: "spool-path".to_owned(),
         })?;
         let spool = Posix::new(spool_root);
-        return push_async(pg_storage, &spool, stanza, segment, Path::new(wal_source), archive_info.as_ref());
+        return push_async(
+            pg_storage,
+            &spool,
+            stanza,
+            segment,
+            Path::new(wal_source),
+            archive_info.as_ref(),
+        );
     }
 
     let bytes = read_segment(pg_storage, Path::new(wal_source))?;
@@ -713,7 +721,15 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
     // reporting it missing. C ref: the retry around walSegmentFind() in
     // src/command/archive/get/get.c.
     let retry = archive_missing_retry(config);
-    fetch_segment_with_retry(repo_storages, pg_storage, stanza, segment, Path::new(dest), retry, RETRY_DELAY)
+    fetch_segment_with_retry(
+        repo_storages,
+        pg_storage,
+        stanza,
+        segment,
+        Path::new(dest),
+        retry,
+        RETRY_DELAY,
+    )
 }
 
 /// Short delay between the first and the retry archive lookup when
@@ -1833,7 +1849,11 @@ mod tests {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         seed_archive_info(&repo_s, "demo", TEST_SYSTEM_ID, "14");
         let wal_source = format!("pg_wal/{SEGMENT}");
-        put(&pg_s, &wal_source, &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024));
+        put(
+            &pg_s,
+            &wal_source,
+            &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024),
+        );
 
         let cfg = fake_config(Some("demo"), vec![wal_source]);
         let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("foreign segment must be rejected");
@@ -1866,7 +1886,11 @@ mod tests {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         seed_archive_info(&repo_s, "demo", TEST_SYSTEM_ID, "14");
         let wal_source = format!("pg_wal/{SEGMENT}");
-        put(&pg_s, &wal_source, &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024));
+        put(
+            &pg_s,
+            &wal_source,
+            &wal_segment_bytes(PG14_WAL_MAGIC, 1, 999, 16 * 1024 * 1024),
+        );
 
         let mut cfg = fake_config(Some("demo"), vec![wal_source]);
         cfg.options
@@ -1969,15 +1993,21 @@ mod tests {
         let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, Some(150)).expect("prefetch");
         assert_eq!(prefetched, 2, "prefetch stops once the in/ spool reaches the cap");
         assert!(
-            spool_s.exists(Path::new("archive/demo/in/000000010000000000000001")).expect("e"),
+            spool_s
+                .exists(Path::new("archive/demo/in/000000010000000000000001"))
+                .expect("e"),
             "first segment staged"
         );
         assert!(
-            spool_s.exists(Path::new("archive/demo/in/000000010000000000000002")).expect("e"),
+            spool_s
+                .exists(Path::new("archive/demo/in/000000010000000000000002"))
+                .expect("e"),
             "second segment staged"
         );
         assert!(
-            !spool_s.exists(Path::new("archive/demo/in/000000010000000000000003")).expect("e"),
+            !spool_s
+                .exists(Path::new("archive/demo/in/000000010000000000000003"))
+                .expect("e"),
             "third segment must not be staged past the cap"
         );
     }
@@ -1989,10 +2019,7 @@ mod tests {
         for seg in ["000000010000000000000001", "000000010000000000000002"] {
             put(&repo_s, &format!("archive/demo/{seg}"), &vec![7u8; 100]);
         }
-        let requested = vec![
-            "000000010000000000000001".to_owned(),
-            "000000010000000000000002".to_owned(),
-        ];
+        let requested = vec!["000000010000000000000001".to_owned(), "000000010000000000000002".to_owned()];
         let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, None).expect("prefetch");
         assert_eq!(prefetched, 2, "no cap fetches every requested segment");
     }
