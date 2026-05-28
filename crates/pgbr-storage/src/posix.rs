@@ -180,6 +180,14 @@ impl Storage for Posix {
             Err(err) => Err(map_io(&err, &resolved)),
         }
     }
+
+    fn create_symlink(&self, link_path: &Path, target: &Path) -> Result<(), StorageError> {
+        // `link_path` is resolved against the configured root (it is a path inside
+        // the managed tree); `target` is written into the link verbatim, exactly as
+        // pgBackRest records it in the manifest (typically an absolute path).
+        let resolved = self.resolve(link_path);
+        std::os::unix::fs::symlink(target, &resolved).map_err(|err| map_io(&err, &resolved))
+    }
 }
 
 /// Adapter that exposes a `std::fs::File` as a [`pgbr_io::IoRead`].
@@ -386,6 +394,24 @@ mod tests {
             StorageError::NotFound { path } => assert_eq!(path, tmp.path().join("nope")),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn posix_create_symlink_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+
+        // Materialise a real target so the link resolves to it.
+        write_file(&tmp.path().join("real_dir_placeholder"), b"x");
+        let target = tmp.path().join("real_dir_placeholder");
+
+        storage.create_symlink(Path::new("pg_wal"), &target).unwrap();
+
+        // The link exists, is reported as a Link, and reads back the target verbatim.
+        let info = storage.info(Path::new("pg_wal")).unwrap();
+        assert_eq!(info.kind, StorageKind::Link, "created entry must be a symlink");
+        let read = fs::read_link(tmp.path().join("pg_wal")).unwrap();
+        assert_eq!(read, target, "symlink must point at the recorded target");
     }
 
     #[test]

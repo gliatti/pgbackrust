@@ -57,19 +57,47 @@
 //! manifest so the target ends up matching the backup exactly. After the copy
 //! pass, the PG target is walked recursively and any regular file whose
 //! manifest-relative path is absent from the manifest's `[target:file]` set is
-//! removed (counted in [`RestoreOutcome::files_removed`]). Empty directories and
-//! symlinks are left alone — directory/symlink reconciliation is still deferred
-//! along with symlink re-creation.
+//! removed (counted in [`RestoreOutcome::files_removed`]). Empty directories are
+//! left alone — directory reconciliation is still deferred.
+//!
+//! # Symlink re-creation
+//!
+//! Every `[target:link]` entry is re-created as a real symlink in the PG target
+//! pointing at its recorded destination, via [`pgbr_storage::Storage::create_symlink`].
+//! On the [`pgbr_storage::Posix`] backend this is a `std::os::unix::fs::symlink`;
+//! backends that do not support symlinks return the trait's default
+//! "unsupported" error and the link is counted in [`RestoreOutcome::skipped_links`]
+//! instead. Successful re-creations are counted in [`RestoreOutcome::links_created`].
+//!
+//! # Recovery configuration
+//!
+//! After the file copy, restore writes the version-appropriate recovery
+//! configuration so `PostgreSQL` knows how to fetch WAL and where to stop. The
+//! split is keyed on the manifest's `db_version`:
+//!
+//! - **PG < 12** — a `recovery.conf` is written into the PG data dir.
+//! - **PG >= 12** — the recovery block is appended to `postgresql.auto.conf`
+//!   (existing contents preserved) and a `recovery.signal` file is created
+//!   (or `standby.signal` for `--type=standby`).
+//!
+//! The block always contains the `restore_command` `PostgreSQL` runs to fetch an
+//! archived WAL segment, plus the resolved recovery-target type: `--type=immediate`
+//! adds `recovery_target = 'immediate'`; `--type=standby` adds `standby_mode = 'on'`
+//! on PG < 12 (PG >= 12 relies on the `standby.signal` file); `--type=time|name|lsn|xid`
+//! emit `recovery_target_<type> = '<--target value>'` (with `recovery_target_inclusive
+//! = 'false'` when `--target-exclusive` is set for time/lsn/xid); `--type=default`
+//! (or unset) writes only the `restore_command`. `--type=none` writes no recovery
+//! files at all. The generator is the pure [`recovery_files`] function so it is
+//! unit-testable without any storage.
 //!
 //! # Deferred to later commits
 //!
 //! - tablespace remapping (`--tablespace-map` / `--tablespace-map-all`),
-//! - recovery-config generation (`recovery.conf` / `postgresql.auto.conf`),
 //! - `--db-include` / `--db-exclude` selective database restore,
-//! - symlink re-creation — the [`pgbr_storage::Storage`] trait has no
-//!   link-create method yet, so `[target:link]` entries are skipped and merely
-//!   counted (`RestoreOutcome::skipped_links`). TODO: wire this up once
-//!   `Storage` grows a symlink primitive.
+//! - `--type=preserve` (leave any existing recovery file untouched) and the full
+//!   `--recovery-option` passthrough — only the target-type-derived settings are
+//!   generated here,
+//! - `--target-action` / `--target-timeline` recovery settings.
 //!
 //! This is the full raw-restore path; everything above is genuinely out of
 //! scope for the slice, not silently dropped.
@@ -99,8 +127,15 @@ pub struct RestoreOutcome {
     pub files_removed: usize,
     /// Number of directories created in the PG target.
     pub paths_created: usize,
-    /// Number of `[target:link]` entries skipped (symlink re-creation deferred).
+    /// Number of `[target:link]` symlinks re-created in the PG target.
+    pub links_created: usize,
+    /// Number of `[target:link]` entries skipped because the backend does not
+    /// support symlinks (or the link could not be created).
     pub skipped_links: usize,
+    /// Relative paths of the recovery files written after the copy pass
+    /// (e.g. `recovery.conf`, or `postgresql.auto.conf` + `recovery.signal`).
+    /// Empty when `--type=none`.
+    pub recovery_files_written: Vec<String>,
 }
 
 fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
@@ -136,6 +171,187 @@ fn delta_enabled(config: &LoadedConfig) -> bool {
         config.options.get(&("delta".to_owned(), None)),
         Some(OptionValue::Boolean(true))
     )
+}
+
+/// First `PostgreSQL` major version that drives recovery via GUCs in
+/// `postgresql.auto.conf` + a `recovery.signal` file, rather than the standalone
+/// `recovery.conf` of earlier versions. Mirrors C's `PG_VERSION_RECOVERY_GUC`.
+const PG_VERSION_RECOVERY_GUC: u32 = 12;
+
+/// The resolved `--type` (recovery target type) for a restore. Mirrors C's
+/// `CFGOPTVAL_RESTORE_TYPE_*`. Only the variants this slice acts on are modelled;
+/// `preserve` is treated like `default` here (its leave-existing-file behaviour is
+/// deferred — see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryType {
+    /// No recovery file is written at all.
+    None,
+    /// Recover immediately (consistency point), no target.
+    Immediate,
+    /// Bring the cluster up as a hot standby.
+    Standby,
+    /// A `recovery_target_<kind>` setting (`time` / `name` / `lsn` / `xid`).
+    Target(TargetKind),
+    /// Default recovery (recover to the end of the WAL): only `restore_command`.
+    Default,
+}
+
+/// The kind of point-in-time target carried by `--type` when it names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Time,
+    Name,
+    Lsn,
+    Xid,
+}
+
+impl TargetKind {
+    /// The `recovery_target_<kind>` GUC suffix `PostgreSQL` expects.
+    const fn guc_suffix(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Name => "name",
+            Self::Lsn => "lsn",
+            Self::Xid => "xid",
+        }
+    }
+
+    /// Whether `recovery_target_inclusive` is meaningful for this kind. `PostgreSQL`
+    /// accepts it for time / lsn / xid but not for name (matches the C generator,
+    /// whose `target-exclusive` option only depends on those three).
+    const fn supports_inclusive(self) -> bool {
+        matches!(self, Self::Time | Self::Lsn | Self::Xid)
+    }
+}
+
+/// Read the `--type` option as a [`RecoveryType`]. Absent or an unrecognised value
+/// resolves to [`RecoveryType::Default`], matching the option's `default: default`.
+fn recovery_type(config: &LoadedConfig) -> RecoveryType {
+    let raw = match config.options.get(&("type".to_owned(), None)) {
+        Some(OptionValue::StringId(value) | OptionValue::String(value)) => value.as_str(),
+        _ => "default",
+    };
+    match raw {
+        "none" => RecoveryType::None,
+        "immediate" => RecoveryType::Immediate,
+        "standby" => RecoveryType::Standby,
+        "time" => RecoveryType::Target(TargetKind::Time),
+        "name" => RecoveryType::Target(TargetKind::Name),
+        "lsn" => RecoveryType::Target(TargetKind::Lsn),
+        "xid" => RecoveryType::Target(TargetKind::Xid),
+        // `default`, `preserve`, or anything else: end-of-WAL recovery.
+        _ => RecoveryType::Default,
+    }
+}
+
+/// Read a plain string option, preferring `--target` for the `time`/`name`/`lsn`/`xid`
+/// target value.
+fn string_option<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::String(value) | OptionValue::StringId(value) | OptionValue::Path(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `--target-exclusive` was supplied and set to `true`.
+fn target_exclusive(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("target-exclusive".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// The `restore_command` `PostgreSQL` runs to fetch one archived WAL segment.
+/// `%f` is the segment name `PostgreSQL` substitutes and `"%p"` the destination
+/// path. Mirrors the C generator's
+/// `<exe> archive-get %f "%p"` shape, reduced here to the binary name + stanza.
+fn restore_command(stanza: &str) -> String {
+    format!("pgbackrest --stanza={stanza} archive-get %f \"%p\"")
+}
+
+/// Render the recovery settings block (a `key = 'value'` line per setting) for the
+/// given PG major version and resolved recovery type. The leading header line
+/// identifies the restore. Always emits `restore_command`; the recovery-target
+/// lines depend on the type. Returns an empty string for [`RecoveryType::None`]
+/// (callers should not write any recovery file in that case).
+fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, target: Option<&str>, exclusive: bool) -> String {
+    use std::fmt::Write as _;
+
+    if ty == RecoveryType::None {
+        return String::new();
+    }
+
+    let mut out = String::from("# Recovery settings generated by pgBackRest restore\n");
+    // `write!` into a `String` is infallible.
+    let _ = writeln!(out, "restore_command = '{}'", restore_command(stanza));
+
+    match ty {
+        RecoveryType::Immediate => out.push_str("recovery_target = 'immediate'\n"),
+        RecoveryType::Standby => {
+            // standby_mode is only a GUC on PG < 12; on >= 12 the standby.signal
+            // file (written by the caller) drives standby mode instead.
+            if db_major < PG_VERSION_RECOVERY_GUC {
+                out.push_str("standby_mode = 'on'\n");
+            }
+        }
+        RecoveryType::Target(kind) => {
+            if let Some(value) = target {
+                let _ = writeln!(out, "recovery_target_{} = '{value}'", kind.guc_suffix());
+                if exclusive && kind.supports_inclusive() {
+                    out.push_str("recovery_target_inclusive = 'false'\n");
+                }
+            }
+        }
+        // Default writes only restore_command; None returned early above.
+        RecoveryType::Default | RecoveryType::None => {}
+    }
+
+    out
+}
+
+/// Parse the manifest's textual `db_version` (e.g. `"14"`, `"9.6"`) into a major
+/// version number used for the PG < 12 vs >= 12 recovery split. `"9.6"` -> `9`
+/// (pre-10 versions are all < 12), everything else takes the integer prefix.
+/// Unparsable input is treated as `>= 12` (modern default).
+fn db_major_version(db_version: &str) -> u32 {
+    let prefix: String = db_version.chars().take_while(char::is_ascii_digit).collect();
+    prefix.parse::<u32>().unwrap_or(PG_VERSION_RECOVERY_GUC)
+}
+
+/// Pure generator for the recovery files a restore must write, given the backed-up
+/// cluster's `db_version` and the resolved recovery options. Returns `(relative
+/// path, contents)` pairs to write into the PG data dir, in write order.
+///
+/// - **PG < 12** -> `[("recovery.conf", <block>)]`.
+/// - **PG >= 12** -> `[("postgresql.auto.conf", <block>), (<signal>, "")]` where
+///   `<signal>` is `standby.signal` for `--type=standby`, else `recovery.signal`.
+///   The `postgresql.auto.conf` entry holds *only the new block*; the caller is
+///   responsible for appending it to any existing file contents.
+/// - **`--type=none`** -> `[]` (no recovery files).
+fn recovery_files(db_version: &str, stanza: &str, config: &LoadedConfig) -> Vec<(PathBuf, String)> {
+    let ty = recovery_type(config);
+    if ty == RecoveryType::None {
+        return Vec::new();
+    }
+
+    let db_major = db_major_version(db_version);
+    let target = string_option(config, "target");
+    let exclusive = target_exclusive(config);
+    let block = recovery_block(db_major, stanza, ty, target, exclusive);
+
+    if db_major < PG_VERSION_RECOVERY_GUC {
+        vec![(PathBuf::from("recovery.conf"), block)]
+    } else {
+        let signal = if ty == RecoveryType::Standby {
+            "standby.signal"
+        } else {
+            "recovery.signal"
+        };
+        vec![
+            (PathBuf::from("postgresql.auto.conf"), block),
+            (PathBuf::from(signal), String::new()),
+        ]
+    }
 }
 
 /// Whether the file already on the PG target matches the manifest entry, so the
@@ -376,9 +592,31 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     //    and delete any regular file not listed in `[target:file]`.
     let files_removed = if delta { remove_stray_files(pg, &manifest)? } else { 0 };
 
-    // 4. Symlinks: deferred — count them and move on. TODO: re-create once the
-    //    `Storage` trait gains a symlink-create method.
-    let skipped_links = manifest.links.len();
+    // 4. Re-create every `[target:link]` symlink in the PG target. A backend that
+    //    cannot create symlinks (the trait default) leaves the link uncreated and
+    //    counted in `skipped_links` instead.
+    let mut links_created = 0;
+    let mut skipped_links = 0;
+    for link in &manifest.links {
+        let link_path = PathBuf::from(&link.path);
+        // Defensively create the link's parent directory (paths are created up
+        // front, but a link could sit in an unlisted path).
+        if let Some(parent) = link_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            pg.create_path(parent, true)?;
+        }
+        match pg.create_symlink(&link_path, Path::new(&link.destination)) {
+            Ok(()) => links_created += 1,
+            Err(_) => skipped_links += 1,
+        }
+    }
+
+    // 5. Write the version-appropriate recovery configuration. The pure
+    //    `recovery_files` generator decides which files and contents apply; the
+    //    only impure step is appending the block to any existing
+    //    `postgresql.auto.conf`.
+    let recovery_files_written = write_recovery_files(pg, &manifest.db_version, stanza, config)?;
 
     Ok(RestoreOutcome {
         label,
@@ -386,8 +624,59 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         files_skipped,
         files_removed,
         paths_created,
+        links_created,
         skipped_links,
+        recovery_files_written,
     })
+}
+
+/// Write the recovery files produced by [`recovery_files`] into the PG target,
+/// returning the relative paths written. `postgresql.auto.conf` is *appended* to
+/// (existing contents preserved); every other file is written verbatim.
+fn write_recovery_files(
+    pg: &dyn Storage,
+    db_version: &str,
+    stanza: &str,
+    config: &LoadedConfig,
+) -> Result<Vec<String>, CommandError> {
+    let mut written = Vec::new();
+
+    for (rel, block) in recovery_files(db_version, stanza, config) {
+        let contents = if rel == Path::new("postgresql.auto.conf") {
+            append_to_existing(pg, &rel, &block)?
+        } else {
+            block.into_bytes()
+        };
+
+        let mut writer = pg.open_write(&rel)?;
+        writer.write(&contents)?;
+        writer.flush()?;
+        writer.close()?;
+        written.push(rel.to_string_lossy().into_owned());
+    }
+
+    Ok(written)
+}
+
+/// Build the new contents of `postgresql.auto.conf`: any existing file's bytes
+/// (with a trailing newline ensured) followed by the recovery `block`. A missing
+/// file is treated as empty so the block is written on its own.
+fn append_to_existing(pg: &dyn Storage, rel: &Path, block: &str) -> Result<Vec<u8>, CommandError> {
+    let mut existing = match pg.open_read(rel) {
+        Ok(mut reader) => reader.read_all()?,
+        Err(StorageError::NotFound { .. }) => Vec::new(),
+        Err(err) => return Err(CommandError::Storage(err)),
+    };
+
+    // Separate old and new settings with a blank line, mirroring the C generator.
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        existing.push(b'\n');
+    }
+    if !existing.is_empty() {
+        existing.push(b'\n');
+    }
+    existing.extend_from_slice(block.as_bytes());
+    Ok(existing)
 }
 
 /// Delete every regular file under the manifest's directory roots that is not
@@ -446,13 +735,16 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
     let outcome = restore_inner(config, repo_storage, pg_storage)?;
 
     println!(
-        "restore: backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) skipped",
+        "restore: backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) created, \
+         {} link(s) skipped, {} recovery file(s) written",
         outcome.label,
         outcome.files_restored,
         outcome.files_skipped,
         outcome.files_removed,
         outcome.paths_created,
-        outcome.skipped_links
+        outcome.links_created,
+        outcome.skipped_links,
+        outcome.recovery_files_written.len(),
     );
 
     Ok(())
@@ -563,6 +855,20 @@ mod tests {
         paths: &[&str],
         links: &[(&str, &str)],
     ) {
+        seed_backup_ver(repo, stanza, label, "14", files, paths, links);
+    }
+
+    /// Like [`seed_backup`] but records `db_version` in the manifest, so recovery
+    /// tests can drive the PG-version-dependent split.
+    fn seed_backup_ver(
+        repo: &Posix,
+        stanza: &str,
+        label: &str,
+        db_version: &str,
+        files: &[(&str, &[u8], Option<String>)],
+        paths: &[&str],
+        links: &[(&str, &str)],
+    ) {
         repo.create_path(Path::new(&format!("backup/{stanza}/{label}")), true)
             .expect("create backup label dir");
 
@@ -583,7 +889,7 @@ mod tests {
             backup_type: "full".to_owned(),
             timestamp_start: 1_704_110_400,
             timestamp_stop: 1_704_110_410,
-            db_version: "14".to_owned(),
+            db_version: db_version.to_owned(),
             db_system_id: 6_873_049_345_984_568_091,
             files: manifest_files,
             paths: paths.iter().map(|p| ManifestPath { path: (*p).to_owned() }).collect(),
@@ -824,9 +1130,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_counts_skipped_links() {
-        // A backup with one symlink: it is skipped but counted in the outcome.
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+    fn restore_creates_symlinks() {
+        // A backup with one symlink: the Posix backend re-creates it pointing at
+        // the recorded destination, counted in `links_created`.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         let stanza = "demo";
         let label = "20240101-120000F";
 
@@ -841,7 +1148,221 @@ mod tests {
         );
 
         let outcome: RestoreOutcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
-        assert_eq!(outcome.skipped_links, 1);
+        assert_eq!(outcome.links_created, 1, "Posix must re-create the symlink");
+        assert_eq!(outcome.skipped_links, 0);
+
+        // The symlink exists in the target and points at the recorded destination.
+        let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
+        assert_eq!(read, Path::new("/var/lib/pg_wal"), "symlink must point at the destination");
+    }
+
+    // ---- recovery config generation ----------------------------------------
+
+    /// A restore config carrying `--type` (and, optionally, `--target`).
+    fn cfg_recovery(stanza: &str, ty: Option<&str>, target: Option<&str>, target_exclusive: bool) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        if let Some(ty) = ty {
+            options.insert(("type".to_owned(), None), OptionValue::StringId(ty.to_owned()));
+        }
+        if let Some(target) = target {
+            options.insert(("target".to_owned(), None), OptionValue::String(target.to_owned()));
+        }
+        if target_exclusive {
+            options.insert(("target-exclusive".to_owned(), None), OptionValue::Boolean(true));
+        }
+        LoadedConfig {
+            command: "restore".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_recovery_conf_for_pg11() {
+        // PG < 12: a recovery.conf is written with the restore_command line.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "11", &[], &["pg_data"], &[]);
+
+        let outcome = restore_inner(&cfg_recovery(stanza, None, None, false), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.recovery_files_written, vec!["recovery.conf".to_owned()]);
+
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("recovery.conf")).expect("open recovery.conf");
+            String::from_utf8(r.read_all().expect("read recovery.conf")).unwrap()
+        };
+        assert!(
+            contents.contains("restore_command = 'pgbackrest --stanza=demo archive-get %f \"%p\"'"),
+            "recovery.conf must contain restore_command: {contents}"
+        );
+        assert!(
+            !pg_s.exists(Path::new("recovery.signal")).unwrap(),
+            "PG<12 must not write recovery.signal"
+        );
+    }
+
+    #[test]
+    fn restore_signal_file_for_pg14() {
+        // PG >= 12: postgresql.auto.conf gets the recovery block APPENDED and
+        // recovery.signal is created.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        // Pre-seed an existing postgresql.auto.conf so we can prove the block is appended.
+        seed_pg_file(
+            &pg_s,
+            "postgresql.auto.conf",
+            b"# existing setting\nshared_buffers = '128MB'\n",
+        );
+
+        let outcome = restore_inner(&cfg_recovery(stanza, None, None, false), &repo_s, &pg_s).expect("restore");
+        assert_eq!(
+            outcome.recovery_files_written,
+            vec!["postgresql.auto.conf".to_owned(), "recovery.signal".to_owned()]
+        );
+
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("postgresql.auto.conf")).expect("open auto.conf");
+            String::from_utf8(r.read_all().expect("read auto.conf")).unwrap()
+        };
+        assert!(
+            contents.starts_with("# existing setting\nshared_buffers = '128MB'\n"),
+            "existing contents must be preserved: {contents}"
+        );
+        assert!(
+            contents.contains("restore_command = 'pgbackrest --stanza=demo archive-get %f \"%p\"'"),
+            "recovery block must be appended: {contents}"
+        );
+        assert!(
+            pg_s.exists(Path::new("recovery.signal")).unwrap(),
+            "PG>=12 must write recovery.signal"
+        );
+        assert!(
+            !pg_s.exists(Path::new("standby.signal")).unwrap(),
+            "non-standby restore must not write standby.signal"
+        );
+        assert!(
+            !pg_s.exists(Path::new("recovery.conf")).unwrap(),
+            "PG>=12 must not write recovery.conf"
+        );
+    }
+
+    #[test]
+    fn restore_standby_writes_standby_signal() {
+        // --type=standby on PG >= 12: standby.signal instead of recovery.signal.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let outcome = restore_inner(&cfg_recovery(stanza, Some("standby"), None, false), &repo_s, &pg_s).expect("restore");
+        assert_eq!(
+            outcome.recovery_files_written,
+            vec!["postgresql.auto.conf".to_owned(), "standby.signal".to_owned()]
+        );
+        assert!(
+            pg_s.exists(Path::new("standby.signal")).unwrap(),
+            "standby restore must write standby.signal"
+        );
+        assert!(
+            !pg_s.exists(Path::new("recovery.signal")).unwrap(),
+            "standby restore must not write recovery.signal"
+        );
+        // standby_mode is NOT a GUC on PG >= 12; the block carries only restore_command.
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("postgresql.auto.conf")).expect("open auto.conf");
+            String::from_utf8(r.read_all().expect("read auto.conf")).unwrap()
+        };
+        assert!(
+            !contents.contains("standby_mode"),
+            "PG>=12 standby must not write standby_mode: {contents}"
+        );
+    }
+
+    #[test]
+    fn restore_type_none_writes_no_recovery_files() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let outcome = restore_inner(&cfg_recovery(stanza, Some("none"), None, false), &repo_s, &pg_s).expect("restore");
+        assert!(
+            outcome.recovery_files_written.is_empty(),
+            "type=none writes no recovery files"
+        );
+        assert!(!pg_s.exists(Path::new("recovery.signal")).unwrap());
+        assert!(!pg_s.exists(Path::new("postgresql.auto.conf")).unwrap());
+    }
+
+    #[test]
+    fn recovery_files_pure_fn() {
+        let stanza = "demo";
+
+        // PG < 12 -> recovery.conf only.
+        let cfg11 = cfg_recovery(stanza, None, None, false);
+        let pg11 = super::recovery_files("11", stanza, &cfg11);
+        assert_eq!(pg11.len(), 1);
+        assert_eq!(pg11[0].0, std::path::PathBuf::from("recovery.conf"));
+        assert!(
+            pg11[0]
+                .1
+                .contains("restore_command = 'pgbackrest --stanza=demo archive-get %f \"%p\"'")
+        );
+
+        // 9.6 -> still treated as < 12.
+        let pg96 = super::recovery_files("9.6", stanza, &cfg11);
+        assert_eq!(pg96[0].0, std::path::PathBuf::from("recovery.conf"));
+
+        // PG >= 12 default -> postgresql.auto.conf + recovery.signal.
+        let cfg14 = cfg_recovery(stanza, None, None, false);
+        let pg14 = super::recovery_files("14", stanza, &cfg14);
+        assert_eq!(pg14.len(), 2);
+        assert_eq!(pg14[0].0, std::path::PathBuf::from("postgresql.auto.conf"));
+        assert_eq!(pg14[1].0, std::path::PathBuf::from("recovery.signal"));
+
+        // PG >= 12 standby -> standby.signal.
+        let cfg_sb = cfg_recovery(stanza, Some("standby"), None, false);
+        let sb = super::recovery_files("14", stanza, &cfg_sb);
+        assert_eq!(sb[1].0, std::path::PathBuf::from("standby.signal"));
+
+        // immediate -> recovery_target = 'immediate'.
+        let cfg_imm = cfg_recovery(stanza, Some("immediate"), None, false);
+        let imm = super::recovery_files("14", stanza, &cfg_imm);
+        assert!(imm[0].1.contains("recovery_target = 'immediate'"));
+
+        // time target with --target-exclusive -> recovery_target_time + inclusive=false.
+        let cfg_time = cfg_recovery(stanza, Some("time"), Some("2024-01-01 12:00:00"), true);
+        let timev = super::recovery_files("11", stanza, &cfg_time);
+        assert!(timev[0].1.contains("recovery_target_time = '2024-01-01 12:00:00'"));
+        assert!(timev[0].1.contains("recovery_target_inclusive = 'false'"));
+
+        // name target: no inclusive line even with --target-exclusive.
+        let cfg_name = cfg_recovery(stanza, Some("name"), Some("my_restore_point"), true);
+        let namev = super::recovery_files("11", stanza, &cfg_name);
+        assert!(namev[0].1.contains("recovery_target_name = 'my_restore_point'"));
+        assert!(!namev[0].1.contains("recovery_target_inclusive"));
+
+        // standby on PG < 12 -> standby_mode = 'on'.
+        let pg11_sb = super::recovery_files("11", stanza, &cfg_sb);
+        assert!(pg11_sb[0].1.contains("standby_mode = 'on'"));
+
+        // none -> nothing.
+        let cfg_none = cfg_recovery(stanza, Some("none"), None, false);
+        assert!(super::recovery_files("14", stanza, &cfg_none).is_empty());
     }
 
     // ---- delta restore -----------------------------------------------------
