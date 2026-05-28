@@ -1,0 +1,739 @@
+//! Remote storage proxy over the pgBackRest local/remote protocol.
+//!
+//! Mirrors the C `src/storage/remote/` pair (`storage.c` on the caller side,
+//! `protocol.c` on the worker side). A pgBackRest process that needs to reach a
+//! repository or PG data directory living on another host does not access it
+//! directly: it drives a helper worker (a child `pgbackrest` reached over SSH,
+//! or a `--local` worker) over the JSON-line protocol from [`pgbr_protocol`].
+//! Each [`Storage`] call becomes one protocol [`Request`]; the worker answers
+//! with one [`Response`].
+//!
+//! This module ships both halves:
+//!
+//! - [`RemoteStorage`] — the caller side. Implements [`Storage`] by issuing a
+//!   `storage-*` request per method through a [`ProtocolClient`] and decoding
+//!   the response.
+//! - [`StorageRequestHandler`] — the worker side. Implements
+//!   [`pgbr_protocol::transport::RequestHandler`] by mapping each `storage-*`
+//!   request onto a wrapped local [`Storage`] (e.g. [`crate::Posix`]).
+//!
+//! ## Transfer model (scope of this slice)
+//!
+//! File payloads are transferred **whole-file (non-chunked)**: `open_read`
+//! issues `storage-read` and the worker returns the entire file's bytes in the
+//! response, which [`RemoteStorage`] hands back as an in-memory
+//! [`pgbr_io::MemRead`]; `open_write` returns a buffering writer that holds all
+//! bytes in memory and, on `close`, sends them in a single `storage-write`
+//! request. Chunked / streaming transfer (the C `protocolStorageRead` block
+//! protocol) is a deliberate follow-up — large files will materialise fully in
+//! memory on both ends until then.
+//!
+//! ## Wire shapes
+//!
+//! Paths travel as UTF-8 lossy strings; file bytes travel base64-encoded
+//! inside the JSON payload (JSON cannot carry raw binary). The request/response
+//! payloads use the [`StorageInfoDto`] / [`StorageKindDto`] serde mirrors of
+//! [`StorageInfo`] / [`StorageKind`].
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use pgbr_io::{IoError, IoRead, IoWrite, MemRead};
+use pgbr_protocol::transport::RequestHandler;
+use pgbr_protocol::{ErrResponse, OkResponse, ProtocolClient, ProtocolError, Request, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::{Storage, StorageError, StorageInfo, StorageKind};
+
+/// Protocol command names. Each [`Storage`] method maps to exactly one.
+pub mod command {
+    /// `Storage::exists` — params: `[path]`; out: `bool`.
+    pub const EXISTS: &str = "storage-exists";
+    /// `Storage::info` — params: `[path]`; out: [`super::StorageInfoDto`].
+    pub const INFO: &str = "storage-info";
+    /// `Storage::list` — params: `[path]`; out: `[StorageInfoDto, ...]`.
+    pub const LIST: &str = "storage-list";
+    /// `Storage::open_read` — params: `[path]`; out: `{ "data": base64 }`.
+    pub const READ: &str = "storage-read";
+    /// `Storage::open_write` (on close) — params: `[path, base64]`; out: `{}`.
+    pub const WRITE: &str = "storage-write";
+    /// `Storage::remove` — params: `[path, error_on_missing]`; out: `{}`.
+    pub const REMOVE: &str = "storage-remove";
+    /// `Storage::rename` — params: `[source, target]`; out: `{}`.
+    pub const RENAME: &str = "storage-rename";
+    /// `Storage::create_path` — params: `[path, recursive]`; out: `{}`.
+    pub const CREATE_PATH: &str = "storage-create-path";
+    /// `Storage::remove_path` — params: `[path, recursive, error_on_missing]`; out: `{}`.
+    pub const REMOVE_PATH: &str = "storage-remove-path";
+    /// `Storage::create_symlink` — params: `[link_path, target]`; out: `{}`.
+    pub const CREATE_SYMLINK: &str = "storage-create-symlink";
+}
+
+// ---------------------------------------------------------------------------
+// serde DTOs
+// ---------------------------------------------------------------------------
+
+/// Serde mirror of [`StorageKind`] for the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageKindDto {
+    /// See [`StorageKind::File`].
+    File,
+    /// See [`StorageKind::Path`].
+    Path,
+    /// See [`StorageKind::Link`].
+    Link,
+    /// See [`StorageKind::Special`].
+    Special,
+}
+
+impl From<StorageKind> for StorageKindDto {
+    fn from(kind: StorageKind) -> Self {
+        match kind {
+            StorageKind::File => Self::File,
+            StorageKind::Path => Self::Path,
+            StorageKind::Link => Self::Link,
+            StorageKind::Special => Self::Special,
+        }
+    }
+}
+
+impl From<StorageKindDto> for StorageKind {
+    fn from(kind: StorageKindDto) -> Self {
+        match kind {
+            StorageKindDto::File => Self::File,
+            StorageKindDto::Path => Self::Path,
+            StorageKindDto::Link => Self::Link,
+            StorageKindDto::Special => Self::Special,
+        }
+    }
+}
+
+/// Serde mirror of [`StorageInfo`] for the wire. `path` is carried as a
+/// UTF-8(-lossy) string since JSON keys must be strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageInfoDto {
+    /// Backend-resolved path of the entry.
+    pub path: String,
+    /// Entry kind.
+    pub kind: StorageKindDto,
+    /// Size in bytes (files only; `0` otherwise).
+    pub size: u64,
+    /// Last-modified time as Unix epoch seconds, if tracked.
+    pub modified: Option<i64>,
+}
+
+impl From<&StorageInfo> for StorageInfoDto {
+    fn from(info: &StorageInfo) -> Self {
+        Self {
+            path: info.path.to_string_lossy().into_owned(),
+            kind: info.kind.into(),
+            size: info.size,
+            modified: info.modified,
+        }
+    }
+}
+
+impl From<StorageInfoDto> for StorageInfo {
+    fn from(dto: StorageInfoDto) -> Self {
+        Self {
+            path: PathBuf::from(dto.path),
+            kind: dto.kind.into(),
+            size: dto.size,
+            modified: dto.modified,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caller side: RemoteStorage
+// ---------------------------------------------------------------------------
+
+/// Shared, lockable handle to the protocol client. Shared between the
+/// [`RemoteStorage`] itself and any [`RemoteWrite`] it hands out, so a buffering
+/// writer can flush its payload on `close` without borrowing the storage (the
+/// `Storage::open_write` signature returns a `'static` `Box<dyn IoWrite>`).
+type SharedClient<R, W> = Arc<Mutex<ProtocolClient<R, W>>>;
+
+/// Caller-side [`Storage`] that proxies every operation to a worker over the
+/// protocol.
+///
+/// The [`ProtocolClient`] needs `&mut` to send a request, but the [`Storage`]
+/// trait takes `&self` (so a single instance can be shared as
+/// `Arc<dyn Storage>`); we bridge that with an `Arc<Mutex<…>>`. Calls are
+/// therefore serialized — the protocol is a strict request/response pipe with a
+/// single in-flight message, so that matches the wire semantics exactly.
+pub struct RemoteStorage<R: IoRead, W: IoWrite> {
+    client: SharedClient<R, W>,
+}
+
+impl<R: IoRead, W: IoWrite> RemoteStorage<R, W> {
+    /// Build a remote storage over an existing reader / writer pair (child
+    /// pipes, a socket, or an in-memory transport in tests).
+    #[must_use]
+    pub fn new(client: ProtocolClient<R, W>) -> Self {
+        Self {
+            client: Arc::new(Mutex::new(client)),
+        }
+    }
+
+    /// Send the `exit` handshake to the worker so its `serve` loop stops, then
+    /// close the writer. Consumes the proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the handshake cannot be written / flushed /
+    /// closed, if any [`RemoteWrite`] still holds a clone of the shared client,
+    /// or if the internal lock is poisoned.
+    pub fn close(self) -> Result<(), StorageError> {
+        let mutex = Arc::try_unwrap(self.client)
+            .map_err(|_| backend(Path::new(""), "remote storage closed while a writer is still open"))?;
+        let mut client = mutex
+            .into_inner()
+            .map_err(|_| backend(Path::new(""), "remote storage mutex poisoned"))?;
+        client.close().map_err(|e| protocol_err(Path::new(""), &e))?;
+        Ok(())
+    }
+
+    /// Issue one request and return its `out` payload (defaulting to `Null`
+    /// when the worker replied with an empty `{}` body).
+    fn execute(&self, path: &Path, cmd: &str, param: Vec<Value>) -> Result<Value, StorageError> {
+        execute_shared(&self.client, path, cmd, param)
+    }
+}
+
+/// Issue one request through a shared client handle. Factored out so both
+/// [`RemoteStorage`] and [`RemoteWrite`] (which only holds the shared handle)
+/// can drive the protocol.
+fn execute_shared<R: IoRead, W: IoWrite>(
+    client: &SharedClient<R, W>,
+    path: &Path,
+    cmd: &str,
+    param: Vec<Value>,
+) -> Result<Value, StorageError> {
+    let request = Request {
+        cmd: cmd.to_owned(),
+        param,
+    };
+    let mut guard = client.lock().map_err(|_| backend(path, "remote storage mutex poisoned"))?;
+    let ok: OkResponse = guard.execute(&request).map_err(|e| protocol_err(path, &e))?;
+    drop(guard);
+    Ok(ok.out.unwrap_or(Value::Null))
+}
+
+/// `path.to_string_lossy()` as an owned JSON string value.
+fn path_param(path: &Path) -> Value {
+    Value::String(path.to_string_lossy().into_owned())
+}
+
+impl<R: IoRead + Send + 'static, W: IoWrite + Send + 'static> Storage for RemoteStorage<R, W> {
+    fn exists(&self, path: &Path) -> Result<bool, StorageError> {
+        let out = self.execute(path, command::EXISTS, vec![path_param(path)])?;
+        out.as_bool()
+            .ok_or_else(|| backend(path, "storage-exists: expected a boolean response"))
+    }
+
+    fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
+        let out = self.execute(path, command::INFO, vec![path_param(path)])?;
+        let dto: StorageInfoDto =
+            serde_json::from_value(out).map_err(|e| backend(path, &format!("storage-info: bad response: {e}")))?;
+        Ok(dto.into())
+    }
+
+    fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
+        let out = self.execute(path, command::LIST, vec![path_param(path)])?;
+        let dtos: Vec<StorageInfoDto> =
+            serde_json::from_value(out).map_err(|e| backend(path, &format!("storage-list: bad response: {e}")))?;
+        Ok(dtos.into_iter().map(Into::into).collect())
+    }
+
+    fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
+        // Whole-file transfer: the worker returns the entire file's bytes,
+        // which we serve from memory. Chunked streaming is a follow-up.
+        let out = self.execute(path, command::READ, vec![path_param(path)])?;
+        let encoded = out
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| backend(path, "storage-read: missing base64 'data' field"))?;
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|e| backend(path, &format!("storage-read: bad base64: {e}")))?;
+        Ok(Box::new(MemRead::new(bytes)))
+    }
+
+    fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
+        // Whole-file transfer: buffer all writes; flush them as a single
+        // `storage-write` on `close`. Chunked streaming is a follow-up.
+        Ok(Box::new(RemoteWrite::new(Arc::clone(&self.client), path)))
+    }
+
+    fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
+        self.execute(path, command::REMOVE, vec![path_param(path), json!(error_on_missing)])?;
+        Ok(())
+    }
+
+    fn rename(&self, source: &Path, target: &Path) -> Result<(), StorageError> {
+        self.execute(source, command::RENAME, vec![path_param(source), path_param(target)])?;
+        Ok(())
+    }
+
+    fn create_path(&self, path: &Path, recursive: bool) -> Result<(), StorageError> {
+        self.execute(path, command::CREATE_PATH, vec![path_param(path), json!(recursive)])?;
+        Ok(())
+    }
+
+    fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), StorageError> {
+        self.execute(
+            path,
+            command::REMOVE_PATH,
+            vec![path_param(path), json!(recursive), json!(error_on_missing)],
+        )?;
+        Ok(())
+    }
+
+    fn create_symlink(&self, link_path: &Path, target: &Path) -> Result<(), StorageError> {
+        self.execute(
+            link_path,
+            command::CREATE_SYMLINK,
+            vec![path_param(link_path), path_param(target)],
+        )?;
+        Ok(())
+    }
+}
+
+/// Buffering writer returned by [`RemoteStorage::open_write`]. Accumulates all
+/// written bytes and, on `close`, sends a single `storage-write` request
+/// carrying the path and the base64-encoded payload.
+///
+/// Holds a clone of the shared client handle (not a borrow of the storage) so
+/// it is `'static` and satisfies the `Box<dyn IoWrite>` return type.
+struct RemoteWrite<R: IoRead, W: IoWrite> {
+    client: SharedClient<R, W>,
+    path: PathBuf,
+    buffer: Vec<u8>,
+    closed: bool,
+}
+
+impl<R: IoRead, W: IoWrite> RemoteWrite<R, W> {
+    fn new(client: SharedClient<R, W>, path: &Path) -> Self {
+        Self {
+            client,
+            path: path.to_path_buf(),
+            buffer: Vec::new(),
+            closed: false,
+        }
+    }
+}
+
+impl<R: IoRead, W: IoWrite> IoWrite for RemoteWrite<R, W> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        if self.closed {
+            return Err(IoError::Closed);
+        }
+        self.buffer.extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        if self.closed {
+            return Err(IoError::Closed);
+        }
+        // Nothing to do: the payload is only transmitted on close (whole-file).
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let encoded = BASE64.encode(&self.buffer);
+        execute_shared(
+            &self.client,
+            &self.path,
+            command::WRITE,
+            vec![path_param(&self.path), Value::String(encoded)],
+        )
+        .map_err(|e| IoError::Backend(format!("storage-write: {e}")))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker side: StorageRequestHandler
+// ---------------------------------------------------------------------------
+
+/// Worker-side [`RequestHandler`] that answers `storage-*` requests against a
+/// wrapped local [`Storage`].
+pub struct StorageRequestHandler<S: Storage> {
+    storage: S,
+}
+
+impl<S: Storage> StorageRequestHandler<S> {
+    /// Wrap a local storage backend (e.g. [`crate::Posix`]) to serve requests.
+    pub const fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Borrow the wrapped storage.
+    pub const fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// Dispatch one request, returning a `Result` so the `?` operator can be
+    /// used freely; [`RequestHandler::handle`] maps the error into an
+    /// [`ErrResponse`].
+    fn dispatch(&self, req: &Request) -> Result<OkResponse, StorageError> {
+        match req.cmd.as_str() {
+            command::EXISTS => {
+                let path = param_path(req, 0)?;
+                let exists = self.storage.exists(&path)?;
+                Ok(ok(json!(exists)))
+            }
+            command::INFO => {
+                let path = param_path(req, 0)?;
+                let info = self.storage.info(&path)?;
+                Ok(ok(
+                    serde_json::to_value(StorageInfoDto::from(&info)).map_err(|e| json_err(&e))?
+                ))
+            }
+            command::LIST => {
+                let path = param_path(req, 0)?;
+                let entries = self.storage.list(&path)?;
+                let dtos: Vec<StorageInfoDto> = entries.iter().map(StorageInfoDto::from).collect();
+                Ok(ok(serde_json::to_value(dtos).map_err(|e| json_err(&e))?))
+            }
+            command::READ => {
+                let path = param_path(req, 0)?;
+                let mut reader = self.storage.open_read(&path)?;
+                let bytes = reader.read_all()?;
+                Ok(ok(json!({ "data": BASE64.encode(&bytes) })))
+            }
+            command::WRITE => {
+                let path = param_path(req, 0)?;
+                let bytes = param_bytes(req, 1, &path)?;
+                let mut writer = self.storage.open_write(&path)?;
+                writer.write(&bytes)?;
+                writer.close()?;
+                Ok(ok_empty())
+            }
+            command::REMOVE => {
+                let path = param_path(req, 0)?;
+                let error_on_missing = param_bool(req, 1, &path)?;
+                self.storage.remove(&path, error_on_missing)?;
+                Ok(ok_empty())
+            }
+            command::RENAME => {
+                let source = param_path(req, 0)?;
+                let target = param_path(req, 1)?;
+                self.storage.rename(&source, &target)?;
+                Ok(ok_empty())
+            }
+            command::CREATE_PATH => {
+                let path = param_path(req, 0)?;
+                let recursive = param_bool(req, 1, &path)?;
+                self.storage.create_path(&path, recursive)?;
+                Ok(ok_empty())
+            }
+            command::REMOVE_PATH => {
+                let path = param_path(req, 0)?;
+                let recursive = param_bool(req, 1, &path)?;
+                let error_on_missing = param_bool(req, 2, &path)?;
+                self.storage.remove_path(&path, recursive, error_on_missing)?;
+                Ok(ok_empty())
+            }
+            command::CREATE_SYMLINK => {
+                let link_path = param_path(req, 0)?;
+                let target = param_path(req, 1)?;
+                self.storage.create_symlink(&link_path, &target)?;
+                Ok(ok_empty())
+            }
+            other => Err(backend(Path::new(""), &format!("unknown storage command: {other}"))),
+        }
+    }
+}
+
+impl<S: Storage> RequestHandler for StorageRequestHandler<S> {
+    fn handle(&mut self, req: &Request) -> Response {
+        match self.dispatch(req) {
+            Ok(out) => Response::Ok(out),
+            Err(err) => Response::Err(ErrResponse {
+                err: storage_error_code(&err),
+                message: err.to_string(),
+                stack: None,
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+const fn ok(out: Value) -> OkResponse {
+    OkResponse { out: Some(out) }
+}
+
+const fn ok_empty() -> OkResponse {
+    OkResponse { out: None }
+}
+
+/// Build a [`StorageError::Backend`] for `path` with `message`.
+fn backend(path: &Path, message: &str) -> StorageError {
+    StorageError::Backend {
+        path: path.to_path_buf(),
+        message: message.to_owned(),
+    }
+}
+
+/// Map a [`ProtocolError`] from the client side into a [`StorageError`].
+fn protocol_err(path: &Path, err: &ProtocolError) -> StorageError {
+    backend(path, &err.to_string())
+}
+
+fn json_err(err: &serde_json::Error) -> StorageError {
+    backend(Path::new(""), &format!("json: {err}"))
+}
+
+/// Extract the `index`-th param as a path.
+fn param_path(req: &Request, index: usize) -> Result<PathBuf, StorageError> {
+    let s = req
+        .param
+        .get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| backend(Path::new(""), &format!("{}: missing path param #{index}", req.cmd)))?;
+    Ok(PathBuf::from(s))
+}
+
+/// Extract the `index`-th param as a boolean.
+fn param_bool(req: &Request, index: usize, path: &Path) -> Result<bool, StorageError> {
+    req.param
+        .get(index)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| backend(path, &format!("{}: missing bool param #{index}", req.cmd)))
+}
+
+/// Extract the `index`-th param as base64-decoded bytes.
+fn param_bytes(req: &Request, index: usize, path: &Path) -> Result<Vec<u8>, StorageError> {
+    let encoded = req
+        .param
+        .get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| backend(path, &format!("{}: missing base64 param #{index}", req.cmd)))?;
+    BASE64
+        .decode(encoded)
+        .map_err(|e| backend(path, &format!("{}: bad base64: {e}", req.cmd)))
+}
+
+/// Map a [`StorageError`] to a numeric protocol error code. The exact value is
+/// informational on the wire (the client surfaces the message); codes match
+/// `crates/pgbr-build/inputs/error.yaml`.
+const fn storage_error_code(err: &StorageError) -> u32 {
+    match err {
+        // 55 == file-missing in error.yaml.
+        StorageError::NotFound { .. } => 55,
+        // 39 == protocol: a generic catch-all for the remaining storage faults.
+        _ => 39,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::Posix;
+    use pgbr_protocol::transport::{PipeRead, PipeWrite, serve};
+    use std::thread::{self, JoinHandle};
+    use tempfile::TempDir;
+
+    /// The concrete `RemoteStorage` instantiation used by the tests: a proxy
+    /// over the two `os_pipe` channels backing the in-thread transport.
+    type TestRemote = RemoteStorage<PipeRead<os_pipe::PipeReader>, PipeWrite<os_pipe::PipeWriter>>;
+
+    /// Spin up a `StorageRequestHandler<Posix>` serving on a thread, and return
+    /// a `RemoteStorage` wired to it over two `os_pipe` channels, plus the
+    /// server's join handle and the backing `TempDir` (kept alive by the
+    /// caller).
+    fn wire() -> (TestRemote, JoinHandle<()>, TempDir, Posix) {
+        let dir = TempDir::new().unwrap();
+        let posix = Posix::new(dir.path());
+        let server_posix = Posix::new(dir.path());
+
+        // client -> server requests; server -> client responses.
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let mut handler = StorageRequestHandler::new(server_posix);
+            serve(&mut reader, &mut writer, &mut handler).unwrap();
+        });
+
+        let client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        let remote = RemoteStorage::new(client);
+        (remote, server, dir, posix)
+    }
+
+    /// Read a whole file from a `Storage` into a `Vec<u8>`.
+    fn read_all(storage: &dyn Storage, path: &Path) -> Vec<u8> {
+        let mut r = storage.open_read(path).unwrap();
+        r.read_all().unwrap()
+    }
+
+    /// Write a whole file to a `Storage`.
+    fn write_all(storage: &dyn Storage, path: &Path, bytes: &[u8]) {
+        let mut w = storage.open_write(path).unwrap();
+        w.write(bytes).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn put_get_round_trip_matches_backing_posix() {
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("file.txt");
+        let payload = b"hello remote storage\n";
+
+        // Write through the remote proxy.
+        write_all(&remote, path, payload);
+
+        // The bytes landed in the backing Posix store...
+        assert_eq!(read_all(&posix, path), payload);
+        // ...and reading back through the proxy yields the same bytes.
+        assert_eq!(read_all(&remote, path), payload);
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exists_info_list() {
+        let (remote, server, _dir, _posix) = wire();
+
+        assert!(!remote.exists(Path::new("nope")).unwrap());
+
+        write_all(&remote, Path::new("a.txt"), b"abc");
+        write_all(&remote, Path::new("b.txt"), b"defgh");
+
+        assert!(remote.exists(Path::new("a.txt")).unwrap());
+
+        let info = remote.info(Path::new("b.txt")).unwrap();
+        assert_eq!(info.kind, StorageKind::File);
+        assert_eq!(info.size, 5);
+
+        let entries = remote.list(Path::new(".")).unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .filter(|e| e.kind == StorageKind::File)
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.txt".to_owned()));
+        assert!(names.contains(&"b.txt".to_owned()));
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remove_deletes_file() {
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("doomed.txt");
+        write_all(&remote, path, b"x");
+        assert!(posix.exists(path).unwrap());
+
+        remote.remove(path, true).unwrap();
+        assert!(!posix.exists(path).unwrap());
+
+        // Removing a missing file with error_on_missing=false is a no-op.
+        remote.remove(path, false).unwrap();
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn create_path_then_list() {
+        let (remote, server, _dir, posix) = wire();
+        remote.create_path(Path::new("sub/dir"), true).unwrap();
+        let info = posix.info(Path::new("sub/dir")).unwrap();
+        assert_eq!(info.kind, StorageKind::Path);
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn not_found_maps_to_error() {
+        let (remote, server, _dir, _posix) = wire();
+        // open_read on a missing file: the worker's Posix returns NotFound,
+        // which serializes to an error response and surfaces as a StorageError.
+        // `Box<dyn IoRead>` is not Debug, so match the Result by hand rather
+        // than `unwrap_err`.
+        match remote.open_read(Path::new("missing.txt")) {
+            Err(StorageError::Backend { message, .. }) => {
+                assert!(message.contains("not found") || message.contains("worker error"));
+            }
+            Err(other) => panic!("expected Backend error carrying worker message, got {other:?}"),
+            Ok(_) => panic!("expected open_read on a missing file to error"),
+        }
+
+        // info on a missing path likewise errors.
+        assert!(remote.info(Path::new("missing.txt")).is_err());
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_command_errs() {
+        // Drive the handler synchronously: an unrecognized command yields an
+        // error response rather than panicking.
+        let dir = TempDir::new().unwrap();
+        let mut handler = StorageRequestHandler::new(Posix::new(dir.path()));
+        let resp = handler.handle(&Request {
+            cmd: "storage-does-not-exist".to_owned(),
+            param: vec![],
+        });
+        match resp {
+            Response::Err(err) => assert!(err.message.contains("unknown storage command")),
+            Response::Ok(_) => panic!("expected an error response for an unknown command"),
+        }
+    }
+
+    #[test]
+    fn empty_file_round_trip() {
+        let (remote, server, _dir, posix) = wire();
+        let path = Path::new("empty.bin");
+        write_all(&remote, path, b"");
+        assert!(posix.exists(path).unwrap());
+        assert_eq!(read_all(&remote, path), b"");
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn binary_payload_round_trip() {
+        // Non-UTF8 bytes must survive the base64 hop intact.
+        let (remote, server, _dir, _posix) = wire();
+        let path = Path::new("blob.bin");
+        let payload: Vec<u8> = (0u8..=255).collect();
+        write_all(&remote, path, &payload);
+        assert_eq!(read_all(&remote, path), payload);
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn kind_dto_round_trips_all_variants() {
+        for kind in [StorageKind::File, StorageKind::Path, StorageKind::Link, StorageKind::Special] {
+            let dto: StorageKindDto = kind.into();
+            let back: StorageKind = dto.into();
+            assert_eq!(kind, back);
+        }
+    }
+}
