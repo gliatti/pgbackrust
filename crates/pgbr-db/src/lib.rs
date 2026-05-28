@@ -12,6 +12,10 @@ use std::fmt;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
 
+pub mod protocol;
+
+pub use crate::protocol::{DbExecutor, DbProtocolClient, DbProtocolError, QueryRows, handle_db_request};
+
 /// One `PostgreSQL` client connection.
 pub struct Connection {
     ptr: NonNull<libpq_sys::PGconn>,
