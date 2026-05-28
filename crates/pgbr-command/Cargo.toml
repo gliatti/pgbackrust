@@ -18,9 +18,17 @@ pgbr-io = { path = "../pgbr-io" }
 pgbr-postgres = { path = "../pgbr-postgres" }
 pgbr-protocol = { path = "../pgbr-protocol" }
 pgbr-storage = { path = "../pgbr-storage" }
+# Pure-Rust TLS. Disable the default `aws_lc_rs` provider (which links the
+# aws-lc C library via bindgen/clang) and use the `ring` provider instead, so
+# no OpenSSL / C crypto build is needed. `install_default()` selects it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
 serde_json = "1"
 
 [dev-dependencies]
+# `rcgen` generates the self-signed cert used by the TLS round-trip tests.
+# Match rustls: use the `ring`-backed crypto so no aws-lc C build is pulled in.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 serde_json = "1"
 tempfile = "3"
 
