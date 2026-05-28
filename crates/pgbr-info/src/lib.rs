@@ -1,8 +1,9 @@
-//! On-disk pgBackRest metadata files: `archive.info` and `backup.info`.
+//! On-disk pgBackRest metadata files: `archive.info`, `backup.info`, and `backup.manifest`.
 //!
-//! Both files are INI-with-checksum documents that describe the state of a pgBackRest
+//! These files are INI-with-checksum documents that describe the state of a pgBackRest
 //! repository — what `PostgreSQL` clusters have been backed up, what backups exist for
-//! each cluster, what versions are supported, and so on. This crate ships:
+//! each cluster, what versions are supported, and what files each backup captured. This
+//! crate ships:
 //!
 //! - [`format`] — a strict INI parser, a stable renderer, and the
 //!   `checksumed_load` / `checksumed_render` pair that enforce the SHA-1-over-the-
@@ -13,6 +14,8 @@
 //! - [`InfoBackup`] — typed wrapper around `backup.info`. Adds the catalog / control
 //!   versions to `[db]`, plus a `[backup:current]` block keyed by backup label and a
 //!   `[db:history]` block of historical clusters.
+//! - [`Manifest`] — typed wrapper around a backup's `backup.manifest`: the per-backup
+//!   inventory of every file, path, and symlink with size / timestamp / checksum metadata.
 //!
 //! Reads and writes go through a [`pgbr_storage::Storage`] reference so callers can stay
 //! backend-agnostic — `Posix` today, `S3` / `Azure` / `GCS` / … as they land.
@@ -22,6 +25,7 @@
 pub mod archive;
 pub mod backup;
 pub mod format;
+pub mod manifest;
 
 use std::fmt;
 
@@ -31,6 +35,7 @@ use pgbr_storage::StorageError;
 pub use crate::archive::{DbHistoryEntry, InfoArchive};
 pub use crate::backup::InfoBackup;
 pub use crate::format::{InfoFile, InfoFormatError};
+pub use crate::manifest::{Manifest, ManifestFile, ManifestLink, ManifestPath};
 
 /// Failure surface for the `pgbr-info` crate.
 #[derive(Debug)]
