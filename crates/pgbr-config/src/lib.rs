@@ -33,6 +33,7 @@ pub use crate::env::{collect_env, env_values_from_process, option_env_name};
 pub use crate::ini::{IniError, IniFile, IniSection, parse_ini};
 pub use crate::merge::{
     EnvValues, LoadError, LoadedConfig, RuntimeContext, load_config, load_config_with_context, load_config_with_env,
+    load_config_with_env_multi,
 };
 pub use crate::option::{CfgOption, ResolvedCommandUsage, ResolvedDepend};
 pub use crate::types::{ConfigCommandRole, DefaultType, LockType, OptionGroup, OptionSection, OptionType};

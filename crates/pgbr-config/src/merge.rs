@@ -263,6 +263,83 @@ pub fn load_config_with_env(
     cfg: &Cfg,
     ctx: &RuntimeContext,
 ) -> Result<LoadedConfig, LoadError> {
+    load_config_with_env_multi(cli, env, std::slice::from_ref(ini), cfg, ctx)
+}
+
+/// Merge a [`ResolvedCli`], the `PGBACKREST_<OPTION>` environment values
+/// (`env`), an ordered slice of [`IniFile`] config sources, and the defaults
+/// from a compiled [`Cfg`] into a final [`LoadedConfig`].
+///
+/// This is the multi-source variant of [`load_config_with_env`]. pgBackRest
+/// reads the main `--config` file plus every `*.conf` under
+/// `--config-include-path`, treating them all as the same "config file"
+/// precedence level (below the CLI and env, above defaults). The slice is
+/// applied **in load order**: the main config first, then the include files
+/// (sorted by name). When two sources set the same key in the same INI
+/// section, a *later* source wins — matching pgBackRest, where include files
+/// are loaded after the main config and override it.
+///
+/// The five-source precedence is therefore CLI, then ENV, then the combined
+/// config files, then defaults; the combined config files themselves resolve by
+/// section (`stanza:cmd`, `stanza`, `global:cmd`, `global`, in that order)
+/// exactly as the single-file path does. The single-file
+/// [`load_config_with_env`] is a thin wrapper over this (a one-element slice),
+/// so all existing behaviour is preserved.
+///
+/// # Errors
+///
+/// Returns [`LoadError`] when a CLI / env / INI value fails to parse, when a
+/// required option is missing, or when validation (allow-list, allow-range,
+/// depend) fails.
+pub fn load_config_with_env_multi(
+    cli: ResolvedCli,
+    env: &EnvValues,
+    inis: &[IniFile],
+    cfg: &Cfg,
+    ctx: &RuntimeContext,
+) -> Result<LoadedConfig, LoadError> {
+    let combined = merge_ini_files(inis);
+    load_config_with_env_single(cli, env, &combined, cfg, ctx)
+}
+
+/// Collapse an ordered slice of [`IniFile`] config sources into one combined
+/// [`IniFile`], applying later sources over earlier ones at the
+/// `(section, key)` granularity.
+///
+/// This is how pgBackRest layers its config files: the main `--config` file is
+/// loaded first, then each `*.conf` under the include path (sorted by name);
+/// a later file's value for the same key in the same section overrides the
+/// earlier one. A single-element slice returns that file unchanged, so the
+/// single-file path is a no-op pass-through.
+fn merge_ini_files(inis: &[IniFile]) -> IniFile {
+    // Fast path: the overwhelmingly common single-file case clones the one
+    // file as-is (no per-key churn).
+    if let [only] = inis {
+        return only.clone();
+    }
+    let mut combined = IniFile::default();
+    for ini in inis {
+        for (section, values) in &ini.sections {
+            let entry = combined.sections.entry(section.clone()).or_default();
+            for (key, value) in values {
+                // Later file wins for the same (section, key).
+                entry.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    combined
+}
+
+/// The original single-`IniFile` merge body, now reached through
+/// [`load_config_with_env`] / [`load_config_with_env_multi`] after the
+/// config sources have been collapsed into one [`IniFile`].
+fn load_config_with_env_single(
+    cli: ResolvedCli,
+    env: &EnvValues,
+    ini: &IniFile,
+    cfg: &Cfg,
+    ctx: &RuntimeContext,
+) -> Result<LoadedConfig, LoadError> {
     let stanza = extract_stanza(&cli);
     let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
 
@@ -985,6 +1062,20 @@ option:
         let env_map: BTreeMap<&str, &str> = env.iter().copied().collect();
         let env_values = crate::env::collect_env(&cfg, |name| env_map.get(name).map(|v| (*v).to_owned()));
         load_config_with_env(resolved, &env_values, &ini, &cfg, &RuntimeContext::default()).map_err(|e| e.to_string())
+    }
+
+    /// Like [`load`] but takes several INI texts (in load order) and merges them
+    /// through the multi-source entry point, mirroring how `pgbr-cli` layers the
+    /// main `--config` file with the `*.conf` include files.
+    fn load_multi(cli_args: &[&str], ini_texts: &[&str]) -> Result<LoadedConfig, String> {
+        let cfg = small_cfg();
+        let cli = parse_cli(cli_args.iter().map(|s| (*s).to_owned())).map_err(|e| e.to_string())?;
+        let resolved = resolve_cli(cli, &cfg).map_err(|e| e.to_string())?;
+        let inis: Vec<IniFile> = ini_texts
+            .iter()
+            .map(|t| crate::ini::parse_ini(t).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        load_config_with_env_multi(resolved, &EnvValues::new(), &inis, &cfg, &RuntimeContext::default()).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -1800,5 +1891,113 @@ option:
         )
         .unwrap();
         assert_eq!(plain, with_empty_env);
+    }
+
+    // ---- multi-source (config-include-path) config files -------------------
+
+    #[test]
+    fn single_element_slice_matches_single_file() {
+        // A one-element slice through the multi-source path must produce exactly
+        // the same result as the single-file path (the `pgbr-cli` invariant when
+        // no include files exist).
+        let single = load(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            "[global]\nbuffer-size=2MiB\n",
+        )
+        .unwrap();
+        let multi = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &["[global]\nbuffer-size=2MiB\n"],
+        )
+        .unwrap();
+        assert_eq!(single, multi);
+    }
+
+    #[test]
+    fn later_include_file_overrides_earlier_for_same_key() {
+        // The main config sets buffer-size=2MiB; a later include file sets it to
+        // 8MiB in the same [global] section. The later source wins (pgBackRest
+        // loads include files after the main config).
+        let r = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &["[global]\nbuffer-size=2MiB\n", "[global]\nbuffer-size=8MiB\n"],
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn include_files_extend_main_config() {
+        // The main config sets buffer-size; a later include file sets a
+        // different key (log-level-file) in the same section. Both values
+        // survive — the include file extends rather than wholesale-replaces.
+        let r = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &["[global]\nbuffer-size=4MiB\n", "[global]\nlog-level-file=debug\n"],
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(4 * 1024 * 1024));
+        assert_eq!(
+            r.options[&("log-level-file".into(), None)],
+            OptionValue::StringId("debug".into())
+        );
+    }
+
+    #[test]
+    fn include_file_order_is_significant() {
+        // Three include files all set buffer-size; the last one in the slice
+        // wins regardless of value magnitude (later = higher precedence).
+        let r = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &[
+                "[global]\nbuffer-size=1MiB\n",
+                "[global]\nbuffer-size=8MiB\n",
+                "[global]\nbuffer-size=2MiB\n",
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn cli_still_overrides_combined_include_files() {
+        // CLI sits above every config file: even when an include file sets
+        // buffer-size, an explicit CLI value wins.
+        let r = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data", "--buffer-size=4MiB"],
+            &["[global]\nbuffer-size=1MiB\n", "[global]\nbuffer-size=8MiB\n"],
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn empty_slice_resolves_with_only_defaults() {
+        // No config files at all (the "missing main config + missing include
+        // dir" case `pgbr-cli` never actually hits, but the merge must tolerate)
+        // resolves purely from CLI + defaults.
+        let r = load_multi(&["backup", "--stanza=demo", "--pg1-path=/data"], &[]).unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(1024 * 1024));
+    }
+
+    #[test]
+    fn section_precedence_preserved_across_merged_files() {
+        // A later include file's [global] value does NOT beat an earlier file's
+        // more-specific [demo:backup] value: section precedence (stanza:cmd >
+        // global) still wins after the files are combined.
+        let r = load_multi(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            &["[demo:backup]\nbuffer-size=8MiB\n", "[global]\nbuffer-size=2MiB\n"],
+        )
+        .unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn merge_ini_files_single_element_is_passthrough() {
+        // The merge helper returns a single-element slice's file unchanged.
+        let ini = crate::ini::parse_ini("[global]\nbuffer-size=2MiB\n").unwrap();
+        let combined = merge_ini_files(std::slice::from_ref(&ini));
+        assert_eq!(combined, ini);
     }
 }
