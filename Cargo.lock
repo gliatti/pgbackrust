@@ -958,6 +958,9 @@ version = "0.1.0"
 dependencies = [
  "libpq-sys",
  "pgbr-error",
+ "pgbr-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
