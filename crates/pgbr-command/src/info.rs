@@ -30,18 +30,36 @@
 //!   stanza-level `backup.info` header (the only copy this fork stores).
 //! - `database.repo-key` / `archive[].database.repo-key` — always `1`; this
 //!   fork is single-repo, so there is no per-backup repo index to report.
-//! - `lsn`, `reference`, `error`, `annotation`, `database-ref`, `link`,
-//!   `tablespace` — only produced by the C side when a manifest is loaded for
-//!   a specific `--set`; omitted here.
+//! - `lsn`, `error`, `annotation`, `database-ref`, `link`, `tablespace` — only
+//!   produced by the C side when a manifest is loaded for a specific `--set`;
+//!   omitted here.
 //! - text timestamps are rendered in UTC (`YYYY-MM-DD HH:MM:SS+0000`) rather
 //!   than the C side's local time + computed offset, to keep rendering pure
 //!   and deterministic without pulling in a timezone database.
+//!
+//! ## `--set=<label>` detailed single-backup view
+//!
+//! When `--set=<label>` names a backup, `info` additionally loads that
+//! backup's `backup.manifest` (at `backup/<stanza>/<label>/backup.manifest`)
+//! and renders a per-backup *detail* block on top of the summary, mirroring the
+//! C side's `set`-specific rendering in `src/command/info/info.c`:
+//!
+//! - text: after the matching backup's summary lines, a `database list:` of the
+//!   backed-up cluster (version + system-id, the only database identity this
+//!   fork's [`Manifest`] records) and a `file list:` line carrying the manifest
+//!   file count and total size.
+//! - JSON: the matching backup object gains a `manifest` detail block with
+//!   `file-count`, `file-total-size`, the manifest timestamps, and a `database`
+//!   list element for the backed-up cluster.
+//!
+//! `--set` requires `--stanza`. An unknown label errors; an unreadable manifest
+//! degrades to a note (the summary still renders) rather than failing.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
-use pgbr_info::{InfoArchive, InfoBackup};
+use pgbr_info::{InfoArchive, InfoBackup, InfoError, Manifest};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 use serde_json::{Value, json};
 
@@ -554,6 +572,189 @@ fn want_json(config: &LoadedConfig) -> bool {
         Some(OptionValue::StringId(v) | OptionValue::String(v)) if v == "json"
     )
 }
+/// The `--set=<label>` backup label, if one was supplied. `info`'s `set`
+/// option is plain `string` (see `config.yaml`), so it arrives as
+/// [`OptionValue::String`].
+fn set_label(config: &LoadedConfig) -> Option<&str> {
+    match config.options.get(&("set".to_owned(), None)) {
+        Some(OptionValue::String(label) | OptionValue::StringId(label)) => Some(label.as_str()),
+        _ => None,
+    }
+}
+
+/// Repository-relative path to a backup's manifest.
+fn manifest_path(stanza: &str, label: &str) -> PathBuf {
+    PathBuf::from(format!("backup/{stanza}/{label}/backup.manifest"))
+}
+
+/// Outcome of trying to load the manifest for a `--set` backup. Distinguishes
+/// "loaded" from "present in backup.info but the manifest file could not be
+/// read" so the renderers can degrade with a note instead of failing.
+enum SetManifest {
+    /// Manifest loaded cleanly.
+    Loaded(Box<Manifest>),
+    /// The backup exists in `backup.info` but its manifest could not be read
+    /// (missing file, malformed, checksum mismatch, …). Carries the reason.
+    Unavailable(String),
+}
+
+/// Load the manifest for `label` under `stanza`. Returns
+/// [`SetManifest::Unavailable`] (never an error) when the manifest file cannot
+/// be read, so the detail view can still render the summary plus a note. The
+/// "unknown label" case is detected separately against `backup.info` before
+/// this is called.
+fn load_set_manifest(repo: &dyn Storage, stanza: &str, label: &str) -> SetManifest {
+    let path = manifest_path(stanza, label);
+    match Manifest::load(repo, &path) {
+        Ok(manifest) => SetManifest::Loaded(Box::new(manifest)),
+        Err(InfoError::Storage(StorageError::NotFound { .. })) => {
+            SetManifest::Unavailable(format!("manifest for backup '{label}' not found"))
+        }
+        Err(err) => SetManifest::Unavailable(format!("manifest for backup '{label}' unreadable: {err}")),
+    }
+}
+
+/// Find the [`BackupSummary`] for `label` within a stanza summary.
+fn find_backup<'a>(summary: &'a StanzaSummary, label: &str) -> Option<&'a BackupSummary> {
+    summary.backups.iter().find(|b| b.label == label)
+}
+
+/// Render the detailed single-backup *text* block for `--set`. Pure over the
+/// loaded [`Manifest`] (plus the `backup.info`-derived [`BackupSummary`] for the
+/// summary lines and the stanza name for context). Mirrors the `set`-specific
+/// rendering in `src/command/info/info.c`: the backup summary, then the
+/// database list of the backed-up cluster and the manifest file list (count +
+/// total size).
+#[must_use]
+fn render_set_text(stanza: &str, backup: &BackupSummary, manifest: &Manifest) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "stanza: {stanza}");
+
+    // The summary block for just this backup (reuses the shared per-backup
+    // formatter so the lines match the repo-wide listing exactly).
+    render_backup_text(&mut out, backup);
+
+    // database list — this fork's Manifest records the backed-up cluster's
+    // identity (version + system-id) rather than a per-database catalog, so the
+    // list has a single entry describing that cluster.
+    out.push_str("\n            database list:\n");
+    let _ = writeln!(
+        out,
+        "                {} (system-id {})",
+        manifest.db_version, manifest.db_system_id
+    );
+
+    // file list — the count and total size captured by this backup's manifest.
+    let file_count = manifest.files.len();
+    let total_size = manifest.total_size();
+    let _ = writeln!(
+        out,
+        "            file list: {file_count} file(s), {} ({total_size}B)",
+        human_size(total_size)
+    );
+
+    // manifest timestamps (surfaced from the manifest itself).
+    let start = format_timestamp(manifest.timestamp_start);
+    let stop = format_timestamp(manifest.timestamp_stop);
+    let _ = writeln!(out, "            manifest timestamp start/stop: {start} / {stop}");
+
+    out
+}
+
+/// Render the detailed single-backup *JSON* detail block for `--set`. Returns
+/// the `manifest` object that gets attached to the backup's JSON. Pure over the
+/// loaded [`Manifest`].
+#[must_use]
+fn render_set_json(manifest: &Manifest) -> Value {
+    json!({
+        "label": manifest.backup_label,
+        "type": manifest.backup_type,
+        "file-count": manifest.files.len(),
+        "file-total-size": manifest.total_size(),
+        "path-count": manifest.paths.len(),
+        "link-count": manifest.links.len(),
+        "timestamp": {
+            "start": manifest.timestamp_start,
+            "stop": manifest.timestamp_stop,
+        },
+        // Single-database identity recorded by this fork's Manifest (the
+        // backed-up cluster). The C side lists every database in the cluster;
+        // this fork carries only the cluster version + system-id.
+        "database": [
+            {
+                "version": manifest.db_version,
+                "system-id": manifest.db_system_id,
+            }
+        ],
+    })
+}
+
+/// Render the `--set` detail view in text form: the matching backup's summary
+/// plus the manifest detail block, or a degradation note when the manifest is
+/// unavailable.
+fn render_set_view_text(stanza: &str, backup: &BackupSummary, manifest: &SetManifest) -> String {
+    match manifest {
+        SetManifest::Loaded(manifest) => render_set_text(stanza, backup, manifest),
+        SetManifest::Unavailable(note) => {
+            let mut out = String::new();
+            let _ = writeln!(out, "stanza: {stanza}");
+            render_backup_text(&mut out, backup);
+            let _ = writeln!(out, "\n            note: {note}");
+            out
+        }
+    }
+}
+
+/// Render the `--set` detail view in JSON form: the summary backup object with
+/// a `manifest` detail block attached, or a `manifest-note` when the manifest
+/// is unavailable.
+fn render_set_view_json(backup: &BackupSummary, format: u32, version: &str, manifest: &SetManifest) -> Value {
+    let mut obj = backup_json(backup, format, version);
+    match manifest {
+        SetManifest::Loaded(manifest) => {
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("manifest".to_owned(), render_set_json(manifest));
+            }
+        }
+        SetManifest::Unavailable(note) => {
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("manifest-note".to_owned(), Value::String(note.clone()));
+            }
+        }
+    }
+    obj
+}
+
+/// Drive the `--set` detail path: resolve the stanza, locate the named backup
+/// in `backup.info`, load its manifest, and render the detail view in the
+/// requested format. Returns the rendered string.
+///
+/// # Errors
+///
+/// - [`CommandError::MissingOption`] when `--stanza` is absent (`--set` depends
+///   on it per `config.yaml`).
+/// - [`CommandError::Other`] when the named label is not present in this
+///   stanza's `backup.info` (unknown backup).
+fn render_set(config: &LoadedConfig, repo_storage: &dyn Storage, label: &str) -> Result<String, CommandError> {
+    let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
+        option: "stanza".to_owned(),
+    })?;
+
+    let summary = summarize_stanza(repo_storage, stanza);
+    let backup = find_backup(&summary, label)
+        .ok_or_else(|| CommandError::Other(format!("backup '{label}' does not exist in stanza '{stanza}'")))?;
+
+    let manifest = load_set_manifest(repo_storage, stanza, label);
+
+    if want_json(config) {
+        let format = summary.backrest_format.unwrap_or(0);
+        let version = summary.backrest_version.as_deref().unwrap_or("");
+        let detail = render_set_view_json(backup, format, version, &manifest);
+        Ok(serde_json::to_string_pretty(&Value::Array(vec![detail])).unwrap_or_else(|_| "[]".to_owned()))
+    } else {
+        Ok(render_set_view_text(stanza, backup, &manifest))
+    }
+}
 
 /// `info` — print backup history for one or more stanzas in the requested
 /// `--output` format (`text` default, or `json`).
@@ -564,6 +765,14 @@ fn want_json(config: &LoadedConfig) -> bool {
 // CLI command: writing to stdout is the whole point.
 #[allow(clippy::print_stdout)]
 pub fn info(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+    // `--set=<label>` switches to the detailed single-backup view (C ref:
+    // src/command/info/info.c set-specific rendering).
+    if let Some(label) = set_label(config) {
+        let rendered = render_set(config, repo_storage, label)?;
+        print!("{rendered}");
+        return Ok(());
+    }
+
     let summaries = info_inner(config, repo_storage)?;
     let rendered = if want_json(config) {
         render_json(&summaries)
@@ -580,14 +789,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig};
-    use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup};
+    use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
     use pgbr_storage::{Posix, Storage};
     use serde_json::json;
     use tempfile::TempDir;
 
     use pgbr_config::OptionValue;
 
-    use super::{StanzaStatus, format_timestamp, info_inner, render_json, render_text, want_json};
+    use super::{CommandError, StanzaStatus, format_timestamp, info, info_inner, render_json, render_set, render_text, want_json};
 
     fn fake_config(stanza: Option<&str>) -> LoadedConfig {
         LoadedConfig {
@@ -603,6 +812,18 @@ mod tests {
         let mut cfg = fake_config(stanza);
         cfg.options
             .insert(("output".to_owned(), None), OptionValue::StringId(output.to_owned()));
+        cfg
+    }
+    /// Config carrying `--set=<label>` (and optionally `--output`).
+    fn fake_config_set(stanza: Option<&str>, set: &str, output: Option<&str>) -> LoadedConfig {
+        let mut cfg = fake_config(stanza);
+        cfg.command = "info".to_owned();
+        cfg.options
+            .insert(("set".to_owned(), None), OptionValue::String(set.to_owned()));
+        if let Some(out) = output {
+            cfg.options
+                .insert(("output".to_owned(), None), OptionValue::StringId(out.to_owned()));
+        }
         cfg
     }
 
@@ -929,5 +1150,208 @@ mod tests {
         assert_eq!(stanza["status"]["message"], json!("missing stanza path"));
         assert_eq!(stanza["db"].as_array().expect("db array").len(), 0);
         assert_eq!(stanza["backup"].as_array().expect("backup array").len(), 0);
+    }
+    /// Build a sample manifest for `label` with two files of known sizes.
+    fn sample_manifest(label: &str) -> Manifest {
+        Manifest {
+            backup_label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_700_000_000,
+            timestamp_stop: 1_700_000_123,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![
+                ManifestFile {
+                    path: "pg_data/PG_VERSION".to_owned(),
+                    size: 3,
+                    timestamp: 1_700_000_000,
+                    checksum: Some("e1f2c3d4".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                },
+                ManifestFile {
+                    path: "pg_data/base/1/1259".to_owned(),
+                    size: 8192,
+                    timestamp: 1_700_000_000,
+                    checksum: Some("a0b1c2d3".to_owned()),
+                    checksum_page: Some(true),
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                },
+            ],
+            paths: vec![ManifestPath {
+                path: "pg_data".to_owned(),
+            }],
+            links: vec![ManifestLink {
+                path: "pg_data/pg_wal".to_owned(),
+                destination: "/var/lib/pg_wal".to_owned(),
+            }],
+        }
+    }
+
+    /// Seed `demo` with one full backup in `backup.info` AND its on-disk
+    /// `backup.manifest`. Returns the live repo + its tempdir (kept alive).
+    fn initialized_demo_with_manifest(label: &str) -> (TempDir, Posix) {
+        let (dir, storage) = posix_repo();
+        storage
+            .create_path(std::path::Path::new("archive/demo"), true)
+            .expect("create archive/demo");
+        storage
+            .create_path(std::path::Path::new("backup/demo"), true)
+            .expect("create backup/demo");
+
+        sample_archive()
+            .save(&storage, std::path::Path::new("archive/demo/archive.info"))
+            .expect("save archive.info");
+
+        let mut current = BTreeMap::new();
+        current.insert(
+            label.to_owned(),
+            json!({
+                "backup-info-size": 8195_u64,
+                "backup-info-repo-size": 4096_u64,
+                "backup-label": label,
+                "backup-timestamp-start": 1_700_000_000,
+                "backup-timestamp-stop": 1_700_000_123,
+                "backup-archive-start": "000000010000000000000002",
+                "backup-archive-stop": "000000010000000000000003",
+                "backup-type": "full",
+                "db-id": 1
+            }),
+        );
+        sample_backup_with(current)
+            .save(&storage, std::path::Path::new("backup/demo/backup.info"))
+            .expect("save backup.info");
+
+        let dir_rel = format!("backup/demo/{label}");
+        storage
+            .create_path(std::path::Path::new(&dir_rel), true)
+            .expect("create backup label dir");
+        sample_manifest(label)
+            .save(&storage, std::path::Path::new(&format!("{dir_rel}/backup.manifest")))
+            .expect("save backup.manifest");
+
+        (dir, storage)
+    }
+
+    #[test]
+    fn set_text_renders_detailed_view_with_file_count_and_size() {
+        let label = "20260101-100000F";
+        let (_dir, storage) = initialized_demo_with_manifest(label);
+
+        let cfg = fake_config_set(Some("demo"), label, None);
+        let text = render_set(&cfg, &storage, label).expect("render_set text");
+
+        assert!(text.contains("stanza: demo\n"), "missing stanza line:\n{text}");
+        assert!(
+            text.contains("full backup: 20260101-100000F\n"),
+            "missing backup heading:\n{text}"
+        );
+        assert!(
+            text.contains("file list: 2 file(s), 8.0KiB (8195B)"),
+            "missing file list line:\n{text}"
+        );
+        assert!(text.contains("database list:"), "missing database list header:\n{text}");
+        assert!(
+            text.contains("14 (system-id 6873049345984568091)"),
+            "missing database list entry:\n{text}"
+        );
+        assert!(
+            text.contains("manifest timestamp start/stop: 2023-11-14 22:13:20+0000 / 2023-11-14 22:15:23+0000"),
+            "missing manifest timestamp line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn set_json_attaches_manifest_detail_block() {
+        let label = "20260101-100000F";
+        let (_dir, storage) = initialized_demo_with_manifest(label);
+
+        let cfg = fake_config_set(Some("demo"), label, Some("json"));
+        let rendered = render_set(&cfg, &storage, label).expect("render_set json");
+
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+        let arr = parsed.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 1);
+        let backup = &arr[0];
+
+        assert_eq!(backup["label"], json!(label));
+        assert_eq!(backup["type"], json!("full"));
+
+        let manifest = &backup["manifest"];
+        assert_eq!(manifest["file-count"], json!(2));
+        assert_eq!(manifest["file-total-size"], json!(8195));
+        assert_eq!(manifest["path-count"], json!(1));
+        assert_eq!(manifest["link-count"], json!(1));
+        assert_eq!(manifest["timestamp"]["start"], json!(1_700_000_000));
+        assert_eq!(manifest["timestamp"]["stop"], json!(1_700_000_123));
+
+        let dbs = manifest["database"].as_array().expect("database array");
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0]["version"], json!("14"));
+        assert_eq!(dbs[0]["system-id"], json!(6_873_049_345_984_568_091_u64));
+    }
+
+    #[test]
+    fn set_unknown_label_errors() {
+        let label = "20260101-100000F";
+        let (_dir, storage) = initialized_demo_with_manifest(label);
+
+        let cfg = fake_config_set(Some("demo"), "20991231-235959F", None);
+        let err = render_set(&cfg, &storage, "20991231-235959F").expect_err("unknown label must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("does not exist"), "got: {msg}"),
+            other => panic!("expected Other(does not exist), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_requires_stanza() {
+        let (_dir, storage) = posix_repo();
+        let cfg = fake_config_set(None, "20260101-100000F", None);
+        let err = render_set(&cfg, &storage, "20260101-100000F").expect_err("missing stanza must error");
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "stanza"),
+            other => panic!("expected MissingOption(stanza), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_missing_manifest_degrades_with_note() {
+        let label = "20260101-100000F";
+        let (_dir, storage) = initialized_demo_with_manifest(label);
+        storage
+            .remove(std::path::Path::new(&format!("backup/demo/{label}/backup.manifest")), false)
+            .expect("remove manifest");
+
+        let cfg = fake_config_set(Some("demo"), label, None);
+        let text = render_set(&cfg, &storage, label).expect("render_set text degrade");
+        assert!(text.contains("full backup: 20260101-100000F\n"), "missing summary:\n{text}");
+        assert!(text.contains("note:"), "missing degradation note:\n{text}");
+        assert!(text.contains("not found"), "note should mention not found:\n{text}");
+
+        let json_cfg = fake_config_set(Some("demo"), label, Some("json"));
+        let rendered = render_set(&json_cfg, &storage, label).expect("render_set json degrade");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+        let backup = &parsed.as_array().expect("array")[0];
+        assert_eq!(backup["label"], json!(label));
+        assert!(backup.get("manifest").is_none(), "should have no manifest block:\n{rendered}");
+        assert!(
+            backup["manifest-note"].as_str().unwrap().contains("not found"),
+            "missing manifest-note:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn info_with_set_dispatches_to_detail_view() {
+        let label = "20260101-100000F";
+        let (_dir, storage) = initialized_demo_with_manifest(label);
+        let cfg = fake_config_set(Some("demo"), label, None);
+        info(&cfg, &storage).expect("info --set should succeed");
     }
 }
