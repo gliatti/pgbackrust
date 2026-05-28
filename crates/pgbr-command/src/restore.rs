@@ -1396,4 +1396,131 @@ mod tests {
             "changed file must match the diff backup"
         );
     }
+
+    #[test]
+    fn backup_full_diff_incr_then_restore_incr() {
+        // END TO END: full -> modify -> diff -> modify -> incr, then restore the
+        // INCR into a fresh target. Three files exercise all three holders:
+        //   - file a: never changes after the full   -> bytes live in the FULL
+        //   - file b: last changed in the diff        -> bytes live in the DIFF
+        //   - file c: changed for the incr            -> bytes live in the INCR
+        // Restore of the incr follows each file's single recorded reference; the
+        // incr must have resolved file b's reference to the diff (its physical
+        // holder) at backup time, so no multi-hop chain walking is needed.
+        use crate::backup::{BackupType, backup_inner_typed};
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let full_label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+
+        // gz transform throughout, so reference restore must also reverse the
+        // referenced backup's recorded transform.
+        let transform = RepoTransform {
+            compress_type: CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+
+        let a = b"file a content that never changes after the full backup";
+        let b_v1 = b"file b version one, present in the full backup only-ish";
+        let c_v1 = b"file c version one, present in the full backup";
+        seed_pg_file(&pg_src_s, "base/1/a", a);
+        seed_pg_file(&pg_src_s, "base/1/b", b_v1);
+        seed_pg_file(&pg_src_s, "base/1/c", c_v1);
+
+        backup_inner_typed(
+            stanza,
+            &repo_s,
+            &pg_src_s,
+            BackupType::Full,
+            Some(full_label),
+            1_704_110_400,
+            &transform,
+        )
+        .expect("full backup");
+
+        // Modify b; diff (prior = full).
+        let b_v2 = b"file b version TWO, changed only for the differential backup";
+        seed_pg_file(&pg_src_s, "base/1/b", b_v2);
+        let diff =
+            backup_inner_typed(stanza, &repo_s, &pg_src_s, BackupType::Diff, None, 1_704_196_800, &transform).expect("diff backup");
+        let diff_label = diff.label;
+
+        // Modify c; incr (prior = diff).
+        let c_v2 = b"file c version TWO, changed only for the incremental backup";
+        seed_pg_file(&pg_src_s, "base/1/c", c_v2);
+        let incr =
+            backup_inner_typed(stanza, &repo_s, &pg_src_s, BackupType::Incr, None, 1_704_283_200, &transform).expect("incr backup");
+        let incr_label = incr.label;
+        assert_eq!(incr_label, format!("{full_label}_20240103-120000I"));
+
+        // The incr manifest must reference file b directly at the DIFF (its
+        // physical holder) — not at the full — so restore needs only one hop.
+        let incr_manifest = Manifest::load(&repo_s, &super::manifest_path(stanza, &incr_label)).expect("load incr manifest");
+        assert_eq!(
+            incr_manifest.file("base/1/a").and_then(|f| f.reference.as_deref()),
+            Some(full_label),
+            "file a must reference the full"
+        );
+        assert_eq!(
+            incr_manifest.file("base/1/b").and_then(|f| f.reference.as_deref()),
+            Some(diff_label.as_str()),
+            "file b must reference the diff (its physical holder), not the full"
+        );
+
+        // Physical-holder invariants: only the changed file's bytes live in the
+        // incr dir; a's bytes live in the full, b's bytes live in the diff.
+        assert!(
+            repo_dir
+                .path()
+                .join(format!("backup/{stanza}/{incr_label}/base/1/c.gz"))
+                .exists(),
+            "incr-changed file must live in the incr dir"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(format!("backup/{stanza}/{incr_label}/base/1/a.gz"))
+                .exists(),
+            "full-held file must not be duplicated into the incr dir"
+        );
+        assert!(
+            !repo_dir
+                .path()
+                .join(format!("backup/{stanza}/{incr_label}/base/1/b.gz"))
+                .exists(),
+            "diff-held file must not be duplicated into the incr dir"
+        );
+
+        // Restore the INCR into a fresh target. No options needed: each file's
+        // transform is read from its source backup's recorded metadata.
+        let outcome = restore_inner(
+            &restore_cfg(stanza, vec![(("set", None), OptionValue::String(incr_label.clone()))]),
+            &repo_s,
+            &pg_dst_s,
+        )
+        .expect("restore incr");
+        assert_eq!(outcome.label, incr_label);
+        assert_eq!(outcome.files_restored, 3, "all three files must be restored");
+
+        // Every file present and correct, sourced from whichever backup holds it.
+        for (rel, expected) in [
+            ("base/1/a", a.as_slice()),
+            ("base/1/b", b_v2.as_slice()),
+            ("base/1/c", c_v2.as_slice()),
+        ] {
+            let restored = {
+                let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored file");
+                r.read_all().expect("read restored file")
+            };
+            assert_eq!(restored.as_slice(), expected, "incr restore mismatch for {rel}");
+        }
+    }
 }
