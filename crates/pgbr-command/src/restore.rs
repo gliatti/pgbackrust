@@ -31,9 +31,25 @@
 //! ([`CommandError::Other`]): restoring corrupt data silently is worse than
 //! failing the restore.
 //!
+//! # Delta restore (`--delta`)
+//!
+//! When `--delta` is set, each manifest file is checked against what is already
+//! on the PG target *before* copying: if the target file exists with the same
+//! size and (when the manifest records one) the same SHA-1, the copy is skipped
+//! and counted in [`RestoreOutcome::files_skipped`]. Mismatched or missing files
+//! are restored exactly as in a non-delta restore. Without `--delta`, every
+//! manifest file is copied (the prior behaviour, unchanged).
+//!
+//! Delta restore also removes target files that are **not** present in the
+//! manifest so the target ends up matching the backup exactly. After the copy
+//! pass, the PG target is walked recursively and any regular file whose
+//! manifest-relative path is absent from the manifest's `[target:file]` set is
+//! removed (counted in [`RestoreOutcome::files_removed`]). Empty directories and
+//! symlinks are left alone — directory/symlink reconciliation is still deferred
+//! along with symlink re-creation.
+//!
 //! # Deferred to later commits
 //!
-//! - `--delta` (only restore files that differ from what is on disk),
 //! - tablespace remapping (`--tablespace-map` / `--tablespace-map-all`),
 //! - recovery-config generation (`recovery.conf` / `postgresql.auto.conf`),
 //! - `--db-include` / `--db-exclude` selective database restore,
@@ -48,9 +64,9 @@
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
-use pgbr_info::{InfoBackup, InfoError, Manifest};
+use pgbr_info::{InfoBackup, InfoError, Manifest, ManifestFile};
 use pgbr_io::{Filter, IoRead, Sha1};
-use pgbr_storage::{Storage, StorageError};
+use pgbr_storage::{Storage, StorageError, StorageKind};
 
 use crate::CommandError;
 use crate::pipeline::RepoTransform;
@@ -60,8 +76,14 @@ use crate::pipeline::RepoTransform;
 pub struct RestoreOutcome {
     /// Backup label that was restored.
     pub label: String,
-    /// Number of files copied into the PG target.
+    /// Number of files actually copied into the PG target.
     pub files_restored: usize,
+    /// Number of files skipped because the target already matched the manifest
+    /// (delta restore only; always `0` without `--delta`).
+    pub files_skipped: usize,
+    /// Number of stray target files removed because they were absent from the
+    /// manifest (delta restore only; always `0` without `--delta`).
+    pub files_removed: usize,
     /// Number of directories created in the PG target.
     pub paths_created: usize,
     /// Number of `[target:link]` entries skipped (symlink re-creation deferred).
@@ -93,6 +115,81 @@ fn requested_set(config: &LoadedConfig) -> Option<&str> {
         Some(OptionValue::String(label)) => Some(label.as_str()),
         _ => None,
     }
+}
+
+/// Whether `--delta` was supplied and set to `true`.
+fn delta_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("delta".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Whether the file already on the PG target matches the manifest entry, so the
+/// copy can be skipped under `--delta`.
+///
+/// A file matches when it exists with the same size as the manifest records
+/// and, when the manifest records a checksum, the same SHA-1. A zero-length
+/// manifest file carries no checksum, so a same-size (zero-byte) target matches
+/// on size alone. A missing target, a size mismatch, a checksum mismatch, or any
+/// read error all count as "does not match" — i.e. restore it.
+fn target_matches(pg: &dyn Storage, rel: &Path, file: &ManifestFile) -> bool {
+    // Size first: cheap, and a mismatch settles it without reading the file.
+    match pg.info(rel) {
+        Ok(info) if info.kind == StorageKind::File && info.size == file.size => {}
+        _ => return false,
+    }
+
+    // When the manifest records a checksum, the target's SHA-1 must match it.
+    let Some(expected) = file.checksum.as_deref() else {
+        // No recorded checksum (zero-length file); same size is enough.
+        return true;
+    };
+
+    let Ok(mut reader) = pg.open_read(rel) else {
+        return false;
+    };
+    let Ok(bytes) = reader.read_all() else {
+        return false;
+    };
+    let mut sha = Sha1::new();
+    let mut sink = Vec::new();
+    if sha.process(&bytes, &mut sink).is_err() {
+        return false;
+    }
+    sha.digest_hex() == expected
+}
+
+/// Recursively collect every regular file under `dir` in the PG target,
+/// returning paths relative to the target root (matching the manifest's
+/// `[target:file]` key format). Symlinks and directories are not collected.
+///
+/// Used by delta restore to find stray files absent from the manifest.
+fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CommandError> {
+    let entries = match pg.list(dir) {
+        Ok(entries) => entries,
+        // A directory recorded in the manifest may not actually exist on the
+        // target (e.g. nothing was restored into it). Treat that as empty.
+        Err(StorageError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(CommandError::Storage(err)),
+    };
+
+    for entry in entries {
+        // `list` returns backend-resolved (absolute) paths; recompute the
+        // target-relative path by appending the file name to `dir`.
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        let rel = dir.join(name);
+        match entry.kind {
+            StorageKind::File => out.push(rel),
+            StorageKind::Path => collect_target_files(pg, &rel, out)?,
+            // Symlinks / specials are left untouched (symlink handling deferred).
+            StorageKind::Link | StorageKind::Special => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve the single backup to restore, returning its label and its
@@ -188,6 +285,7 @@ fn copy_file(
 ///   manifest.
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
+    let delta = delta_enabled(config);
     let (label, metadata) = select_backup(config, repo, stanza)?;
 
     // The transform the backup applied — read from the recorded metadata, with
@@ -210,13 +308,21 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     }
 
     // 2. Copy every file, reversing the transform and verifying its plaintext
-    //    checksum on the way out.
+    //    checksum on the way out. Under `--delta`, a file whose target copy
+    //    already matches the manifest (same size + SHA-1) is skipped.
     let mut files_restored = 0;
+    let mut files_skipped = 0;
     for file in &manifest.files {
+        let dst = PathBuf::from(&file.path);
+
+        if delta && target_matches(pg, &dst, file) {
+            files_skipped += 1;
+            continue;
+        }
+
         // The repo file carries the compression suffix; the PG-target file does not.
         let repo_rel = format!("{}{}", file.path, transform.repo_suffix());
         let src = backup_file_path(stanza, &label, &repo_rel);
-        let dst = PathBuf::from(&file.path);
         let actual = copy_file(repo, pg, &src, &dst, &transform)?;
 
         // Zero-length files carry no checksum; nothing to compare.
@@ -229,16 +335,67 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         files_restored += 1;
     }
 
-    // 3. Symlinks: deferred — count them and move on. TODO: re-create once the
+    // 3. Delta restore removes target files absent from the manifest so the
+    //    target matches the backup exactly. Walk every restored directory root
+    //    and delete any regular file not listed in `[target:file]`.
+    let files_removed = if delta { remove_stray_files(pg, &manifest)? } else { 0 };
+
+    // 4. Symlinks: deferred — count them and move on. TODO: re-create once the
     //    `Storage` trait gains a symlink-create method.
     let skipped_links = manifest.links.len();
 
     Ok(RestoreOutcome {
         label,
         files_restored,
+        files_skipped,
+        files_removed,
         paths_created,
         skipped_links,
     })
+}
+
+/// Delete every regular file under the manifest's directory roots that is not
+/// listed in the manifest's `[target:file]` set, returning the number removed.
+///
+/// Roots are the top-level components of the manifest's recorded paths and
+/// files, so the walk covers exactly the tree the backup describes without
+/// descending into unrelated parts of the filesystem.
+fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
+    use std::collections::BTreeSet;
+
+    // The set of paths the manifest captured — anything else under the roots is stray.
+    let kept: BTreeSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+
+    // Top-level directory roots to walk: the first component of every recorded
+    // path and file. A `BTreeSet` dedups them so each root is walked once.
+    let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
+    for path in &manifest.paths {
+        if let Some(root) = Path::new(&path.path).components().next() {
+            roots.insert(PathBuf::from(root.as_os_str()));
+        }
+    }
+    for file in &manifest.files {
+        if let Some(root) = Path::new(&file.path).components().next() {
+            roots.insert(PathBuf::from(root.as_os_str()));
+        }
+    }
+
+    let mut present = Vec::new();
+    for root in &roots {
+        collect_target_files(pg, root, &mut present)?;
+    }
+
+    let mut files_removed = 0;
+    for rel in present {
+        // Compare against the manifest's `/`-joined string keys.
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !kept.contains(rel_str.as_str()) {
+            pg.remove(&rel, false)?;
+            files_removed += 1;
+        }
+    }
+
+    Ok(files_removed)
 }
 
 /// `restore` — restore a backup into a PG data directory.
@@ -253,8 +410,13 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
     let outcome = restore_inner(config, repo_storage, pg_storage)?;
 
     println!(
-        "restore: backup {} — {} file(s) restored, {} path(s) created, {} link(s) skipped",
-        outcome.label, outcome.files_restored, outcome.paths_created, outcome.skipped_links
+        "restore: backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) skipped",
+        outcome.label,
+        outcome.files_restored,
+        outcome.files_skipped,
+        outcome.files_removed,
+        outcome.paths_created,
+        outcome.skipped_links
     );
 
     Ok(())
@@ -285,9 +447,17 @@ mod tests {
     }
 
     fn cfg(stanza: Option<&str>, set: Option<&str>) -> LoadedConfig {
+        cfg_delta(stanza, set, false)
+    }
+
+    /// Like [`cfg`] but also toggles `--delta`.
+    fn cfg_delta(stanza: Option<&str>, set: Option<&str>, delta: bool) -> LoadedConfig {
         let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
         if let Some(label) = set {
             options.insert(("set".to_owned(), None), OptionValue::String(label.to_owned()));
+        }
+        if delta {
+            options.insert(("delta".to_owned(), None), OptionValue::Boolean(true));
         }
         LoadedConfig {
             command: "restore".to_owned(),
@@ -635,6 +805,241 @@ mod tests {
 
         let outcome: RestoreOutcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
         assert_eq!(outcome.skipped_links, 1);
+    }
+
+    // ---- delta restore -----------------------------------------------------
+
+    #[test]
+    fn delta_skips_matching_files() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let same = b"already identical contents".as_slice();
+        let other = b"needs restoring".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[
+                ("pg_data/match.txt", same, Some(sha1_hex(same))),
+                ("pg_data/other.txt", other, Some(sha1_hex(other))),
+            ],
+            &["pg_data"],
+            &[],
+        );
+
+        // Pre-place the matching file (identical to the backup) on the target.
+        seed_pg_file(&pg_s, "pg_data/match.txt", same);
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        // One file matched and was skipped; the other was restored.
+        assert_eq!(outcome.files_skipped, 1);
+        assert_eq!(outcome.files_restored, 1);
+
+        // The skipped file is untouched and the other file is now present.
+        let kept = {
+            let mut r = pg_s.open_read(Path::new("pg_data/match.txt")).expect("open match");
+            r.read_all().expect("read match")
+        };
+        assert_eq!(kept, same, "skipped file content must be unchanged");
+
+        let restored = {
+            let mut r = pg_s.open_read(Path::new("pg_data/other.txt")).expect("open other");
+            r.read_all().expect("read other")
+        };
+        assert_eq!(restored, other);
+    }
+
+    #[test]
+    fn delta_restores_changed_files() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let backup_bytes = b"the canonical backup contents".as_slice();
+        let stale_bytes = b"stale local edits that differ".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/changed.txt", backup_bytes, Some(sha1_hex(backup_bytes)))],
+            &["pg_data"],
+            &[],
+        );
+
+        // Pre-place a file with DIFFERENT content (and a different size).
+        seed_pg_file(&pg_s, "pg_data/changed.txt", stale_bytes);
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.files_restored, 1, "mismatched file must be restored");
+        assert_eq!(outcome.files_skipped, 0);
+
+        let restored = {
+            let mut r = pg_s.open_read(Path::new("pg_data/changed.txt")).expect("open changed");
+            r.read_all().expect("read changed")
+        };
+        assert_eq!(restored, backup_bytes, "target must now match the backup");
+    }
+
+    #[test]
+    fn delta_restores_missing_files() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a file absent from the target".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/fresh.txt", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data"],
+            &[],
+        );
+
+        // Nothing pre-placed on the target.
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.files_restored, 1, "missing file must be restored normally");
+        assert_eq!(outcome.files_skipped, 0);
+
+        let restored = {
+            let mut r = pg_s.open_read(Path::new("pg_data/fresh.txt")).expect("open fresh");
+            r.read_all().expect("read fresh")
+        };
+        assert_eq!(restored, bytes);
+    }
+
+    #[test]
+    fn delta_removes_files_absent_from_manifest() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/keep.txt", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data", "pg_data/sub"],
+            &[],
+        );
+
+        // Pre-place a stray file not present in the manifest, plus one in a subdir.
+        seed_pg_file(&pg_s, "pg_data/stray.txt", b"not in the backup");
+        seed_pg_file(&pg_s, "pg_data/sub/orphan.txt", b"also not in the backup");
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.files_restored, 1);
+        assert_eq!(outcome.files_removed, 2, "both stray files must be removed");
+
+        assert!(
+            pg_s.exists(Path::new("pg_data/keep.txt")).unwrap(),
+            "managed file must remain"
+        );
+        assert!(
+            !pg_s.exists(Path::new("pg_data/stray.txt")).unwrap(),
+            "stray file must be removed"
+        );
+        assert!(
+            !pg_s.exists(Path::new("pg_data/sub/orphan.txt")).unwrap(),
+            "nested stray file must be removed"
+        );
+    }
+
+    #[test]
+    fn non_delta_restores_everything() {
+        // No-regression guard: without `--delta`, even a byte-identical
+        // pre-existing target file is restored (counted, not skipped) and no
+        // stray-file removal happens.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let same = b"already identical contents".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/match.txt", same, Some(sha1_hex(same)))],
+            &["pg_data"],
+            &[],
+        );
+        seed_pg_file(&pg_s, "pg_data/match.txt", same);
+        // A stray file that delta would remove but a normal restore leaves alone.
+        seed_pg_file(&pg_s, "pg_data/stray.txt", b"untouched without delta");
+
+        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.files_restored, 1, "matching file is still restored without --delta");
+        assert_eq!(outcome.files_skipped, 0);
+        assert_eq!(outcome.files_removed, 0);
+        assert!(
+            pg_s.exists(Path::new("pg_data/stray.txt")).unwrap(),
+            "stray file must survive a non-delta restore"
+        );
+    }
+
+    #[test]
+    fn target_matches_helper() {
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+
+        let bytes = b"helper fixture bytes".as_slice();
+        let file = ManifestFile {
+            path: "pg_data/h.txt".to_owned(),
+            size: bytes.len() as u64,
+            timestamp: 1_704_110_400,
+            checksum: Some(sha1_hex(bytes)),
+            checksum_page: None,
+        };
+
+        // Missing target: does not match.
+        assert!(
+            !super::target_matches(&pg_s, Path::new("pg_data/h.txt"), &file),
+            "missing target must not match"
+        );
+
+        // Same size + same checksum: matches.
+        seed_pg_file(&pg_s, "pg_data/h.txt", bytes);
+        assert!(
+            super::target_matches(&pg_s, Path::new("pg_data/h.txt"), &file),
+            "identical target must match"
+        );
+
+        // Same size, different content (checksum mismatch): does not match.
+        let other = b"helper fixturf bytes".as_slice(); // same length, one byte differs
+        assert_eq!(other.len(), bytes.len(), "fixture must keep the size equal");
+        seed_pg_file(&pg_s, "pg_data/h.txt", other);
+        assert!(
+            !super::target_matches(&pg_s, Path::new("pg_data/h.txt"), &file),
+            "checksum mismatch must not match"
+        );
+
+        // Different size: does not match (size check short-circuits).
+        seed_pg_file(&pg_s, "pg_data/h.txt", b"a different length entirely");
+        assert!(
+            !super::target_matches(&pg_s, Path::new("pg_data/h.txt"), &file),
+            "size mismatch must not match"
+        );
+
+        // Zero-length manifest file (no checksum): matches a zero-length target on size alone.
+        let empty_file = ManifestFile {
+            path: "pg_data/empty".to_owned(),
+            size: 0,
+            timestamp: 1_704_110_400,
+            checksum: None,
+            checksum_page: None,
+        };
+        seed_pg_file(&pg_s, "pg_data/empty", b"");
+        assert!(
+            super::target_matches(&pg_s, Path::new("pg_data/empty"), &empty_file),
+            "zero-length target must match a checksum-less manifest entry"
+        );
     }
 
     // ---- end-to-end backup -> restore round trips --------------------------
