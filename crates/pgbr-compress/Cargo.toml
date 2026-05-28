@@ -29,6 +29,10 @@ bzip2-sys = "0.1"
 # byte-for-byte. The streaming compress / decompress wrappers in `zst::compress` /
 # `zst::decompress` call `ZSTD_compressStream2` / `ZSTD_decompressStream`.
 zstd-sys = "2"
+# The `filter` module bridges each codec into `pgbr_io::Filter` so they compose in a
+# `pgbr_io::FilterChain`. pgbr-compress depends on pgbr-io (not the reverse) to keep
+# pgbr-io free of a compression dependency.
+pgbr-io = { path = "../pgbr-io" }
 
 [lints]
 workspace = true

@@ -554,6 +554,7 @@ dependencies = [
  "bzip2-sys",
  "libz-sys",
  "lz4-sys",
+ "pgbr-io",
  "zstd-sys",
 ]
 

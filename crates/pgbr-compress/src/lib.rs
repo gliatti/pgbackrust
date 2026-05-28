@@ -13,6 +13,9 @@
 //!   `pckWriteI32P` + `pckWriteBoolP` + `pckWriteEndP` chain emits, so the C side can wrap
 //!   the bytes in a `Buffer*` (which is what `Pack*` is, structurally) without changing the
 //!   public ABI.
+//! - [`filter`] — [`pgbr_io::Filter`] adapters wrapping each codec so they compose in a
+//!   [`pgbr_io::FilterChain`]. The compressing / decompressing filter types are re-exported
+//!   at the crate root (`GzCompress`, `GzDecompress`, `Bz2Compress`, …).
 
 pub mod params {
     //! Pack-encoded parameter lists for compress / decompress filters.
@@ -173,10 +176,13 @@ pub mod params {
 }
 
 pub mod bz2;
+pub mod filter;
 pub mod gz;
 pub mod helper;
 pub mod lz4;
 pub mod zst;
+
+pub use filter::{Bz2Compress, Bz2Decompress, GzCompress, GzDecompress, Lz4Compress, Lz4Decompress, ZstCompress, ZstDecompress};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
