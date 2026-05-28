@@ -70,40 +70,73 @@ fn backup_info_path(stanza: &str) -> PathBuf {
     PathBuf::from(format!("backup/{stanza}/backup.info"))
 }
 
-/// Apply the annotation hash to one backup entry's JSON value, mutating the
-/// `backup-annotation` object in place. Returns the keys set and removed so
-/// the caller can report what changed.
-fn apply_annotations(entry: &mut Value, requested: &BTreeMap<String, String>) -> (Vec<String>, Vec<String>) {
-    let mut set_keys = Vec::new();
-    let mut removed_keys = Vec::new();
-
-    // Pull out (or start) the existing annotation object. If the field holds
-    // a non-object value it is treated as absent and replaced.
-    let mut annotation = match entry.get(ANNOTATION_KEY) {
+/// Merge an annotation hash into the existing `backup-annotation` value.
+///
+/// This is the pure core of the command, isolated so it can be unit-tested
+/// without any storage or `backup.info` plumbing:
+///
+/// - a non-empty value sets / updates the key,
+/// - an empty value removes the key (pgBackRest's delete convention),
+/// - if every key is removed the result is `None`, so the caller drops the
+///   `backup-annotation` field entirely (matches the C
+///   `backupAnnotation = NULL` behaviour).
+///
+/// `existing` may hold a non-object [`Value`]; it is then treated as absent
+/// and replaced wholesale.
+fn merge_annotations(existing: Option<&Value>, updates: &BTreeMap<String, String>) -> Option<Value> {
+    let mut annotation = match existing {
         Some(Value::Object(existing)) => existing.clone(),
         _ => Map::new(),
     };
 
+    for (key, value) in updates {
+        if value.is_empty() {
+            // Empty value -> delete convention.
+            annotation.remove(key);
+        } else {
+            annotation.insert(key.clone(), Value::String(value.clone()));
+        }
+    }
+
+    if annotation.is_empty() {
+        None
+    } else {
+        Some(Value::Object(annotation))
+    }
+}
+
+/// Apply the annotation hash to one backup entry's JSON value, mutating the
+/// `backup-annotation` object in place via [`merge_annotations`]. Returns the
+/// keys set and removed so the caller can report what changed.
+fn apply_annotations(entry: &mut Value, requested: &BTreeMap<String, String>) -> (Vec<String>, Vec<String>) {
+    let mut set_keys = Vec::new();
+    let mut removed_keys = Vec::new();
+
+    // Determine which keys this pass actually changes for reporting. An empty
+    // value only counts as a removal if the key was present beforehand.
+    let present = |key: &str| -> bool { matches!(entry.get(ANNOTATION_KEY), Some(Value::Object(obj)) if obj.contains_key(key)) };
     for (key, value) in requested {
         if value.is_empty() {
-            // Empty value -> delete convention. Only count keys that were
-            // actually present.
-            if annotation.remove(key).is_some() {
+            if present(key) {
                 removed_keys.push(key.clone());
             }
         } else {
-            annotation.insert(key.clone(), Value::String(value.clone()));
             set_keys.push(key.clone());
         }
     }
 
+    let merged = merge_annotations(entry.get(ANNOTATION_KEY), requested);
+
     // Reflect the merged object back onto the entry. An emptied object is
     // dropped entirely (matches the C `backupAnnotation = NULL` behaviour).
     if let Value::Object(obj) = entry {
-        if annotation.is_empty() {
-            obj.remove(ANNOTATION_KEY);
-        } else {
-            obj.insert(ANNOTATION_KEY.to_owned(), Value::Object(annotation));
+        match merged {
+            Some(value) => {
+                obj.insert(ANNOTATION_KEY.to_owned(), value);
+            }
+            None => {
+                obj.remove(ANNOTATION_KEY);
+            }
         }
     }
 
@@ -176,7 +209,55 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{CommandError, annotate_inner};
+    use super::{CommandError, annotate_inner, merge_annotations};
+
+    /// Build a `BTreeMap` of update pairs for the pure merge tests.
+    fn updates(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn merge_adds_new_keys() {
+        // No existing annotations -> object with the new keys.
+        let result = merge_annotations(None, &updates(&[("k1", "v1"), ("k2", "v2")]));
+        assert_eq!(result, Some(json!({ "k1": "v1", "k2": "v2" })));
+    }
+
+    #[test]
+    fn merge_updates_existing_key() {
+        let existing = json!({ "k1": "old", "keep": "yes" });
+        let result = merge_annotations(Some(&existing), &updates(&[("k1", "new")]));
+        assert_eq!(result, Some(json!({ "k1": "new", "keep": "yes" })));
+    }
+
+    #[test]
+    fn merge_empty_value_removes_key() {
+        let existing = json!({ "k1": "v1", "k2": "v2" });
+        let result = merge_annotations(Some(&existing), &updates(&[("k1", "")]));
+        assert_eq!(result, Some(json!({ "k2": "v2" })));
+    }
+
+    #[test]
+    fn merge_removing_last_key_drops_object() {
+        let existing = json!({ "only": "v" });
+        let result = merge_annotations(Some(&existing), &updates(&[("only", "")]));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn merge_removing_absent_key_is_noop() {
+        // Removing a key that was never present must not resurrect an object.
+        let result = merge_annotations(None, &updates(&[("ghost", "")]));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn merge_replaces_non_object_existing() {
+        // A non-object existing value is treated as absent and replaced.
+        let existing = json!("not-an-object");
+        let result = merge_annotations(Some(&existing), &updates(&[("k1", "v1")]));
+        assert_eq!(result, Some(json!({ "k1": "v1" })));
+    }
 
     fn fake_config(stanza: &str, set: Option<&str>, annotations: &[(&str, &str)]) -> LoadedConfig {
         let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
