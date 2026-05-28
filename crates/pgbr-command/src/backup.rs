@@ -61,7 +61,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
 use pgbr_protocol::message::{OkResponse, Request, Response};
@@ -203,6 +203,55 @@ fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
 
 fn backup_info_path(stanza: &str) -> PathBuf {
     PathBuf::from(format!("backup/{stanza}/backup.info"))
+}
+
+/// Take the advisory lock(s) a command needs, holding them for its duration.
+///
+/// C ref: every mutating command opens with `lockAcquire(cfgLockType())`
+/// (`src/main.c`). The lock category is fixed per command (backup → backup,
+/// archive → archive, expire → backup, stanza-* → all); this helper maps that
+/// [`LockType`] onto the on-disk `<lock-path>/<stanza>-<type>.lock` files via
+/// [`crate::lock::lock_acquire`].
+///
+/// The returned handles must be bound (`let _locks = …;`) so they live to the
+/// end of the command and release on drop. `LockType::None` and a `None`
+/// stanza both yield an empty `Vec` (nothing to lock); the caller still binds
+/// it, so two concurrent runs that *do* have a stanza collide as they should.
+///
+/// Lock-path resolution mirrors the rest of the crate: a real CLI run always
+/// has the `lock-path` option resolved (its `config.yaml` default is
+/// `/tmp/pgbackrest`), so the option is present and
+/// [`crate::lock::resolved_lock_path`] returns the configured directory and the
+/// lock is genuinely taken. Hand-built test configs that omit the `lock-path`
+/// option no-op (empty `Vec`) so the many unit tests that drive these entry
+/// points concurrently never collide on a shared default lock file; tests that
+/// want to exercise locking set `lock-path` explicitly to an isolated temp dir.
+///
+/// # Errors
+///
+/// Returns whatever [`crate::lock::lock_acquire`] returns — notably
+/// [`CommandError::Other`] when another run already holds the lock.
+pub(crate) fn acquire_command_lock(
+    config: &LoadedConfig,
+    lock_type: LockType,
+) -> Result<Vec<crate::lock::LockHandle>, CommandError> {
+    // No stanza ⇒ nothing stanza-scoped to lock (commands that require a
+    // stanza already error earlier; this keeps the helper total).
+    let Some(stanza) = config.stanza.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if lock_type == LockType::None {
+        return Ok(Vec::new());
+    }
+    // Only lock when a lock-path is actually configured. A resolved CLI run
+    // always carries the option (default `/tmp/pgbackrest`); hand-built test
+    // configs that omit it skip locking so parallel tests don't share a file.
+    if !config.options.contains_key(&("lock-path".to_owned(), None)) {
+        return Ok(Vec::new());
+    }
+
+    let lock_path = crate::lock::resolved_lock_path(config);
+    crate::lock::lock_acquire(&lock_path, stanza, lock_type)
 }
 
 /// Whether a PG-data-relative path is excluded from the backup by the
@@ -468,6 +517,8 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
 #[allow(clippy::print_stdout)]
 pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // Hold the backup lock for the whole command. C ref: lockAcquire(lockTypeBackup).
+    let _locks = acquire_command_lock(config, LockType::Backup)?;
     let backup_type = BackupType::from_options(config);
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
@@ -1873,6 +1924,51 @@ mod tests {
             options,
             params: Vec::new(),
         }
+    }
+
+    /// `typed_cfg` plus an explicit `lock-path` so the command takes a real
+    /// advisory lock under an isolated directory (no shared default path).
+    fn typed_cfg_locked(stanza: &str, backup_type: &str, lock_path: &Path) -> LoadedConfig {
+        let mut cfg = typed_cfg(stanza, backup_type);
+        cfg.options.insert(
+            ("lock-path".to_owned(), None),
+            OptionValue::Path(lock_path.to_string_lossy().into_owned()),
+        );
+        cfg
+    }
+
+    #[test]
+    fn backup_acquires_backup_lock() {
+        // Backup must take the `<stanza>-backup.lock` under the configured
+        // lock-path for its whole duration, so a concurrent run can't collide.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let cfg = typed_cfg_locked("demo", "full", lock_dir.path());
+        let expected_lock = lock_dir.path().join("demo-backup.lock");
+
+        // Simulate a *concurrent* backup already holding the lock: a fresh
+        // `backup` must then fail with the "another backup is running" error,
+        // proving the entry point genuinely acquires the backup lock.
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
+        assert!(expected_lock.exists(), "lock file must appear while held");
+
+        let err = backup(&cfg, &repo_s, &pg_s).expect_err("backup must fail while the backup lock is held");
+        assert!(
+            err.to_string().contains("another backup is running"),
+            "unexpected error: {err}"
+        );
+
+        // Releasing the concurrent lock lets a backup run to completion; the
+        // handle drops at return so the stale lock file is cleaned up.
+        drop(held);
+        backup(&cfg, &repo_s, &pg_s).expect("backup succeeds once the lock is free");
+        assert!(
+            !expected_lock.exists(),
+            "lock file must be removed after the command releases it"
+        );
     }
 
     #[test]

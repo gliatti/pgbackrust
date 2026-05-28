@@ -43,11 +43,12 @@
 use std::path::{Path, PathBuf};
 
 use pgbr_compress::{Bz2Compress, Bz2Decompress, GzCompress, GzDecompress, Lz4Compress, Lz4Decompress, ZstCompress, ZstDecompress};
-use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_io::Filter;
 use pgbr_storage::{Posix, Storage};
 
 use crate::CommandError;
+use crate::backup::acquire_command_lock;
 
 /// File extensions for stored WAL, in the order `archive-get` probes them
 /// once the plaintext form is found absent. Each maps to the compress codec
@@ -234,6 +235,8 @@ pub fn push(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn 
     let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })?;
+    // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
+    let _locks = acquire_command_lock(config, LockType::Archive)?;
     let wal_source = config.params.first().ok_or_else(|| CommandError::MissingOption {
         option: "<wal-source>".to_owned(),
     })?;
@@ -424,6 +427,8 @@ pub fn get(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn S
     let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })?;
+    // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
+    let _locks = acquire_command_lock(config, LockType::Archive)?;
     let segment = config.params.first().ok_or_else(|| CommandError::MissingOption {
         option: "<wal-segment>".to_owned(),
     })?;
@@ -572,7 +577,7 @@ mod tests {
     use std::path::Path;
 
     use pgbr_compress::{GzCompress, ZstCompress};
-    use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
+    use pgbr_config::{ConfigCommandRole, LoadedConfig, LockType, OptionValue};
     use pgbr_io::Filter;
     use pgbr_storage::{Posix, Storage};
     use tempfile::TempDir;
@@ -713,6 +718,64 @@ mod tests {
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "pg copy should match repo bytes");
+    }
+
+    /// `fake_config` plus an explicit `lock-path` so the command takes a real
+    /// archive lock under an isolated directory.
+    fn fake_config_locked(stanza: Option<&str>, params: Vec<String>, lock_path: &Path) -> LoadedConfig {
+        let mut cfg = fake_config(stanza, params);
+        cfg.options.insert(
+            ("lock-path".to_owned(), None),
+            OptionValue::Path(lock_path.to_string_lossy().into_owned()),
+        );
+        cfg
+    }
+
+    #[test]
+    fn archive_push_acquires_archive_lock() {
+        // archive-push must take the `<stanza>-archive.lock`; a concurrent run
+        // already holding it makes the push fail with "another archive".
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let cfg = fake_config_locked(Some("demo"), vec![wal_source], lock_dir.path());
+        let expected_lock = lock_dir.path().join("demo-archive.lock");
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
+        assert!(expected_lock.exists(), "archive lock file must appear while held");
+
+        let err = push(&cfg, &repo_s, &pg_s).expect_err("push must fail while the archive lock is held");
+        assert!(
+            err.to_string().contains("another archive is running"),
+            "unexpected error: {err}"
+        );
+
+        drop(held);
+        push(&cfg, &repo_s, &pg_s).expect("push succeeds once the lock is free");
+    }
+
+    #[test]
+    fn archive_get_acquires_archive_lock() {
+        // archive-get takes the same archive lock as push.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let dest = format!("pg_wal/{SEGMENT}");
+        let cfg = fake_config_locked(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], lock_dir.path());
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
+        let err = get(&cfg, &repo_s, &pg_s).expect_err("get must fail while the archive lock is held");
+        assert!(
+            err.to_string().contains("another archive is running"),
+            "unexpected error: {err}"
+        );
+
+        drop(held);
+        get(&cfg, &repo_s, &pg_s).expect("get succeeds once the lock is free");
+        assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
     }
 
     #[test]

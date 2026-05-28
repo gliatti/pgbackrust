@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_db::Connection;
 use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup};
 use pgbr_postgres::control::{PgControlHeader, decode_pg_control_header, header_version};
@@ -33,6 +33,7 @@ use pgbr_postgres::version::by_catalog_version_no;
 use pgbr_storage::{Storage, StorageError};
 
 use crate::CommandError;
+use crate::backup::acquire_command_lock;
 
 /// pgBackRest on-disk info-file format version written by this port.
 const BACKREST_FORMAT: u32 = 5;
@@ -283,6 +284,8 @@ fn resolve_cluster_identity(config: &LoadedConfig, pg_storage: &dyn Storage) -> 
 ///   failures.
 pub fn create(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
+    let _locks = acquire_command_lock(config, LockType::All)?;
     let identity = resolve_cluster_identity(config, pg_storage)?;
     create_with_identity(stanza, repo_storage, identity)?;
     Ok(())
@@ -375,6 +378,8 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 ///   than "missing".
 pub fn delete(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
+    let _locks = acquire_command_lock(config, LockType::All)?;
 
     let archive: PathBuf = format!("archive/{stanza}").into();
     let backup: PathBuf = format!("backup/{stanza}").into();
@@ -408,6 +413,8 @@ fn remove_subtree(storage: &dyn Storage, path: &Path) -> Result<(), CommandError
 ///   read/write failures.
 pub fn upgrade(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
+    let _locks = acquire_command_lock(config, LockType::All)?;
     let identity = resolve_cluster_identity(config, pg_storage)?;
     upgrade_with_identity(stanza, repo_storage, identity)?;
     Ok(())
@@ -518,6 +525,75 @@ mod tests {
             options: BTreeMap::new(),
             params: Vec::new(),
         }
+    }
+
+    /// `config_with_stanza` plus an explicit `lock-path` so the command takes
+    /// its real `all` (archive + backup) advisory locks under an isolated dir.
+    fn config_with_stanza_locked(stanza: Option<&str>, lock_path: &Path) -> LoadedConfig {
+        let mut cfg = config_with_stanza(stanza);
+        cfg.options.insert(
+            ("lock-path".to_owned(), None),
+            OptionValue::Path(lock_path.to_string_lossy().into_owned()),
+        );
+        cfg
+    }
+
+    #[test]
+    fn stanza_create_acquires_all_locks() {
+        // stanza-create takes the `all` lock (archive + backup). A concurrent
+        // holder of the backup component makes it fail.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        write_pg_control(&pg_s, 0x0102_0304, &SUPPORTED[0]);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
+        let err = create(&cfg, &repo_s, &pg_s).expect_err("create must fail while a component lock is held");
+        assert!(err.to_string().contains("running"), "unexpected error: {err}");
+
+        drop(held);
+        create(&cfg, &repo_s, &pg_s).expect("create succeeds once the locks are free");
+        assert!(
+            !lock_dir.path().join("demo-backup.lock").exists(),
+            "lock files must be released after the command returns"
+        );
+    }
+
+    #[test]
+    fn stanza_delete_acquires_all_locks() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+        create_inner("demo", &repo_s, &pg_s).expect("seed stanza");
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
+        cfg.command = "stanza-delete".to_owned();
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
+        let err = delete(&cfg, &repo_s).expect_err("delete must fail while a component lock is held");
+        assert!(err.to_string().contains("running"), "unexpected error: {err}");
+
+        drop(held);
+        delete(&cfg, &repo_s).expect("delete succeeds once the locks are free");
+    }
+
+    #[test]
+    fn stanza_upgrade_acquires_all_locks() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+        create_inner("demo", &repo_s, &pg_s).expect("seed stanza");
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
+        cfg.command = "stanza-upgrade".to_owned();
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
+        let err = upgrade(&cfg, &repo_s, &pg_s).expect_err("upgrade must fail while a component lock is held");
+        assert!(err.to_string().contains("running"), "unexpected error: {err}");
+
+        drop(held);
+        upgrade(&cfg, &repo_s, &pg_s).expect("upgrade succeeds once the locks are free");
     }
 
     #[test]
