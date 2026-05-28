@@ -8,25 +8,44 @@
 //! pgBackRest process that connects; `server-ping` is the client that
 //! connects and issues a no-op to confirm the server is alive.
 //!
-//! The TLS/TCP transport is out of scope for this slice. What lives here
-//! is the transport-agnostic *protocol* core both commands drive:
+//! The transport-agnostic *protocol* core both commands drive lives here:
 //!
 //! - [`serve`] — the request/response loop a server runs per connection.
 //! - [`ping_exchange`] — the single no-op round trip the ping client does.
 //!
 //! Both operate over any [`IoRead`] / [`IoWrite`] pair, so they are tested
 //! over in-memory [`MemRead`](pgbr_io::MemRead) /
-//! [`MemWrite`](pgbr_io::MemWrite) streams. The user-facing [`server`] and
-//! [`ping`] entry points remain [`CommandError::NotYetImplemented`] until
-//! the transport lands: once it does, `server` will accept a connection,
-//! wrap its read/write halves, and call [`serve`]; `ping` will connect and
-//! call [`ping_exchange`].
+//! [`MemWrite`](pgbr_io::MemWrite) streams.
+//!
+//! On top of those cores this module supplies a **plain-TCP** transport:
+//!
+//! - [`TcpIo`] adapts a [`std::net::TcpStream`] to [`IoRead`] / [`IoWrite`].
+//! - [`serve_listener`] / [`serve_tcp`] accept connections and run [`serve`]
+//!   per connection; [`ping_tcp`] connects and runs [`ping_exchange`].
+//!
+//! The user-facing [`server`] and [`ping`] entry points read the bind /
+//! connect address from the configured `tls-server-address` /
+//! `tls-server-port` options (defaulting to `127.0.0.1:8432`) and drive the
+//! TCP helpers.
+//!
+//! **TLS is a documented follow-up.** The real pgBackRest `server` terminates
+//! TLS on the socket; here the transport is plain TCP. Because [`serve`] and
+//! [`ping_exchange`] are transport-agnostic, TLS slots in later by swapping
+//! [`TcpIo`] for a TLS stream adapter (rustls / openssl) — the protocol cores
+//! do not change.
 
-use pgbr_config::LoadedConfig;
-use pgbr_io::{IoRead, IoWrite};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+
+use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_io::{IoError, IoRead, IoWrite};
 use pgbr_storage::Storage;
 
 use crate::CommandError;
+
+/// Default bind / connect address used when the configured
+/// `tls-server-address` / `tls-server-port` options are absent.
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8432";
 
 /// Protocol error code returned for malformed or unexpected requests.
 ///
@@ -119,39 +138,172 @@ pub fn ping_exchange<R: IoRead, W: IoWrite>(reader: &mut R, writer: &mut W) -> R
     }
 }
 
-/// `server` — listen for protocol connections from remote pgBackRest
-/// processes.
+/// Adapts a [`std::net::TcpStream`] to the [`IoRead`] / [`IoWrite`] traits
+/// the protocol cores expect.
 ///
-/// The serve loop itself is implemented and tested as [`serve`]; what is
-/// still missing is the transport. When the TLS/TCP listener lands this
-/// will bind a socket, accept connections, and call [`serve`] with the
-/// connection's read/write halves per client.
+/// `serve` and `ping_exchange` take a *separate* reader and writer, but a
+/// `TcpStream` is a single bidirectional handle, so each end of an exchange
+/// holds two `TcpIo`s wrapping `try_clone`d handles of the same socket — one
+/// used as the reader, one as the writer.
+///
+/// `read` maps a zero-length read to EOF (sets the `eof` flag); errors map to
+/// [`IoError::Backend`]. `close` does a best-effort write-shutdown
+/// (`TcpStream::shutdown(Shutdown::Write)`) so the peer sees a clean EOF.
+pub struct TcpIo {
+    stream: TcpStream,
+    eof: bool,
+}
+
+impl TcpIo {
+    /// Wrap a connected `TcpStream`.
+    #[must_use]
+    pub const fn new(stream: TcpStream) -> Self {
+        Self { stream, eof: false }
+    }
+}
+
+impl IoRead for TcpIo {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let n = self
+            .stream
+            .read(buf)
+            .map_err(|e| IoError::Backend(format!("tcp read: {e}")))?;
+        if n == 0 {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+
+    fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+impl IoWrite for TcpIo {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.stream
+            .write_all(buf)
+            .map_err(|e| IoError::Backend(format!("tcp write: {e}")))
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        Write::flush(&mut self.stream).map_err(|e| IoError::Backend(format!("tcp flush: {e}")))
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        // Best-effort write-shutdown so the peer reads a clean EOF; a stream
+        // already shut down by the peer is not an error worth surfacing.
+        self.stream
+            .shutdown(Shutdown::Write)
+            .map_err(|e| IoError::Backend(format!("tcp shutdown: {e}")))
+    }
+}
+
+/// Split a connected `TcpStream` into a reader half and a writer half, both
+/// wrapping `try_clone`d handles of the same socket.
+fn split(stream: TcpStream) -> Result<(TcpIo, TcpIo), CommandError> {
+    let read_half = stream
+        .try_clone()
+        .map_err(|e| CommandError::Other(format!("tcp try_clone: {e}")))?;
+    Ok((TcpIo::new(read_half), TcpIo::new(stream)))
+}
+
+/// Accept connections on an already-bound [`TcpListener`] and run [`serve`]
+/// on each until the listener is exhausted.
+///
+/// This slice handles a single connection then returns: each accepted socket
+/// is served to its `exit`/EOF, after which the function stops. That keeps the
+/// transport simple and makes loopback tests deterministic; serving multiple
+/// connections in a loop is a follow-up (wrap the body in `for stream in
+/// listener.incoming()`).
 ///
 /// # Errors
 ///
-/// Always returns [`CommandError::NotYetImplemented`] until the socket
-/// transport is ported.
-pub fn server(_config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
-    Err(CommandError::NotYetImplemented {
-        command: "server".to_owned(),
-    })
+/// [`CommandError::Other`] on an accept / clone failure, or whatever [`serve`]
+/// returns for a protocol or write error.
+pub fn serve_listener(listener: &TcpListener) -> Result<(), CommandError> {
+    let (stream, _peer) = listener
+        .accept()
+        .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+    let (mut reader, mut writer) = split(stream)?;
+    serve(&mut reader, &mut writer)?;
+    // Signal a clean EOF to the peer; ignore an already-closed socket.
+    let _ = writer.close();
+    Ok(())
+}
+
+/// Bind a [`TcpListener`] to `addr` and serve a connection via
+/// [`serve_listener`].
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the address cannot be bound, plus anything
+/// [`serve_listener`] returns.
+pub fn serve_tcp(addr: &str) -> Result<(), CommandError> {
+    let listener = TcpListener::bind(addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
+    serve_listener(&listener)
+}
+
+/// Connect a [`TcpStream`] to `addr` and run [`ping_exchange`] over its
+/// reader / writer halves.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the connection cannot be made or cloned, plus
+/// anything [`ping_exchange`] returns.
+pub fn ping_tcp(addr: &str) -> Result<(), CommandError> {
+    let stream = TcpStream::connect(addr).map_err(|e| CommandError::Other(format!("tcp connect {addr}: {e}")))?;
+    let (mut reader, mut writer) = split(stream)?;
+    ping_exchange(&mut reader, &mut writer)
+}
+
+/// Resolve the bind / connect address from the configured
+/// `tls-server-address` and `tls-server-port` options, falling back to
+/// [`DEFAULT_ADDRESS`] when either is absent.
+fn server_address(config: &LoadedConfig) -> String {
+    let host = match config.options.get(&("tls-server-address".to_owned(), None)) {
+        Some(OptionValue::String(h) | OptionValue::Path(h)) => Some(h.clone()),
+        _ => None,
+    };
+    let port = match config.options.get(&("tls-server-port".to_owned(), None)) {
+        Some(OptionValue::Integer(p)) if (1..=65535).contains(p) => Some(*p),
+        _ => None,
+    };
+
+    match (host, port) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        _ => DEFAULT_ADDRESS.to_owned(),
+    }
+}
+
+/// `server` — listen for protocol connections from remote pgBackRest
+/// processes over plain TCP and drive [`serve`] per connection.
+///
+/// The bind address comes from `tls-server-address` / `tls-server-port`
+/// (default `127.0.0.1:8432`). TLS termination is a documented follow-up: the
+/// transport-agnostic [`serve`] core is unchanged, so it slots in by swapping
+/// [`TcpIo`] for a TLS stream adapter.
+///
+/// # Errors
+///
+/// Propagates whatever [`serve_tcp`] returns (bind / accept failures, or a
+/// protocol / write error from [`serve`]).
+pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
+    serve_tcp(&server_address(config))
 }
 
 /// `server-ping` — health check against a running `server` instance.
 ///
-/// The exchange itself is implemented and tested as [`ping_exchange`];
-/// what is still missing is the transport. When the TLS/TCP client lands
-/// this will connect to the configured server and call [`ping_exchange`]
-/// over the socket's read/write halves.
+/// Connects over plain TCP to the configured `tls-server-address` /
+/// `tls-server-port` (default `127.0.0.1:8432`) and runs [`ping_exchange`].
+/// TLS is the same documented follow-up as for [`server`].
 ///
 /// # Errors
 ///
-/// Always returns [`CommandError::NotYetImplemented`] until the socket
-/// transport is ported.
-pub fn ping(_config: &LoadedConfig) -> Result<(), CommandError> {
-    Err(CommandError::NotYetImplemented {
-        command: "server-ping".to_owned(),
-    })
+/// Propagates whatever [`ping_tcp`] returns (connect failure, or a protocol /
+/// rejection error from [`ping_exchange`]).
+pub fn ping(config: &LoadedConfig) -> Result<(), CommandError> {
+    ping_tcp(&server_address(config))
 }
 
 #[cfg(test)]
@@ -161,6 +313,7 @@ mod tests {
     use pgbr_io::{MemRead, MemWrite};
     use pgbr_protocol::{ErrResponse, Message, OkResponse, Request, Response, read_message, write_message};
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     /// Serialize a sequence of messages into a byte buffer suitable for
     /// feeding to a `MemRead`.
@@ -303,31 +456,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_command_is_not_yet_implemented() {
-        // `server` and `ping` are thin NotYetImplemented wrappers until the
-        // TLS transport lands; the tested core lives in `serve` /
-        // `ping_exchange` above. Build a minimal config to call them.
-        let config = LoadedConfig {
+    fn config_with(opts: Vec<((&str, Option<u32>), OptionValue)>) -> LoadedConfig {
+        let mut options = BTreeMap::new();
+        for ((name, group), value) in opts {
+            options.insert((name.to_owned(), group), value);
+        }
+        LoadedConfig {
             command: "server".to_owned(),
             command_role: ConfigCommandRole::Main,
             stanza: None,
-            options: BTreeMap::new(),
+            options,
             params: Vec::new(),
-        };
-        let repo = pgbr_storage::Posix::new("/");
+        }
+    }
 
-        assert_eq!(
-            server(&config, &repo),
-            Err(CommandError::NotYetImplemented {
-                command: "server".to_owned(),
-            })
-        );
-        assert_eq!(
-            ping(&config),
-            Err(CommandError::NotYetImplemented {
-                command: "server-ping".to_owned(),
-            })
-        );
+    #[test]
+    fn server_address_uses_options_when_present() {
+        let config = config_with(vec![
+            (("tls-server-address", None), OptionValue::String("10.0.0.1".to_owned())),
+            (("tls-server-port", None), OptionValue::Integer(9999)),
+        ]);
+        assert_eq!(server_address(&config), "10.0.0.1:9999");
+    }
+
+    #[test]
+    fn server_address_falls_back_to_default() {
+        // Missing options, and an out-of-range port, both fall back.
+        assert_eq!(server_address(&config_with(vec![])), DEFAULT_ADDRESS);
+        let bad_port = config_with(vec![
+            (("tls-server-address", None), OptionValue::String("host".to_owned())),
+            (("tls-server-port", None), OptionValue::Integer(0)),
+        ]);
+        assert_eq!(server_address(&bad_port), DEFAULT_ADDRESS);
+    }
+
+    #[test]
+    fn tcpio_read_write_round_trip() {
+        // Loopback pair: bind a listener, connect a client, accept the server
+        // side, then push bytes client -> server through `TcpIo`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        let mut client_io = TcpIo::new(client);
+        let mut server_io = TcpIo::new(server_stream);
+
+        client_io.write(b"hello tcp").unwrap();
+        client_io.flush().unwrap();
+        // Write-shutdown so the server read sees a clean EOF after the bytes.
+        client_io.close().unwrap();
+
+        let got = server_io.read_all().unwrap();
+        assert_eq!(got, b"hello tcp");
+        assert!(server_io.eof());
+    }
+
+    #[test]
+    fn tcp_ping_round_trip() {
+        // Bind on an ephemeral port, read the assigned address BEFORE moving
+        // the listener into the server thread, then ping it from the main
+        // thread and join.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || serve_listener(&listener));
+
+        // Connect, set a read timeout so a hung server fails the test fast
+        // rather than blocking CI, then run the ping exchange.
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (mut reader, mut writer) = split(stream).unwrap();
+        ping_exchange(&mut reader, &mut writer).unwrap();
+
+        // `ping_exchange` issues a `noOp` but no `exit`, so the server's read
+        // loop only ends when it sees EOF. Close the write half and drop both
+        // client handles so the socket is torn down, giving the server a clean
+        // EOF; otherwise the join below would block on a still-open socket.
+        writer.close().unwrap();
+        drop(reader);
+        drop(writer);
+
+        // The server thread completed without error after serving the
+        // connection to its clean EOF.
+        server.join().expect("server thread panicked").expect("serve_listener");
     }
 }
