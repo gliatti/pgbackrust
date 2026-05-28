@@ -392,7 +392,30 @@ fn resolve_option(
         opt.commands = resolve_commands_field(&def.command, name, commands, resolved)?;
     }
 
+    // Default command list: an option with no `command:` block AND no inherited
+    // commands is valid for ALL commands except `help` / `version`. This mirrors
+    // the C build generator (`src/build/config/parse.c`, "Build default command
+    // list if not defined": when `cmdList == NULL` it adds every command except
+    // `help` and `version`). Without this, universally-usable options that omit
+    // a `command:` block — `config`, `config-path`, `config-include-path` —
+    // resolve to an empty command set and are rejected for every command (e.g.
+    // `--config=… backup` fails with `OptionNotValidForCommand`).
+    if opt.commands.is_empty() {
+        opt.commands = default_all_commands(commands);
+    }
+
     Ok(opt)
+}
+
+/// Build the default command set for an option that declares no `command:`
+/// block: every command except `help` and `version`. C ref:
+/// `src/build/config/parse.c` ("Build default command list if not defined").
+fn default_all_commands(commands: &BTreeMap<String, CfgCommand>) -> BTreeMap<String, ResolvedCommandUsage> {
+    commands
+        .keys()
+        .filter(|name| name.as_str() != "help" && name.as_str() != "version")
+        .map(|name| (name.clone(), ResolvedCommandUsage::default()))
+        .collect()
 }
 
 fn option_command_locally_specified(spec: &OptionCommandSpec) -> bool {
@@ -744,6 +767,58 @@ option:
         let child = &cfg.options["child"];
         assert!(!child.commands.contains_key("backup"));
         assert!(child.commands.contains_key("restore"));
+    }
+
+    #[test]
+    fn option_without_command_block_defaults_to_all_commands_except_help_version() {
+        // An option that declares neither a `command:` block nor an `inherit:`
+        // parent is valid for every command EXCEPT `help` / `version` (C ref:
+        // `src/build/config/parse.c`, default-command-list build). Before this
+        // default the option resolved to an empty command set and was rejected
+        // for every command.
+        let yaml = "
+command:
+  backup: {}
+  restore: {}
+  help:
+    log-file: false
+  version:
+    log-file: false
+optionGroup: {}
+option:
+  universal:
+    type: string
+";
+        let cfg = compile(&parse_config(yaml).unwrap()).unwrap();
+        let universal = &cfg.options["universal"];
+        assert!(universal.commands.contains_key("backup"));
+        assert!(universal.commands.contains_key("restore"));
+        assert!(
+            !universal.commands.contains_key("help"),
+            "help must be excluded from the default command set"
+        );
+        assert!(
+            !universal.commands.contains_key("version"),
+            "version must be excluded from the default command set"
+        );
+        assert_eq!(universal.commands.len(), 2);
+    }
+
+    #[test]
+    fn real_config_option_is_valid_for_backup() {
+        // Regression for the binary-blocking gap: `config` declares no
+        // `command:` block in the shipped config.yaml, so it must default to
+        // all-commands-except-help/version and be usable with e.g. `backup`.
+        let cfg = load_fixture();
+        let config_opt = &cfg.options["config"];
+        assert!(
+            config_opt.commands.contains_key("backup"),
+            "`--config` must be valid for `backup`"
+        );
+        assert!(
+            !config_opt.commands.contains_key("help"),
+            "`--config` is excluded from `help` (matches the C default list)"
+        );
     }
 
     #[test]
