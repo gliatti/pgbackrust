@@ -38,8 +38,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD_NO_PAD as BASE64_NO_PAD;
 use pgbr_io::{IoError, IoRead, IoWrite};
-use ssh2::{ErrorCode, FileStat, FileType, OpenFlags, OpenType, RenameFlags, Session};
+use ssh2::{
+    CheckResult, ErrorCode, FileStat, FileType, HashType, KnownHostFileKind, KnownHostKeyFormat, OpenFlags, OpenType, RenameFlags,
+    Session,
+};
 
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
@@ -69,9 +74,92 @@ pub enum SftpAuth {
     KeyFile {
         /// Path to the private key (PEM/OpenSSH format).
         private_key: PathBuf,
+        /// Optional explicit public-key file (`repo-sftp-public-key-file`). Some
+        /// libssh2 key formats need the matching `.pub`; `None` lets ssh2 derive
+        /// it from the private key.
+        public_key: Option<PathBuf>,
         /// Optional passphrase protecting the private key.
         passphrase: Option<String>,
     },
+}
+
+/// The digest used to render / compare a host-key fingerprint
+/// (`repo-sftp-host-key-hash-type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostKeyHashType {
+    /// MD5 (legacy `ssh-keygen -l -E md5` colon-hex form).
+    Md5,
+    /// SHA-1.
+    Sha1,
+    /// SHA-256 (the modern default).
+    #[default]
+    Sha256,
+}
+
+impl HostKeyHashType {
+    /// Parse the `repo-sftp-host-key-hash-type` option value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unrecognised value as an error string for the caller to wrap.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "md5" => Ok(Self::Md5),
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            other => Err(format!(
+                "unrecognised repo-sftp-host-key-hash-type `{other}` (expected md5, sha1, or sha256)"
+            )),
+        }
+    }
+
+    /// The matching ssh2 [`HashType`].
+    const fn ssh2_hash(self) -> HashType {
+        match self {
+            Self::Md5 => HashType::Md5,
+            Self::Sha1 => HashType::Sha1,
+            Self::Sha256 => HashType::Sha256,
+        }
+    }
+}
+
+/// How the server's host key is verified at connect time
+/// (`repo-sftp-host-key-check-type` + the related options).
+#[derive(Debug, Clone)]
+pub enum HostKeyCheck {
+    /// No host-key verification (`none`). Insecure; accepts any server key.
+    None,
+    /// Pin the server key against a configured fingerprint
+    /// (`repo-sftp-host-fingerprint`) hashed with `hash_type`.
+    Fingerprint {
+        /// The expected fingerprint, as a hex string (with or without colons /
+        /// `MD5:`/`SHA256:` prefixes) or — for SHA-256 — the OpenSSH base64 form.
+        fingerprint: String,
+        /// Which digest the configured fingerprint is in.
+        hash_type: HostKeyHashType,
+    },
+    /// Validate the server key against OpenSSH `known_hosts` files
+    /// (`repo-sftp-known-host`). With `accept_new` an unknown host is appended to
+    /// the first known-hosts file rather than rejected (the `accept-new` mode);
+    /// otherwise an unknown host is an error (the `strict` mode).
+    KnownHosts {
+        /// `known_hosts` file paths to load (in order). Empty falls back to the
+        /// user's `~/.ssh/known_hosts`.
+        known_hosts: Vec<PathBuf>,
+        /// Append an unknown host key instead of rejecting it.
+        accept_new: bool,
+    },
+}
+
+impl Default for HostKeyCheck {
+    fn default() -> Self {
+        // Matches config.yaml's `repo-sftp-host-key-check-type` default of
+        // `strict`: validate against known_hosts, never auto-accept.
+        Self::KnownHosts {
+            known_hosts: Vec::new(),
+            accept_new: false,
+        }
+    }
 }
 
 /// Immutable inputs needed to open an [`Sftp`] backend.
@@ -87,6 +175,8 @@ pub struct SftpConfig {
     pub base_path: PathBuf,
     /// Authentication method.
     pub auth: SftpAuth,
+    /// How the server's host key is verified at connect time.
+    pub host_key_check: HostKeyCheck,
 }
 
 impl SftpConfig {
@@ -104,6 +194,7 @@ impl SftpConfig {
             user: user.into(),
             base_path: base_path.into(),
             auth: SftpAuth::Password(password.into()),
+            host_key_check: HostKeyCheck::default(),
         }
     }
 
@@ -123,8 +214,10 @@ impl SftpConfig {
             base_path: base_path.into(),
             auth: SftpAuth::KeyFile {
                 private_key: private_key.into(),
+                public_key: None,
                 passphrase,
             },
+            host_key_check: HostKeyCheck::default(),
         }
     }
 }
@@ -162,6 +255,7 @@ impl Sftp {
             user,
             base_path: base,
             auth,
+            host_key_check,
         } = config;
         let addr = format!("{host}:{port}");
 
@@ -174,15 +268,23 @@ impl Sftp {
         session.set_tcp_stream(tcp);
         session.handshake().map_err(|err| map_ssh_error(&err, &base))?;
 
+        // Verify the server's host key (post-handshake, pre-auth) so we never
+        // authenticate to — or send credentials to — an unverified server.
+        verify_host_key(&session, &host, port, &host_key_check, &base)?;
+
         match auth {
             SftpAuth::Password(password) => {
                 session
                     .userauth_password(&user, &password)
                     .map_err(|err| map_ssh_error(&err, &base))?;
             }
-            SftpAuth::KeyFile { private_key, passphrase } => {
+            SftpAuth::KeyFile {
+                private_key,
+                public_key,
+                passphrase,
+            } => {
                 session
-                    .userauth_pubkey_file(&user, None, &private_key, passphrase.as_deref())
+                    .userauth_pubkey_file(&user, public_key.as_deref(), &private_key, passphrase.as_deref())
                     .map_err(|err| map_ssh_error(&err, &base))?;
             }
         }
@@ -276,6 +378,135 @@ fn map_ssh_error(err: &ssh2::Error, path: &Path) -> StorageError {
             path: path.to_path_buf(),
             message: err.message().to_string(),
         },
+    }
+}
+
+/// Verify the connected `session`'s host key according to `check`, before any
+/// authentication. Returns `Ok(())` when the key is trusted (or checking is
+/// disabled) and a [`StorageError`] when it is rejected / cannot be verified.
+fn verify_host_key(session: &Session, host: &str, port: u16, check: &HostKeyCheck, base: &Path) -> Result<(), StorageError> {
+    match check {
+        HostKeyCheck::None => Ok(()),
+        HostKeyCheck::Fingerprint { fingerprint, hash_type } => {
+            let actual = session
+                .host_key_hash(hash_type.ssh2_hash())
+                .ok_or_else(|| StorageError::Backend {
+                    path: base.to_path_buf(),
+                    message: format!("server presented no host key for the configured {hash_type:?} fingerprint"),
+                })?;
+            if fingerprint_matches(fingerprint, actual) {
+                Ok(())
+            } else {
+                Err(StorageError::Backend {
+                    path: base.to_path_buf(),
+                    message: format!(
+                        "host-key fingerprint mismatch for {host}:{port}: expected {fingerprint}, got {}",
+                        hex_lower(actual)
+                    ),
+                })
+            }
+        }
+        HostKeyCheck::KnownHosts { known_hosts, accept_new } => {
+            verify_against_known_hosts(session, host, port, known_hosts, *accept_new, base)
+        }
+    }
+}
+
+/// Compare a configured `expected` host-key fingerprint against the raw `actual`
+/// digest bytes. Accepts the expected value in several common renderings: plain
+/// or colon-separated lowercase hex (optionally with an `MD5:`/`SHA256:`/`SHA1:`
+/// prefix) and, for SHA-256, the OpenSSH base64 form. Pure / unit-testable.
+fn fingerprint_matches(expected: &str, actual: &[u8]) -> bool {
+    let trimmed = expected
+        .trim()
+        .trim_start_matches("MD5:")
+        .trim_start_matches("SHA256:")
+        .trim_start_matches("SHA1:")
+        .trim_start_matches("sha256:")
+        .trim_start_matches("md5:");
+    let normalised: String = trimmed.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
+    let actual_hex = hex_lower(actual);
+    if normalised.eq_ignore_ascii_case(&actual_hex) {
+        return true;
+    }
+    // OpenSSH SHA-256 fingerprints are unpadded base64 of the raw digest.
+    BASE64_NO_PAD.encode(actual).eq(trimmed.trim_end_matches('='))
+}
+
+/// Lowercase hex-encode a byte slice (no separators).
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Validate the server key against OpenSSH `known_hosts` files.
+fn verify_against_known_hosts(
+    session: &Session,
+    host: &str,
+    port: u16,
+    files: &[PathBuf],
+    accept_new: bool,
+    base: &Path,
+) -> Result<(), StorageError> {
+    let backend = |message: String| StorageError::Backend {
+        path: base.to_path_buf(),
+        message,
+    };
+
+    let (key, key_type) = session
+        .host_key()
+        .ok_or_else(|| backend("server presented no host key".to_string()))?;
+    let fmt = KnownHostKeyFormat::from(key_type);
+
+    let mut known = session.known_hosts().map_err(|err| map_ssh_error(&err, base))?;
+
+    // Load each configured known_hosts file; an absent file is tolerated (it may
+    // be created on accept-new). At least one readable file is required unless we
+    // are accepting new keys.
+    let mut loaded_any = false;
+    for file in files {
+        if file.exists() {
+            known
+                .read_file(file, KnownHostFileKind::OpenSSH)
+                .map_err(|err| backend(format!("reading known_hosts {}: {}", file.display(), err.message())))?;
+            loaded_any = true;
+        }
+    }
+
+    match known.check_port(host, port, key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch => Err(backend(format!(
+            "host-key mismatch for {host}:{port}: the server key does not match known_hosts (possible MITM)"
+        ))),
+        CheckResult::NotFound if accept_new => {
+            // Append the new key to the first configured known_hosts file.
+            known
+                .add(host, key, "added by pgbackrest accept-new", fmt)
+                .map_err(|err| map_ssh_error(&err, base))?;
+            if let Some(target) = files.first() {
+                known
+                    .write_file(target, KnownHostFileKind::OpenSSH)
+                    .map_err(|err| backend(format!("writing known_hosts {}: {}", target.display(), err.message())))?;
+            }
+            Ok(())
+        }
+        CheckResult::NotFound => {
+            let detail = if loaded_any {
+                "not present in known_hosts"
+            } else {
+                "no known_hosts file configured or readable"
+            };
+            Err(backend(format!(
+                "host key for {host}:{port} is unknown ({detail}); add it to known_hosts or use \
+                 repo-sftp-host-key-check-type=accept-new"
+            )))
+        }
+        CheckResult::Failure => Err(backend(format!("failed to check the host key for {host}:{port}"))),
     }
 }
 
@@ -624,12 +855,70 @@ mod tests {
         );
         assert_eq!(config.port, DEFAULT_PORT);
         match config.auth {
-            SftpAuth::KeyFile { private_key, passphrase } => {
+            SftpAuth::KeyFile {
+                private_key,
+                public_key,
+                passphrase,
+            } => {
                 assert_eq!(private_key, PathBuf::from("/home/backup/.ssh/id_ed25519"));
+                assert!(public_key.is_none(), "no explicit public key by default");
                 assert_eq!(passphrase.as_deref(), Some("phrase"));
             }
             other @ SftpAuth::Password(_) => panic!("expected KeyFile, got {other:?}"),
         }
+        // The default host-key policy is strict known_hosts (never auto-accept).
+        match config.host_key_check {
+            HostKeyCheck::KnownHosts { accept_new, .. } => assert!(!accept_new),
+            other => panic!("expected strict KnownHosts default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_key_hash_type_parse() {
+        assert_eq!(HostKeyHashType::parse("md5").unwrap(), HostKeyHashType::Md5);
+        assert_eq!(HostKeyHashType::parse("sha1").unwrap(), HostKeyHashType::Sha1);
+        assert_eq!(HostKeyHashType::parse("sha256").unwrap(), HostKeyHashType::Sha256);
+        assert!(HostKeyHashType::parse("crc32").is_err());
+        assert_eq!(HostKeyHashType::default(), HostKeyHashType::Sha256);
+    }
+
+    #[test]
+    fn fingerprint_matches_hex_forms() {
+        // Raw SHA-256 digest of "host-key" (computed independently).
+        let actual: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+        // Plain lowercase hex.
+        assert!(fingerprint_matches("deadbeef", &actual));
+        // Upper-case hex.
+        assert!(fingerprint_matches("DEADBEEF", &actual));
+        // Colon-separated (ssh-keygen MD5 style).
+        assert!(fingerprint_matches("de:ad:be:ef", &actual));
+        // With an algorithm prefix.
+        assert!(fingerprint_matches("SHA256:deadbeef", &actual));
+        // A different value does not match.
+        assert!(!fingerprint_matches("cafebabe", &actual));
+    }
+
+    #[test]
+    fn fingerprint_matches_openssh_base64() {
+        // OpenSSH SHA-256 fingerprints are unpadded base64 of the raw digest.
+        let actual: [u8; 3] = [0x01, 0x02, 0x03]; // base64 -> "AQID"
+        assert!(fingerprint_matches("AQID", &actual));
+        assert!(fingerprint_matches("SHA256:AQID", &actual));
+        assert!(!fingerprint_matches("AAAA", &actual));
+    }
+
+    #[test]
+    fn hex_lower_encodes_bytes() {
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+    }
+
+    #[test]
+    fn sftp_config_default_host_key_check_is_strict() {
+        let config = SftpConfig::with_password("h", "u", "p", "/srv");
+        assert!(matches!(
+            config.host_key_check,
+            HostKeyCheck::KnownHosts { accept_new: false, .. }
+        ));
     }
 
     /// Live round trip against a real SFTP server. Skipped unless the
@@ -656,6 +945,9 @@ mod tests {
             user,
             base_path: PathBuf::from(base_path),
             auth: SftpAuth::Password(password),
+            // The live test server's key is typically not in known_hosts; disable
+            // the check so the round trip is about transfers, not key trust.
+            host_key_check: HostKeyCheck::None,
         };
         let sftp = Sftp::connect(config).expect("connect");
 

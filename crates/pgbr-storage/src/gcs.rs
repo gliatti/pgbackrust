@@ -34,6 +34,7 @@
 //! `404 -> NotFound`, `401`/`403 -> PermissionDenied`, any other non-2xx ->
 //! `Backend`.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::{Deserialize, Serialize};
 
+use crate::http::HttpOptions;
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 /// Default GCS XML/JSON API endpoint base URL.
@@ -153,6 +155,45 @@ pub fn build_signed_jwt(
     })
 }
 
+/// The subset of a Google service-account key JSON file this backend needs.
+///
+/// A standard `gcloud` service-account key carries far more, but only the
+/// `client_email`, `private_key` (RS256 PEM) and `token_uri` participate in the
+/// JWT-bearer `OAuth2` flow.
+#[derive(Debug, Deserialize)]
+struct ServiceAccountKey {
+    client_email: String,
+    private_key: String,
+    #[serde(default)]
+    token_uri: Option<String>,
+}
+
+/// Parse a Google service-account key JSON document into a
+/// [`GcsAuth::ServiceAccount`].
+///
+/// Reads `client_email`, `private_key` and `token_uri` (defaulting to
+/// [`DEFAULT_TOKEN_URI`] when the key omits it). Pure and unit-testable without
+/// a live endpoint. C ref: `storageGcsAuthService` consuming the key file.
+///
+/// # Errors
+///
+/// Returns an error string when the JSON cannot be parsed or is missing the
+/// required `client_email` / `private_key` fields.
+pub fn service_account_auth_from_json(json: &str) -> Result<GcsAuth, String> {
+    let key: ServiceAccountKey = serde_json::from_str(json).map_err(|err| format!("invalid service-account key JSON: {err}"))?;
+    if key.client_email.is_empty() {
+        return Err("service-account key JSON missing client_email".to_string());
+    }
+    if key.private_key.is_empty() {
+        return Err("service-account key JSON missing private_key".to_string());
+    }
+    Ok(GcsAuth::ServiceAccount {
+        client_email: key.client_email,
+        private_key_pem: key.private_key,
+        token_uri: key.token_uri.unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string()),
+    })
+}
+
 /// Immutable configuration for a [`Gcs`] backend.
 ///
 /// Mirrors the credential / addressing inputs the C `storage/gcs` driver takes,
@@ -166,6 +207,30 @@ pub struct GcsConfig {
     pub endpoint: Option<String>,
     /// Authentication mechanism (bearer token or service-account key).
     pub auth: GcsAuth,
+    /// Optional billing project for requester-pays buckets
+    /// (`repo-gcs-user-project`), sent as the `x-goog-user-project` header.
+    pub user_project: Option<String>,
+    /// Object tags applied on upload (`repo-storage-tag`), sent as
+    /// `x-goog-meta-<key>: <value>` custom-metadata headers.
+    pub tags: BTreeMap<String, String>,
+    /// Shared HTTPS-client transport options (`repo-storage-*`).
+    pub http: HttpOptions,
+}
+
+impl GcsConfig {
+    /// Build a config with only the required inputs and every optional field at
+    /// its default (matches the prior constructor shape).
+    #[must_use]
+    pub fn new(bucket: String, endpoint: Option<String>, auth: GcsAuth) -> Self {
+        Self {
+            bucket,
+            endpoint,
+            auth,
+            user_project: None,
+            tags: BTreeMap::new(),
+            http: HttpOptions::default(),
+        }
+    }
 }
 
 /// Google Cloud Storage backend speaking the XML API over a synchronous
@@ -179,6 +244,8 @@ pub struct Gcs {
     bucket: String,
     endpoint: String,
     auth: GcsAuth,
+    user_project: Option<String>,
+    tags: BTreeMap<String, String>,
     agent: ureq::Agent,
     /// Cached service-account access token, shared across clones so a refresh by
     /// one clone is visible to the others. `None` for the [`GcsAuth::Token`]
@@ -187,14 +254,21 @@ pub struct Gcs {
 }
 
 impl Gcs {
-    /// Build a `Gcs` backend from `config`, constructing a fresh
-    /// [`ureq::Agent`].
-    #[must_use]
-    pub fn new(config: GcsConfig) -> Self {
-        Self::with_agent(config, ureq::agent())
+    /// Build a `Gcs` backend from `config`, constructing a [`ureq::Agent`] from
+    /// the config's [`HttpOptions`] (custom CA / verify-tls when set).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] if the configured TLS options
+    /// (`repo-storage-ca-file` / `-ca-path`) cannot be loaded into a client
+    /// config.
+    pub fn new(config: GcsConfig) -> Result<Self, StorageError> {
+        let agent = config.http.build_agent()?;
+        Ok(Self::with_agent(config, agent))
     }
 
-    /// Build a `Gcs` backend with a caller-supplied [`ureq::Agent`].
+    /// Build a `Gcs` backend with a caller-supplied [`ureq::Agent`], ignoring the
+    /// config's [`HttpOptions`] TLS settings (the agent is taken as-is).
     #[must_use]
     pub fn with_agent(config: GcsConfig, agent: ureq::Agent) -> Self {
         let endpoint = config
@@ -206,6 +280,8 @@ impl Gcs {
             bucket: config.bucket,
             endpoint,
             auth: config.auth,
+            user_project: config.user_project,
+            tags: config.tags,
             agent,
             token_cache: Arc::new(Mutex::new(None)),
         }
@@ -324,6 +400,28 @@ impl Gcs {
             }
             Err(ureq::Error::Transport(transport)) => Err(backend(format!("token exchange transport error: {transport}"))),
         }
+    }
+
+    /// The transport headers sent on *every* request: the `x-goog-user-project`
+    /// billing-project header when `repo-gcs-user-project` is set. Returned as
+    /// `(name, value)` pairs the request methods set verbatim.
+    fn common_headers(&self) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        if let Some(project) = &self.user_project {
+            headers.push(("x-goog-user-project".to_string(), project.clone()));
+        }
+        headers
+    }
+
+    /// The headers sent only on upload (PUT): object tags become
+    /// `x-goog-meta-<key>: <value>` custom-metadata headers, on top of the
+    /// [`Self::common_headers`].
+    fn upload_headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.common_headers();
+        for (k, v) in &self.tags {
+            headers.push((format!("x-goog-meta-{k}"), v.clone()));
+        }
+        headers
     }
 
     /// Translate a `Path` into a GCS object key. Backend-relative: any leading
@@ -584,7 +682,10 @@ impl Gcs {
     fn put_object(&self, key: &str, body: &[u8]) -> Result<(), StorageError> {
         let url = self.object_url(key);
         let (auth_name, auth_value) = self.auth_header()?;
-        let req = self.agent.put(&url).set(&auth_name, &auth_value);
+        let mut req = self.agent.put(&url).set(&auth_name, &auth_value);
+        for (name, value) in self.upload_headers() {
+            req = req.set(&name, &value);
+        }
         match req.send_bytes(body) {
             Ok(_) => Ok(()),
             Err(err) => Err(map_ureq_error(err, key)),
@@ -618,7 +719,10 @@ impl Storage for Gcs {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
-        let req = self.agent.head(&url).set(&auth_name, &auth_value);
+        let mut req = self.agent.head(&url).set(&auth_name, &auth_value);
+        for (name, value) in self.common_headers() {
+            req = req.set(&name, &value);
+        }
         match req.call() {
             Ok(resp) => {
                 let size = resp.header("content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
@@ -643,6 +747,9 @@ impl Storage for Gcs {
         let url = self.bucket_url();
         let (auth_name, auth_value) = self.auth_header()?;
         let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
+        for (name, value) in self.common_headers() {
+            req = req.set(&name, &value);
+        }
         if !prefix.is_empty() {
             // ureq percent-encodes the query value for the wire request.
             req = req.query("prefix", &prefix);
@@ -678,7 +785,10 @@ impl Storage for Gcs {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
-        let req = self.agent.get(&url).set(&auth_name, &auth_value);
+        let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
+        for (name, value) in self.common_headers() {
+            req = req.set(&name, &value);
+        }
         match req.call() {
             Ok(resp) => {
                 let mut data = Vec::new();
@@ -708,7 +818,10 @@ impl Storage for Gcs {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
-        let req = self.agent.delete(&url).set(&auth_name, &auth_value);
+        let mut req = self.agent.delete(&url).set(&auth_name, &auth_value);
+        for (name, value) in self.common_headers() {
+            req = req.set(&name, &value);
+        }
         match req.call() {
             Ok(_) => Ok(()),
             Err(err) => match map_ureq_error(err, &key) {
@@ -772,15 +885,15 @@ mod tests {
     use super::*;
 
     fn test_config() -> GcsConfig {
-        GcsConfig {
-            bucket: "examplebucket".to_string(),
-            endpoint: None,
-            auth: GcsAuth::Token("ya29.EXAMPLE_ACCESS_TOKEN".to_string()),
-        }
+        GcsConfig::new(
+            "examplebucket".to_string(),
+            None,
+            GcsAuth::Token("ya29.EXAMPLE_ACCESS_TOKEN".to_string()),
+        )
     }
 
     fn test_gcs() -> Gcs {
-        Gcs::new(test_config())
+        Gcs::new(test_config()).unwrap()
     }
 
     /// A deterministic 2048-bit RSA private key in PKCS#8 PEM, generated solely
@@ -994,18 +1107,91 @@ mod tests {
     fn service_account_config_is_accepted() {
         // A ServiceAccount-configured backend builds without contacting Google;
         // the token exchange is deferred until the first request.
-        let config = GcsConfig {
-            bucket: "examplebucket".to_string(),
-            endpoint: None,
-            auth: GcsAuth::ServiceAccount {
+        let config = GcsConfig::new(
+            "examplebucket".to_string(),
+            None,
+            GcsAuth::ServiceAccount {
                 client_email: "svc@example.iam.gserviceaccount.com".to_string(),
                 private_key_pem: TEST_RSA_PRIVATE_KEY_PEM.to_string(),
                 token_uri: DEFAULT_TOKEN_URI.to_string(),
             },
-        };
-        let gcs = Gcs::new(config);
+        );
+        let gcs = Gcs::new(config).unwrap();
         assert_eq!(gcs.bucket(), "examplebucket");
         assert!(matches!(gcs.auth, GcsAuth::ServiceAccount { .. }));
+    }
+
+    #[test]
+    fn service_account_auth_parses_key_json() {
+        // A minimal service-account key JSON parses into ServiceAccount auth,
+        // mapping client_email / private_key / token_uri across.
+        let json = format!(
+            r#"{{
+                "type": "service_account",
+                "client_email": "svc@example.iam.gserviceaccount.com",
+                "private_key": {private_key},
+                "token_uri": "https://oauth2.example.com/token"
+            }}"#,
+            private_key = serde_json::to_string(TEST_RSA_PRIVATE_KEY_PEM).unwrap()
+        );
+        match service_account_auth_from_json(&json).unwrap() {
+            GcsAuth::ServiceAccount {
+                client_email,
+                private_key_pem,
+                token_uri,
+            } => {
+                assert_eq!(client_email, "svc@example.iam.gserviceaccount.com");
+                assert_eq!(private_key_pem, TEST_RSA_PRIVATE_KEY_PEM);
+                assert_eq!(token_uri, "https://oauth2.example.com/token");
+            }
+            GcsAuth::Token(_) => panic!("expected ServiceAccount auth"),
+        }
+    }
+
+    #[test]
+    fn service_account_auth_defaults_token_uri_and_validates() {
+        // token_uri defaults to the standard endpoint when omitted.
+        let json = format!(
+            r#"{{"client_email": "a@b.iam.gserviceaccount.com", "private_key": {pk}}}"#,
+            pk = serde_json::to_string(TEST_RSA_PRIVATE_KEY_PEM).unwrap()
+        );
+        match service_account_auth_from_json(&json).unwrap() {
+            GcsAuth::ServiceAccount { token_uri, .. } => assert_eq!(token_uri, DEFAULT_TOKEN_URI),
+            GcsAuth::Token(_) => panic!("expected ServiceAccount auth"),
+        }
+
+        // Missing required fields are rejected with a clear message.
+        assert!(service_account_auth_from_json("not json").is_err());
+        let missing = r#"{"private_key": "x"}"#;
+        assert!(service_account_auth_from_json(missing).unwrap_err().contains("client_email"));
+    }
+
+    #[test]
+    fn user_project_header_sent_on_all_requests() {
+        let config = GcsConfig {
+            user_project: Some("my-billing-project".to_string()),
+            ..test_config()
+        };
+        let gcs = Gcs::new(config).unwrap();
+        let common = gcs.common_headers();
+        assert_eq!(
+            common,
+            vec![("x-goog-user-project".to_string(), "my-billing-project".to_string())]
+        );
+        // Without it, no header is added.
+        assert!(test_gcs().common_headers().is_empty());
+    }
+
+    #[test]
+    fn tags_become_goog_meta_headers_on_upload() {
+        let mut tags = BTreeMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        let config = GcsConfig { tags, ..test_config() };
+        let gcs = Gcs::new(config).unwrap();
+        let upload = gcs.upload_headers();
+        assert!(upload.iter().any(|(n, v)| n == "x-goog-meta-env" && v == "prod"));
+        // common_headers (used on reads) carry no object metadata.
+        assert!(!gcs.common_headers().iter().any(|(n, _)| n.starts_with("x-goog-meta-")));
     }
 
     /// Integration test against a real bucket using a bearer token. Skipped
@@ -1014,12 +1200,12 @@ mod tests {
     #[test]
     #[ignore = "requires a live GCS bucket and PGBR_GCS_* env vars"]
     fn gcs_round_trip() {
-        let config = GcsConfig {
-            bucket: std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
-            endpoint: std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
-            auth: GcsAuth::Token(std::env::var("PGBR_GCS_TEST_TOKEN").expect("PGBR_GCS_TEST_TOKEN")),
-        };
-        let gcs = Gcs::new(config);
+        let config = GcsConfig::new(
+            std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
+            std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
+            GcsAuth::Token(std::env::var("PGBR_GCS_TEST_TOKEN").expect("PGBR_GCS_TEST_TOKEN")),
+        );
+        let gcs = Gcs::new(config).unwrap();
 
         let key = Path::new("pgbr-storage-round-trip.txt");
         {
@@ -1045,16 +1231,16 @@ mod tests {
     #[test]
     #[ignore = "requires a live GCS bucket and PGBR_GCS_SA_* env vars"]
     fn gcs_service_account_round_trip() {
-        let config = GcsConfig {
-            bucket: std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
-            endpoint: std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
-            auth: GcsAuth::ServiceAccount {
+        let config = GcsConfig::new(
+            std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
+            std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
+            GcsAuth::ServiceAccount {
                 client_email: std::env::var("PGBR_GCS_SA_CLIENT_EMAIL").expect("PGBR_GCS_SA_CLIENT_EMAIL"),
                 private_key_pem: std::env::var("PGBR_GCS_SA_PRIVATE_KEY").expect("PGBR_GCS_SA_PRIVATE_KEY"),
                 token_uri: std::env::var("PGBR_GCS_SA_TOKEN_URI").unwrap_or_else(|_| DEFAULT_TOKEN_URI.to_string()),
             },
-        };
-        let gcs = Gcs::new(config);
+        );
+        let gcs = Gcs::new(config).unwrap();
 
         let key = Path::new("pgbr-storage-sa-round-trip.txt");
         {

@@ -20,6 +20,7 @@
 //! HTTP responses are mapped to [`StorageError`] via [`status_to_error`]:
 //! `404 -> NotFound`, `403 -> PermissionDenied`, any other non-2xx -> `Backend`.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha2::{Digest, Sha256};
 
+use crate::http::HttpOptions;
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -40,10 +42,56 @@ const EMPTY_PAYLOAD_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b
 /// The `SigV4` algorithm identifier.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
+/// S3 bucket addressing style (`repo-s3-uri-style`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum S3UriStyle {
+    /// Virtual-hosted-style: the bucket is part of the hostname
+    /// (`<bucket>.<endpoint-host>/<key>`). The C default (`repo-s3-uri-style=host`).
+    #[default]
+    Host,
+    /// Path-style: the bucket is the first path segment
+    /// (`<endpoint>/<bucket>/<key>`). Required by most S3-compatible stores.
+    Path,
+}
+
+impl S3UriStyle {
+    /// Parse the `repo-s3-uri-style` option value (`host` / `path`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the unrecognised value as an error string for the caller to wrap.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "host" => Ok(Self::Host),
+            "path" => Ok(Self::Path),
+            other => Err(format!("unrecognised repo-s3-uri-style `{other}` (expected host or path)")),
+        }
+    }
+}
+
+/// Server-side-encryption request settings (`repo-s3-kms-key-id` /
+/// `repo-s3-sse-customer-key`). Grouped so the credential struct does not sprout
+/// several mutually-related optional fields.
+#[derive(Debug, Clone, Default)]
+pub enum S3Encryption {
+    /// No server-side encryption headers (the default).
+    #[default]
+    None,
+    /// SSE-KMS: `x-amz-server-side-encryption: aws:kms` plus the KMS key id in
+    /// `x-amz-server-side-encryption-aws-kms-key-id` (`repo-s3-kms-key-id`).
+    Kms(String),
+    /// SSE-C: customer-provided AES-256 key (`repo-s3-sse-customer-key`). The
+    /// stored value is the raw key string; the request headers carry its base64
+    /// encoding and an MD5 digest.
+    CustomerKey(String),
+}
+
 /// Immutable configuration for an [`S3`] backend.
 ///
 /// Mirrors the credential / addressing inputs the C `storage/s3` driver takes,
-/// minus the live HTTP agent (which [`S3::new`] constructs).
+/// minus the live HTTP agent (which [`S3::new`] constructs). The non-credential
+/// fields default to their documented `config.yaml` defaults, so existing
+/// callers can build with [`S3Config::default`]-style `..` spreads.
 #[derive(Debug, Clone)]
 pub struct S3Config {
     /// Endpoint base URL including scheme, e.g. `https://s3.us-east-1.amazonaws.com`.
@@ -58,6 +106,46 @@ pub struct S3Config {
     pub secret_key: String,
     /// Optional session token (`x-amz-security-token`) for temporary credentials.
     pub token: Option<String>,
+    /// Bucket addressing style (`repo-s3-uri-style`).
+    pub uri_style: S3UriStyle,
+    /// Server-side-encryption settings (`repo-s3-kms-key-id` / `-sse-customer-key`).
+    pub encryption: S3Encryption,
+    /// Send `x-amz-request-payer: requester` on every request
+    /// (`repo-s3-requester-pays`).
+    pub requester_pays: bool,
+    /// Object tags applied on upload (`repo-storage-tag`), sent as the
+    /// `x-amz-tagging` header (`k1=v1&k2=v2`).
+    pub tags: BTreeMap<String, String>,
+    /// Shared HTTPS-client transport options (`repo-storage-*`).
+    pub http: HttpOptions,
+}
+
+impl S3Config {
+    /// Build a config with only the required credential / addressing inputs and
+    /// every optional field at its default (matches the prior constructor shape).
+    #[must_use]
+    pub fn new(
+        endpoint: String,
+        region: String,
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+        token: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint,
+            region,
+            bucket,
+            access_key,
+            secret_key,
+            token,
+            uri_style: S3UriStyle::default(),
+            encryption: S3Encryption::default(),
+            requester_pays: false,
+            tags: BTreeMap::new(),
+            http: HttpOptions::default(),
+        }
+    }
 }
 
 /// S3 storage backend speaking the REST API over a synchronous [`ureq`] client.
@@ -73,17 +161,29 @@ pub struct S3 {
     access_key: String,
     secret_key: String,
     token: Option<String>,
+    uri_style: S3UriStyle,
+    encryption: S3Encryption,
+    requester_pays: bool,
+    tags: BTreeMap<String, String>,
     agent: ureq::Agent,
 }
 
 impl S3 {
-    /// Build an `S3` backend from `config`, constructing a fresh [`ureq::Agent`].
-    #[must_use]
-    pub fn new(config: S3Config) -> Self {
-        Self::with_agent(config, ureq::agent())
+    /// Build an `S3` backend from `config`, constructing a [`ureq::Agent`] from
+    /// the config's [`HttpOptions`] (custom CA / verify-tls when set).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] if the configured TLS options
+    /// (`repo-storage-ca-file` / `-ca-path`) cannot be loaded into a client
+    /// config.
+    pub fn new(config: S3Config) -> Result<Self, StorageError> {
+        let agent = config.http.build_agent()?;
+        Ok(Self::with_agent(config, agent))
     }
 
-    /// Build an `S3` backend with a caller-supplied [`ureq::Agent`].
+    /// Build an `S3` backend with a caller-supplied [`ureq::Agent`], ignoring the
+    /// config's [`HttpOptions`] TLS settings (the agent is taken as-is).
     #[must_use]
     pub fn with_agent(config: S3Config, agent: ureq::Agent) -> Self {
         let endpoint = config.endpoint.trim_end_matches('/').to_string();
@@ -94,6 +194,10 @@ impl S3 {
             access_key: config.access_key,
             secret_key: config.secret_key,
             token: config.token,
+            uri_style: config.uri_style,
+            encryption: config.encryption,
+            requester_pays: config.requester_pays,
+            tags: config.tags,
             agent,
         }
     }
@@ -110,9 +214,10 @@ impl S3 {
         &self.bucket
     }
 
-    /// The host portion of the endpoint (no scheme, no trailing slash). Used as
-    /// the canonical `host` header in `SigV4` signing.
-    fn host(&self) -> &str {
+    /// The bare host portion of the configured endpoint (no scheme, no trailing
+    /// slash, no port stripping). The `SigV4` `host` header and request URL are
+    /// derived from this, possibly with the bucket prepended (host-style).
+    fn endpoint_host(&self) -> &str {
         let no_scheme = self
             .endpoint
             .strip_prefix("https://")
@@ -121,20 +226,63 @@ impl S3 {
         no_scheme.split('/').next().unwrap_or(no_scheme)
     }
 
-    /// Canonical (percent-encoded, path-style) request URI for `key`:
-    /// `/<bucket>/<encoded key>`. Each path segment is percent-encoded but the
-    /// `/` separators are preserved, per the `S3` `SigV4` canonical-URI rules.
+    /// The scheme of the configured endpoint (`http` or `https`), defaulting to
+    /// `https` when the endpoint carries no explicit scheme.
+    fn scheme(&self) -> &str {
+        if self.endpoint.starts_with("http://") {
+            "http"
+        } else {
+            "https"
+        }
+    }
+
+    /// The `host` header value for `SigV4` signing and the wire request: the bare
+    /// endpoint host for path-style, or `<bucket>.<endpoint-host>` for host-style.
+    fn host(&self) -> String {
+        match self.uri_style {
+            S3UriStyle::Path => self.endpoint_host().to_string(),
+            S3UriStyle::Host => format!("{}.{}", self.bucket, self.endpoint_host()),
+        }
+    }
+
+    /// Canonical (percent-encoded) request URI for `key`, per the `S3` `SigV4`
+    /// canonical-URI rules. Path-style prepends the bucket
+    /// (`/<bucket>/<encoded key>`); host-style omits it (`/<encoded key>`) since
+    /// the bucket is in the hostname. Each path segment is percent-encoded but
+    /// the `/` separators are preserved.
     fn canonical_uri(&self, key: &str) -> String {
         let mut uri = String::from("/");
-        uri.push_str(&uri_encode(&self.bucket, false));
-        uri.push('/');
+        if matches!(self.uri_style, S3UriStyle::Path) {
+            uri.push_str(&uri_encode(&self.bucket, false));
+            uri.push('/');
+        }
         uri.push_str(&uri_encode(key, false));
         uri
     }
 
-    /// Full request URL for `key`: `<endpoint>/<bucket>/<encoded key>`.
+    /// The canonical request URI used for a bucket-level (list) request: `/` for
+    /// host-style, `/<bucket>` for path-style.
+    fn bucket_canonical_uri(&self) -> String {
+        match self.uri_style {
+            S3UriStyle::Host => "/".to_string(),
+            S3UriStyle::Path => format!("/{}", uri_encode(&self.bucket, false)),
+        }
+    }
+
+    /// Base request URL (scheme + host + bucket-path-prefix) without any object
+    /// key — `<scheme>://<host>` for host-style or `<scheme>://<host>/<bucket>`
+    /// for path-style.
+    fn base_url(&self) -> String {
+        match self.uri_style {
+            S3UriStyle::Host => format!("{}://{}", self.scheme(), self.host()),
+            S3UriStyle::Path => format!("{}://{}/{}", self.scheme(), self.host(), uri_encode(&self.bucket, false)),
+        }
+    }
+
+    /// Full request URL for `key`: the [`Self::base_url`] joined with the
+    /// percent-encoded key.
     fn object_url(&self, key: &str) -> String {
-        format!("{}{}", self.endpoint, self.canonical_uri(key))
+        format!("{}/{}", self.base_url(), uri_encode(key, false))
     }
 
     /// Build the `SigV4` `Authorization` header value for a request.
@@ -192,6 +340,10 @@ impl S3 {
     /// Assemble the standard signed headers for a request and return the
     /// `(header pairs, authorization)` needed to dispatch it. `payload_hash`
     /// is the hex SHA-256 of the request body (or [`EMPTY_PAYLOAD_SHA256`]).
+    ///
+    /// `extra` carries request-type-specific `x-amz-*` headers (server-side
+    /// encryption, object tags, requester-pays) that must participate in the
+    /// `SigV4` signature; see [`Self::request_extra_headers`].
     fn signed_headers(
         &self,
         method: &str,
@@ -199,18 +351,48 @@ impl S3 {
         query: &str,
         timestamp: &str,
         payload_hash: &str,
+        extra: &[(String, String)],
     ) -> Vec<(String, String)> {
         let mut headers = vec![
-            ("host".to_string(), self.host().to_string()),
+            ("host".to_string(), self.host()),
             ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
             ("x-amz-date".to_string(), timestamp.to_string()),
         ];
         if let Some(token) = &self.token {
             headers.push(("x-amz-security-token".to_string(), token.clone()));
         }
+        headers.extend(extra.iter().cloned());
 
         let authorization = self.sign_request(method, canonical_uri, query, &headers, payload_hash, timestamp);
         headers.push(("authorization".to_string(), authorization));
+        headers
+    }
+
+    /// Build the request-type-specific `x-amz-*` headers to sign and send.
+    ///
+    /// `is_upload` selects whether upload-only headers (SSE-KMS, object tags)
+    /// apply. The requester-pays header (`x-amz-request-payer: requester`) and
+    /// SSE-C headers are sent on every request type, since SSE-C must be repeated
+    /// on reads to decrypt the object. Returned `(name, value)` pairs are
+    /// lowercase-named so they sort correctly into the canonical headers.
+    fn request_extra_headers(&self, is_upload: bool) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        if self.requester_pays {
+            headers.push(("x-amz-request-payer".to_string(), "requester".to_string()));
+        }
+        match &self.encryption {
+            S3Encryption::None => {}
+            S3Encryption::Kms(key_id) => {
+                if is_upload {
+                    headers.push(("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()));
+                    headers.push(("x-amz-server-side-encryption-aws-kms-key-id".to_string(), key_id.clone()));
+                }
+            }
+            S3Encryption::CustomerKey(key) => headers.extend(sse_customer_headers(key)),
+        }
+        if is_upload && !self.tags.is_empty() {
+            headers.push(("x-amz-tagging".to_string(), encode_tagging(&self.tags)));
+        }
         headers
     }
 
@@ -407,6 +589,36 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     out
 }
 
+/// Build the SSE-C (customer-provided key) request headers for the raw key
+/// string `key`: the AES-256 algorithm marker, the base64-encoded key, and the
+/// base64-encoded MD5 of the key, per the AWS SSE-C protocol. Returned with
+/// lowercase header names so they sort into the canonical signed headers.
+fn sse_customer_headers(key: &str) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    use md5::{Digest as _, Md5};
+    let b64 = base64::engine::general_purpose::STANDARD.encode(key.as_bytes());
+    let digest = Md5::digest(key.as_bytes());
+    let md5_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+    vec![
+        (
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        ),
+        ("x-amz-server-side-encryption-customer-key".to_string(), b64),
+        ("x-amz-server-side-encryption-customer-key-md5".to_string(), md5_b64),
+    ]
+}
+
+/// Encode object tags as the `x-amz-tagging` header value: a URL-query-style
+/// `k1=v1&k2=v2` string with each key and value percent-encoded. Keys are sorted
+/// (the map is a [`BTreeMap`]) so the output is deterministic.
+fn encode_tagging(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Adapter exposing an owned byte buffer (a fetched object body) as [`IoRead`].
 struct S3Read {
     data: Vec<u8>,
@@ -480,7 +692,8 @@ impl S3 {
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(key);
         let payload_hash = hex_sha256(body);
-        let headers = self.signed_headers("PUT", &canonical_uri, "", &timestamp, &payload_hash);
+        let extra = self.request_extra_headers(true);
+        let headers = self.signed_headers("PUT", &canonical_uri, "", &timestamp, &payload_hash, &extra);
 
         let url = self.object_url(key);
         let mut req = self.agent.put(&url);
@@ -520,7 +733,8 @@ impl Storage for S3 {
         let key = Self::key_for(path);
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
-        let headers = self.signed_headers("HEAD", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256);
+        let extra = self.request_extra_headers(false);
+        let headers = self.signed_headers("HEAD", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
 
         let url = self.object_url(&key);
         let mut req = self.agent.head(&url);
@@ -556,10 +770,11 @@ impl Storage for S3 {
         } else {
             format!("list-type=2&prefix={}", uri_encode(&prefix, true))
         };
-        let canonical_uri = format!("/{}", uri_encode(&self.bucket, false));
-        let headers = self.signed_headers("GET", &canonical_uri, &query, &timestamp, EMPTY_PAYLOAD_SHA256);
+        let canonical_uri = self.bucket_canonical_uri();
+        let extra = self.request_extra_headers(false);
+        let headers = self.signed_headers("GET", &canonical_uri, &query, &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
 
-        let url = format!("{}/{}?{}", self.endpoint, uri_encode(&self.bucket, false), query);
+        let url = format!("{}?{}", self.base_url(), query);
         let mut req = self.agent.get(&url);
         for (name, value) in &headers {
             req = req.set(name, value);
@@ -595,7 +810,8 @@ impl Storage for S3 {
         let key = Self::key_for(path);
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
-        let headers = self.signed_headers("GET", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256);
+        let extra = self.request_extra_headers(false);
+        let headers = self.signed_headers("GET", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
 
         let url = self.object_url(&key);
         let mut req = self.agent.get(&url);
@@ -632,7 +848,8 @@ impl Storage for S3 {
         let key = Self::key_for(path);
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
-        let headers = self.signed_headers("DELETE", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256);
+        let extra = self.request_extra_headers(false);
+        let headers = self.signed_headers("DELETE", &canonical_uri, "", &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
 
         let url = self.object_url(&key);
         let mut req = self.agent.delete(&url);
@@ -770,15 +987,26 @@ fn parse_http_date_secs(text: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// Path-style test config (bucket as first path segment), preserving the
+    /// addressing the URL-building / canonical-URI assertions below expect.
     fn test_config() -> S3Config {
         S3Config {
-            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
-            region: "us-east-1".to_string(),
-            bucket: "examplebucket".to_string(),
-            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            token: None,
+            uri_style: S3UriStyle::Path,
+            ..S3Config::new(
+                "https://s3.us-east-1.amazonaws.com".to_string(),
+                "us-east-1".to_string(),
+                "examplebucket".to_string(),
+                "AKIAIOSFODNN7EXAMPLE".to_string(),
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                None,
+            )
         }
+    }
+
+    /// Build the path-style test backend, unwrapping the (infallible for the
+    /// default `HttpOptions`) `S3::new` result.
+    fn test_s3() -> S3 {
+        S3::new(test_config()).unwrap()
     }
 
     /// Anchor #1: AWS's published signing-key intermediate value.
@@ -813,7 +1041,7 @@ mod tests {
     /// `f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41`
     #[test]
     fn sigv4_matches_aws_test_vector() {
-        let s3 = S3::new(test_config());
+        let s3 = test_s3();
         let timestamp = "20130524T000000Z";
         // GET /test.txt with a Range header, per the AWS GET Object example.
         let canonical_uri = "/test.txt";
@@ -845,7 +1073,7 @@ mod tests {
 
     #[test]
     fn object_url_building() {
-        let s3 = S3::new(test_config());
+        let s3 = test_s3();
         assert_eq!(
             s3.object_url("path/to/object.bin"),
             "https://s3.us-east-1.amazonaws.com/examplebucket/path/to/object.bin"
@@ -853,6 +1081,125 @@ mod tests {
         // The canonical URI percent-encodes special chars but keeps slashes.
         assert_eq!(s3.canonical_uri("a b/c+d"), "/examplebucket/a%20b/c%2Bd");
         assert_eq!(s3.host(), "s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.base_url(), "https://s3.us-east-1.amazonaws.com/examplebucket");
+        assert_eq!(s3.bucket_canonical_uri(), "/examplebucket");
+    }
+
+    #[test]
+    fn host_style_addressing() {
+        // Host-style: the bucket lives in the hostname, the canonical URI omits
+        // it, and the request URL is `<scheme>://<bucket>.<host>/<key>`.
+        let cfg = S3Config {
+            uri_style: S3UriStyle::Host,
+            ..test_config()
+        };
+        let s3 = S3::new(cfg).unwrap();
+        assert_eq!(s3.host(), "examplebucket.s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.canonical_uri("path/to/object.bin"), "/path/to/object.bin");
+        assert_eq!(
+            s3.object_url("path/to/object.bin"),
+            "https://examplebucket.s3.us-east-1.amazonaws.com/path/to/object.bin"
+        );
+        assert_eq!(s3.base_url(), "https://examplebucket.s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.bucket_canonical_uri(), "/");
+    }
+
+    #[test]
+    fn uri_style_parse() {
+        assert_eq!(S3UriStyle::parse("host").unwrap(), S3UriStyle::Host);
+        assert_eq!(S3UriStyle::parse("path").unwrap(), S3UriStyle::Path);
+        assert!(S3UriStyle::parse("dns").is_err());
+        // The documented default is host-style.
+        assert_eq!(S3UriStyle::default(), S3UriStyle::Host);
+    }
+
+    #[test]
+    fn requester_pays_header_is_signed_and_sent() {
+        // With requester-pays on, every request carries the request-payer header,
+        // and it participates in the signature (it appears in SignedHeaders).
+        let cfg = S3Config {
+            requester_pays: true,
+            ..test_config()
+        };
+        let s3 = S3::new(cfg).unwrap();
+        let extra = s3.request_extra_headers(false);
+        assert!(extra.iter().any(|(n, v)| n == "x-amz-request-payer" && v == "requester"));
+
+        let headers = s3.signed_headers(
+            "GET",
+            "/examplebucket/k",
+            "",
+            "20130524T000000Z",
+            EMPTY_PAYLOAD_SHA256,
+            &extra,
+        );
+        let auth = headers
+            .iter()
+            .find(|(n, _)| n == "authorization")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(auth.contains("x-amz-request-payer"), "auth was {auth}");
+    }
+
+    #[test]
+    fn sse_kms_headers_on_upload_only() {
+        let cfg = S3Config {
+            encryption: S3Encryption::Kms("arn:aws:kms:key/abc".to_string()),
+            ..test_config()
+        };
+        let s3 = S3::new(cfg).unwrap();
+        // Upload carries the SSE-KMS markers.
+        let up = s3.request_extra_headers(true);
+        assert!(up.iter().any(|(n, v)| n == "x-amz-server-side-encryption" && v == "aws:kms"));
+        assert!(
+            up.iter()
+                .any(|(n, v)| n == "x-amz-server-side-encryption-aws-kms-key-id" && v == "arn:aws:kms:key/abc")
+        );
+        // A read request does not (SSE-KMS is server-side; reads need no header).
+        let down = s3.request_extra_headers(false);
+        assert!(!down.iter().any(|(n, _)| n.starts_with("x-amz-server-side-encryption")));
+    }
+
+    #[test]
+    fn sse_customer_key_headers_on_read_and_write() {
+        // SSE-C key "0123456789012345678901234567890" (raw) -> base64 + md5 b64.
+        let headers = sse_customer_headers("0123456789012345678901234567890");
+        assert_eq!(headers[0].1, "AES256");
+        // base64("0123456789012345678901234567890")
+        assert_eq!(headers[1].1, "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MA==");
+        // md5 of that string, base64-encoded (computed independently).
+        assert_eq!(headers[2].0, "x-amz-server-side-encryption-customer-key-md5");
+        assert!(!headers[2].1.is_empty());
+
+        // SSE-C is repeated on reads (needed to decrypt) and writes.
+        let cfg = S3Config {
+            encryption: S3Encryption::CustomerKey("0123456789012345678901234567890".to_string()),
+            ..test_config()
+        };
+        let s3 = S3::new(cfg).unwrap();
+        assert!(
+            s3.request_extra_headers(false)
+                .iter()
+                .any(|(n, _)| n == "x-amz-server-side-encryption-customer-key")
+        );
+        assert!(
+            s3.request_extra_headers(true)
+                .iter()
+                .any(|(n, _)| n == "x-amz-server-side-encryption-customer-key")
+        );
+    }
+
+    #[test]
+    fn object_tags_only_on_upload() {
+        let mut tags = BTreeMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "db ops".to_string());
+        assert_eq!(encode_tagging(&tags), "env=prod&team=db%20ops");
+
+        let cfg = S3Config { tags, ..test_config() };
+        let s3 = S3::new(cfg).unwrap();
+        assert!(s3.request_extra_headers(true).iter().any(|(n, _)| n == "x-amz-tagging"));
+        assert!(!s3.request_extra_headers(false).iter().any(|(n, _)| n == "x-amz-tagging"));
     }
 
     #[test]
@@ -977,14 +1324,19 @@ mod tests {
     fn s3_round_trip_against_real_endpoint() {
         let bucket = std::env::var("PGBR_S3_TEST_BUCKET").expect("PGBR_S3_TEST_BUCKET");
         let config = S3Config {
-            endpoint: std::env::var("PGBR_S3_TEST_ENDPOINT").unwrap_or_else(|_| "https://s3.us-east-1.amazonaws.com".to_string()),
-            region: std::env::var("PGBR_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-            bucket,
-            access_key: std::env::var("PGBR_S3_TEST_ACCESS_KEY").expect("PGBR_S3_TEST_ACCESS_KEY"),
-            secret_key: std::env::var("PGBR_S3_TEST_SECRET_KEY").expect("PGBR_S3_TEST_SECRET_KEY"),
-            token: std::env::var("PGBR_S3_TEST_TOKEN").ok(),
+            // Path-style is the most portable choice across S3-compatible
+            // endpoints (MinIO etc.); host-style is exercised by unit tests.
+            uri_style: S3UriStyle::Path,
+            ..S3Config::new(
+                std::env::var("PGBR_S3_TEST_ENDPOINT").unwrap_or_else(|_| "https://s3.us-east-1.amazonaws.com".to_string()),
+                std::env::var("PGBR_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+                bucket,
+                std::env::var("PGBR_S3_TEST_ACCESS_KEY").expect("PGBR_S3_TEST_ACCESS_KEY"),
+                std::env::var("PGBR_S3_TEST_SECRET_KEY").expect("PGBR_S3_TEST_SECRET_KEY"),
+                std::env::var("PGBR_S3_TEST_TOKEN").ok(),
+            )
         };
-        let s3 = S3::new(config);
+        let s3 = S3::new(config).unwrap();
 
         let key = Path::new("pgbr-storage-round-trip.txt");
         {

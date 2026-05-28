@@ -13,8 +13,12 @@ pgbr-error = { path = "../pgbr-error" }
 pgbr-io = { path = "../pgbr-io" }
 pgbr-protocol = { path = "../pgbr-protocol" }
 ureq = "2"
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 quick-xml = "0.38"
 sha2 = "0.10"
+md-5 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 ssh2 = "0.9"

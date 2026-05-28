@@ -29,6 +29,7 @@
 //! HTTP responses are mapped to [`StorageError`] via [`status_to_error`]:
 //! `404 -> NotFound`, `403 -> PermissionDenied`, any other non-2xx -> `Backend`.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha2::Sha256;
 
+use crate::http::HttpOptions;
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -84,6 +86,34 @@ pub struct AzureConfig {
     /// Optional endpoint base URL including scheme. Defaults to
     /// `https://<account>.blob.core.windows.net`.
     pub endpoint: Option<String>,
+    /// Blob tags applied on upload (`repo-storage-tag`), sent as the
+    /// `x-ms-tags` header (`k1=v1&k2=v2`).
+    pub tags: BTreeMap<String, String>,
+    /// Shared HTTPS-client transport options (`repo-storage-*`).
+    pub http: HttpOptions,
+}
+
+impl AzureConfig {
+    /// Build a config with only the required credential / addressing inputs and
+    /// every optional field at its default (matches the prior constructor shape).
+    #[must_use]
+    pub fn new(
+        account: String,
+        container: String,
+        account_key_base64: Option<String>,
+        sas_token: Option<String>,
+        endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            account,
+            container,
+            account_key_base64,
+            sas_token,
+            endpoint,
+            tags: BTreeMap::new(),
+            http: HttpOptions::default(),
+        }
+    }
 }
 
 /// Azure Blob storage backend speaking the REST API over a synchronous
@@ -99,20 +129,22 @@ pub struct Azure {
     container: String,
     auth: AzureAuth,
     endpoint: String,
+    tags: BTreeMap<String, String>,
     agent: ureq::Agent,
 }
 
 impl Azure {
-    /// Build an `Azure` backend from `config`, constructing a fresh
-    /// [`ureq::Agent`].
+    /// Build an `Azure` backend from `config`, constructing a [`ureq::Agent`]
+    /// from the config's [`HttpOptions`] (custom CA / verify-tls when set).
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::Backend`] if neither (or both) of
-    /// `account_key_base64` / `sas_token` is supplied, or if
-    /// `account_key_base64` is not valid base64.
+    /// `account_key_base64` / `sas_token` is supplied, if `account_key_base64`
+    /// is not valid base64, or if the configured TLS options cannot be loaded.
     pub fn new(config: AzureConfig) -> Result<Self, StorageError> {
-        Self::with_agent(config, ureq::agent())
+        let agent = config.http.build_agent()?;
+        Self::with_agent(config, agent)
     }
 
     /// Build an `Azure` backend with a caller-supplied [`ureq::Agent`].
@@ -154,6 +186,7 @@ impl Azure {
             container: config.container,
             auth,
             endpoint,
+            tags: config.tags,
             agent,
         })
     }
@@ -434,6 +467,16 @@ fn percent_encode_query(value: &str) -> String {
     out
 }
 
+/// Encode blob tags as the `x-ms-tags` header value: a URL-query-style
+/// `k1=v1&k2=v2` string with each key and value percent-encoded. Keys are sorted
+/// (the map is a [`BTreeMap`]) so the output is deterministic.
+fn encode_blob_tags(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| format!("{}={}", percent_encode_query(k), percent_encode_query(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// HMAC-SHA256 of `data` under `key`, returned as 32 bytes.
 ///
 /// `new_from_slice` is infallible for HMAC — it accepts keys of any length, so
@@ -510,6 +553,11 @@ impl Azure {
     fn put_blob(&self, key: &str, body: &[u8]) -> Result<(), StorageError> {
         let mut ms_headers = Self::ms_base_headers();
         ms_headers.push(("x-ms-blob-type".to_string(), "BlockBlob".to_string()));
+        // Object tags (`repo-storage-tag`) are sent as the signed `x-ms-tags`
+        // header (`k1=v1&k2=v2`, percent-encoded). Only on upload.
+        if !self.tags.is_empty() {
+            ms_headers.push(("x-ms-tags".to_string(), encode_blob_tags(&self.tags)));
+        }
 
         let content_length = body.len().to_string();
         let resource = self.canonicalized_resource(key, &[]);
@@ -843,26 +891,26 @@ mod tests {
     use super::*;
 
     fn test_config() -> AzureConfig {
-        AzureConfig {
-            account: "devstoreaccount1".to_string(),
-            container: "mycontainer".to_string(),
+        AzureConfig::new(
+            "devstoreaccount1".to_string(),
+            "mycontainer".to_string(),
             // "0123456789" base64-encoded — a deterministic, non-secret test key.
-            account_key_base64: Some("MDEyMzQ1Njc4OQ==".to_string()),
-            sas_token: None,
-            endpoint: None,
-        }
+            Some("MDEyMzQ1Njc4OQ==".to_string()),
+            None,
+            None,
+        )
     }
 
     /// A SAS-configured test config (no account key). The token is a fixed,
     /// non-secret fixture; the `sig` value is illustrative, not a real HMAC.
     fn sas_config() -> AzureConfig {
-        AzureConfig {
-            account: "devstoreaccount1".to_string(),
-            container: "mycontainer".to_string(),
-            account_key_base64: None,
-            sas_token: Some("sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=ABC%2Bdef123".to_string()),
-            endpoint: None,
-        }
+        AzureConfig::new(
+            "devstoreaccount1".to_string(),
+            "mycontainer".to_string(),
+            None,
+            Some("sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=ABC%2Bdef123".to_string()),
+            None,
+        )
     }
 
     fn test_azure() -> Azure {
@@ -1091,6 +1139,31 @@ mod tests {
     }
 
     #[test]
+    fn blob_tags_encode_deterministically() {
+        let mut tags = BTreeMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "db ops".to_string());
+        // Sorted by key (BTreeMap), values percent-encoded.
+        assert_eq!(encode_blob_tags(&tags), "env=prod&team=db%20ops");
+    }
+
+    #[test]
+    fn tags_set_signed_x_ms_tags_on_upload() {
+        // A tagged config carries the tags through to the backend; the put path
+        // adds them as the `x-ms-tags` header (verified via the field here, the
+        // header assembly is exercised by the put method).
+        let mut tags = BTreeMap::new();
+        tags.insert("k".to_string(), "v".to_string());
+        let config = AzureConfig {
+            tags: tags.clone(),
+            ..test_config()
+        };
+        let azure = Azure::new(config).unwrap();
+        assert_eq!(azure.tags, tags);
+        assert_eq!(encode_blob_tags(&azure.tags), "k=v");
+    }
+
+    #[test]
     fn key_for_strips_leading_slash_and_normalises() {
         assert_eq!(Azure::key_for(Path::new("/repo/archive/x")), "repo/archive/x");
         assert_eq!(Azure::key_for(Path::new("repo/archive/x")), "repo/archive/x");
@@ -1180,13 +1253,13 @@ mod tests {
     #[test]
     #[ignore = "requires a live Azure account and PGBR_AZURE_* env vars"]
     fn azure_round_trip() {
-        let config = AzureConfig {
-            account: std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
-            container: std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
-            account_key_base64: Some(std::env::var("PGBR_AZURE_KEY").expect("PGBR_AZURE_KEY")),
-            sas_token: None,
-            endpoint: std::env::var("PGBR_AZURE_ENDPOINT").ok(),
-        };
+        let config = AzureConfig::new(
+            std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
+            std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
+            Some(std::env::var("PGBR_AZURE_KEY").expect("PGBR_AZURE_KEY")),
+            None,
+            std::env::var("PGBR_AZURE_ENDPOINT").ok(),
+        );
         let azure = Azure::new(config).unwrap();
 
         let key = Path::new("pgbr-storage-round-trip.txt");
@@ -1213,13 +1286,13 @@ mod tests {
     #[test]
     #[ignore = "requires a live Azure account and PGBR_AZURE_SAS env var"]
     fn azure_sas_round_trip() {
-        let config = AzureConfig {
-            account: std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
-            container: std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
-            account_key_base64: None,
-            sas_token: Some(std::env::var("PGBR_AZURE_SAS").expect("PGBR_AZURE_SAS")),
-            endpoint: std::env::var("PGBR_AZURE_ENDPOINT").ok(),
-        };
+        let config = AzureConfig::new(
+            std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
+            std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
+            None,
+            Some(std::env::var("PGBR_AZURE_SAS").expect("PGBR_AZURE_SAS")),
+            std::env::var("PGBR_AZURE_ENDPOINT").ok(),
+        );
         let azure = Azure::new(config).unwrap();
 
         let key = Path::new("pgbr-storage-sas-round-trip.txt");
