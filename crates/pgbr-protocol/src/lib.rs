@@ -19,6 +19,8 @@
 
 pub mod codec;
 pub mod message;
+pub mod parallel;
 
 pub use crate::codec::{CodecError, read_message, write_message};
 pub use crate::message::{ErrResponse, Message, OkResponse, Request, Response};
+pub use crate::parallel::{Job, JobResult, ParallelExecutor};
