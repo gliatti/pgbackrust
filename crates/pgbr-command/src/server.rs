@@ -17,29 +17,51 @@
 //! over in-memory [`MemRead`](pgbr_io::MemRead) /
 //! [`MemWrite`](pgbr_io::MemWrite) streams.
 //!
-//! On top of those cores this module supplies a **plain-TCP** transport:
+//! On top of those cores this module supplies two transports:
+//!
+//! **Plain TCP** (no encryption):
 //!
 //! - [`TcpIo`] adapts a [`std::net::TcpStream`] to [`IoRead`] / [`IoWrite`].
 //! - [`serve_listener`] / [`serve_tcp`] accept connections and run [`serve`]
 //!   per connection; [`ping_tcp`] connects and runs [`ping_exchange`].
 //!
+//! **TLS** (matching the real pgBackRest, C reference `src/common/io/tls/`):
+//!
+//! - [`TlsIo`] adapts a [`rustls`] stream ([`rustls::StreamOwned`] over a
+//!   [`TcpStream`], server or client side) to [`IoRead`] / [`IoWrite`] — the
+//!   same shape as [`TcpIo`], since a `rustls` stream is also a single
+//!   bidirectional `Read`/`Write` handle.
+//! - [`serve_tls`] accepts a TCP connection, runs the rustls **server**
+//!   handshake from a cert chain + private key, then drives [`serve`].
+//! - [`ping_tls`] connects, runs the rustls **client** handshake trusting a
+//!   configured CA, then drives [`ping_exchange`].
+//!
+//! Because [`serve`] and [`ping_exchange`] are transport-agnostic, the TLS
+//! path reuses them unchanged — only the byte transport differs.
+//!
 //! The user-facing [`server`] and [`ping`] entry points read the bind /
 //! connect address from the configured `tls-server-address` /
-//! `tls-server-port` options (defaulting to `127.0.0.1:8432`) and drive the
-//! TCP helpers.
+//! `tls-server-port` options (defaulting to `127.0.0.1:8432`) and select the
+//! transport from the configured TLS options:
 //!
-//! **TLS is a documented follow-up.** The real pgBackRest `server` terminates
-//! TLS on the socket; here the transport is plain TCP. Because [`serve`] and
-//! [`ping_exchange`] are transport-agnostic, TLS slots in later by swapping
-//! [`TcpIo`] for a TLS stream adapter (rustls / openssl) — the protocol cores
-//! do not change.
+//! - [`server`] uses TLS when `tls-server-cert-file` **and**
+//!   `tls-server-key-file` are configured (loading PEM via `rustls-pemfile`),
+//!   otherwise falls back to plain TCP.
+//! - [`ping`] uses TLS when a CA file (`tls-server-ca-file`) is configured,
+//!   otherwise falls back to plain TCP.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::{IoError, IoRead, IoWrite};
 use pgbr_storage::Storage;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, ConnectionCommon, RootCertStore, ServerConfig, ServerConnection, SideData, StreamOwned,
+};
 
 use crate::CommandError;
 
@@ -257,6 +279,283 @@ pub fn ping_tcp(addr: &str) -> Result<(), CommandError> {
     ping_exchange(&mut reader, &mut writer)
 }
 
+/// Ensure a process-level [`rustls`] [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// is installed.
+///
+/// `rustls` 0.23 requires a crypto provider to be selected before any
+/// `ClientConfig` / `ServerConfig` is built. With the default `ring` feature
+/// enabled the `ring` provider is available; we install it as the process
+/// default exactly once. `install_default` returns `Err` if a provider is
+/// already installed (e.g. installed by an earlier call or by another part of
+/// the process), which is fine — we only need *a* provider, so that case is
+/// ignored.
+fn ensure_crypto_provider() {
+    // Ignore the result: an `Err` means a provider is already installed, which
+    // satisfies the precondition just as well as our installing one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Adapts an owned [`rustls`] stream to the [`IoRead`] / [`IoWrite`] traits the
+/// protocol cores expect.
+///
+/// A [`StreamOwned`] couples a `rustls` connection (server or client) with the
+/// underlying [`TcpStream`] and implements [`std::io::Read`] / [`Write`],
+/// transparently encrypting writes and decrypting reads. Unlike [`TcpIo`],
+/// which holds two `try_clone`d halves of one socket, a `rustls` stream is a
+/// single stateful object that must own both directions — so one `TlsIo`
+/// serves as *both* the reader and the writer of an exchange (the protocol
+/// cores accept the same value for both arguments via `&mut`).
+///
+/// `read` maps a zero-length read to EOF (sets the `eof` flag); errors map to
+/// [`IoError::Backend`]. `close` sends the TLS `close_notify` alert and then
+/// write-shuts the underlying socket so the peer sees a clean EOF.
+pub struct TlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    stream: StreamOwned<C, TcpStream>,
+    eof: bool,
+}
+
+/// Server-side TLS adapter: a [`TlsIo`] over a [`ServerConnection`].
+pub type TlsServerIo = TlsIo<ServerConnection, rustls::server::ServerConnectionData>;
+
+/// Client-side TLS adapter: a [`TlsIo`] over a [`ClientConnection`].
+pub type TlsClientIo = TlsIo<ClientConnection, rustls::client::ClientConnectionData>;
+
+impl<C, S> TlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    /// Wrap an established `rustls` stream.
+    #[must_use]
+    pub const fn new(stream: StreamOwned<C, TcpStream>) -> Self {
+        Self { stream, eof: false }
+    }
+}
+
+impl<C, S> IoRead for TlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let n = self
+            .stream
+            .read(buf)
+            .map_err(|e| IoError::Backend(format!("tls read: {e}")))?;
+        if n == 0 {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+
+    fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+impl<C, S> IoWrite for TlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.stream
+            .write_all(buf)
+            .map_err(|e| IoError::Backend(format!("tls write: {e}")))
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        Write::flush(&mut self.stream).map_err(|e| IoError::Backend(format!("tls flush: {e}")))
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        // Send the TLS close_notify alert so the peer can distinguish an orderly
+        // shutdown from a truncation attack, then write-shut the socket so the
+        // peer reads a clean EOF. A socket already shut down by the peer is not
+        // an error worth surfacing. `send_close_notify` lives on `CommonState`,
+        // reached through the connection's `DerefMut`.
+        self.stream.conn.send_close_notify();
+        let _ = self.stream.flush();
+        self.stream
+            .sock
+            .shutdown(Shutdown::Write)
+            .map_err(|e| IoError::Backend(format!("tls shutdown: {e}")))
+    }
+}
+
+/// A shared, cloneable handle to one [`TlsIo`].
+///
+/// [`serve`] / [`ping_exchange`] take *separate* reader and writer values, but
+/// a `rustls` [`StreamOwned`] is a single stateful object owning both
+/// directions — it cannot be `try_clone`d into independent halves the way a
+/// [`TcpStream`] can (see [`split`]). So we wrap one `TlsIo` in
+/// `Rc<RefCell<…>>` and hand out two cheap clones of the handle: one used as
+/// the reader, one as the writer. Both borrow the inner `TlsIo` only for the
+/// duration of a single `read` / `write` / `flush` / `close` call, and the
+/// protocol cores never hold a read borrow live across a write (or vice
+/// versa), so the `RefCell` borrows never overlap at runtime.
+struct SharedTlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    inner: std::rc::Rc<std::cell::RefCell<TlsIo<C, S>>>,
+}
+
+impl<C, S> SharedTlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    fn new(io: TlsIo<C, S>) -> Self {
+        Self {
+            inner: std::rc::Rc::new(std::cell::RefCell::new(io)),
+        }
+    }
+
+    fn clone_handle(&self) -> Self {
+        Self {
+            inner: std::rc::Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<C, S> IoRead for SharedTlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        self.inner.borrow_mut().read(buf)
+    }
+
+    fn eof(&self) -> bool {
+        self.inner.borrow().eof()
+    }
+}
+
+impl<C, S> IoWrite for SharedTlsIo<C, S>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+    S: SideData,
+{
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.inner.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.inner.borrow_mut().flush()
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        self.inner.borrow_mut().close()
+    }
+}
+
+/// Load a PEM certificate chain from `path`.
+fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, CommandError> {
+    let pem = std::fs::read(path).map_err(|e| CommandError::Other(format!("read cert file {path}: {e}")))?;
+    let mut reader = &pem[..];
+    rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CommandError::Other(format!("parse cert file {path}: {e}")))
+}
+
+/// Load a single PEM private key from `path` (PKCS#8, PKCS#1, or SEC1).
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, CommandError> {
+    let pem = std::fs::read(path).map_err(|e| CommandError::Other(format!("read key file {path}: {e}")))?;
+    let mut reader = &pem[..];
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| CommandError::Other(format!("parse key file {path}: {e}")))?
+        .ok_or_else(|| CommandError::Other(format!("no private key found in {path}")))
+}
+
+/// Build a [`RootCertStore`] trusting every certificate in the PEM file at
+/// `ca_path`.
+fn root_store_from_ca(ca_path: &str) -> Result<RootCertStore, CommandError> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_cert_chain(ca_path)? {
+        roots
+            .add(cert)
+            .map_err(|e| CommandError::Other(format!("add CA from {ca_path}: {e}")))?;
+    }
+    Ok(roots)
+}
+
+/// Accept a single TCP connection on `listener`, perform the rustls server
+/// handshake from `cert_chain` + `private_key`, wrap the resulting stream in
+/// [`TlsIo`], and drive [`serve`].
+///
+/// Mirrors [`serve_listener`]: one connection is served to its `exit` / EOF,
+/// after which the function returns.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] on an accept failure, an invalid cert/key, a TLS
+/// handshake failure, or whatever [`serve`] returns.
+pub fn serve_tls(
+    listener: &TcpListener,
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+) -> Result<(), CommandError> {
+    ensure_crypto_provider();
+
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| CommandError::Other(format!("tls server config: {e}")))?;
+    let server_config = Arc::new(server_config);
+
+    let (stream, _peer) = listener
+        .accept()
+        .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+
+    let conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
+    let io = SharedTlsIo::new(TlsServerIo::new(StreamOwned::new(conn, stream)));
+
+    let mut reader = io.clone_handle();
+    let mut writer = io.clone_handle();
+    serve(&mut reader, &mut writer)?;
+    // Signal a clean EOF (close_notify + write-shutdown) to the peer.
+    let _ = writer.close();
+    Ok(())
+}
+
+/// Connect a [`TcpStream`] to `addr`, perform the rustls client handshake with
+/// a [`ClientConfig`] trusting the CA in `ca_file`, wrap the stream in
+/// [`TlsIo`], and run [`ping_exchange`].
+///
+/// `server_name` is the hostname presented for SNI and validated against the
+/// server certificate.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the connection cannot be made, the CA cannot be
+/// loaded, `server_name` is not a valid DNS name, the TLS handshake fails, or
+/// whatever [`ping_exchange`] returns.
+pub fn ping_tls(addr: &str, server_name: &str, ca_file: &str) -> Result<(), CommandError> {
+    ensure_crypto_provider();
+
+    let roots = root_store_from_ca(ca_file)?;
+    let client_config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let client_config = Arc::new(client_config);
+
+    let name = ServerName::try_from(server_name.to_owned())
+        .map_err(|e| CommandError::Other(format!("invalid server name `{server_name}`: {e}")))?;
+
+    let stream = TcpStream::connect(addr).map_err(|e| CommandError::Other(format!("tcp connect {addr}: {e}")))?;
+    let conn = ClientConnection::new(client_config, name).map_err(|e| CommandError::Other(format!("tls client new: {e}")))?;
+    let io = SharedTlsIo::new(TlsClientIo::new(StreamOwned::new(conn, stream)));
+
+    let mut reader = io.clone_handle();
+    let mut writer = io.clone_handle();
+    ping_exchange(&mut reader, &mut writer)
+}
+
 /// Resolve the bind / connect address from the configured
 /// `tls-server-address` and `tls-server-port` options, falling back to
 /// [`DEFAULT_ADDRESS`] when either is absent.
@@ -276,34 +575,80 @@ fn server_address(config: &LoadedConfig) -> String {
     }
 }
 
+/// Resolve just the host portion of the configured `tls-server-address`
+/// (default `localhost`), for use as the TLS SNI / certificate name in
+/// [`ping`].
+fn server_host(config: &LoadedConfig) -> String {
+    match config.options.get(&("tls-server-address".to_owned(), None)) {
+        Some(OptionValue::String(h) | OptionValue::Path(h)) if !h.is_empty() => h.clone(),
+        _ => "localhost".to_owned(),
+    }
+}
+
+/// Read a string/path-typed option as an owned `String`, returning `None` when
+/// the option is absent or carries an empty value.
+fn option_path(config: &LoadedConfig, name: &str) -> Option<String> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Path(p) | OptionValue::String(p)) if !p.is_empty() => Some(p.clone()),
+        _ => None,
+    }
+}
+
 /// `server` — listen for protocol connections from remote pgBackRest
-/// processes over plain TCP and drive [`serve`] per connection.
+/// processes and drive [`serve`] per connection.
 ///
 /// The bind address comes from `tls-server-address` / `tls-server-port`
-/// (default `127.0.0.1:8432`). TLS termination is a documented follow-up: the
-/// transport-agnostic [`serve`] core is unchanged, so it slots in by swapping
-/// [`TcpIo`] for a TLS stream adapter.
+/// (default `127.0.0.1:8432`).
+///
+/// **Transport selection:** if both `tls-server-cert-file` and
+/// `tls-server-key-file` are configured, the cert chain + private key are
+/// loaded from those PEM files and the connection is served over TLS via
+/// [`serve_tls`]. Otherwise the server falls back to plain TCP via
+/// [`serve_tcp`]. The transport-agnostic [`serve`] core is identical on both
+/// paths.
 ///
 /// # Errors
 ///
-/// Propagates whatever [`serve_tcp`] returns (bind / accept failures, or a
-/// protocol / write error from [`serve`]).
+/// Propagates whatever [`serve_tls`] / [`serve_tcp`] return (bind / accept
+/// failures, invalid cert/key, TLS handshake errors, or a protocol / write
+/// error from [`serve`]).
 pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
-    serve_tcp(&server_address(config))
+    let addr = server_address(config);
+
+    match (
+        option_path(config, "tls-server-cert-file"),
+        option_path(config, "tls-server-key-file"),
+    ) {
+        (Some(cert_file), Some(key_file)) => {
+            let cert_chain = load_cert_chain(&cert_file)?;
+            let private_key = load_private_key(&key_file)?;
+            let listener = TcpListener::bind(&addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
+            serve_tls(&listener, cert_chain, private_key)
+        }
+        _ => serve_tcp(&addr),
+    }
 }
 
 /// `server-ping` — health check against a running `server` instance.
 ///
-/// Connects over plain TCP to the configured `tls-server-address` /
-/// `tls-server-port` (default `127.0.0.1:8432`) and runs [`ping_exchange`].
-/// TLS is the same documented follow-up as for [`server`].
+/// Connects to the configured `tls-server-address` / `tls-server-port`
+/// (default `127.0.0.1:8432`) and runs [`ping_exchange`].
+///
+/// **Transport selection:** if a CA file (`tls-server-ca-file`) is configured,
+/// the ping is performed over TLS via [`ping_tls`], trusting that CA and
+/// validating the server certificate against the configured host name.
+/// Otherwise it falls back to plain TCP via [`ping_tcp`].
 ///
 /// # Errors
 ///
-/// Propagates whatever [`ping_tcp`] returns (connect failure, or a protocol /
-/// rejection error from [`ping_exchange`]).
+/// Propagates whatever [`ping_tls`] / [`ping_tcp`] return (connect failure,
+/// CA-load / handshake error, or a protocol / rejection error from
+/// [`ping_exchange`]).
 pub fn ping(config: &LoadedConfig) -> Result<(), CommandError> {
-    ping_tcp(&server_address(config))
+    let addr = server_address(config);
+
+    option_path(config, "tls-server-ca-file")
+        .map_or_else(|| ping_tcp(&addr), |ca_file| ping_tls(&addr, &server_host(config), &ca_file))
 }
 
 #[cfg(test)]
@@ -541,5 +886,188 @@ mod tests {
         // The server thread completed without error after serving the
         // connection to its clean EOF.
         server.join().expect("server thread panicked").expect("serve_listener");
+    }
+
+    // --- TLS transport -----------------------------------------------------
+
+    /// Generate a self-signed cert/key pair for `localhost` and return the two
+    /// PEM strings `(cert_pem, key_pem)`. The cert is its own issuer, so it
+    /// doubles as the CA the client trusts.
+    fn self_signed_localhost() -> (String, String) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        (certified.cert.pem(), certified.key_pair.serialize_pem())
+    }
+
+    /// Parse PEM strings into the in-memory rustls types `serve_tls` /
+    /// `ping_tls`'s callers would otherwise read from files.
+    fn cert_chain_from_pem(cert_pem: &str) -> Vec<CertificateDer<'static>> {
+        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn private_key_from_pem(key_pem: &str) -> PrivateKeyDer<'static> {
+        rustls_pemfile::private_key(&mut key_pem.as_bytes()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn tls_ping_round_trip() {
+        // Self-signed cert for `localhost`; the client trusts it as its CA.
+        let (cert_pem, key_pem) = self_signed_localhost();
+        let cert_chain = cert_chain_from_pem(&cert_pem);
+        let private_key = private_key_from_pem(&key_pem);
+
+        // CA file the client reads (the server's own self-signed cert).
+        let ca_dir = tempfile::tempdir().unwrap();
+        let ca_path = ca_dir.path().join("ca.pem");
+        std::fs::write(&ca_path, cert_pem.as_bytes()).unwrap();
+        let ca_path = ca_path.to_str().unwrap().to_owned();
+
+        // Bind on an ephemeral port and read the assigned address BEFORE moving
+        // the listener into the server thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || serve_tls(&listener, cert_chain, private_key));
+
+        // Connect to 127.0.0.1 but present the SNI / cert name `localhost`,
+        // which the self-signed cert covers. The TLS layer drives its own
+        // socket reads; set a generous read timeout so a hung handshake fails
+        // the test fast rather than blocking CI.
+        let addr = format!("127.0.0.1:{port}");
+        ping_tls_with_timeout(&addr, "localhost", &ca_path, Duration::from_secs(10)).unwrap();
+
+        server.join().expect("server thread panicked").expect("serve_tls");
+    }
+
+    /// `ping_tls` variant that sets a socket read timeout before the handshake,
+    /// so a hung server fails the test instead of blocking forever. Mirrors
+    /// `ping_tls` otherwise.
+    fn ping_tls_with_timeout(addr: &str, server_name: &str, ca_file: &str, timeout: Duration) -> Result<(), CommandError> {
+        ensure_crypto_provider();
+
+        let roots = root_store_from_ca(ca_file)?;
+        let client_config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let client_config = Arc::new(client_config);
+
+        let name = ServerName::try_from(server_name.to_owned())
+            .map_err(|e| CommandError::Other(format!("invalid server name `{server_name}`: {e}")))?;
+
+        let stream = TcpStream::connect(addr).map_err(|e| CommandError::Other(format!("tcp connect {addr}: {e}")))?;
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        let conn = ClientConnection::new(client_config, name).map_err(|e| CommandError::Other(format!("tls client new: {e}")))?;
+        let io = SharedTlsIo::new(TlsClientIo::new(StreamOwned::new(conn, stream)));
+
+        let mut reader = io.clone_handle();
+        let mut writer = io.clone_handle();
+        let result = ping_exchange(&mut reader, &mut writer);
+        // Close the write half so the server reads a clean EOF and its
+        // `serve` loop ends, letting the server thread join.
+        let _ = writer.close();
+        result
+    }
+
+    #[test]
+    fn tlsio_read_write_round_trip() {
+        // Establish a loopback TLS connection: a server thread completes the
+        // server handshake and echoes back whatever it reads through `TlsIo`;
+        // the main thread drives the client `TlsIo`.
+        let (cert_pem, key_pem) = self_signed_localhost();
+        let cert_chain = cert_chain_from_pem(&cert_pem);
+        let private_key = private_key_from_pem(&key_pem);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            ensure_crypto_provider();
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, private_key)
+                .unwrap();
+            let (stream, _peer) = listener.accept().unwrap();
+            let conn = ServerConnection::new(Arc::new(server_config)).unwrap();
+            let mut io = TlsServerIo::new(StreamOwned::new(conn, stream));
+
+            // Read the client's message and echo it straight back through
+            // `TlsIo`, then close to flush close_notify.
+            let mut buf = [0u8; 64];
+            let n = io.read(&mut buf).unwrap();
+            io.write(&buf[..n]).unwrap();
+            io.flush().unwrap();
+            let _ = io.close();
+        });
+
+        ensure_crypto_provider();
+        let mut roots = RootCertStore::empty();
+        for cert in cert_chain_from_pem(&cert_pem) {
+            roots.add(cert).unwrap();
+        }
+        let client_config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+        let mut client_io = TlsClientIo::new(StreamOwned::new(conn, stream));
+
+        client_io.write(b"hello tls").unwrap();
+        client_io.flush().unwrap();
+
+        let mut got = [0u8; 64];
+        let n = client_io.read(&mut got).unwrap();
+        assert_eq!(&got[..n], b"hello tls");
+        let _ = client_io.close();
+
+        server.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn server_uses_tls_when_cert_and_key_set() {
+        // `server` selects the TLS transport when both cert and key files are
+        // configured. Pointing them at a missing path surfaces the PEM-load
+        // error from the TLS path (not a plain-TCP bind), proving the branch
+        // was taken.
+        let config = config_with(vec![
+            (
+                ("tls-server-cert-file", None),
+                OptionValue::Path("/no/such/cert.pem".to_owned()),
+            ),
+            (
+                ("tls-server-key-file", None),
+                OptionValue::Path("/no/such/key.pem".to_owned()),
+            ),
+        ]);
+        let repo = tempfile::tempdir().unwrap();
+        let storage = pgbr_storage::Posix::new(repo.path());
+        let err = server(&config, &storage).unwrap_err();
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("cert file"), "message was {msg:?}"),
+            other => panic!("expected Other(read cert file), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_uses_tls_when_ca_set() {
+        // `ping` selects the TLS transport when a CA file is configured.
+        // A missing CA path surfaces the CA-read error from the TLS path.
+        let config = config_with(vec![
+            (("tls-server-ca-file", None), OptionValue::Path("/no/such/ca.pem".to_owned())),
+            (("tls-server-port", None), OptionValue::Integer(1)),
+        ]);
+        let err = ping(&config).unwrap_err();
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("cert file"), "message was {msg:?}"),
+            other => panic!("expected Other(read cert file), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_host_defaults_to_localhost() {
+        assert_eq!(server_host(&config_with(vec![])), "localhost");
+        let with_host = config_with(vec![(
+            ("tls-server-address", None),
+            OptionValue::String("example.com".to_owned()),
+        )]);
+        assert_eq!(server_host(&with_host), "example.com");
     }
 }
