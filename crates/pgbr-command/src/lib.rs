@@ -34,6 +34,7 @@ pub mod restore;
 pub mod server;
 pub mod stanza;
 pub mod verify;
+pub mod worker;
 
 /// Typed failure raised by any per-command function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +109,14 @@ pub fn dispatch(
     repo_storage: &dyn pgbr_storage::Storage,
     pg_storage: &dyn pgbr_storage::Storage,
 ) -> Result<(), CommandError> {
+    // The subordinate `local` / `remote` worker roles short-circuit the
+    // command table: regardless of the user-facing command name, a worker
+    // invocation serves the protocol on stdin/stdout rather than running a
+    // command itself. C ref: src/command/{local,remote}, src/main.c.
+    if worker::is_worker(config) {
+        return worker::run_worker_stdio(config);
+    }
+
     match config.command.as_str() {
         "version" => control::version(config),
         "help" => help::help(config),

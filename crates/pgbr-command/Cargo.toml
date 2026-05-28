@@ -29,6 +29,9 @@ serde_json = "1"
 # `rcgen` generates the self-signed cert used by the TLS round-trip tests.
 # Match rustls: use the `ring`-backed crypto so no aws-lc C build is pulled in.
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# Cross-platform pipe pair backing the in-process worker protocol round-trip
+# tests (server on a thread, client in the test), so no child process is spawned.
+os_pipe = "1"
 serde_json = "1"
 tempfile = "3"
 
