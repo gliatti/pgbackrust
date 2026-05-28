@@ -9,6 +9,10 @@ repository.workspace = true
 [lib]
 
 [dependencies]
+# Cross-platform advisory file locking (flock / LockFileEx) for lock-type
+# acquisition in `lock.rs`. Keeps the crate unsafe-free (the crate root has
+# `forbid(unsafe_code)`), unlike a raw `libc::flock` call.
+fs2 = "0.4"
 pgbr-build = { path = "../pgbr-build" }
 pgbr-compress = { path = "../pgbr-compress" }
 pgbr-config = { path = "../pgbr-config" }
