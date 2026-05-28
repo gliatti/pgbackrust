@@ -560,6 +560,13 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let excludes = excludes_from_config(config);
     let start_fast = start_fast_enabled(config);
 
+    // File-bundling / block-incremental features. Validate the cross-option
+    // constraints up front: bundling and repo-hardlink are mutually exclusive
+    // (a bundled file has no standalone repo object to hard-link), and
+    // block-incremental requires bundling (block bytes live in bundles).
+    let features = BackupFeatures::from_options(config);
+    validate_features(config, features)?;
+
     // Surface the applied user exclusions: pgBackRest records these in the
     // manifest's `[backup:option]` metadata, but the `Manifest` struct here owns
     // no exclude field (another concern), so for this slice the applied entries
@@ -595,6 +602,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         primary.as_mut().map(|c| c as &mut dyn BackupControl),
         standby.as_mut().map(|c| c as &mut dyn BackupControl),
         start_fast,
+        features,
     )?;
     println!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -791,6 +799,137 @@ fn excludes_from_config(config: &LoadedConfig) -> Vec<String> {
     }
 }
 
+/// Default `repo-bundle-size` (20 MiB) when the option is absent.
+const DEFAULT_BUNDLE_SIZE: u64 = 20 * 1024 * 1024;
+/// Default `repo-bundle-limit` (2 MiB) when the option is absent.
+const DEFAULT_BUNDLE_LIMIT: u64 = 2 * 1024 * 1024;
+
+/// The bundling / block-incremental features a backup applies, resolved from the
+/// `repo-bundle*` / `repo-block` options.
+///
+/// All-off ([`BackupFeatures::disabled`]) reproduces the prior per-file,
+/// parallel copy path byte-for-byte; the `backup_inner_*` test wrappers always
+/// pass that, so every existing test keeps its exact behaviour. The public
+/// [`backup`] entry reads the real values from the resolved config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupFeatures {
+    /// `repo-bundle=y`: pack small files into shared bundle objects.
+    pub bundle: bool,
+    /// `repo-bundle-size`: maximum bytes per bundle object.
+    pub bundle_size: u64,
+    /// `repo-bundle-limit`: files with a repo size at or below this are eligible
+    /// for bundling; larger files stay as individual objects.
+    pub bundle_limit: u64,
+    /// `repo-block=y`: split large eligible files into blocks (requires `bundle`).
+    pub block: bool,
+}
+
+impl BackupFeatures {
+    /// All features off — the classic per-file parallel copy path.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            bundle: false,
+            bundle_size: DEFAULT_BUNDLE_SIZE,
+            bundle_limit: DEFAULT_BUNDLE_LIMIT,
+            block: false,
+        }
+    }
+
+    /// Read the bundling / block options from the resolved configuration.
+    ///
+    /// `repo-bundle` / `repo-block` are booleans; `repo-bundle-size` /
+    /// `repo-bundle-limit` are `Size` (bytes). Absent size options fall back to
+    /// pgBackRest's defaults (20 MiB / 2 MiB).
+    #[must_use]
+    pub fn from_options(config: &LoadedConfig) -> Self {
+        let boolean = |name: &str| matches!(config.options.get(&(name.to_owned(), None)), Some(OptionValue::Boolean(true)));
+        let size = |name: &str, default: u64| match config.options.get(&(name.to_owned(), None)) {
+            Some(OptionValue::Size(value)) => *value,
+            Some(OptionValue::Integer(value)) if *value >= 0 => u64::try_from(*value).unwrap_or(default),
+            _ => default,
+        };
+        // Group options resolve to `repo1-...`; the `repoN-` prefix is stripped by
+        // the config layer to the bare option name with a group index, but the CLI
+        // also accepts the bare name (index None). Check both the indexed and
+        // un-indexed forms so a hand-built or real config resolves either way.
+        let boolean_grouped = |name: &str| boolean(name) || boolean_indexed(config, name);
+        let size_grouped = |name: &str, default: u64| {
+            let bare = size(name, default);
+            if bare == default {
+                size_indexed(config, name, default)
+            } else {
+                bare
+            }
+        };
+        Self {
+            bundle: boolean_grouped("repo-bundle"),
+            bundle_size: size_grouped("repo-bundle-size", DEFAULT_BUNDLE_SIZE),
+            bundle_limit: size_grouped("repo-bundle-limit", DEFAULT_BUNDLE_LIMIT),
+            block: boolean_grouped("repo-block"),
+        }
+    }
+}
+
+/// Validate the cross-option constraints on the bundling / block features.
+///
+/// - **Bundling vs `repo-hardlink`** — a bundled file shares a repo object with
+///   other files, so there is no standalone object to hard-link; the two are
+///   mutually exclusive. (The option model's `depend` already disallows this in a
+///   real CLI run, but the check is enforced here too so a hand-built config or a
+///   future option-model change still fails loudly rather than producing a
+///   corrupt backup.)
+/// - **`repo-block` requires `repo-bundle`** — block bytes are stored inside
+///   bundle objects, so block-incremental without bundling is rejected.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when either constraint is violated.
+fn validate_features(config: &LoadedConfig, features: BackupFeatures) -> Result<(), CommandError> {
+    if features.bundle && repo_hardlink_enabled(config) {
+        return Err(CommandError::Other(
+            "repo-bundle and repo-hardlink are mutually exclusive".to_owned(),
+        ));
+    }
+    if features.block && !features.bundle {
+        return Err(CommandError::Other("repo-block requires repo-bundle".to_owned()));
+    }
+    Ok(())
+}
+
+/// Whether `repo-hardlink=y` is set (checking both the un-indexed and `repoN-`
+/// group-indexed forms, mirroring [`BackupFeatures::from_options`]).
+fn repo_hardlink_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("repo-hardlink".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    ) || boolean_indexed(config, "repo-hardlink")
+}
+
+/// Read a boolean group option that resolved with a group index (`repo1-...`),
+/// scanning indices 1..=8 (pgBackRest's repo maximum).
+fn boolean_indexed(config: &LoadedConfig, name: &str) -> bool {
+    (1..=8).any(|idx| {
+        matches!(
+            config.options.get(&(name.to_owned(), Some(idx))),
+            Some(OptionValue::Boolean(true))
+        )
+    })
+}
+
+/// Read a `Size` group option that resolved with a group index (`repo1-...`),
+/// returning the first set index's value or `default` when none is set.
+fn size_indexed(config: &LoadedConfig, name: &str, default: u64) -> u64 {
+    for idx in 1..=8 {
+        match config.options.get(&(name.to_owned(), Some(idx))) {
+            Some(OptionValue::Size(value)) => return *value,
+            Some(OptionValue::Integer(value)) if *value >= 0 => return u64::try_from(*value).unwrap_or(default),
+            _ => {}
+        }
+    }
+    default
+}
+
 /// Number of parallel file-copy workers, from the resolved `process-max` option.
 ///
 /// `process-max` is an `Integer` (default 1). Values `<= 0` clamp to one worker
@@ -949,6 +1088,9 @@ fn plan_file(
         mode,
         user,
         group,
+        bundle_id: None,
+        bundle_offset: None,
+        block_map: None,
     };
 
     // For a diff/incr: when the prior backup *might* hold this file unchanged
@@ -1041,6 +1183,234 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
         repo_bytes: repo_bytes.len() as u64,
         checksum_page,
         invalid_blocks,
+    })
+}
+
+/// Inputs to [`run_bundled_copy`]. Grouped into a struct so the signature stays
+/// readable (and clippy's `too_many_arguments` stays happy).
+struct BundledCopyCtx<'a> {
+    /// Repository storage backend.
+    repo_storage: &'a dyn Storage,
+    /// `backup/<stanza>/<label>` repo-relative root of this backup.
+    backup_root: &'a str,
+    /// The compress + encrypt transform applied to every file (and block).
+    transform: &'a RepoTransform,
+    /// This backup's label (recorded as the holder of every block / file it
+    /// physically stores).
+    label: &'a str,
+    /// Skeleton manifest entries for the files that must be copied (everything
+    /// except the checksum). Correlated to [`Self::jobs`] by `path`.
+    skeletons: Vec<ManifestFile>,
+    /// The copy jobs (absolute source + page-validation flag) for those files.
+    jobs: Vec<CopyJob>,
+    /// Files already decided as whole-file references (unchanged in a diff/incr);
+    /// passed through unchanged.
+    referenced: Vec<ManifestFile>,
+    /// The prior backup's manifest, for block-incremental block reuse on a
+    /// diff/incr. `None` for a full backup.
+    prior_manifest: Option<&'a Manifest>,
+    /// The resolved bundling / block features.
+    features: BackupFeatures,
+    /// Backup start timestamp, used to compute each file's age for the block-size
+    /// policy.
+    timestamp_start: i64,
+}
+
+/// Serial copy pass for `repo-bundle=y` (and optionally `repo-block=y`).
+///
+/// Small files (repo size ≤ `repo-bundle-limit`) are packed into shared bundle
+/// objects via [`crate::bundle::BundlePacker`]; each records its `bundle_id` /
+/// `bundle_offset` in the manifest. Large files stay as individual repo objects
+/// (the unbundled layout) **unless** `repo-block` is on and the file is
+/// block-eligible, in which case it is split into blocks: each changed block is
+/// transformed and appended to a bundle, unchanged blocks (matching the prior
+/// backup's block map by checksum) are referenced, and a per-file block map is
+/// recorded. A full backup writes a self-referencing block map so later
+/// diff/incr backups have something to diff against.
+///
+/// Returns the completed manifest file entries plus the total repo bytes written.
+///
+/// # Errors
+///
+/// Propagates read / write / transform failures.
+fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
+    let mut files: Vec<ManifestFile> = ctx.referenced;
+    let mut repo_size: u64 = 0;
+
+    // Correlate jobs to skeletons by path so each file has both its planned
+    // manifest entry and its absolute source / validation flag.
+    let mut job_by_rel: std::collections::HashMap<String, CopyJob> = ctx.jobs.into_iter().map(|j| (j.rel.clone(), j)).collect();
+
+    // The open bundle for small files; appended to in walk order. A separate
+    // packer tracks block bundles so block and whole-file bundles never collide
+    // in the same object (block bundles use ids offset above the file bundles).
+    let mut file_packer = crate::bundle::BundlePacker::new(ctx.features.bundle_size);
+    // Lazily-opened append writers keyed by bundle id, so each bundle object is
+    // written once with all its members concatenated.
+    let mut bundle_bytes: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+
+    for skeleton in ctx.skeletons {
+        let job = job_by_rel
+            .remove(&skeleton.path)
+            .ok_or_else(|| CommandError::Other(format!("no copy job for {}", skeleton.path)))?;
+        let bytes =
+            std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+        let checksum = plaintext_sha1(&bytes)?;
+
+        // Page-checksum validation, identical to the per-file path.
+        let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
+            let invalid = validate_relation_pages(&bytes);
+            (Some(invalid.is_empty()), invalid)
+        } else {
+            (None, Vec::new())
+        };
+        if checksum_page == Some(false) {
+            warn_invalid_pages(&skeleton.path, &invalid_blocks);
+        }
+
+        // Decide the block size for this file (age + size policy). A `Some` size
+        // means block-incremental applies; `None` means store the file whole.
+        let age = ctx.timestamp_start.saturating_sub(skeleton.timestamp);
+        let block_size = if ctx.features.block {
+            crate::block::block_size(skeleton.size, age)
+        } else {
+            None
+        };
+
+        let entry = if let Some(block_size) = block_size {
+            // Block-incremental file: split, store changed blocks in bundles,
+            // reference unchanged ones, record a per-file block map.
+            let prior_map = ctx
+                .prior_manifest
+                .and_then(|m| m.file(&skeleton.path))
+                .and_then(|f| f.block_map.as_ref());
+            let block_map = build_block_map(
+                &bytes,
+                block_size,
+                ctx.transform,
+                ctx.label,
+                prior_map,
+                &mut bundle_bytes,
+                &mut file_packer,
+                &mut repo_size,
+            )?;
+            ManifestFile {
+                checksum: Some(checksum),
+                checksum_page,
+                block_map: Some(block_map),
+                ..skeleton
+            }
+        } else {
+            // Whole file. Transform once; bundle it when it fits the limit,
+            // otherwise write it as its own repo object (unbundled layout).
+            let repo_bytes = ctx.transform.apply_forward(&bytes)?;
+            let repo_len = repo_bytes.len() as u64;
+            repo_size += repo_len;
+            if repo_len <= ctx.features.bundle_limit {
+                let slot = file_packer.place(repo_len);
+                bundle_bytes.entry(slot.bundle_id).or_default().extend_from_slice(&repo_bytes);
+                ManifestFile {
+                    checksum: Some(checksum),
+                    checksum_page,
+                    bundle_id: Some(slot.bundle_id),
+                    bundle_offset: Some(slot.offset),
+                    ..skeleton
+                }
+            } else {
+                // Over the limit: its own object at `<rel><suffix>`, as in the
+                // unbundled path.
+                let abs_dest = job.abs_dest.clone();
+                if let Some(parent) = abs_dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+                }
+                std::fs::write(&abs_dest, &repo_bytes)
+                    .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
+                ManifestFile {
+                    checksum: Some(checksum),
+                    checksum_page,
+                    ..skeleton
+                }
+            }
+        };
+        files.push(entry);
+    }
+
+    // Flush every accumulated bundle object to the repo, creating the bundle
+    // subdirectory first so the writes have a home.
+    if !bundle_bytes.is_empty() {
+        ctx.repo_storage
+            .create_path(Path::new(&format!("{}/{}", ctx.backup_root, crate::bundle::BUNDLE_DIR)), true)?;
+    }
+    for (id, data) in bundle_bytes {
+        let path = crate::bundle::bundle_object_path(ctx.backup_root, id);
+        write_repo_file(ctx.repo_storage, &path, &data)?;
+    }
+
+    Ok((files, repo_size))
+}
+
+/// Build a block-incremental [`BlockMap`] for one file's `bytes`.
+///
+/// Each block is transformed (compress + encrypt) on its own. A block whose
+/// plaintext checksum matches the prior backup's block at the same index is
+/// *referenced* (its bytes are reused from the backup the prior pointed at, so
+/// nothing new is stored); otherwise the transformed block is appended to a
+/// bundle in *this* backup and the new location recorded. A full backup (no
+/// prior map) stores every block here and the map self-references this backup.
+///
+/// `bundle_bytes` / `packer` / `repo_size` are the shared accumulators threaded
+/// from [`run_bundled_copy`] so blocks share the same bundle objects as whole
+/// bundled files.
+///
+/// # Errors
+///
+/// Propagates transform failures.
+#[allow(clippy::too_many_arguments)]
+fn build_block_map(
+    bytes: &[u8],
+    block_size: u64,
+    transform: &RepoTransform,
+    label: &str,
+    prior_map: Option<&pgbr_info::manifest::BlockMap>,
+    bundle_bytes: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+    packer: &mut crate::bundle::BundlePacker,
+    repo_size: &mut u64,
+) -> Result<pgbr_info::manifest::BlockMap, CommandError> {
+    use pgbr_info::manifest::{BlockMap, BlockRef};
+
+    let blocks = crate::block::split_blocks(bytes, block_size);
+    let mut refs: Vec<BlockRef> = Vec::with_capacity(blocks.len());
+
+    for (idx, block) in blocks.iter().enumerate() {
+        let checksum = plaintext_sha1(block)?;
+
+        // Reuse an unchanged block from the prior backup when its checksum matches.
+        if let Some(prior) = prior_map.and_then(|m| m.blocks.get(idx))
+            && prior.checksum == checksum
+        {
+            refs.push(prior.clone());
+            continue;
+        }
+
+        // Changed / new block: transform it and append to a bundle in this backup.
+        let repo_bytes = transform.apply_forward(block)?;
+        let repo_len = repo_bytes.len() as u64;
+        *repo_size += repo_len;
+        let slot = packer.place(repo_len);
+        bundle_bytes.entry(slot.bundle_id).or_default().extend_from_slice(&repo_bytes);
+        refs.push(BlockRef {
+            checksum,
+            reference: label.to_owned(),
+            bundle_id: slot.bundle_id,
+            offset: slot.offset,
+            size: repo_len,
+        });
+    }
+
+    Ok(BlockMap {
+        block_size,
+        blocks: refs,
     })
 }
 
@@ -1515,6 +1885,7 @@ pub fn backup_inner_with_workers(
         None,
         None,
         false,
+        BackupFeatures::disabled(),
     )
 }
 
@@ -1562,6 +1933,7 @@ fn run_backup(
     mut control: Option<&mut dyn BackupControl>,
     mut standby: Option<&mut dyn BackupControl>,
     start_fast: bool,
+    features: BackupFeatures,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -1614,7 +1986,7 @@ fn run_backup(
     // Walk the PG dir and classify every entry: referenced files (decided here,
     // not copied), copy jobs (dispatched to workers), directories, and links.
     // User `--exclude` entries are applied alongside the built-in exclusions.
-    let plan = plan_backup(
+    let mut plan = plan_backup(
         pg_storage,
         &abs_repo_backup_root,
         transform,
@@ -1624,31 +1996,51 @@ fn run_backup(
         excludes,
     )?;
 
-    // Fan the copy jobs out across the worker pool, then stitch each worker's
-    // checksum + repo size back onto the matching skeleton by relative path.
-    let copy_results = run_copy_jobs(&plan.copy_jobs, transform, process_max)?;
-    let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
+    // Produce the file entries + total repo size. With bundling off this is the
+    // classic per-file parallel copy (byte-for-byte unchanged); with bundling on
+    // the small files are packed into shared bundle objects and large eligible
+    // files may be block-split — a serial pass since a bundle object is appended
+    // to in order.
+    let referenced = std::mem::take(&mut plan.referenced);
+    let (mut files, repo_size) = if features.bundle {
+        run_bundled_copy(BundledCopyCtx {
+            repo_storage,
+            backup_root: &backup_root,
+            transform,
+            label: &label,
+            skeletons: plan.copy_skeletons,
+            jobs: plan.copy_jobs,
+            referenced,
+            prior_manifest: prior_manifest.as_ref(),
+            features,
+            timestamp_start,
+        })?
+    } else {
+        let copy_results = run_copy_jobs(&plan.copy_jobs, transform, process_max)?;
+        let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
 
-    let mut files: Vec<ManifestFile> = plan.referenced;
-    let mut repo_size: u64 = 0;
-    for skeleton in plan.copy_skeletons {
-        let copied = result_by_rel
-            .remove(&skeleton.path)
-            .ok_or_else(|| CommandError::Other(format!("no copy result for {}", skeleton.path)))?;
-        repo_size += copied.repo_bytes;
-        // A file with one or more invalid pages records `checksum_page = Some(false)`
-        // and a warning naming the bad blocks (the `ManifestFile` has no invalid-page
-        // list field — another concern owns that — so the blocks surface only in the
-        // warning, exactly as the task scopes it).
-        if copied.checksum_page == Some(false) {
-            warn_invalid_pages(&skeleton.path, &copied.invalid_blocks);
+        let mut files: Vec<ManifestFile> = referenced;
+        let mut repo_size: u64 = 0;
+        for skeleton in plan.copy_skeletons {
+            let copied = result_by_rel
+                .remove(&skeleton.path)
+                .ok_or_else(|| CommandError::Other(format!("no copy result for {}", skeleton.path)))?;
+            repo_size += copied.repo_bytes;
+            // A file with one or more invalid pages records `checksum_page = Some(false)`
+            // and a warning naming the bad blocks (the `ManifestFile` has no invalid-page
+            // list field — another concern owns that — so the blocks surface only in the
+            // warning, exactly as the task scopes it).
+            if copied.checksum_page == Some(false) {
+                warn_invalid_pages(&skeleton.path, &copied.invalid_blocks);
+            }
+            files.push(ManifestFile {
+                checksum: Some(copied.checksum),
+                checksum_page: copied.checksum_page,
+                ..skeleton
+            });
         }
-        files.push(ManifestFile {
-            checksum: Some(copied.checksum),
-            checksum_page: copied.checksum_page,
-            ..skeleton
-        });
-    }
+        (files, repo_size)
+    };
     let mut paths = plan.paths;
     let mut links = plan.links;
 
@@ -3368,6 +3760,7 @@ mod tests {
             Some(control as &mut dyn BackupControl),
             None,
             start_fast,
+            BackupFeatures::disabled(),
         )
     }
 
@@ -3739,6 +4132,7 @@ mod tests {
             Some(&mut control as &mut dyn BackupControl),
             None,
             true,
+            BackupFeatures::disabled(),
         )
         .expect("live control-driven backup");
 
@@ -3748,5 +4142,151 @@ mod tests {
         // backup_label must have been returned and written.
         let backup_root = repo.path().join(format!("backup/demo/{LABEL}"));
         assert!(backup_root.join("backup_label").exists(), "live backup_label written");
+    }
+
+    // ---- file bundling + block-incremental ---------------------------------
+
+    /// A `full` backup config with `repo-bundle` (and optional `repo-block`) set.
+    fn bundle_cfg(stanza: &str, block: bool, bundle_limit: Option<u64>) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId("full".to_owned()));
+        options.insert(("repo-bundle".to_owned(), None), OptionValue::Boolean(true));
+        if block {
+            options.insert(("repo-block".to_owned(), None), OptionValue::Boolean(true));
+        }
+        if let Some(limit) = bundle_limit {
+            options.insert(("repo-bundle-limit".to_owned(), None), OptionValue::Size(limit));
+        }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backup_features_from_options_reads_values() {
+        let cfg = bundle_cfg("demo", true, Some(4096));
+        let f = BackupFeatures::from_options(&cfg);
+        assert!(f.bundle);
+        assert!(f.block);
+        assert_eq!(f.bundle_limit, 4096);
+        assert_eq!(f.bundle_size, DEFAULT_BUNDLE_SIZE);
+        // All-off config: disabled defaults.
+        let off = BackupFeatures::from_options(&typed_cfg("demo", "full"));
+        assert!(!off.bundle && !off.block);
+    }
+
+    #[test]
+    fn validate_features_rejects_block_without_bundle() {
+        let mut cfg = typed_cfg("demo", "full");
+        cfg.options
+            .insert(("repo-block".to_owned(), None), OptionValue::Boolean(true));
+        let features = BackupFeatures {
+            bundle: false,
+            block: true,
+            ..BackupFeatures::disabled()
+        };
+        let err = validate_features(&cfg, features).expect_err("block without bundle must fail");
+        assert!(err.to_string().contains("repo-block requires repo-bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_features_rejects_bundle_with_hardlink() {
+        let mut cfg = bundle_cfg("demo", false, None);
+        cfg.options
+            .insert(("repo-hardlink".to_owned(), None), OptionValue::Boolean(true));
+        let features = BackupFeatures::from_options(&cfg);
+        let err = validate_features(&cfg, features).expect_err("bundle + hardlink must fail");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn backup_bundle_packs_small_files() {
+        // With repo-bundle on, small files are packed into bundle objects and
+        // recorded with bundle id/offset; no per-file repo object is written.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"small relation one");
+        seed_file(&pg_s, "base/1/1260", b"small relation two, slightly bigger");
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+
+        backup(&bundle_cfg("demo", false, None), &repo_s, &pg_s).expect("bundled backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        // Every file is bundled (all are tiny, well under the 2 MiB limit).
+        for f in &manifest.files {
+            assert!(f.bundle_id.is_some(), "{} must be bundled", f.path);
+            assert!(f.bundle_offset.is_some());
+        }
+        // A bundle object exists; no individual per-file repo objects were written.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+        assert!(backup_root.join("bundle/1").exists(), "bundle object must exist");
+        assert!(
+            !backup_root.join("base/1/1259").exists(),
+            "no standalone repo file when bundled"
+        );
+    }
+
+    #[test]
+    fn backup_bundle_large_file_stays_standalone() {
+        // A file over the bundle limit is written as its own repo object.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        let big = vec![7u8; 4096];
+        seed_file(&pg_s, "base/1/1259", &big);
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+
+        // Limit of 100 bytes: the 4096-byte file exceeds it and stays standalone;
+        // PG_VERSION is bundled. repo-block off so the big file is not split.
+        backup(&bundle_cfg("demo", false, Some(100)), &repo_s, &pg_s).expect("bundled backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        let big_file = manifest.file("base/1/1259").expect("big file");
+        assert!(big_file.bundle_id.is_none(), "over-limit file must not be bundled");
+        let small = manifest.file("PG_VERSION").expect("small file");
+        assert!(small.bundle_id.is_some(), "small file must be bundled");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+        assert!(
+            backup_root.join("base/1/1259").exists(),
+            "over-limit file is a standalone object"
+        );
+    }
+
+    #[test]
+    fn backup_block_writes_block_map_for_large_file() {
+        // A large, fresh, block-eligible file gets a block map; small files do not.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        // 256 KiB easily clears the block-eligibility floor.
+        let big: Vec<u8> = (0..256 * 1024u32).map(|n| (n % 251) as u8).collect();
+        seed_file(&pg_s, "base/1/1259", &big);
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+
+        backup(&bundle_cfg("demo", true, None), &repo_s, &pg_s).expect("block backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        let big_file = manifest.file("base/1/1259").expect("big file");
+        let bm = big_file.block_map.as_ref().expect("large file must have a block map");
+        assert!(bm.blocks.len() > 1, "256 KiB file must split into multiple blocks");
+        // Full backup: every block references this backup.
+        assert!(
+            bm.blocks.iter().all(|b| b.reference == *label),
+            "full backup blocks self-reference"
+        );
+        // Small file: no block map.
+        assert!(manifest.file("PG_VERSION").unwrap().block_map.is_none());
     }
 }

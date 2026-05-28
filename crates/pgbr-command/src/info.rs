@@ -1171,6 +1171,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -1182,6 +1185,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
             ],
             paths: vec![ManifestPath {

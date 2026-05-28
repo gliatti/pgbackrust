@@ -22,6 +22,8 @@ pub mod annotate;
 pub mod archive;
 pub mod backup;
 pub mod backup_control;
+pub mod block;
+pub mod bundle;
 pub mod check;
 pub mod control;
 pub mod expire;

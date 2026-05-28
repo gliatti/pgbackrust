@@ -874,13 +874,11 @@ fn process_max(config: &LoadedConfig) -> usize {
 struct RestoreCopyJob {
     /// Manifest file path, used as the dispatcher correlation key and in errors.
     rel: String,
-    /// Absolute source path of the repo file (suffix included).
-    abs_src: PathBuf,
+    /// How to obtain the recovered plaintext: a standalone repo object, a slice
+    /// of a bundle object, or a reassembled block-incremental file.
+    source: RestoreSource,
     /// Absolute destination path in the PG target (plaintext, no suffix).
     abs_dst: PathBuf,
-    /// The transform the source backup applied, to be reversed (decrypt then
-    /// decompress) into the recovered plaintext.
-    transform: RepoTransform,
     /// Plaintext SHA-1 the manifest recorded, or `None` for a zero-length file.
     expected_checksum: Option<String>,
     /// Unix file mode the manifest recorded, re-applied to the restored file via
@@ -890,6 +888,301 @@ struct RestoreCopyJob {
     /// needs privilege; documented follow-up). C ref: chmod in
     /// `src/command/restore/restore.c`.
     mode: Option<u32>,
+}
+
+/// How a worker should obtain a file's recovered plaintext.
+#[derive(Debug, Clone)]
+enum RestoreSource {
+    /// A whole file stored as its own repo object (suffix included): read the
+    /// object and reverse the transform. The classic, unbundled layout.
+    Standalone {
+        /// Absolute source path of the repo file.
+        abs_src: PathBuf,
+        /// Transform the source backup applied (reversed to recover plaintext).
+        transform: RepoTransform,
+    },
+    /// A whole file packed into a bundle object: read `len` bytes of the bundle
+    /// at `offset` and reverse the transform. File-bundling (`repo-bundle=y`).
+    Bundled {
+        /// Absolute path of the bundle object.
+        abs_bundle: PathBuf,
+        /// Byte offset of this file's (transformed) bytes within the bundle.
+        offset: u64,
+        /// Number of (transformed) bytes the file occupies in the bundle.
+        len: u64,
+        /// Transform the source backup applied (reversed to recover plaintext).
+        transform: RepoTransform,
+    },
+    /// A block-incremental file: reassemble it from its per-block sources, each a
+    /// `len`-byte slice of a (possibly different backup's) bundle object reversed
+    /// through that backup's transform. The blocks are concatenated in order.
+    Blocks(Vec<BlockSource>),
+}
+
+/// One block of a block-incremental file's [`RestoreSource::Blocks`] list.
+#[derive(Debug, Clone)]
+struct BlockSource {
+    /// Absolute path of the bundle object the block's bytes live in.
+    abs_bundle: PathBuf,
+    /// Byte offset of the block's (transformed) bytes within that bundle.
+    offset: u64,
+    /// Number of (transformed) bytes the block occupies.
+    len: u64,
+    /// Transform the holding backup applied (reversed to recover the plaintext
+    /// block).
+    transform: RepoTransform,
+}
+
+/// Read `len` bytes at `offset` from the file at `path`, recovering the plaintext
+/// of one bundled member / block by reversing `transform`.
+fn read_bundle_slice(path: &Path, offset: u64, len: u64, transform: &RepoTransform) -> Result<Vec<u8>, CommandError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|err| CommandError::Other(format!("open {}: {err}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| CommandError::Other(format!("seek {}: {err}", path.display())))?;
+    let mut repo_bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    file.read_exact(&mut repo_bytes)
+        .map_err(|err| CommandError::Other(format!("read {}: {err}", path.display())))?;
+    Ok(transform.apply_reverse(&repo_bytes)?)
+}
+
+/// The member offsets within one bundle object, used to derive each member's
+/// (transformed) byte length as the gap to the next member (the last member runs
+/// to the end of the bundle object).
+struct BundleLayout {
+    /// On-disk byte size of the bundle object.
+    bundle_size: u64,
+    /// All member start offsets in the bundle, sorted ascending and deduplicated.
+    offsets: Vec<u64>,
+}
+
+impl BundleLayout {
+    /// The number of (transformed) bytes the member starting at `offset` occupies:
+    /// the distance to the next member start, or to the end of the bundle object
+    /// for the last member. Returns `0` for an offset at/after the object end (a
+    /// defensively-handled corrupt manifest).
+    fn member_len(&self, offset: u64) -> u64 {
+        let next = self.offsets.iter().copied().find(|&o| o > offset).unwrap_or(self.bundle_size);
+        next.saturating_sub(offset)
+    }
+}
+
+/// Build the [`BundleLayout`] of bundle `bundle_id` in `manifest`: every member
+/// offset (from bundled whole files and block-map entries that name this bundle)
+/// plus the bundle object's on-disk size.
+fn bundle_layout(
+    repo: &dyn Storage,
+    stanza: &str,
+    holder_label: &str,
+    manifest: &Manifest,
+    bundle_id: u64,
+) -> Result<BundleLayout, CommandError> {
+    use std::collections::BTreeSet;
+    let mut offsets: BTreeSet<u64> = BTreeSet::new();
+    for f in &manifest.files {
+        if f.bundle_id == Some(bundle_id)
+            && let Some(off) = f.bundle_offset
+        {
+            offsets.insert(off);
+        }
+        if let Some(bm) = &f.block_map {
+            for b in &bm.blocks {
+                // Only blocks physically stored in THIS holder's bundle count
+                // toward this bundle's layout.
+                if b.reference == holder_label && b.bundle_id == bundle_id {
+                    offsets.insert(b.offset);
+                }
+            }
+        }
+    }
+    let backup_root = format!("backup/{stanza}/{holder_label}");
+    let path = PathBuf::from(crate::bundle::bundle_object_path(&backup_root, bundle_id));
+    let bundle_size = repo.info(&path)?.size;
+    Ok(BundleLayout {
+        bundle_size,
+        offsets: offsets.into_iter().collect(),
+    })
+}
+
+/// Resolves each manifest file to a physical [`RestoreSource`], following a
+/// whole-file `reference` to the backup that holds the bytes and caching the
+/// referenced manifests + bundle layouts it loads.
+struct SourceResolver<'a> {
+    repo: &'a dyn Storage,
+    stanza: &'a str,
+    config: &'a LoadedConfig,
+    /// Label + transform + manifest of the backup being restored.
+    label: &'a str,
+    transform: &'a RepoTransform,
+    manifest: &'a Manifest,
+    info: &'a InfoBackup,
+    /// Cache of loaded referenced-backup manifests, keyed by label.
+    manifest_cache: BTreeMap<String, Manifest>,
+    /// Cache of bundle layouts, keyed by `(holder label, bundle id)`.
+    layout_cache: BTreeMap<(String, u64), std::rc::Rc<BundleLayout>>,
+}
+
+impl<'a> SourceResolver<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        repo: &'a dyn Storage,
+        stanza: &'a str,
+        config: &'a LoadedConfig,
+        label: &'a str,
+        transform: &'a RepoTransform,
+        manifest: &'a Manifest,
+        info: &'a InfoBackup,
+    ) -> Self {
+        Self {
+            repo,
+            stanza,
+            config,
+            label,
+            transform,
+            manifest,
+            info,
+            manifest_cache: BTreeMap::new(),
+            layout_cache: BTreeMap::new(),
+        }
+    }
+
+    /// The transform a backup `holder_label` applied, from its `backup.info`
+    /// entry (cipher password from the restore options). Falls back to the
+    /// restored backup's transform when the holder has no recorded metadata.
+    fn holder_transform(&self, holder_label: &str) -> RepoTransform {
+        if holder_label == self.label {
+            return self.transform.clone();
+        }
+        self.info.current.get(holder_label).map_or_else(
+            || self.transform.clone(),
+            |entry| RepoTransform::from_metadata(entry, self.config),
+        )
+    }
+
+    /// Load (and cache) the manifest of backup `holder_label`.
+    fn load_manifest(&mut self, holder_label: &str) -> Result<&Manifest, CommandError> {
+        use std::collections::btree_map::Entry;
+        match self.manifest_cache.entry(holder_label.to_owned()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let m = Manifest::load(self.repo, &manifest_path(self.stanza, holder_label)).map_err(|err| match err {
+                    InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
+                        path: manifest_path(self.stanza, holder_label),
+                    }),
+                    other => CommandError::Other(other.to_string()),
+                })?;
+                Ok(e.insert(m))
+            }
+        }
+    }
+
+    /// The cached [`BundleLayout`] for `(holder, bundle_id)`, loading it on first
+    /// use. The holder manifest is the restored backup's in-memory manifest when
+    /// the holder is the restored backup itself, else the cached referenced one.
+    fn layout(&mut self, holder_label: &str, bundle_id: u64) -> Result<std::rc::Rc<BundleLayout>, CommandError> {
+        let key = (holder_label.to_owned(), bundle_id);
+        if let Some(layout) = self.layout_cache.get(&key) {
+            return Ok(layout.clone());
+        }
+        let layout = if holder_label == self.label {
+            std::rc::Rc::new(bundle_layout(self.repo, self.stanza, holder_label, self.manifest, bundle_id)?)
+        } else {
+            let holder_manifest = self.load_manifest(holder_label)?.clone();
+            std::rc::Rc::new(bundle_layout(
+                self.repo,
+                self.stanza,
+                holder_label,
+                &holder_manifest,
+                bundle_id,
+            )?)
+        };
+        self.layout_cache.insert(key, layout.clone());
+        Ok(layout)
+    }
+
+    /// Resolve `file` (from the restored backup's manifest) to a physical source.
+    fn resolve(&mut self, file: &ManifestFile) -> Result<RestoreSource, CommandError> {
+        // A block-incremental file always carries its full block map in this
+        // manifest (each block names the backup that holds it), so it is resolved
+        // directly regardless of any whole-file reference.
+        if let Some(block_map) = &file.block_map {
+            return self.resolve_block_map(block_map);
+        }
+
+        // Find the holder of the whole-file bytes: this backup, or the backup the
+        // `reference` names. The holder's manifest entry carries the physical
+        // storage (standalone vs bundled).
+        let (holder_label, holder_entry): (String, ManifestFile) = match file.reference.as_deref() {
+            None => (self.label.to_owned(), file.clone()),
+            Some(reference) => {
+                let holder_manifest = self.load_manifest(reference)?;
+                let entry = holder_manifest
+                    .file(&file.path)
+                    .cloned()
+                    // The referenced backup should list the file; if not, fall
+                    // back to treating the reference as a standalone object (the
+                    // pre-bundling behaviour) so older repos still restore.
+                    .unwrap_or_else(|| file.clone());
+                (reference.to_owned(), entry)
+            }
+        };
+
+        // The holder entry might itself be block-mapped (an unchanged
+        // block-incremental file referenced whole).
+        if let Some(block_map) = &holder_entry.block_map {
+            return self.resolve_block_map(block_map);
+        }
+
+        let holder_transform = self.holder_transform(&holder_label);
+        if let (Some(bundle_id), Some(offset)) = (holder_entry.bundle_id, holder_entry.bundle_offset) {
+            let layout = self.layout(&holder_label, bundle_id)?;
+            let backup_root = format!("backup/{}/{holder_label}", self.stanza);
+            let abs_bundle = self
+                .repo
+                .info(&PathBuf::from(crate::bundle::bundle_object_path(&backup_root, bundle_id)))?
+                .path;
+            Ok(RestoreSource::Bundled {
+                abs_bundle,
+                offset,
+                len: layout.member_len(offset),
+                transform: holder_transform,
+            })
+        } else {
+            // Standalone repo object (`<rel><suffix>`).
+            let repo_rel = format!("{}{}", file.path, holder_transform.repo_suffix());
+            let src = backup_file_path(self.stanza, &holder_label, &repo_rel);
+            let abs_src = self.repo.info(&src)?.path;
+            Ok(RestoreSource::Standalone {
+                abs_src,
+                transform: holder_transform,
+            })
+        }
+    }
+
+    /// Build a [`RestoreSource::Blocks`] from a block map: each block's bytes live
+    /// in the bundle of the backup its [`pgbr_info::manifest::BlockRef`] names.
+    fn resolve_block_map(&self, block_map: &pgbr_info::manifest::BlockMap) -> Result<RestoreSource, CommandError> {
+        let mut sources = Vec::with_capacity(block_map.blocks.len());
+        for block in &block_map.blocks {
+            let holder_label = block.reference.clone();
+            let holder_transform = self.holder_transform(&holder_label);
+            let backup_root = format!("backup/{}/{holder_label}", self.stanza);
+            let abs_bundle = self
+                .repo
+                .info(&PathBuf::from(crate::bundle::bundle_object_path(
+                    &backup_root,
+                    block.bundle_id,
+                )))?
+                .path;
+            sources.push(BlockSource {
+                abs_bundle,
+                offset: block.offset,
+                len: block.size,
+                transform: holder_transform,
+            });
+        }
+        Ok(RestoreSource::Blocks(sources))
+    }
 }
 
 /// Re-apply a manifest-recorded Unix file mode to a restored file.
@@ -929,12 +1222,31 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
 /// `transform` carried in the job. A checksum mismatch is a hard error here, so
 /// the failing job fails the whole restore.
 fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
-    let repo_bytes =
-        std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
-
-    // Reverse the transform: decrypt then decompress. With the identity
-    // transform this returns the bytes unchanged.
-    let plaintext = job.transform.apply_reverse(&repo_bytes)?;
+    // Recover the plaintext per the source spec: a whole standalone object, a
+    // bundle slice, or a reassembled block-incremental file.
+    let plaintext = match &job.source {
+        RestoreSource::Standalone { abs_src, transform } => {
+            let repo_bytes =
+                std::fs::read(abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", abs_src.display())))?;
+            // Reverse the transform: decrypt then decompress. With the identity
+            // transform this returns the bytes unchanged.
+            transform.apply_reverse(&repo_bytes)?
+        }
+        RestoreSource::Bundled {
+            abs_bundle,
+            offset,
+            len,
+            transform,
+        } => read_bundle_slice(abs_bundle, *offset, *len, transform)?,
+        RestoreSource::Blocks(blocks) => {
+            let mut out = Vec::new();
+            for block in blocks {
+                let part = read_bundle_slice(&block.abs_bundle, block.offset, block.len, &block.transform)?;
+                out.extend_from_slice(&part);
+            }
+            out
+        }
+    };
 
     if let Some(parent) = job.abs_dst.parent()
         && !parent.as_os_str().is_empty()
@@ -1123,6 +1435,11 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     //    never becomes a job.
     let mut files_skipped = 0;
     let mut jobs: Vec<RestoreCopyJob> = Vec::new();
+    // Resolver that follows whole-file references to the holding backup and
+    // builds the physical source (standalone / bundled / block map). It caches
+    // referenced manifests + bundle layouts so a multi-file backup loads each
+    // referenced manifest at most once.
+    let mut resolver = SourceResolver::new(repo, stanza, config, &label, &transform, &manifest, &info);
     for file in &manifest.files {
         let dst = PathBuf::from(&file.path);
 
@@ -1137,40 +1454,18 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             continue;
         }
 
-        // A referenced file's bytes live in an earlier backup (differential
-        // restore). Resolve which backup supplies the bytes and the transform
-        // they were written under: the restored backup uses `transform`; a
-        // referenced backup uses the transform recorded in *its* `backup.info`
-        // entry (the cipher password still comes from the restore options).
-        let (src_label, src_transform) = match file.reference.as_deref() {
-            None => (label.as_str(), transform.clone()),
-            Some(reference) => {
-                let reference_transform = info
-                    .current
-                    .get(reference)
-                    .map_or_else(|| transform.clone(), |entry| RepoTransform::from_metadata(entry, config));
-                (reference, reference_transform)
-            }
-        };
-
-        // The repo file carries the compression suffix; the PG-target file does
-        // not. Resolve both ends to absolute paths now (on the main thread,
-        // which holds the `Storage` handles) so each worker can do its I/O via
-        // `std::fs` without a `Storage` borrow crossing the thread boundary. The
-        // repo source must exist (its absolute path comes straight from
-        // `Storage::info`, propagating `NotFound` exactly as the serial
-        // `open_read` did); the PG destination may not, so its parent dir is
-        // created and the absolute path anchored there.
-        let repo_rel = format!("{}{}", file.path, src_transform.repo_suffix());
-        let src = backup_file_path(stanza, src_label, &repo_rel);
-        let abs_src = repo.info(&src)?.path;
+        // Resolve where this file's bytes physically live and how they are
+        // stored — a standalone repo object, a slice of a bundle, or a
+        // reassembled block-incremental file — following a whole-file reference
+        // to the holding backup when needed. The PG destination may not exist
+        // yet, so its parent dir is created and the absolute path anchored there.
+        let source = resolver.resolve(file)?;
         let abs_dst = destination_absolute_path(pg, &dst)?;
 
         jobs.push(RestoreCopyJob {
             rel: file.path.clone(),
-            abs_src,
+            source,
             abs_dst,
-            transform: src_transform,
             expected_checksum: file.checksum.clone(),
             mode: file.mode,
         });
@@ -1494,6 +1789,9 @@ mod tests {
                 mode: None,
                 user: None,
                 group: None,
+                bundle_id: None,
+                bundle_offset: None,
+                block_map: None,
             })
             .collect();
 
@@ -2452,6 +2750,9 @@ mod tests {
             mode: None,
             user: None,
             group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
         };
 
         // Missing target: does not match.
@@ -2494,6 +2795,9 @@ mod tests {
             mode: None,
             user: None,
             group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
         };
         seed_pg_file(&pg_s, "pg_data/empty", b"");
         assert!(
@@ -3535,5 +3839,160 @@ mod tests {
             let restored = std::fs::read(pg.path().join(rel)).unwrap_or_else(|_| panic!("read restored {rel}"));
             assert_eq!(&restored, bytes, "round trip mismatch for {rel}");
         }
+    }
+
+    // ---- file bundling + block-incremental round trips ----------------------
+
+    /// Backup config carrying `repo-bundle` (+ optional `repo-block`) for a given type.
+    fn backup_cfg(stanza: &str, ty: &str, block: bool, limit: Option<u64>) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId(ty.to_owned()));
+        options.insert(("repo-bundle".to_owned(), None), OptionValue::Boolean(true));
+        if block {
+            options.insert(("repo-block".to_owned(), None), OptionValue::Boolean(true));
+        }
+        if let Some(limit) = limit {
+            options.insert(("repo-bundle-limit".to_owned(), None), OptionValue::Size(limit));
+        }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    fn latest_label(repo: &Posix, stanza: &str) -> String {
+        let info = InfoBackup::load(repo, &super::backup_info_path(stanza)).unwrap();
+        info.current.keys().next_back().unwrap().clone()
+    }
+
+    #[test]
+    fn bundled_backup_restores_round_trip() {
+        // A bundled full backup must restore byte-for-byte: small files come out
+        // of the bundle, an over-limit file out of its standalone object.
+        let (_repo, pg_dst, repo_s, pg_dst_s) = posix_pair();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_s, stanza);
+
+        let a = b"first small relation".as_slice();
+        let b = b"second small relation, a bit longer than the first one".as_slice();
+        let big = vec![3u8; 4096];
+        seed_pg_file(&pg_src_s, "PG_VERSION", b"14\n");
+        seed_pg_file(&pg_src_s, "base/1/1259", a);
+        seed_pg_file(&pg_src_s, "base/1/1260", b);
+        seed_pg_file(&pg_src_s, "base/1/1261", &big);
+
+        crate::backup::backup(&backup_cfg(stanza, "full", false, Some(100)), &repo_s, &pg_src_s).expect("bundled backup");
+        let label = latest_label(&repo_s, stanza);
+
+        let outcome = restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.files_restored, 4);
+
+        assert_eq!(std::fs::read(pg_dst.path().join("PG_VERSION")).unwrap(), b"14\n");
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(), a);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1260")).unwrap(), b);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1261")).unwrap(), big);
+    }
+
+    #[test]
+    fn bundled_compressed_backup_restores_round_trip() {
+        // Bundling + compression: the bundle holds per-file gz-compressed bytes;
+        // restore slices and decompresses each member back to plaintext.
+        let (_repo, pg_dst, repo_s, pg_dst_s) = posix_pair();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_s, stanza);
+
+        let a = b"compressible compressible compressible relation aaaa".as_slice();
+        let b = b"another compressible relation bbbb bbbb bbbb bbbb".as_slice();
+        seed_pg_file(&pg_src_s, "base/1/1259", a);
+        seed_pg_file(&pg_src_s, "base/1/1260", b);
+
+        let mut bcfg = backup_cfg(stanza, "full", false, None);
+        bcfg.options
+            .insert(("compress-type".to_owned(), None), OptionValue::StringId("gz".to_owned()));
+        crate::backup::backup(&bcfg, &repo_s, &pg_src_s).expect("bundled gz backup");
+        let label = latest_label(&repo_s, stanza);
+
+        restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(), a);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1260")).unwrap(), b);
+    }
+
+    #[test]
+    fn block_incremental_full_restores_round_trip() {
+        // A block-incremental full backup of a large file must restore identically.
+        let (_repo, pg_dst, repo_s, pg_dst_s) = posix_pair();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_s, stanza);
+
+        let big: Vec<u8> = (0..300 * 1024u32).map(|n| (n % 251) as u8).collect();
+        seed_pg_file(&pg_src_s, "PG_VERSION", b"14\n");
+        seed_pg_file(&pg_src_s, "base/1/1259", &big);
+
+        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &pg_src_s).expect("block backup");
+        let label = latest_label(&repo_s, stanza);
+
+        restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(
+            std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
+            big,
+            "block-incremental round trip"
+        );
+    }
+
+    #[test]
+    fn block_incremental_diff_reuses_unchanged_blocks_and_restores() {
+        // A full block backup, then a diff that changes only the first block of a
+        // large file. The diff must reuse the unchanged blocks (referencing the
+        // full) and still restore the modified file byte-for-byte.
+        let (_repo, pg_dst, repo_s, pg_dst_s) = posix_pair();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_s, stanza);
+
+        let original: Vec<u8> = (0..300 * 1024u32).map(|n| (n % 251) as u8).collect();
+        seed_pg_file(&pg_src_s, "base/1/1259", &original);
+        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &pg_src_s).expect("full block backup");
+        let full_label = latest_label(&repo_s, stanza);
+
+        // Mutate the first 8 KiB only, then take a diff. `original` is not used
+        // again, so move it into `modified` rather than clone.
+        let mut modified = original;
+        for byte in modified.iter_mut().take(8192) {
+            *byte = byte.wrapping_add(1);
+        }
+        seed_pg_file(&pg_src_s, "base/1/1259", &modified);
+        crate::backup::backup(&backup_cfg(stanza, "diff", true, None), &repo_s, &pg_src_s).expect("diff block backup");
+        let diff_label = latest_label(&repo_s, stanza);
+        assert_ne!(diff_label, full_label, "diff produced a new label");
+
+        // The diff's block map must reference the full for the unchanged tail.
+        let diff_manifest = Manifest::load(&repo_s, &super::manifest_path(stanza, &diff_label)).unwrap();
+        let bm = diff_manifest.file("base/1/1259").unwrap().block_map.as_ref().unwrap();
+        assert!(
+            bm.blocks.iter().any(|b| b.reference == full_label),
+            "diff must reuse unchanged blocks from the full"
+        );
+        assert!(
+            bm.blocks.iter().any(|b| b.reference == diff_label),
+            "diff must store the changed block itself"
+        );
+
+        // Restoring the diff reassembles the modified file from both backups.
+        restore_inner(&cfg(Some(stanza), Some(&diff_label)), &repo_s, &pg_dst_s).expect("restore diff");
+        assert_eq!(
+            std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
+            modified,
+            "diff block round trip"
+        );
     }
 }
