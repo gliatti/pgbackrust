@@ -22,6 +22,15 @@ use sha1::{Digest, Sha1};
 pub const BACKREST_SECTION: &str = "backrest";
 /// Key name within the `[backrest]` section that stores the SHA-1 checksum.
 pub const CHECKSUM_KEY: &str = "backrest-checksum";
+/// Section name that holds the repository encryption sub-key.
+///
+/// Present only when the repository is encrypted
+/// (`repo-cipher-type=aes-256-cbc`). Mirrors pgBackRest's
+/// `INFO_SECTION_CIPHER` in `src/info/info.c`.
+pub const CIPHER_SECTION: &str = "cipher";
+/// Key name within the `[cipher]` section that stores the (JSON-string-encoded)
+/// repository sub-key — pgBackRest's `INFO_KEY_CIPHER_PASS`.
+pub const CIPHER_PASS_KEY: &str = "cipher-pass";
 
 /// Parsed INI document. Sections and keys retain their insertion order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

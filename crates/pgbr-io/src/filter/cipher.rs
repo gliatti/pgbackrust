@@ -1,7 +1,8 @@
 //! AES-256-CBC cipher filter, OpenSSL-compatible `Salted__` framing.
 //!
 //! Wire format (matches `openssl enc -aes-256-cbc -salt`, and the on-disk
-//! layout pgBackRest's repos use today):
+//! layout pgBackRest's repos use — pgBackRest's `CIPHER_BLOCK_MAGIC` is
+//! literally `"Salted__"`, see `src/common/crypto/cipherBlock.c`):
 //!
 //! ```text
 //! "Salted__"   8 bytes — OpenSSL salt magic
@@ -9,12 +10,27 @@
 //! <ciphertext> AES-256-CBC, PKCS#7-padded
 //! ```
 //!
-//! Key + IV are derived from `(password, salt)` via the legacy OpenSSL KDF
-//! `EVP_BytesToKey(MD5, password, salt, 1)`. That function emits
-//! `MD5(D_{n-1} || password || salt)` until 48 bytes are available; the
-//! first 32 are the AES-256 key and the next 16 are the IV. MD5 +
-//! 1-iteration is a known-weak KDF, but the on-disk format is locked for
+//! Key + IV are derived from `(password, salt)` via the OpenSSL KDF
+//! `EVP_BytesToKey(digest, password, salt, 1)`. That function emits
+//! `digest(D_{n-1} || password || salt)` until 48 bytes are available; the
+//! first 32 are the AES-256 key and the next 16 are the IV. A single
+//! iteration is a known-weak KDF, but the on-disk format is locked for
 //! backward compatibility with existing pgBackRest repos.
+//!
+//! # Digest selection
+//!
+//! The KDF digest is selectable via [`CipherDigest`]:
+//!
+//! - [`CipherDigest::Md5`] — the `openssl enc` CLI default. Used by the
+//!   legacy [`Cipher::encrypt`] / [`Cipher::decrypt`] constructors so any
+//!   pre-existing repo bytes round-trip unchanged.
+//! - [`CipherDigest::Sha1`] — **pgBackRest's default digest** (its
+//!   `cipherBlockDigestCode` falls back to `EVP_sha1()` when no digest is
+//!   passed, which is the case for info-file and backup-file encryption).
+//!   Use [`Cipher::encrypt_pgbackrest`] / [`Cipher::decrypt_pgbackrest`] for
+//!   byte-compatibility with a pgBackRest C repository.
+//! - [`CipherDigest::Sha256`] — available for completeness; pgBackRest can
+//!   be asked for it explicitly but does not use it by default.
 //!
 //! # Implementation note (buffering)
 //!
@@ -27,8 +43,10 @@
 //! refinement that won't change the bytes on the wire.
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-use md5::{Digest as _, Md5};
+use md5::Md5;
 use rand::RngCore;
+use sha1::Sha1;
+use sha2::Sha256;
 
 use crate::{Filter, IoError};
 
@@ -55,37 +73,78 @@ pub enum CipherMode {
     Decrypt,
 }
 
-/// AES-256-CBC filter compatible with `openssl enc -aes-256-cbc -salt`.
+/// Hash used by the `EVP_BytesToKey` key-derivation function.
+///
+/// pgBackRest's `cipherBlockDigestCode` maps the optional `digest` parameter
+/// to one of these; when no digest is supplied it falls back to
+/// [`CipherDigest::Sha1`]. The `openssl enc` CLI defaults to
+/// [`CipherDigest::Md5`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherDigest {
+    /// MD5 — the `openssl enc -aes-256-cbc` CLI default.
+    Md5,
+    /// SHA-1 — pgBackRest's default digest for info/backup-file encryption.
+    Sha1,
+    /// SHA-256.
+    Sha256,
+}
+
+/// AES-256-CBC filter compatible with `openssl enc -aes-256-cbc -salt` and
+/// with pgBackRest's `CipherBlock`.
 ///
 /// The filter buffers its input in `process` and performs the actual
 /// encrypt / decrypt in `finish`. See the module docstring for why.
 pub struct Cipher {
     mode: CipherMode,
+    digest: CipherDigest,
     pass: Vec<u8>,
     /// Accumulated input, encrypted or decrypted in one shot at `finish`.
     pending: Vec<u8>,
 }
 
 impl Cipher {
-    /// Build an encryption filter using `password`. A fresh random salt
-    /// is drawn at `finish`-time, so two `Cipher::encrypt` filters built
-    /// with the same password produce different ciphertexts.
+    /// Build an encryption filter using `password` and the MD5 KDF (the
+    /// `openssl enc` CLI default). A fresh random salt is drawn at
+    /// `finish`-time, so two `Cipher::encrypt` filters built with the same
+    /// password produce different ciphertexts.
+    ///
+    /// This is the historical constructor and is kept byte-for-byte stable;
+    /// for pgBackRest-repository compatibility use
+    /// [`Cipher::encrypt_pgbackrest`] instead.
     #[must_use]
     pub fn encrypt(password: &[u8]) -> Self {
-        Self {
-            mode: CipherMode::Encrypt,
-            pass: password.to_vec(),
-            pending: Vec::new(),
-        }
+        Self::new(CipherMode::Encrypt, CipherDigest::Md5, password)
     }
 
-    /// Build a decryption filter using `password`. The filter expects the
-    /// stream to start with `"Salted__"` followed by 8 salt bytes; the
-    /// remainder is treated as PKCS#7-padded AES-256-CBC ciphertext.
+    /// Build a decryption filter using `password` and the MD5 KDF. The filter
+    /// expects the stream to start with `"Salted__"` followed by 8 salt bytes;
+    /// the remainder is treated as PKCS#7-padded AES-256-CBC ciphertext.
     #[must_use]
     pub fn decrypt(password: &[u8]) -> Self {
+        Self::new(CipherMode::Decrypt, CipherDigest::Md5, password)
+    }
+
+    /// Build an encryption filter compatible with a pgBackRest C repository:
+    /// `"Salted__"` framing with the **SHA-1** KDF that pgBackRest uses by
+    /// default for info-file and backup-file encryption.
+    #[must_use]
+    pub fn encrypt_pgbackrest(password: &[u8]) -> Self {
+        Self::new(CipherMode::Encrypt, CipherDigest::Sha1, password)
+    }
+
+    /// Build a decryption filter compatible with a pgBackRest C repository
+    /// (SHA-1 KDF). See [`Cipher::encrypt_pgbackrest`].
+    #[must_use]
+    pub fn decrypt_pgbackrest(password: &[u8]) -> Self {
+        Self::new(CipherMode::Decrypt, CipherDigest::Sha1, password)
+    }
+
+    /// Build a cipher filter with an explicit `mode` and KDF `digest`.
+    #[must_use]
+    pub fn new(mode: CipherMode, digest: CipherDigest, password: &[u8]) -> Self {
         Self {
-            mode: CipherMode::Decrypt,
+            mode,
+            digest,
             pass: password.to_vec(),
             pending: Vec::new(),
         }
@@ -97,22 +156,42 @@ impl Cipher {
         self.mode
     }
 
+    /// KDF digest in use.
+    #[must_use]
+    pub const fn digest(&self) -> CipherDigest {
+        self.digest
+    }
+
     /// Derive a 32-byte AES key + 16-byte IV from `(pass, salt)` using
-    /// `EVP_BytesToKey(MD5, pass, salt, 1)`:
+    /// `EVP_BytesToKey(digest, pass, salt, 1)`:
     ///
     /// ```text
-    /// D_1 = MD5(pass || salt)
-    /// D_n = MD5(D_{n-1} || pass || salt)   for n >= 2
+    /// D_1 = digest(pass || salt)
+    /// D_n = digest(D_{n-1} || pass || salt)   for n >= 2
     /// ```
     ///
     /// Concatenate `D_1 .. D_n` until 48 bytes are available; the first
-    /// 32 are the key, the next 16 the IV. `Md5` blocks are 16 bytes, so
-    /// we need exactly three rounds (`16 + 16 + 16 = 48`).
-    fn derive_key_iv(pass: &[u8], salt: &[u8]) -> ([u8; KEY_LEN], [u8; IV_LEN]) {
+    /// 32 are the key, the next 16 the IV.
+    fn derive_key_iv(digest: CipherDigest, pass: &[u8], salt: &[u8]) -> ([u8; KEY_LEN], [u8; IV_LEN]) {
+        let buf = match digest {
+            CipherDigest::Md5 => Self::derive_bytes::<Md5>(pass, salt),
+            CipherDigest::Sha1 => Self::derive_bytes::<Sha1>(pass, salt),
+            CipherDigest::Sha256 => Self::derive_bytes::<Sha256>(pass, salt),
+        };
+        let mut key = [0u8; KEY_LEN];
+        let mut iv = [0u8; IV_LEN];
+        key.copy_from_slice(&buf[..KEY_LEN]);
+        iv.copy_from_slice(&buf[KEY_LEN..KEY_LEN + IV_LEN]);
+        (key, iv)
+    }
+
+    /// Generic `EVP_BytesToKey` body over any `RustCrypto` `Digest`, emitting at
+    /// least `KEY_LEN + IV_LEN` bytes.
+    fn derive_bytes<D: md5::Digest>(pass: &[u8], salt: &[u8]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(KEY_LEN + IV_LEN);
         let mut prev: Vec<u8> = Vec::new();
         while buf.len() < KEY_LEN + IV_LEN {
-            let mut hasher = Md5::new();
+            let mut hasher = D::new();
             if !prev.is_empty() {
                 hasher.update(&prev);
             }
@@ -121,11 +200,7 @@ impl Cipher {
             prev = hasher.finalize().to_vec();
             buf.extend_from_slice(&prev);
         }
-        let mut key = [0u8; KEY_LEN];
-        let mut iv = [0u8; IV_LEN];
-        key.copy_from_slice(&buf[..KEY_LEN]);
-        iv.copy_from_slice(&buf[KEY_LEN..KEY_LEN + IV_LEN]);
-        (key, iv)
+        buf
     }
 }
 
@@ -141,7 +216,7 @@ impl Filter for Cipher {
             CipherMode::Encrypt => {
                 let mut salt = [0u8; SALT_LEN];
                 rand::thread_rng().fill_bytes(&mut salt);
-                let (key, iv) = Self::derive_key_iv(&self.pass, &salt);
+                let (key, iv) = Self::derive_key_iv(self.digest, &self.pass, &salt);
 
                 out.extend_from_slice(SALT_MAGIC);
                 out.extend_from_slice(&salt);
@@ -172,7 +247,7 @@ impl Filter for Cipher {
                     .map_err(|_| IoError::Backend("cipher: salt slice".to_owned()))?;
                 let mut body = self.pending[SALT_MAGIC.len() + SALT_LEN..].to_vec();
 
-                let (key, iv) = Self::derive_key_iv(&self.pass, &salt);
+                let (key, iv) = Self::derive_key_iv(self.digest, &self.pass, &salt);
 
                 let decryptor = Decryptor::new(&key.into(), &iv.into());
                 let plaintext = decryptor
@@ -204,6 +279,20 @@ mod tests {
         Filter::finish(&mut enc, &mut ciphertext).unwrap();
 
         let mut dec = Cipher::decrypt(password);
+        let mut recovered = Vec::new();
+        Filter::process(&mut dec, &ciphertext, &mut recovered).unwrap();
+        Filter::finish(&mut dec, &mut recovered).unwrap();
+        recovered
+    }
+
+    /// One-shot encrypt then decrypt with a chosen digest.
+    fn roundtrip_digest(plaintext: &[u8], password: &[u8], digest: CipherDigest) -> Vec<u8> {
+        let mut enc = Cipher::new(CipherMode::Encrypt, digest, password);
+        let mut ciphertext = Vec::new();
+        Filter::process(&mut enc, plaintext, &mut ciphertext).unwrap();
+        Filter::finish(&mut enc, &mut ciphertext).unwrap();
+
+        let mut dec = Cipher::new(CipherMode::Decrypt, digest, password);
         let mut recovered = Vec::new();
         Filter::process(&mut dec, &ciphertext, &mut recovered).unwrap();
         Filter::finish(&mut dec, &mut recovered).unwrap();
@@ -295,7 +384,7 @@ mod tests {
     #[test]
     fn kdf_matches_openssl_reference() {
         let salt: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let (key, iv) = Cipher::derive_key_iv(b"password", &salt);
+        let (key, iv) = Cipher::derive_key_iv(CipherDigest::Md5, b"password", &salt);
 
         let expected_key = [
             0x45, 0xcd, 0x1c, 0x2d, 0x6c, 0xd6, 0xfa, 0x6d, 0xb6, 0xd7, 0x26, 0x83, 0xb5, 0x8e, 0xe0, 0x6c, 0x3a, 0x66, 0xb9, 0xf0,
@@ -304,8 +393,93 @@ mod tests {
         let expected_iv = [
             0xeb, 0xb6, 0xc9, 0x87, 0xd4, 0x3b, 0x07, 0x64, 0xfb, 0x7d, 0x91, 0x5e, 0x2b, 0x88, 0xe2, 0x8d,
         ];
-        assert_eq!(key, expected_key, "EVP_BytesToKey key drift");
-        assert_eq!(iv, expected_iv, "EVP_BytesToKey iv drift");
+        assert_eq!(key, expected_key, "EVP_BytesToKey(MD5) key drift");
+        assert_eq!(iv, expected_iv, "EVP_BytesToKey(MD5) iv drift");
+    }
+
+    /// Known-answer vector for the SHA-1 KDF that pgBackRest uses by default.
+    ///
+    /// Reproduce with OpenSSL (matches what pgBackRest's `CipherBlock` feeds
+    /// libcrypto):
+    ///
+    /// ```sh
+    /// echo -n "" | openssl enc -aes-256-cbc -md sha1 -k password \
+    ///     -S 0123456789abcdef -nopad -P
+    /// ```
+    ///
+    /// SHA-1 is a 20-byte digest, so three rounds (`20*3 = 60`) are needed to
+    /// cover the 48 key+iv bytes; the first 32 are the key and the next 16 the
+    /// IV. Cross-checked against the `openssl enc` output above.
+    #[test]
+    fn kdf_matches_pgbackrest_sha1_reference() {
+        let salt: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let (key, iv) = Cipher::derive_key_iv(CipherDigest::Sha1, b"password", &salt);
+
+        let expected_key = [
+            0xfb, 0x5d, 0xfc, 0xce, 0x81, 0xef, 0x00, 0x69, 0x77, 0x4e, 0xbe, 0xbc, 0x1f, 0x97, 0x22, 0xe9, 0x0f, 0x59, 0x45, 0x07,
+            0xe0, 0x15, 0xa3, 0x83, 0xac, 0x4e, 0x38, 0x09, 0xc8, 0xf1, 0x60, 0xb2,
+        ];
+        let expected_iv = [
+            0x77, 0x4b, 0xe4, 0xc3, 0x17, 0x0c, 0xf7, 0x49, 0x35, 0xac, 0x9c, 0x53, 0x20, 0xbd, 0xdb, 0x4c,
+        ];
+        assert_eq!(key, expected_key, "EVP_BytesToKey(SHA1) key drift");
+        assert_eq!(iv, expected_iv, "EVP_BytesToKey(SHA1) iv drift");
+    }
+
+    #[test]
+    fn pgbackrest_sha1_round_trips() {
+        let plaintext = b"a repo sub-key stored inside archive.info / backup.info";
+        let recovered = roundtrip_digest(plaintext, b"user passphrase", CipherDigest::Sha1);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn pgbackrest_constructors_use_sha1() {
+        // The convenience constructors must select the SHA-1 digest.
+        assert_eq!(Cipher::encrypt_pgbackrest(b"x").digest(), CipherDigest::Sha1);
+        assert_eq!(Cipher::decrypt_pgbackrest(b"x").digest(), CipherDigest::Sha1);
+        // Legacy constructors stay on MD5.
+        assert_eq!(Cipher::encrypt(b"x").digest(), CipherDigest::Md5);
+        assert_eq!(Cipher::decrypt(b"x").digest(), CipherDigest::Md5);
+    }
+
+    #[test]
+    fn pgbackrest_encrypt_decrypt_round_trips_via_helpers() {
+        let plaintext = b"chain: user pass -> repo sub-key -> backup sub-key -> file data";
+        let mut enc = Cipher::encrypt_pgbackrest(b"hunter2");
+        let mut ciphertext = Vec::new();
+        Filter::process(&mut enc, plaintext, &mut ciphertext).unwrap();
+        Filter::finish(&mut enc, &mut ciphertext).unwrap();
+        // pgBackRest framing: "Salted__" + 8-byte salt prefix.
+        assert_eq!(&ciphertext[..SALT_MAGIC.len()], SALT_MAGIC);
+
+        let mut dec = Cipher::decrypt_pgbackrest(b"hunter2");
+        let mut recovered = Vec::new();
+        Filter::process(&mut dec, &ciphertext, &mut recovered).unwrap();
+        Filter::finish(&mut dec, &mut recovered).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn sha256_round_trips() {
+        let plaintext = b"sha256 digest variant also round-trips cleanly";
+        let recovered = roundtrip_digest(plaintext, b"pw", CipherDigest::Sha256);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn digest_mismatch_fails_to_decrypt() {
+        // Encrypting with SHA-1 then decrypting with MD5 derives a different
+        // key, so PKCS#7 unpadding must fail.
+        let mut enc = Cipher::new(CipherMode::Encrypt, CipherDigest::Sha1, b"pw");
+        let mut ciphertext = Vec::new();
+        Filter::process(&mut enc, b"payload", &mut ciphertext).unwrap();
+        Filter::finish(&mut enc, &mut ciphertext).unwrap();
+
+        let mut dec = Cipher::new(CipherMode::Decrypt, CipherDigest::Md5, b"pw");
+        let mut out = Vec::new();
+        Filter::process(&mut dec, &ciphertext, &mut out).unwrap();
+        assert!(Filter::finish(&mut dec, &mut out).is_err(), "digest mismatch must fail");
     }
 
     #[test]

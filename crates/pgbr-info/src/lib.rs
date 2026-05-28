@@ -17,6 +17,10 @@
 //!   `[db:history]` block of historical clusters.
 //! - [`Manifest`] — typed wrapper around a backup's `backup.manifest`: the per-backup
 //!   inventory of every file, path, and symlink with size / timestamp / checksum metadata.
+//! - [`cipher`] — the repository two-level encryption key scheme: sub-key generation,
+//!   info-file encrypt/decrypt wrappers, and the [`RepoKeys`] resolver that turns
+//!   `repo-cipher-type` / `repo-cipher-pass` plus the recorded `[cipher]` sub-key into the
+//!   keys backup / restore / archive need.
 //!
 //! Reads and writes go through a [`pgbr_storage::Storage`] reference so callers can stay
 //! backend-agnostic — `Posix` today, `S3` / `Azure` / `GCS` / … as they land.
@@ -25,6 +29,7 @@
 
 pub mod archive;
 pub mod backup;
+pub mod cipher;
 pub mod format;
 pub mod manifest;
 
@@ -35,6 +40,7 @@ use pgbr_storage::StorageError;
 
 pub use crate::archive::{DbHistoryEntry, InfoArchive};
 pub use crate::backup::InfoBackup;
+pub use crate::cipher::{CipherType, RepoKeys, cipher_pass_gen, decrypt_info, encrypt_info};
 pub use crate::format::{InfoFile, InfoFormatError};
 pub use crate::manifest::{Manifest, ManifestFile, ManifestLink, ManifestPath};
 

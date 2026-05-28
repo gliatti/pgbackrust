@@ -17,7 +17,8 @@ use pgbr_io::{IoRead, IoWrite};
 use pgbr_storage::Storage;
 use serde::{Deserialize, Serialize};
 
-use crate::format::{self, BACKREST_SECTION, InfoFile};
+use crate::cipher::{self};
+use crate::format::{self, BACKREST_SECTION, CIPHER_PASS_KEY, CIPHER_SECTION, InfoFile};
 use crate::{InfoError, InfoFormatError};
 
 /// Section that holds the active cluster's identity.
@@ -90,15 +91,7 @@ impl InfoArchive {
     /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`]; format
     /// failures as [`InfoError::Format`]; missing fields as [`InfoError::MissingField`].
     pub fn load(storage: &dyn Storage, path: &Path) -> Result<Self, InfoError> {
-        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
-        let bytes = reader.read_all()?;
-        let raw = String::from_utf8(bytes).map_err(|err| {
-            InfoError::Format(InfoFormatError::InvalidLine {
-                line_number: 0,
-                line: format!("non-utf8 input: {err}"),
-            })
-        })?;
-        Self::from_text(&raw)
+        Self::load_keyed(storage, path, None).map(|(archive, _)| archive)
     }
 
     /// Write `archive.info` to `path` via `storage`. Truncates / creates the file as
@@ -114,6 +107,71 @@ impl InfoArchive {
         writer.flush()?;
         writer.close()?;
         Ok(())
+    }
+
+    /// Decode an `archive.info` document that may be encrypted under the user
+    /// passphrase, returning the parsed wrapper **and** the repository sub-key
+    /// recovered from the `[cipher]` section (if present). When `passphrase` is
+    /// `Some`, the bytes are first decrypted (pgBackRest `"Salted__"` + SHA-1
+    /// framing) and then parsed; when `None`, the bytes are parsed directly.
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Format`] for parse / checksum errors (a wrong passphrase
+    /// typically surfaces here, since the decrypted bytes are garbage), plus
+    /// the usual missing-field / JSON errors.
+    pub fn from_bytes_keyed(raw: &[u8], passphrase: Option<&str>) -> Result<(Self, Option<String>), InfoError> {
+        let plaintext = decode_maybe_encrypted(raw, passphrase)?;
+        let text = bytes_to_text(plaintext)?;
+        let file = format::checksumed_load(&text)?;
+        let cipher_pass = file.get(CIPHER_SECTION, CIPHER_PASS_KEY).map(strip_json_quotes);
+        let archive = Self::from_file(&file)?;
+        Ok((archive, cipher_pass))
+    }
+
+    /// Render this `archive.info` to bytes, injecting `cipher_pass` into the
+    /// `[cipher]` section (when supplied) and encrypting the whole document
+    /// under `passphrase` (when supplied).
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Io`] if the cipher filter fails.
+    pub fn to_bytes_keyed(&self, passphrase: Option<&str>, cipher_pass: Option<&str>) -> Result<Vec<u8>, InfoError> {
+        let text = format::checksumed_render(&self.to_file_with_cipher(cipher_pass));
+        encode_maybe_encrypted(text.as_bytes(), passphrase)
+    }
+
+    /// Read `archive.info` from `path`, decrypting under `passphrase` when the
+    /// repository is encrypted. Returns the wrapper and the recovered repo
+    /// sub-key.
+    ///
+    /// # Errors
+    ///
+    /// Storage / I/O / format failures as for [`InfoArchive::load`].
+    pub fn load_keyed(storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<(Self, Option<String>), InfoError> {
+        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
+        let bytes = reader.read_all()?;
+        Self::from_bytes_keyed(&bytes, passphrase)
+    }
+
+    /// Write `archive.info` (and its `.copy` mirror) to `path` via `storage`,
+    /// storing `cipher_pass` in the `[cipher]` section and encrypting under
+    /// `passphrase` when the repository is encrypted. Matches pgBackRest's
+    /// `infoArchiveSaveFile`, which always writes both the primary and the
+    /// `.copy` file from the same buffer.
+    ///
+    /// # Errors
+    ///
+    /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`].
+    pub fn save_keyed(
+        &self,
+        storage: &dyn Storage,
+        path: &Path,
+        passphrase: Option<&str>,
+        cipher_pass: Option<&str>,
+    ) -> Result<(), InfoError> {
+        let bytes = self.to_bytes_keyed(passphrase, cipher_pass)?;
+        write_with_copy(storage, path, &bytes)
     }
 
     fn from_file(file: &InfoFile) -> Result<Self, InfoError> {
@@ -150,11 +208,25 @@ impl InfoArchive {
     }
 
     fn to_file(&self) -> InfoFile {
+        self.to_file_with_cipher(None)
+    }
+
+    /// Build the [`InfoFile`], optionally injecting the repository sub-key into
+    /// a `[cipher]` section. The cipher section is placed right after
+    /// `[backrest]`, matching pgBackRest's `infoSave`.
+    fn to_file_with_cipher(&self, cipher_pass: Option<&str>) -> InfoFile {
         let mut file = InfoFile::new();
 
         // [backrest]
         file.set(BACKREST_SECTION, KEY_FORMAT, self.backrest_format.to_string());
         file.set(BACKREST_SECTION, KEY_VERSION, json_string(&self.backrest_version));
+
+        // [cipher] — present only for an encrypted repository. The sub-key is
+        // stored JSON-string-encoded, and the whole file is encrypted under the
+        // user passphrase by the keyed save path. C ref: INFO_SECTION_CIPHER.
+        if let Some(pass) = cipher_pass {
+            file.set(CIPHER_SECTION, CIPHER_PASS_KEY, json_string(pass));
+        }
 
         // [db]
         file.set(DB_SECTION, KEY_DB_ID, self.db_id.to_string());
@@ -176,6 +248,53 @@ impl InfoArchive {
 /// Encode `s` as a JSON string literal (i.e. with surrounding quotes and escapes).
 pub(crate) fn json_string(s: &str) -> String {
     serde_json::Value::String(s.to_owned()).to_string()
+}
+
+/// Decrypt `raw` under `passphrase` if encrypted, sharing the cipher logic with
+/// the backup side.
+pub(crate) fn decode_maybe_encrypted(raw: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>, InfoError> {
+    cipher::decode_maybe_encrypted(raw, passphrase)
+}
+
+/// Encrypt `plaintext` under `passphrase` if requested.
+pub(crate) fn encode_maybe_encrypted(plaintext: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>, InfoError> {
+    cipher::encode_maybe_encrypted(plaintext, passphrase)
+}
+
+/// Interpret a (decrypted) info-file byte buffer as UTF-8 text.
+pub(crate) fn bytes_to_text(bytes: Vec<u8>) -> Result<String, InfoError> {
+    String::from_utf8(bytes).map_err(|err| {
+        InfoError::Format(InfoFormatError::InvalidLine {
+            line_number: 0,
+            line: format!("non-utf8 input: {err}"),
+        })
+    })
+}
+
+/// Write `bytes` to `path` and to its `.copy` mirror, matching pgBackRest's
+/// `infoArchiveSaveFile` / `infoBackupSaveFile` (both files are written from
+/// the same buffer so they stay in lock-step).
+pub(crate) fn write_with_copy(storage: &dyn Storage, path: &Path, bytes: &[u8]) -> Result<(), InfoError> {
+    write_one(storage, path, bytes)?;
+    let copy_path = copy_path(path);
+    write_one(storage, &copy_path, bytes)?;
+    Ok(())
+}
+
+/// The `<name>.copy` sibling path for an info file.
+fn copy_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".copy");
+    std::path::PathBuf::from(s)
+}
+
+/// Write a single info file's bytes via `storage`.
+fn write_one(storage: &dyn Storage, path: &Path, bytes: &[u8]) -> Result<(), InfoError> {
+    let mut writer: Box<dyn IoWrite> = storage.open_write(path)?;
+    writer.write(bytes)?;
+    writer.flush()?;
+    writer.close()?;
+    Ok(())
 }
 
 /// Strip surrounding double quotes from a JSON-string-encoded value. Returns the input
@@ -262,5 +381,78 @@ mod tests {
         bytes[pos] = b'2';
         let err = InfoArchive::from_text(&text).unwrap_err();
         assert!(matches!(err, InfoError::Format(InfoFormatError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn cipher_section_round_trips_in_plaintext_info() {
+        // The [cipher] sub-key is injected on render and recovered on the keyed
+        // parse path (the struct itself stays cipher-agnostic).
+        let archive = sample();
+        let bytes = archive.to_bytes_keyed(None, Some("aRepoSubKeyBase64==")).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("[cipher]"), "rendered file must carry a [cipher] section");
+        assert!(text.contains("cipher-pass=\"aRepoSubKeyBase64==\""));
+
+        let (parsed, sub) = InfoArchive::from_bytes_keyed(&bytes, None).unwrap();
+        assert_eq!(sub.as_deref(), Some("aRepoSubKeyBase64=="));
+        assert_eq!(parsed, archive);
+    }
+
+    #[test]
+    fn encrypted_keyed_round_trip() {
+        let archive = sample();
+        let sub_key = crate::cipher::cipher_pass_gen();
+
+        // Encrypt the whole file under the user passphrase.
+        let bytes = archive.to_bytes_keyed(Some("user-passphrase"), Some(&sub_key)).unwrap();
+        assert_eq!(&bytes[..8], b"Salted__", "encrypted info file uses pgBackRest framing");
+
+        // Decrypt + parse recovers the original (including the [cipher] sub-key).
+        let (parsed, sub) = InfoArchive::from_bytes_keyed(&bytes, Some("user-passphrase")).unwrap();
+        assert_eq!(parsed, archive);
+        assert_eq!(sub.as_deref(), Some(sub_key.as_str()));
+
+        // Wrong passphrase fails.
+        assert!(InfoArchive::from_bytes_keyed(&bytes, Some("wrong")).is_err());
+    }
+
+    #[test]
+    fn save_keyed_writes_primary_and_copy() {
+        use pgbr_storage::Posix;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Posix::new(dir.path());
+
+        let archive = sample();
+        let sub_key = crate::cipher::cipher_pass_gen();
+        let path = Path::new("archive/demo/archive.info");
+        storage.create_path(Path::new("archive/demo"), true).unwrap();
+        archive.save_keyed(&storage, path, Some("pw"), Some(&sub_key)).unwrap();
+
+        assert!(storage.exists(path).unwrap(), "primary file written");
+        assert!(
+            storage.exists(Path::new("archive/demo/archive.info.copy")).unwrap(),
+            ".copy mirror written"
+        );
+
+        let (reloaded, sub) = InfoArchive::load_keyed(&storage, path, Some("pw")).unwrap();
+        assert_eq!(reloaded, archive);
+        assert_eq!(sub.as_deref(), Some(sub_key.as_str()));
+    }
+
+    #[test]
+    fn plaintext_keyed_save_omits_cipher_section() {
+        use pgbr_storage::Posix;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Posix::new(dir.path());
+
+        let archive = sample();
+        let path = Path::new("archive/demo/archive.info");
+        storage.create_path(Path::new("archive/demo"), true).unwrap();
+        archive.save_keyed(&storage, path, None, None).unwrap();
+
+        // Unencrypted file is readable as plain text and has no [cipher] section.
+        let (reloaded, sub) = InfoArchive::load_keyed(&storage, path, None).unwrap();
+        assert_eq!(reloaded, archive);
+        assert_eq!(sub, None);
     }
 }

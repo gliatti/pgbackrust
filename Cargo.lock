@@ -991,8 +991,10 @@ name = "pgbr-info"
 version = "0.1.0"
 dependencies = [
  "indexmap",
+ "pgbr-encode",
  "pgbr-io",
  "pgbr-storage",
+ "rand",
  "serde",
  "serde_json",
  "sha1",
