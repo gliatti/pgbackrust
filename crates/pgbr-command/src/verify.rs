@@ -755,6 +755,9 @@ mod tests {
             mode: None,
             user: None,
             group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
         }
     }
 
@@ -770,6 +773,9 @@ mod tests {
             mode: None,
             user: None,
             group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
         }
     }
 

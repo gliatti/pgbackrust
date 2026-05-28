@@ -106,12 +106,95 @@ struct FileValue {
     /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     group: Option<u32>,
+    /// Identifier of the bundle object the file's bytes live in (file-bundling,
+    /// `repo-bundle=y`). Serialised as `bni` to mirror the C manifest key. Absent
+    /// from the JSON when `None`, so non-bundled manifests stay byte-unchanged.
+    #[serde(rename = "bni", default, skip_serializing_if = "Option::is_none")]
+    bundle_id: Option<u64>,
+    /// Byte offset of the file's bytes within its bundle object. Serialised as
+    /// `bno`. Absent from the JSON when `None`.
+    #[serde(rename = "bno", default, skip_serializing_if = "Option::is_none")]
+    bundle_offset: Option<u64>,
+    /// Block-incremental map (`repo-block=y`): the per-block checksum + location
+    /// list that lets diff/incr backups store only changed blocks. Serialised as
+    /// `blk`. Absent from the JSON when `None`, so non-block manifests stay
+    /// byte-unchanged.
+    #[serde(rename = "blk", default, skip_serializing_if = "Option::is_none")]
+    block_map: Option<BlockMapValue>,
+}
+
+/// JSON shape of a single block in a [`BlockMap`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockValue {
+    /// SHA-1 checksum (lowercase hex) of the block's plaintext bytes.
+    #[serde(rename = "c")]
+    checksum: String,
+    /// Label of the backup whose bundle physically holds this block's bytes.
+    #[serde(rename = "r")]
+    reference: String,
+    /// Identifier of the bundle object the block's bytes live in.
+    #[serde(rename = "b")]
+    bundle_id: u64,
+    /// Byte offset of the block's (transformed) bytes within that bundle.
+    #[serde(rename = "o")]
+    offset: u64,
+    /// Number of (transformed) bytes the block occupies in the bundle.
+    #[serde(rename = "s")]
+    size: u64,
 }
 
 /// JSON shape of a `[target:link]` value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LinkValue {
     destination: String,
+}
+
+/// Location of one block's stored bytes within a block-incremental backup.
+///
+/// A block-incremental file (`repo-block=y`) is split into fixed-size blocks;
+/// each block's bytes live in a bundle object — possibly in *this* backup
+/// (changed block) or in an earlier backup (unchanged block a diff/incr defers
+/// to). The [`BlockRef`] records the SHA-1 of the block's plaintext plus where
+/// the (compressed/encrypted) bytes physically live, so restore can pull each
+/// block from the right backup and reverse the transform. C ref: the block-map
+/// entries in `src/info/manifest.c` / `src/command/backup/blockMap.c`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRef {
+    /// SHA-1 checksum (lowercase hex) of the block's plaintext bytes.
+    pub checksum: String,
+    /// Label of the backup whose bundle physically holds this block's bytes.
+    pub reference: String,
+    /// Identifier of the bundle object the block's bytes live in.
+    pub bundle_id: u64,
+    /// Byte offset of the block's (transformed) bytes within that bundle.
+    pub offset: u64,
+    /// Number of (transformed) bytes the block occupies in the bundle.
+    pub size: u64,
+}
+
+/// The block-incremental map for one file: its block size plus an ordered list
+/// of [`BlockRef`]s, one per block (block `i` covers plaintext bytes
+/// `[i*block_size, (i+1)*block_size)`).
+///
+/// A full backup with `repo-block=y` writes a map whose every block references
+/// itself; a later diff/incr reuses unchanged blocks by referencing the earlier
+/// backup and only stores the changed blocks in its own bundle. C ref:
+/// `ManifestBlockDelta` / the block map in `src/info/manifest.c`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMap {
+    /// Size, in bytes, of each (non-final) block.
+    pub block_size: u64,
+    /// One [`BlockRef`] per block, in file order.
+    pub blocks: Vec<BlockRef>,
+}
+
+/// JSON shape of a [`BlockMap`] value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockMapValue {
+    #[serde(rename = "bs")]
+    block_size: u64,
+    #[serde(rename = "bl")]
+    blocks: Vec<BlockValue>,
 }
 
 /// One file entry in `[target:file]`.
@@ -144,6 +227,18 @@ pub struct ManifestFile {
     /// Recorded only — re-applying owner needs privilege (documented follow-up).
     /// C ref: `ManifestFile.group`.
     pub group: Option<u32>,
+    /// Identifier of the bundle object this file's bytes live in (file-bundling,
+    /// `repo-bundle=y`). `None` for a file stored as its own repo object (the
+    /// default, unbundled behaviour). C ref: `ManifestFile.bundleId`.
+    pub bundle_id: Option<u64>,
+    /// Byte offset of this file's (transformed) bytes within its bundle object.
+    /// `None` when the file is not bundled. C ref: `ManifestFile.bundleOffset`.
+    pub bundle_offset: Option<u64>,
+    /// Block-incremental map for this file (`repo-block=y`). `None` when the file
+    /// is stored whole (the default). When present, the file's bytes are
+    /// reassembled from the per-block [`BlockRef`]s rather than from a single
+    /// stored object. C ref: the per-file block map in `src/info/manifest.c`.
+    pub block_map: Option<BlockMap>,
 }
 
 /// One path (directory) entry in `[target:path]`.
@@ -266,6 +361,20 @@ impl Manifest {
                     context: format!("[{TARGET_FILE_SECTION}].{path}"),
                     error: err,
                 })?;
+                let block_map = value.block_map.map(|bm| BlockMap {
+                    block_size: bm.block_size,
+                    blocks: bm
+                        .blocks
+                        .into_iter()
+                        .map(|b| BlockRef {
+                            checksum: b.checksum,
+                            reference: b.reference,
+                            bundle_id: b.bundle_id,
+                            offset: b.offset,
+                            size: b.size,
+                        })
+                        .collect(),
+                });
                 files.push(ManifestFile {
                     path: path.clone(),
                     size: value.size,
@@ -276,6 +385,9 @@ impl Manifest {
                     mode: value.mode,
                     user: value.user,
                     group: value.group,
+                    bundle_id: value.bundle_id,
+                    bundle_offset: value.bundle_offset,
+                    block_map,
                 });
             }
         }
@@ -329,6 +441,20 @@ impl Manifest {
 
         // [target:file]
         for entry in &self.files {
+            let block_map = entry.block_map.as_ref().map(|bm| BlockMapValue {
+                block_size: bm.block_size,
+                blocks: bm
+                    .blocks
+                    .iter()
+                    .map(|b| BlockValue {
+                        checksum: b.checksum.clone(),
+                        reference: b.reference.clone(),
+                        bundle_id: b.bundle_id,
+                        offset: b.offset,
+                        size: b.size,
+                    })
+                    .collect(),
+            });
             let value = FileValue {
                 size: entry.size,
                 timestamp: entry.timestamp,
@@ -338,6 +464,9 @@ impl Manifest {
                 mode: entry.mode,
                 user: entry.user,
                 group: entry.group,
+                bundle_id: entry.bundle_id,
+                bundle_offset: entry.bundle_offset,
+                block_map,
             };
             let json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
             file.set(TARGET_FILE_SECTION, &entry.path, json);
@@ -402,6 +531,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -413,6 +545,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -476,6 +611,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
                 ManifestFile {
                     path: "pg_data/changed".to_owned(),
@@ -487,6 +625,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -542,6 +683,9 @@ mod tests {
                     mode: Some(0o640),
                     user: Some(1000),
                     group: Some(1001),
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
                 ManifestFile {
                     path: "pg_data/no_mode".to_owned(),
@@ -553,6 +697,9 @@ mod tests {
                     mode: None,
                     user: None,
                     group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -596,6 +743,148 @@ mod tests {
         assert_eq!(no_mode.mode, None);
         assert_eq!(no_mode.user, None);
         assert_eq!(no_mode.group, None);
+    }
+
+    #[test]
+    fn manifest_file_bundle_round_trips() {
+        // A bundled file records `bni`/`bno`; a non-bundled file omits them so
+        // unbundled manifests stay byte-unchanged.
+        let manifest = Manifest {
+            backup_label: "20240101-120000F".to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![
+                ManifestFile {
+                    path: "pg_data/bundled".to_owned(),
+                    size: 10,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("aaaa1111".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                    bundle_id: Some(1),
+                    bundle_offset: Some(4096),
+                    block_map: None,
+                },
+                ManifestFile {
+                    path: "pg_data/solo".to_owned(),
+                    size: 3,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("bbbb2222".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
+                },
+            ],
+            paths: Vec::new(),
+            links: Vec::new(),
+        };
+
+        let text = manifest.to_text();
+        let bundled_line = text.lines().find(|l| l.starts_with("pg_data/bundled=")).unwrap();
+        assert!(bundled_line.contains("\"bni\":1"), "bundle id recorded: {bundled_line}");
+        assert!(
+            bundled_line.contains("\"bno\":4096"),
+            "bundle offset recorded: {bundled_line}"
+        );
+        let solo_line = text.lines().find(|l| l.starts_with("pg_data/solo=")).unwrap();
+        assert!(
+            !solo_line.contains("bni") && !solo_line.contains("bno"),
+            "solo omits bundle keys: {solo_line}"
+        );
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed, manifest);
+        let bundled = parsed.file("pg_data/bundled").unwrap();
+        assert_eq!(bundled.bundle_id, Some(1));
+        assert_eq!(bundled.bundle_offset, Some(4096));
+    }
+
+    #[test]
+    fn manifest_file_block_map_round_trips() {
+        // A block-incremental file records its block size + per-block refs; a
+        // whole file omits `blk` so non-block manifests stay byte-unchanged.
+        let manifest = Manifest {
+            backup_label: "20240101-120000F".to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![
+                ManifestFile {
+                    path: "pg_data/blocky".to_owned(),
+                    size: 24576,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("cccc3333".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: Some(BlockMap {
+                        block_size: 8192,
+                        blocks: vec![
+                            BlockRef {
+                                checksum: "1111".to_owned(),
+                                reference: "20240101-120000F".to_owned(),
+                                bundle_id: 1,
+                                offset: 0,
+                                size: 100,
+                            },
+                            BlockRef {
+                                checksum: "2222".to_owned(),
+                                reference: "20240101-120000F".to_owned(),
+                                bundle_id: 1,
+                                offset: 100,
+                                size: 120,
+                            },
+                        ],
+                    }),
+                },
+                ManifestFile {
+                    path: "pg_data/whole".to_owned(),
+                    size: 3,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("dddd4444".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                    mode: None,
+                    user: None,
+                    group: None,
+                    bundle_id: None,
+                    bundle_offset: None,
+                    block_map: None,
+                },
+            ],
+            paths: Vec::new(),
+            links: Vec::new(),
+        };
+
+        let text = manifest.to_text();
+        let blocky_line = text.lines().find(|l| l.starts_with("pg_data/blocky=")).unwrap();
+        assert!(blocky_line.contains("\"blk\""), "block map recorded: {blocky_line}");
+        let whole_line = text.lines().find(|l| l.starts_with("pg_data/whole=")).unwrap();
+        assert!(!whole_line.contains("blk"), "whole file omits block map: {whole_line}");
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed, manifest);
+        let bm = parsed.file("pg_data/blocky").unwrap().block_map.as_ref().unwrap();
+        assert_eq!(bm.block_size, 8192);
+        assert_eq!(bm.blocks.len(), 2);
+        assert_eq!(bm.blocks[1].offset, 100);
     }
 
     #[test]
