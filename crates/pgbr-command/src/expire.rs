@@ -65,11 +65,12 @@
 
 use std::path::PathBuf;
 
-use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::{InfoArchive, InfoBackup, InfoError};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 
 use crate::CommandError;
+use crate::backup::acquire_command_lock;
 
 /// An archive-id paired with whether it is the *current* cluster.
 type ArchiveIdMarked = (String, bool);
@@ -892,6 +893,9 @@ fn anchor_backups_oldest_first(
 ///
 /// Forwards every error from [`expire_inner`].
 pub fn expire(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+    // Hold the backup lock for the whole command — expire mutates the same
+    // repository state as backup. C ref: lockAcquire(lockTypeBackup).
+    let _locks = acquire_command_lock(config, LockType::Backup)?;
     let summary = expire_inner(config, repo_storage)?;
     if summary.expired_labels.is_empty() {
         println!("expire: nothing to expire ({} kept)", summary.kept_labels.len());
@@ -920,7 +924,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
+    use pgbr_config::{ConfigCommandRole, LoadedConfig, LockType, OptionValue};
     use pgbr_info::{DbHistoryEntry, InfoBackup};
     use pgbr_storage::{Posix, Storage};
     use serde_json::json;
@@ -1190,6 +1194,34 @@ mod tests {
                 expired_archive_segments: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn expire_acquires_backup_lock() {
+        // expire mutates the same state as backup, so it takes the backup
+        // lock; a concurrent holder makes the public `expire` fail.
+        let (_dir, repo) = empty_repo();
+        seed_backup_info(&repo, "demo", &[("20260101-100000F", 100, "full")]);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = cfg(Some("demo"), Some(2));
+        cfg.options.insert(
+            ("lock-path".to_owned(), None),
+            OptionValue::Path(lock_dir.path().to_string_lossy().into_owned()),
+        );
+        let expected_lock = lock_dir.path().join("demo-backup.lock");
+
+        let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
+        assert!(expected_lock.exists(), "backup lock file must appear while held");
+
+        let err = super::expire(&cfg, &repo).expect_err("expire must fail while the backup lock is held");
+        assert!(
+            err.to_string().contains("another backup is running"),
+            "unexpected error: {err}"
+        );
+
+        drop(held);
+        super::expire(&cfg, &repo).expect("expire succeeds once the lock is free");
     }
 
     #[test]
