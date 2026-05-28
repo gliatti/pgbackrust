@@ -137,6 +137,212 @@ fn backup_type(value: &serde_json::Value) -> &str {
     value.get("backup-type").and_then(serde_json::Value::as_str).unwrap_or("")
 }
 
+/// The labels in a `[backup:current]` entry's `backup-reference` list — the
+/// backups whose files this one depends on. A diff references its full; an incr
+/// references the full plus every prior backup in its dedup chain. Used to walk
+/// the dependency graph during adhoc (`--set` / `--oldest`) expiry.
+fn backup_references(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("backup-reference")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// The `--set=<label>` adhoc-expire target, if supplied.
+fn set_option(config: &LoadedConfig) -> Option<String> {
+    match config.options.get(&("set".to_owned(), None)) {
+        Some(OptionValue::String(s) | OptionValue::StringId(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Whether `--oldest` was supplied (expire the oldest full backup set,
+/// bypassing the retention rules).
+fn oldest_option(config: &LoadedConfig) -> bool {
+    matches!(config.options.get(&("oldest".to_owned(), None)), Some(OptionValue::Boolean(true)))
+}
+
+/// Forward transitive closure of dependents: every backup in `current` that
+/// references (directly or transitively) any label in `seed`, plus the seed
+/// labels themselves. Expiring `seed` therefore requires expiring all of these,
+/// since their files live in — or chain through — a backup being removed.
+fn dependent_closure(current: &std::collections::BTreeMap<String, serde_json::Value>, seed: &[String]) -> Vec<String> {
+    let mut expire: std::collections::BTreeSet<String> = seed.iter().cloned().collect();
+    loop {
+        let mut grew = false;
+        for (label, value) in current {
+            if expire.contains(label) {
+                continue;
+            }
+            if backup_references(value).iter().any(|r| expire.contains(r)) {
+                expire.insert(label.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    expire.into_iter().collect()
+}
+
+/// Count the full backups in `current` that are NOT in `expire`.
+fn remaining_full_count(
+    current: &std::collections::BTreeMap<String, serde_json::Value>,
+    expire: &[String],
+) -> usize {
+    let expire_set: std::collections::BTreeSet<&String> = expire.iter().collect();
+    current
+        .iter()
+        .filter(|(label, value)| !expire_set.contains(label) && backup_type(value) == "full")
+        .count()
+}
+
+/// Remove the on-disk directories for `labels`, drop them from `info.current`,
+/// and persist `backup.info` when anything changed. Shared by both adhoc paths.
+fn remove_backups(
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &mut InfoBackup,
+    labels: &[String],
+) -> Result<(), CommandError> {
+    for label in labels {
+        let path = PathBuf::from(format!("backup/{stanza}/{label}"));
+        match repo.remove_path(&path, true, false) {
+            Ok(()) | Err(StorageError::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+        info.current.remove(label);
+    }
+    if !labels.is_empty() {
+        info.save(repo, &backup_info_path(stanza))
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Run the standard archive-retention pass against the backups that survive an
+/// adhoc expiry, returning the WAL segments removed (empty when
+/// `repo-retention-archive` is unset). Mirrors the tail of [`expire_inner`].
+fn archive_expire_tail(
+    config: &LoadedConfig,
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &InfoBackup,
+) -> Result<Vec<String>, CommandError> {
+    let archive_type = retention_archive_type(config);
+    let kept_labels: Vec<String> = info.current.keys().cloned().collect();
+    let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
+    retention_archive(config)?.map_or_else(
+        || Ok(Vec::new()),
+        |keep_archive| expire_archive(repo, stanza, keep_archive, archive_type, &kept_anchor_oldest_first, info),
+    )
+}
+
+/// Adhoc `--set=<label>` expiry: remove the named backup and every backup that
+/// depends on it. C reference: `expireAdhocBackup` in `src/command/expire/expire.c`.
+///
+/// The target must be a `full` or `diff` backup (the KB documents `--set` for
+/// these only); an unknown label or an `incr` target errors. Expiry is refused
+/// if it would leave the repository with no full backup.
+fn expire_adhoc_set(
+    config: &LoadedConfig,
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &mut InfoBackup,
+    set: &str,
+) -> Result<ExpireSummary, CommandError> {
+    let Some(target) = info.current.get(set) else {
+        return Err(CommandError::Other(format!(
+            "backup set '{set}' to expire does not exist in stanza '{stanza}'"
+        )));
+    };
+    let ttype = backup_type(target);
+    if ttype != "full" && ttype != "diff" {
+        return Err(CommandError::Other(format!(
+            "backup set '{set}' is type '{ttype}'; --set expiry requires a full or diff backup"
+        )));
+    }
+
+    let expire = dependent_closure(&info.current, std::slice::from_ref(&set.to_owned()));
+    if remaining_full_count(&info.current, &expire) == 0 {
+        return Err(CommandError::Other(format!(
+            "backup set '{set}' cannot be expired: at least one full backup must remain"
+        )));
+    }
+
+    let kept_labels: Vec<String> = info
+        .current
+        .keys()
+        .filter(|l| !expire.contains(*l))
+        .cloned()
+        .collect();
+    remove_backups(repo, stanza, info, &expire)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
+    Ok(ExpireSummary {
+        expired_labels: expire,
+        kept_labels,
+        expired_archive_segments,
+    })
+}
+
+/// Adhoc `--oldest` expiry: remove the oldest full backup set (the full plus
+/// every backup that depends on it), bypassing the retention rules. Refused if
+/// only one full backup exists (pgBackRest always keeps at least one full).
+fn expire_adhoc_oldest(
+    config: &LoadedConfig,
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &mut InfoBackup,
+) -> Result<ExpireSummary, CommandError> {
+    // Oldest full by (timestamp-stop, label).
+    let oldest_full = info
+        .current
+        .iter()
+        .filter(|(_, v)| backup_type(v) == "full")
+        .min_by(|(a_l, a_v), (b_l, b_v)| {
+            timestamp_stop(a_v)
+                .cmp(&timestamp_stop(b_v))
+                .then_with(|| a_l.cmp(b_l))
+        })
+        .map(|(label, _)| label.clone());
+
+    let Some(oldest_full) = oldest_full else {
+        return Ok(ExpireSummary {
+            expired_labels: Vec::new(),
+            kept_labels: info.current.keys().cloned().collect(),
+            expired_archive_segments: Vec::new(),
+        });
+    };
+
+    let total_fulls = info.current.values().filter(|v| backup_type(v) == "full").count();
+    if total_fulls <= 1 {
+        return Err(CommandError::Other(
+            "--oldest: refusing to expire the only full backup (at least one must remain)".to_owned(),
+        ));
+    }
+
+    let expire = dependent_closure(&info.current, std::slice::from_ref(&oldest_full));
+    let kept_labels: Vec<String> = info
+        .current
+        .keys()
+        .filter(|l| !expire.contains(*l))
+        .cloned()
+        .collect();
+    remove_backups(repo, stanza, info, &expire)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
+    Ok(ExpireSummary {
+        expired_labels: expire,
+        kept_labels,
+        expired_archive_segments,
+    })
+}
+
 /// `repo-retention-full` lookup. Missing option is reported as `None`
 /// (no-op). A non-integer value is reported as `Other`.
 fn retention_full(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
@@ -766,6 +972,15 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         });
     };
 
+    // Adhoc expiry (--set / --oldest) removes a specific backup set and bypasses
+    // the retention policy entirely. C reference: the adhoc path in cmdExpire.
+    if let Some(set) = set_option(config) {
+        return expire_adhoc_set(config, repo, stanza, &mut info, &set);
+    }
+    if oldest_option(config) {
+        return expire_adhoc_oldest(config, repo, stanza, &mut info);
+    }
+
     let archive_type = retention_archive_type(config);
 
     // No backup retention configured. Backups are all kept, but archive
@@ -1087,6 +1302,201 @@ mod tests {
         let mut w = repo.open_write(Path::new(&format!("{dir}/marker"))).expect("open marker");
         w.write(b"x").expect("write marker");
         w.close().expect("close marker");
+    }
+
+    /// Seed `backup.info` where each row also carries a `backup-reference`
+    /// list, plus an on-disk directory per label. Each tuple is
+    /// `(label, ts, ty, references)`. Used by the adhoc (`--set` / `--oldest`)
+    /// expiry tests, which depend on the dependency graph.
+    fn seed_backup_info_refs(repo: &Posix, stanza: &str, entries: &[(&str, i64, &str, &[&str])]) {
+        let mut current = BTreeMap::new();
+        for (label, ts, ty, refs) in entries {
+            current.insert(
+                (*label).to_owned(),
+                json!({
+                    "backup-info-size": 100,
+                    "backup-label": *label,
+                    "backup-timestamp-stop": ts,
+                    "backup-type": *ty,
+                    "backup-reference": refs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>(),
+                }),
+            );
+            seed_backup_dir(repo, stanza, label);
+        }
+
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history,
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup/<stanza>");
+        info.save(repo, &super::backup_info_path(stanza)).expect("save backup.info");
+    }
+
+    /// `expire` config carrying `--set=<label>`.
+    fn cfg_set(stanza: Option<&str>, set: &str) -> LoadedConfig {
+        let mut cfg = cfg(stanza, None);
+        cfg.options.insert(("set".to_owned(), None), OptionValue::String(set.to_owned()));
+        cfg
+    }
+
+    /// `expire` config carrying `--oldest`.
+    fn cfg_oldest(stanza: Option<&str>) -> LoadedConfig {
+        let mut cfg = cfg(stanza, None);
+        cfg.options.insert(("oldest".to_owned(), None), OptionValue::Boolean(true));
+        cfg
+    }
+
+    /// Helper: does the on-disk backup directory still exist?
+    fn backup_dir_exists(repo: &Posix, stanza: &str, label: &str) -> bool {
+        repo.exists(Path::new(&format!("backup/{stanza}/{label}"))).unwrap_or(false)
+    }
+
+    #[test]
+    fn expire_set_full_removes_full_and_all_dependents() {
+        let (_dir, repo) = empty_repo();
+        // F1 (full) with diff D1 and incr I1 in its set, plus an independent F2.
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260101F_20260103I", 300, "incr", &["20260101F", "20260101F_20260102D"]),
+                ("20260110F", 400, "full", &[]),
+            ],
+        );
+        let summary = expire_inner(&cfg_set(Some("demo"), "20260101F"), &repo).expect("expire --set");
+        assert_eq!(
+            summary.expired_labels,
+            vec![
+                "20260101F".to_owned(),
+                "20260101F_20260102D".to_owned(),
+                "20260101F_20260103I".to_owned()
+            ]
+        );
+        assert_eq!(summary.kept_labels, vec!["20260110F".to_owned()]);
+        assert!(!backup_dir_exists(&repo, "demo", "20260101F"));
+        assert!(!backup_dir_exists(&repo, "demo", "20260101F_20260103I"));
+        assert!(backup_dir_exists(&repo, "demo", "20260110F"));
+    }
+
+    #[test]
+    fn expire_set_diff_removes_diff_and_its_incrs_only() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260101F_20260103I", 300, "incr", &["20260101F", "20260101F_20260102D"]),
+                ("20260101F_20260104D", 400, "diff", &["20260101F"]),
+            ],
+        );
+        let summary = expire_inner(&cfg_set(Some("demo"), "20260101F_20260102D"), &repo).expect("expire --set diff");
+        // D1 and the incr that depends on it go; F1 and the later D2 stay.
+        assert_eq!(
+            summary.expired_labels,
+            vec!["20260101F_20260102D".to_owned(), "20260101F_20260103I".to_owned()]
+        );
+        assert!(summary.kept_labels.contains(&"20260101F".to_owned()));
+        assert!(summary.kept_labels.contains(&"20260101F_20260104D".to_owned()));
+        assert!(backup_dir_exists(&repo, "demo", "20260101F_20260104D"));
+    }
+
+    #[test]
+    fn expire_set_unknown_label_errors() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(&repo, "demo", &[("20260101F", 100, "full", &[])]);
+        let err = expire_inner(&cfg_set(Some("demo"), "nope"), &repo).expect_err("unknown set errors");
+        assert!(format!("{err}").contains("does not exist"));
+    }
+
+    #[test]
+    fn expire_set_incr_type_errors() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260103I", 300, "incr", &["20260101F"]),
+            ],
+        );
+        let err = expire_inner(&cfg_set(Some("demo"), "20260101F_20260103I"), &repo).expect_err("incr set errors");
+        assert!(format!("{err}").contains("requires a full or diff"));
+    }
+
+    #[test]
+    fn expire_set_last_full_is_refused() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+            ],
+        );
+        let err = expire_inner(&cfg_set(Some("demo"), "20260101F"), &repo).expect_err("last full refused");
+        assert!(format!("{err}").contains("at least one full backup must remain"));
+        // Nothing removed.
+        assert!(backup_dir_exists(&repo, "demo", "20260101F"));
+    }
+
+    #[test]
+    fn expire_oldest_removes_oldest_full_set() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260110F", 400, "full", &[]),
+                ("20260110F_20260111I", 500, "incr", &["20260110F"]),
+            ],
+        );
+        let summary = expire_inner(&cfg_oldest(Some("demo")), &repo).expect("expire --oldest");
+        assert_eq!(
+            summary.expired_labels,
+            vec!["20260101F".to_owned(), "20260101F_20260102D".to_owned()]
+        );
+        assert!(backup_dir_exists(&repo, "demo", "20260110F"));
+        assert!(backup_dir_exists(&repo, "demo", "20260110F_20260111I"));
+    }
+
+    #[test]
+    fn expire_oldest_single_full_is_refused() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+            ],
+        );
+        let err = expire_inner(&cfg_oldest(Some("demo")), &repo).expect_err("single full refused");
+        assert!(format!("{err}").contains("only full backup"));
+        assert!(backup_dir_exists(&repo, "demo", "20260101F"));
     }
 
     /// Build + seed `backup.info` with full per-backup detail, including the
