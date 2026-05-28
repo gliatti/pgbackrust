@@ -32,12 +32,16 @@
 //! not part of the repository fan-out). C ref: `cfgOptionGroupIdxDefault` /
 //! the `repo` iteration in `src/config/config.c` and `src/storage/helper.c`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_protocol::PGBACKREST_PROGRAM;
-use pgbr_storage::{Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage};
+use pgbr_storage::s3::{S3Encryption, S3UriStyle};
+use pgbr_storage::sftp::{HostKeyCheck, HostKeyHashType};
+use pgbr_storage::{
+    Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, HttpOptions, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage,
+};
 
 use std::sync::Arc;
 
@@ -359,26 +363,117 @@ fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u
 fn build_s3(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Storage>, CliRunError> {
     let bucket = require_string(cfg, "repo-s3-bucket", index)?;
     let region = require_string(cfg, "repo-s3-region", index)?;
-    let access_key = require_string(cfg, "repo-s3-key", index)?;
-    let secret_key = require_string(cfg, "repo-s3-key-secret", index)?;
-    let token = string_option(cfg, "repo-s3-token", index);
+
+    // `repo-s3-key-type` (default `shared`) selects how credentials are sourced.
+    // `shared` uses the configured key/secret; `web-id`/`auto` read AWS
+    // web-identity / instance credentials (best-effort: web-id reads the token
+    // file env; auto falls back to it). C ref: `storageS3New` key-type switch.
+    let key_type = string_option(cfg, "repo-s3-key-type", index).unwrap_or_else(|| "shared".to_owned());
+    let (access_key, secret_key, token) = resolve_s3_credentials(cfg, index, &key_type)?;
 
     // `repo-s3-endpoint` is a bare host (e.g. `s3.us-east-1.amazonaws.com`);
     // `repo-storage-host` overrides it when present. The S3 backend wants a
     // full URL with scheme, so prepend `https://` when the value is scheme-less
     // (matching the C `defaultType = httpProtocolTypeHttps`).
-    let host = string_option(cfg, "repo-storage-host", index)
+    let raw_host = string_option(cfg, "repo-storage-host", index)
         .or_else(|| string_option(cfg, "repo-s3-endpoint", index))
         .ok_or_else(|| CliRunError::StorageConfig("repo-type=s3 requires repo-s3-endpoint (or repo-storage-host)".to_owned()))?;
+    let endpoint = with_scheme(&host_with_optional_port(cfg, &raw_host, index));
 
-    Ok(Box::new(S3::new(S3Config {
-        endpoint: with_scheme(&host),
+    // `repo-s3-uri-style` (default `host`): host vs path bucket addressing.
+    let uri_style = match string_option(cfg, "repo-s3-uri-style", index) {
+        None => S3UriStyle::default(),
+        Some(value) => S3UriStyle::parse(&value).map_err(CliRunError::StorageConfig)?,
+    };
+
+    // `repo-s3-role`: STS AssumeRole. Not yet implemented — surface a clear
+    // error rather than silently ignoring the configured role, but only when it
+    // is actually set so the common path is unaffected.
+    if let Some(role) = string_option(cfg, "repo-s3-role", index) {
+        return Err(CliRunError::NotSupportedYet(format!(
+            "repo-s3-role={role}: STS AssumeRole is not implemented yet (configure static credentials via \
+             repo-s3-key-type=shared, or web-identity via repo-s3-key-type=web-id)"
+        )));
+    }
+
+    let encryption = s3_encryption_from(cfg, index);
+    let requester_pays = boolean_option(cfg, "repo-s3-requester-pays", index).unwrap_or(false);
+    let tags = hash_option(cfg, "repo-storage-tag", index);
+    let http = http_options_from(cfg, index);
+
+    let s3 = S3::new(S3Config {
+        endpoint,
         region,
         bucket,
         access_key,
         secret_key,
         token,
-    })))
+        uri_style,
+        encryption,
+        requester_pays,
+        tags,
+        http,
+    })
+    .map_err(CliRunError::Storage)?;
+    Ok(Box::new(s3))
+}
+
+/// Resolve the S3 access-key / secret-key / session-token triple for `key_type`.
+///
+/// `shared` reads `repo-s3-key` + `repo-s3-key-secret` (the configured static
+/// credentials) plus an optional `repo-s3-token`. `web-id` reads the AWS
+/// web-identity token file from the standard environment
+/// (`AWS_WEB_IDENTITY_TOKEN_FILE`) and passes its contents as the session token
+/// — a best-effort wiring of the web-identity flow without a full STS exchange.
+/// `auto` falls back to the web-identity path. C ref: `storageS3New`.
+fn resolve_s3_credentials(cfg: &LoadedConfig, index: u32, key_type: &str) -> Result<(String, String, Option<String>), CliRunError> {
+    match key_type {
+        "shared" => {
+            let access_key = require_string(cfg, "repo-s3-key", index)?;
+            let secret_key = require_string(cfg, "repo-s3-key-secret", index)?;
+            let token = string_option(cfg, "repo-s3-token", index);
+            Ok((access_key, secret_key, token))
+        }
+        "web-id" | "auto" => {
+            // Best-effort web-identity: the AWS SDK convention exposes the OIDC
+            // token file via AWS_WEB_IDENTITY_TOKEN_FILE and the role via
+            // AWS_ROLE_ARN. Without a full STS AssumeRoleWithWebIdentity exchange
+            // we cannot mint signing credentials, so require a clear setup.
+            let token_file = std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok();
+            match token_file {
+                Some(path) => {
+                    let token = std::fs::read_to_string(&path)
+                        .map_err(|err| CliRunError::StorageConfig(format!("repo-s3-key-type={key_type}: reading {path}: {err}")))?;
+                    // The web-identity token is an OIDC JWT, not a SigV4 signing
+                    // credential; a full implementation would exchange it via STS.
+                    // Surface the limitation clearly rather than signing wrongly.
+                    let _ = token;
+                    Err(CliRunError::NotSupportedYet(format!(
+                        "repo-s3-key-type={key_type}: web-identity token file {path} was found, but the STS \
+                         AssumeRoleWithWebIdentity exchange that turns it into signing credentials is not \
+                         implemented yet; use repo-s3-key-type=shared with static credentials for now"
+                    )))
+                }
+                None => Err(CliRunError::StorageConfig(format!(
+                    "repo-s3-key-type={key_type} requires the AWS_WEB_IDENTITY_TOKEN_FILE environment variable \
+                     (web-identity credentials); set it or use repo-s3-key-type=shared"
+                ))),
+            }
+        }
+        other => Err(CliRunError::StorageConfig(format!(
+            "unrecognised repo-s3-key-type `{other}` (expected shared, web-id, or auto)"
+        ))),
+    }
+}
+
+/// Resolve the S3 server-side-encryption settings from `repo-s3-kms-key-id` and
+/// `repo-s3-sse-customer-key`. KMS takes precedence when both are set (they are
+/// mutually exclusive in practice; pgBackRest disallows configuring both).
+fn s3_encryption_from(cfg: &LoadedConfig, index: u32) -> S3Encryption {
+    if let Some(kms) = string_option(cfg, "repo-s3-kms-key-id", index) {
+        return S3Encryption::Kms(kms);
+    }
+    string_option(cfg, "repo-s3-sse-customer-key", index).map_or(S3Encryption::None, S3Encryption::CustomerKey)
 }
 
 /// Build the [`Azure`] backend from the `repo-azure-*` options at repository
@@ -398,20 +493,52 @@ fn build_azure(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Storage>, CliRu
             )));
         }
     };
-    // `repo-azure-endpoint` is a bare suffix (default `blob.core.windows.net`);
-    // the Azure backend builds the full URL from account + endpoint, so pass a
-    // full URL only when an explicit storage host overrides it.
-    let endpoint = string_option(cfg, "repo-storage-host", index).map(|h| with_scheme(&h));
+    // The Azure backend builds the full URL from account + endpoint. An explicit
+    // `repo-storage-host` overrides the host entirely; otherwise
+    // `repo-azure-endpoint` (default `blob.core.windows.net`) is the DNS suffix
+    // and the full host is `<account>.<endpoint>`. `repo-azure-uri-style`
+    // (host | path) selects whether the account lives in the hostname (host) or
+    // the first path segment (path). C ref: `storageAzureNew`.
+    let uri_style = string_option(cfg, "repo-azure-uri-style", index).unwrap_or_else(|| "host".to_owned());
+    let endpoint = azure_endpoint(cfg, index, &account, &uri_style)?;
 
+    let http = http_options_from(cfg, index);
     let azure = Azure::new(AzureConfig {
         account,
         container,
         account_key_base64,
         sas_token,
         endpoint,
+        tags: hash_option(cfg, "repo-storage-tag", index),
+        http,
     })
     .map_err(CliRunError::Storage)?;
     Ok(Box::new(azure))
+}
+
+/// Compute the Azure endpoint base URL (including scheme) for the given account
+/// and `repo-azure-uri-style`.
+///
+/// An explicit `repo-storage-host` (with optional `repo-storage-port`) overrides
+/// everything. Otherwise the host suffix is `repo-azure-endpoint` (default
+/// `blob.core.windows.net`); for host-style the account is prepended to the
+/// hostname (`<account>.<suffix>`), and for path-style the bare suffix is used
+/// (the backend places the account in the path).
+fn azure_endpoint(cfg: &LoadedConfig, index: u32, account: &str, uri_style: &str) -> Result<Option<String>, CliRunError> {
+    if let Some(host) = string_option(cfg, "repo-storage-host", index) {
+        return Ok(Some(with_scheme(&host_with_optional_port(cfg, &host, index))));
+    }
+    let suffix = string_option(cfg, "repo-azure-endpoint", index).unwrap_or_else(|| "blob.core.windows.net".to_owned());
+    let host = match uri_style {
+        "host" => format!("{account}.{suffix}"),
+        "path" => suffix,
+        other => {
+            return Err(CliRunError::StorageConfig(format!(
+                "unrecognised repo-azure-uri-style `{other}` (expected host or path)"
+            )));
+        }
+    };
+    Ok(Some(with_scheme(&host_with_optional_port(cfg, &host, index))))
 }
 
 /// Build the [`Gcs`] backend from the `repo-gcs-*` options at repository index
@@ -423,26 +550,58 @@ fn build_gcs(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Storage>, CliRunE
     let auth = match key_type.as_str() {
         // `token` auth: the key value is a pre-acquired OAuth2 bearer token.
         "token" => GcsAuth::Token(key),
-        // `service` auth needs the parsed service-account JSON (client_email,
-        // private_key, token_uri). Loading + parsing that key file is a
-        // follow-up; for now the token path is the wired option.
-        "service" => {
+        // `service` auth: `repo-gcs-key` is the path to the service-account JSON
+        // key file; parse it into client_email / private_key / token_uri and let
+        // the backend perform the JWT -> access-token exchange.
+        "service" => gcs_service_account_auth(&key)?,
+        // `auto` discovers a GCE instance credential — best-effort: not wired,
+        // so error clearly rather than silently using the wrong auth.
+        "auto" => {
             return Err(CliRunError::NotSupportedYet(
-                "repo-gcs-key-type=service: service-account key-file parsing is not wired into the binary yet \
-                 (pgbr-storage::Gcs supports it via GcsAuth::ServiceAccount, but loading the key JSON is a follow-up); \
-                 use repo-gcs-key-type=token for now"
+                "repo-gcs-key-type=auto: GCE instance-metadata credential discovery is not implemented yet; \
+                 use repo-gcs-key-type=service (a service-account key file) or token (a bearer token)"
                     .to_owned(),
             ));
         }
         other => {
             return Err(CliRunError::StorageConfig(format!(
-                "repo-gcs-key-type=`{other}` is not supported by the binary yet (expected token or service)"
+                "unrecognised repo-gcs-key-type `{other}` (expected service, token, or auto)"
             )));
         }
     };
-    let endpoint = string_option(cfg, "repo-storage-host", index).map(|h| with_scheme(&h));
 
-    Ok(Box::new(Gcs::new(GcsConfig { bucket, endpoint, auth })))
+    // An explicit `repo-storage-host` overrides the endpoint; otherwise
+    // `repo-gcs-endpoint` (default `storage.googleapis.com`) is the host.
+    let raw_host = string_option(cfg, "repo-storage-host", index).or_else(|| string_option(cfg, "repo-gcs-endpoint", index));
+    let endpoint = raw_host.map(|h| with_scheme(&host_with_optional_port(cfg, &h, index)));
+
+    let user_project = string_option(cfg, "repo-gcs-user-project", index);
+    let http = http_options_from(cfg, index);
+
+    let gcs = Gcs::new(GcsConfig {
+        bucket,
+        endpoint,
+        auth,
+        user_project,
+        tags: hash_option(cfg, "repo-storage-tag", index),
+        http,
+    })
+    .map_err(CliRunError::Storage)?;
+    Ok(Box::new(gcs))
+}
+
+/// Load and parse a GCS service-account JSON key file at `path` into a
+/// [`GcsAuth::ServiceAccount`].
+///
+/// The standard Google service-account key JSON carries `client_email`,
+/// `private_key` (an RS256 PEM) and `token_uri`; these become the JWT `iss`,
+/// signing key and audience / POST target respectively. C ref:
+/// `storageGcsAuthService` reading the `key-file`.
+fn gcs_service_account_auth(path: &str) -> Result<GcsAuth, CliRunError> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|err| CliRunError::StorageConfig(format!("repo-gcs-key-type=service: reading key file {path}: {err}")))?;
+    pgbr_storage::gcs::service_account_auth_from_json(&json)
+        .map_err(|err| CliRunError::StorageConfig(format!("repo-gcs-key-type=service: parsing key file {path}: {err}")))
 }
 
 /// Assemble an [`SftpConfig`] from the resolved `repo-sftp-*` option family.
@@ -463,18 +622,66 @@ fn sftp_config_from(cfg: &LoadedConfig, index: u32) -> Result<SftpConfig, CliRun
     let private_key = path_option(cfg, "repo-sftp-private-key-file", index)
         .ok_or_else(|| CliRunError::StorageConfig("repo-type=sftp requires repo-sftp-private-key-file".to_owned()))?;
     let passphrase = string_option(cfg, "repo-sftp-private-key-passphrase", index);
+    // Optional public-key file alongside the private key (some libssh2 key
+    // formats need the explicit `.pub`); `None` lets ssh2 derive it.
+    let public_key = path_option(cfg, "repo-sftp-public-key-file", index);
     let port = match integer_option(cfg, "repo-sftp-host-port", index) {
         None => pgbr_storage::sftp::DEFAULT_PORT,
         Some(n) => u16::try_from(n).map_err(|_| CliRunError::StorageConfig(format!("repo-sftp-host-port out of range: {n}")))?,
     };
     let base_path = path_option(cfg, "repo-path", index).unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_PATH));
+    let host_key_check = sftp_host_key_check(cfg, index)?;
     Ok(SftpConfig {
         host,
         port,
         user,
         base_path,
-        auth: SftpAuth::KeyFile { private_key, passphrase },
+        auth: SftpAuth::KeyFile {
+            private_key,
+            public_key,
+            passphrase,
+        },
+        host_key_check,
     })
+}
+
+/// Resolve the SFTP host-key-verification policy from the `repo-sftp-host-key-*`
+/// / `repo-sftp-known-host` options.
+///
+/// `repo-sftp-host-key-check-type` (default `strict`) selects the mode:
+/// `none` disables checking, `fingerprint` pins the server key against
+/// `repo-sftp-host-fingerprint` (hashed with `repo-sftp-host-key-hash-type`),
+/// and `strict` / `accept-new` validate against the `repo-sftp-known-host`
+/// known-hosts files (accept-new appending unknown keys). C ref:
+/// `storageSftpNew` host-key handling.
+fn sftp_host_key_check(cfg: &LoadedConfig, index: u32) -> Result<HostKeyCheck, CliRunError> {
+    // Default is `strict` (matches config.yaml). When set explicitly, honour it.
+    let mode = string_option(cfg, "repo-sftp-host-key-check-type", index).unwrap_or_else(|| "strict".to_owned());
+    match mode.as_str() {
+        "none" => Ok(HostKeyCheck::None),
+        "fingerprint" | "strict" if string_option(cfg, "repo-sftp-host-fingerprint", index).is_some() => {
+            let fingerprint = require_string(cfg, "repo-sftp-host-fingerprint", index)?;
+            let hash_type = match string_option(cfg, "repo-sftp-host-key-hash-type", index) {
+                None => HostKeyHashType::Sha256,
+                Some(value) => HostKeyHashType::parse(&value).map_err(CliRunError::StorageConfig)?,
+            };
+            Ok(HostKeyCheck::Fingerprint { fingerprint, hash_type })
+        }
+        "fingerprint" => Err(CliRunError::StorageConfig(
+            "repo-sftp-host-key-check-type=fingerprint requires repo-sftp-host-fingerprint".to_owned(),
+        )),
+        "strict" | "accept-new" => {
+            let accept_new = mode == "accept-new";
+            let known_hosts = list_option(cfg, "repo-sftp-known-host", index);
+            Ok(HostKeyCheck::KnownHosts {
+                known_hosts: known_hosts.into_iter().map(PathBuf::from).collect(),
+                accept_new,
+            })
+        }
+        other => Err(CliRunError::StorageConfig(format!(
+            "unrecognised repo-sftp-host-key-check-type `{other}` (expected none, fingerprint, strict, or accept-new)"
+        ))),
+    }
 }
 
 /// Build the SFTP repository backend, opening the SSH/SFTP connection.
@@ -540,6 +747,95 @@ fn integer_option(cfg: &LoadedConfig, name: &str, index: u32) -> Option<i64> {
 /// message when absent.
 fn require_string(cfg: &LoadedConfig, name: &str, index: u32) -> Result<String, CliRunError> {
     string_option(cfg, name, index).ok_or_else(|| CliRunError::StorageConfig(format!("required option `{name}` is not set")))
+}
+
+/// Read a `boolean` option at group index `index`, falling back to the ungrouped
+/// key. Returns `None` when absent or not a boolean-typed value.
+fn boolean_option(cfg: &LoadedConfig, name: &str, index: u32) -> Option<bool> {
+    cfg.options
+        .get(&(name.to_owned(), Some(index)))
+        .or_else(|| cfg.options.get(&(name.to_owned(), None)))
+        .and_then(|v| match v {
+            OptionValue::Boolean(b) => Some(*b),
+            _ => None,
+        })
+}
+
+/// Read a `size` option (bytes) at group index `index`, falling back to the
+/// ungrouped key. Returns `None` when absent or not a size-typed value.
+fn size_option(cfg: &LoadedConfig, name: &str, index: u32) -> Option<u64> {
+    cfg.options
+        .get(&(name.to_owned(), Some(index)))
+        .or_else(|| cfg.options.get(&(name.to_owned(), None)))
+        .and_then(|v| match v {
+            OptionValue::Size(s) => Some(*s),
+            _ => None,
+        })
+}
+
+/// Read a `hash` option (key→value map) at group index `index`, falling back to
+/// the ungrouped key. Returns an empty map when absent or not a hash value.
+fn hash_option(cfg: &LoadedConfig, name: &str, index: u32) -> BTreeMap<String, String> {
+    cfg.options
+        .get(&(name.to_owned(), Some(index)))
+        .or_else(|| cfg.options.get(&(name.to_owned(), None)))
+        .and_then(|v| match v {
+            OptionValue::Hash(h) => Some(h.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Read a `list` option at group index `index`, falling back to the ungrouped
+/// key. A single `string`/`path` value is treated as a one-element list.
+/// Returns an empty `Vec` when absent.
+fn list_option(cfg: &LoadedConfig, name: &str, index: u32) -> Vec<String> {
+    cfg.options
+        .get(&(name.to_owned(), Some(index)))
+        .or_else(|| cfg.options.get(&(name.to_owned(), None)))
+        .map(|v| match v {
+            OptionValue::List(items) => items.clone(),
+            OptionValue::String(s) | OptionValue::StringId(s) | OptionValue::Path(s) => vec![s.clone()],
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// Assemble the shared [`HttpOptions`] from the `repo-storage-*` family at group
+/// index `index`: TLS verification (`repo-storage-verify-tls`), custom CA roots
+/// (`repo-storage-ca-file` / `-ca-path`), the TLS port (`repo-storage-port`) and
+/// the upload-chunk size (`repo-storage-upload-chunk-size`).
+///
+/// Pure (reads only the resolved config), so it is unit-testable without a live
+/// endpoint.
+fn http_options_from(cfg: &LoadedConfig, index: u32) -> HttpOptions {
+    let verify_tls = boolean_option(cfg, "repo-storage-verify-tls", index).unwrap_or(true);
+    let ca_file = path_option(cfg, "repo-storage-ca-file", index);
+    let ca_path = path_option(cfg, "repo-storage-ca-path", index);
+    let port = integer_option(cfg, "repo-storage-port", index).and_then(|p| u16::try_from(p).ok());
+    let upload_chunk_size = size_option(cfg, "repo-storage-upload-chunk-size", index);
+    HttpOptions {
+        verify_tls,
+        ca_file,
+        ca_path,
+        port,
+        upload_chunk_size,
+    }
+}
+
+/// Append `:<port>` to the bare host `host` when `repo-storage-port` is set to a
+/// non-default value (the C driver builds the endpoint URL with the explicit
+/// port). The host must not already carry a scheme; pass the raw host.
+///
+/// 443 — the `repo-storage-port` default for HTTPS — is treated as "no override"
+/// so the common case yields a clean `https://host` URL.
+fn host_with_optional_port(cfg: &LoadedConfig, host: &str, index: u32) -> String {
+    match integer_option(cfg, "repo-storage-port", index) {
+        Some(port) if port != 443 && (1..=65535).contains(&port) && !host.contains(':') => {
+            format!("{host}:{port}")
+        }
+        _ => host.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -809,12 +1105,22 @@ mod tests {
         assert_eq!(sftp.port, 22, "port defaults to 22");
         assert_eq!(sftp.base_path, Path::new("/srv/backups"));
         match sftp.auth {
-            SftpAuth::KeyFile { private_key, passphrase } => {
+            SftpAuth::KeyFile {
+                private_key,
+                public_key,
+                passphrase,
+            } => {
                 assert_eq!(private_key, Path::new("/home/pgbackrest/.ssh/id_ed25519"));
+                assert!(public_key.is_none());
                 assert!(passphrase.is_none());
             }
             SftpAuth::Password(_) => panic!("expected key-file auth"),
         }
+        // The default host-key policy is strict known_hosts.
+        assert!(matches!(
+            sftp.host_key_check,
+            pgbr_storage::sftp::HostKeyCheck::KnownHosts { accept_new: false, .. }
+        ));
     }
 
     #[test]
