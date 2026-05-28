@@ -4,21 +4,32 @@
 //! C reference: `src/command/stanza/create.c`, `src/command/stanza/delete.c`,
 //! `src/command/stanza/upgrade.c`.
 //!
-//! Unlike the C implementation — which opens a live libpq connection to learn
-//! the cluster's identity — this port reads the cluster's system id, PG
-//! version, catalog version, and control version straight out of
-//! `<pg-path>/global/pg_control` via
-//! [`pgbr_postgres::control::read_pg_control_header`]. That keeps
-//! `stanza-create` / `stanza-upgrade` testable without a running `PostgreSQL`;
-//! the libpq path can replace the control-file read later when remote stanzas
-//! need it.
+//! The cluster's identity (system id, PG version, catalog version, control
+//! version) is obtained from **either** of two sources, matching the C
+//! implementation's two information paths:
+//!
+//! - A **live libpq connection** — when a DB connection is derivable from the
+//!   resolved configuration (`pg1-*` options) or from `DATABASE_URL`. The
+//!   version comes from `server_version_num`; the system id / catalog version
+//!   / control version come from `pg_control_system()` (available on PG 9.6+),
+//!   mirroring `dbOpen` in `src/db/db.c`.
+//! - The on-disk **`<pg-path>/global/pg_control`** file — read via
+//!   [`pgbr_postgres::control::decode_pg_control_header`]. This is the default
+//!   and keeps `stanza-create` / `stanza-upgrade` testable without a running
+//!   `PostgreSQL`.
+//!
+//! The row→identity mapping ([`query_result_to_identity`]) is a pure function
+//! over already-parsed column values, so it is unit-tested without any live
+//! server; [`cluster_identity_from_db`] is the thin libpq adapter around it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use pgbr_config::LoadedConfig;
+use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_db::Connection;
 use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup};
 use pgbr_postgres::control::{PgControlHeader, decode_pg_control_header, header_version};
+use pgbr_postgres::version::by_catalog_version_no;
 use pgbr_storage::{Storage, StorageError};
 
 use crate::CommandError;
@@ -30,7 +41,9 @@ const BACKREST_VERSION: &str = "2.58";
 /// Path of the control file relative to the PG data directory.
 const PG_CONTROL_PATH: &str = "global/pg_control";
 
-/// Cluster identity resolved from `pg_control`, plus the textual PG label.
+/// Cluster identity resolved from `pg_control` (or a live libpq connection),
+/// plus the textual PG label.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClusterIdentity {
     header: PgControlHeader,
     version: String,
@@ -79,6 +92,182 @@ fn read_cluster_identity(pg_storage: &dyn Storage) -> Result<ClusterIdentity, Co
     Ok(ClusterIdentity { header, version })
 }
 
+/// The four raw values pgBackRest needs to identify a cluster, exactly as the
+/// libpq queries return them as text. Kept separate from [`ClusterIdentity`]
+/// so the mapping below ([`query_result_to_identity`]) is a pure function that
+/// needs no live `PostgreSQL` to exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbIdentityRow {
+    /// `server_version_num` from `pg_settings` (e.g. `160004`, `90600`).
+    server_version_num: u32,
+    /// `system_identifier` from `pg_control_system()`.
+    system_identifier: u64,
+    /// `catalog_version_no` from `pg_control_system()`.
+    catalog_version_no: u32,
+    /// `pg_control_version` from `pg_control_system()`.
+    pg_control_version: u32,
+}
+
+/// Map a `server_version_num` (e.g. `160004`, `90600`) to a pgBackRest major
+/// version label (`"9.6"`, `"10"`, …). Mirrors the C `pgVersionFromNum` /
+/// `(num / 100 * 100)` major-stripping in `src/postgres/interface.c`.
+///
+/// PG < 10 encodes the major as `9.x` (`90600` → `9.6`); PG >= 10 uses
+/// `<major>0000` (`160004` → `16`). Returns `None` for a version number with
+/// no [`pgbr_postgres::version::SUPPORTED`] entry.
+fn pg_version_label_from_num(server_version_num: u32) -> Option<&'static str> {
+    // Strip the minor: PG < 10 keeps the .x minor (e.g. 90600 -> "9.6"); PG >=
+    // 10 collapses to the bare major (e.g. 160004 -> "16").
+    let label = if server_version_num < 100_000 {
+        format!("{}.{}", server_version_num / 10_000, (server_version_num % 10_000) / 100)
+    } else {
+        (server_version_num / 10_000).to_string()
+    };
+    pgbr_postgres::version::by_label(&label).map(|v| v.label)
+}
+
+/// Pure mapping from the raw libpq column values to a [`ClusterIdentity`].
+///
+/// Cross-checks the cluster's catalog version against the
+/// [`pgbr_postgres::version::SUPPORTED`] registry (the same authority the
+/// control-file path uses) and verifies the `(pg_control_version,
+/// catalog_version_no)` pair agrees with the version derived from
+/// `server_version_num`. No I/O, no libpq — unit-testable with synthetic rows.
+fn query_result_to_identity(row: DbIdentityRow) -> Result<ClusterIdentity, CommandError> {
+    let version = pg_version_label_from_num(row.server_version_num)
+        .ok_or_else(|| CommandError::Other(format!("unsupported server_version_num {}", row.server_version_num)))?;
+
+    // The catalog version is the unique per-major key; confirm it is known and
+    // that the reported control version matches the registry entry, exactly as
+    // decode_pg_control_header validates the on-disk header.
+    let entry = by_catalog_version_no(row.catalog_version_no).ok_or_else(|| {
+        CommandError::Other(format!(
+            "unknown catalog_version_no {} reported by pg_control_system()",
+            row.catalog_version_no
+        ))
+    })?;
+    if entry.pg_control_version != row.pg_control_version {
+        return Err(CommandError::Other(format!(
+            "pg_control_system() control version {} does not match catalog_version_no {} (expected {})",
+            row.pg_control_version, row.catalog_version_no, entry.pg_control_version
+        )));
+    }
+
+    Ok(ClusterIdentity {
+        header: PgControlHeader {
+            system_identifier: row.system_identifier,
+            pg_control_version: row.pg_control_version,
+            catalog_version_no: row.catalog_version_no,
+        },
+        version: version.to_owned(),
+    })
+}
+
+/// Query a live `PostgreSQL` for its cluster identity.
+///
+/// Runs the same information queries the C `dbOpen` uses: `server_version_num`
+/// from `pg_settings`, and `system_identifier` / `catalog_version_no` /
+/// `pg_control_version` from `pg_control_system()` (PG 9.6+). The parsed
+/// columns are handed to the pure [`query_result_to_identity`] mapper.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] on connection failure, query failure, missing /
+/// unparseable columns, or an unrecognised version.
+fn cluster_identity_from_db(conn: &mut Connection) -> Result<ClusterIdentity, CommandError> {
+    let version_result = conn
+        .query("select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4")
+        .map_err(|err| CommandError::Other(err.to_string()))?;
+    let server_version_num = version_result
+        .value(0, 0)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read server_version_num from pg_settings".to_owned()))?;
+
+    let control_result = conn
+        .query(
+            "select system_identifier::text, catalog_version_no::text, pg_control_version::text \
+             from pg_catalog.pg_control_system()",
+        )
+        .map_err(|err| CommandError::Other(err.to_string()))?;
+    let system_identifier = control_result
+        .value(0, 0)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| CommandError::Other("could not read system_identifier from pg_control_system()".to_owned()))?;
+    let catalog_version_no = control_result
+        .value(0, 1)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read catalog_version_no from pg_control_system()".to_owned()))?;
+    let pg_control_version = control_result
+        .value(0, 2)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read pg_control_version from pg_control_system()".to_owned()))?;
+
+    query_result_to_identity(DbIdentityRow {
+        server_version_num,
+        system_identifier,
+        catalog_version_no,
+        pg_control_version,
+    })
+}
+
+/// Build a libpq conninfo string for the primary cluster when the resolved
+/// configuration (or `DATABASE_URL`) describes a reachable `PostgreSQL`, or
+/// `None` when no DB source is configured (the caller then falls back to
+/// reading `global/pg_control`).
+///
+/// `DATABASE_URL` wins when set (it is already a complete libpq URI). Otherwise
+/// a connection is derived from `pg1-host` + `pg1-port` / `pg1-socket-path` /
+/// `pg1-database` / `pg1-user`; a bare local `pg1-path` alone is **not** enough
+/// to imply a live server, so the control-file path stays the default.
+fn derive_conninfo(config: &LoadedConfig) -> Option<String> {
+    derive_conninfo_with_url(config, std::env::var("DATABASE_URL").ok().as_deref())
+}
+
+/// Pure core of [`derive_conninfo`]: `database_url` is the already-resolved
+/// `DATABASE_URL` (so the env read stays out of the unit tests).
+fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -> Option<String> {
+    if let Some(url) = database_url
+        && !url.is_empty()
+    {
+        return Some(url.to_owned());
+    }
+
+    let opt = |name: &str| -> Option<String> {
+        match config.options.get(&(name.to_owned(), None)) {
+            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
+            Some(OptionValue::Integer(i)) => Some(i.to_string()),
+            _ => None,
+        }
+    };
+
+    // Only treat the cluster as connectable when a host or a unix-socket
+    // directory is configured; otherwise leave the on-disk path as the source.
+    // libpq accepts a directory in `host=` and reads it as a socket dir.
+    let host = opt("pg1-host").or_else(|| opt("pg1-socket-path"))?;
+
+    let mut parts: Vec<String> = vec![format!("host={host}")];
+    if let Some(p) = opt("pg1-port") {
+        parts.push(format!("port={p}"));
+    }
+    if let Some(db) = opt("pg1-database") {
+        parts.push(format!("dbname={db}"));
+    }
+    if let Some(user) = opt("pg1-user") {
+        parts.push(format!("user={user}"));
+    }
+    Some(parts.join(" "))
+}
+
+/// Resolve the cluster identity, preferring a live libpq connection when one is
+/// configured and falling back to the on-disk `global/pg_control` otherwise.
+fn resolve_cluster_identity(config: &LoadedConfig, pg_storage: &dyn Storage) -> Result<ClusterIdentity, CommandError> {
+    if let Some(conninfo) = derive_conninfo(config) {
+        let mut conn = Connection::open(&conninfo).map_err(|err| CommandError::Other(err.to_string()))?;
+        return cluster_identity_from_db(&mut conn);
+    }
+    read_cluster_identity(pg_storage)
+}
+
 /// `stanza-create` — initialise on-disk repository state for a stanza.
 ///
 /// Reads the cluster identity from `<pg-path>/global/pg_control`, then writes
@@ -94,13 +283,23 @@ fn read_cluster_identity(pg_storage: &dyn Storage) -> Result<ClusterIdentity, Co
 ///   failures.
 pub fn create(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
-    create_inner(stanza, repo_storage, pg_storage)?;
+    let identity = resolve_cluster_identity(config, pg_storage)?;
+    create_with_identity(stanza, repo_storage, identity)?;
     Ok(())
 }
 
+/// Test/`pg_control`-only convenience: read the identity off disk, then create.
+#[cfg(test)]
 fn create_inner(stanza: &str, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<CreateOutcome, CommandError> {
     let identity = read_cluster_identity(pg_storage)?;
+    create_with_identity(stanza, repo_storage, identity)
+}
 
+fn create_with_identity(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    identity: ClusterIdentity,
+) -> Result<CreateOutcome, CommandError> {
     let archive_info_path = archive_info_path(stanza);
     let backup_info_path = backup_info_path(stanza);
 
@@ -209,13 +408,23 @@ fn remove_subtree(storage: &dyn Storage, path: &Path) -> Result<(), CommandError
 ///   read/write failures.
 pub fn upgrade(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
-    upgrade_inner(stanza, repo_storage, pg_storage)?;
+    let identity = resolve_cluster_identity(config, pg_storage)?;
+    upgrade_with_identity(stanza, repo_storage, identity)?;
     Ok(())
 }
 
+/// Test/`pg_control`-only convenience: read the identity off disk, then upgrade.
+#[cfg(test)]
 fn upgrade_inner(stanza: &str, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<UpgradeOutcome, CommandError> {
     let identity = read_cluster_identity(pg_storage)?;
+    upgrade_with_identity(stanza, repo_storage, identity)
+}
 
+fn upgrade_with_identity(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    identity: ClusterIdentity,
+) -> Result<UpgradeOutcome, CommandError> {
     let archive_info_path = archive_info_path(stanza);
     let backup_info_path = backup_info_path(stanza);
 
@@ -276,6 +485,7 @@ fn upgrade_inner(stanza: &str, repo_storage: &dyn Storage, pg_storage: &dyn Stor
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use pgbr_postgres::version;
     use pgbr_postgres::version::{SUPPORTED, VersionInterface};
     use pgbr_storage::Posix;
 
@@ -413,5 +623,160 @@ mod tests {
             CommandError::Other(msg) => assert_eq!(msg, "stanza not initialized; run stanza-create first"),
             other => panic!("expected Other(not initialized), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn query_result_to_identity_maps_synthetic_rows() {
+        // PG 16: server_version_num 160004 -> label "16"; control/catalog from
+        // the registry; an arbitrary system id passes through unchanged.
+        let v = version::by_label("16").expect("PG 16 in registry");
+        let identity = query_result_to_identity(DbIdentityRow {
+            server_version_num: 160_004,
+            system_identifier: 0x0102_0304_0506_0708,
+            catalog_version_no: v.catalog_version_no,
+            pg_control_version: v.pg_control_version,
+        })
+        .expect("synthetic PG 16 rows map cleanly");
+
+        assert_eq!(identity.version, "16");
+        assert_eq!(identity.header.system_identifier, 0x0102_0304_0506_0708);
+        assert_eq!(identity.header.catalog_version_no, v.catalog_version_no);
+        assert_eq!(identity.header.pg_control_version, v.pg_control_version);
+    }
+
+    #[test]
+    fn query_result_to_identity_maps_pg96() {
+        // PG 9.6: server_version_num 90600 -> label "9.6".
+        let v = version::by_label("9.6").expect("PG 9.6 in registry");
+        let identity = query_result_to_identity(DbIdentityRow {
+            server_version_num: 90_600,
+            system_identifier: 7,
+            catalog_version_no: v.catalog_version_no,
+            pg_control_version: v.pg_control_version,
+        })
+        .expect("synthetic PG 9.6 rows map cleanly");
+        assert_eq!(identity.version, "9.6");
+        assert_eq!(identity.header.system_identifier, 7);
+    }
+
+    #[test]
+    fn query_result_to_identity_rejects_unknown_version() {
+        let v = version::by_label("16").expect("PG 16 in registry");
+        let err = query_result_to_identity(DbIdentityRow {
+            server_version_num: 80_400, // PG 8.4, unsupported
+            system_identifier: 1,
+            catalog_version_no: v.catalog_version_no,
+            pg_control_version: v.pg_control_version,
+        })
+        .expect_err("unsupported version must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("server_version_num"), "message was {msg:?}"),
+            other => panic!("expected Other(server_version_num), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_result_to_identity_rejects_unknown_catalog() {
+        let err = query_result_to_identity(DbIdentityRow {
+            server_version_num: 160_004,
+            system_identifier: 1,
+            catalog_version_no: 1, // not in the registry
+            pg_control_version: 1300,
+        })
+        .expect_err("unknown catalog version must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("catalog_version_no"), "message was {msg:?}"),
+            other => panic!("expected Other(catalog_version_no), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_result_to_identity_rejects_control_catalog_mismatch() {
+        let v = version::by_label("16").expect("PG 16 in registry");
+        let err = query_result_to_identity(DbIdentityRow {
+            server_version_num: 160_004,
+            system_identifier: 1,
+            catalog_version_no: v.catalog_version_no,
+            pg_control_version: v.pg_control_version + 1, // disagrees with catalog
+        })
+        .expect_err("control/catalog mismatch must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("control version"), "message was {msg:?}"),
+            other => panic!("expected Other(control version), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_version_label_from_num_handles_majors() {
+        assert_eq!(pg_version_label_from_num(90_600), Some("9.6"));
+        assert_eq!(pg_version_label_from_num(100_000), Some("10"));
+        assert_eq!(pg_version_label_from_num(160_004), Some("16"));
+        assert_eq!(pg_version_label_from_num(180_000), Some("18"));
+        assert_eq!(pg_version_label_from_num(80_400), None); // PG 8.4 unsupported
+        assert_eq!(pg_version_label_from_num(990_000), None);
+    }
+
+    #[test]
+    fn derive_conninfo_none_without_db_config() {
+        let cfg = config_with_stanza(Some("demo"));
+        assert_eq!(
+            derive_conninfo_with_url(&cfg, None),
+            None,
+            "no pg1-host and no DATABASE_URL means control-file path"
+        );
+    }
+
+    #[test]
+    fn derive_conninfo_database_url_wins() {
+        let cfg = config_with_stanza(Some("demo"));
+        assert_eq!(
+            derive_conninfo_with_url(&cfg, Some("host=/tmp dbname=postgres")).as_deref(),
+            Some("host=/tmp dbname=postgres"),
+        );
+        // An empty DATABASE_URL is ignored (falls through to config-derived).
+        assert_eq!(derive_conninfo_with_url(&cfg, Some("")), None);
+    }
+
+    #[test]
+    fn derive_conninfo_builds_from_pg1_options() {
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        cfg.options.insert(("pg1-port".to_owned(), None), OptionValue::Integer(5433));
+        cfg.options
+            .insert(("pg1-database".to_owned(), None), OptionValue::String("postgres".to_owned()));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("pg1-host present -> conninfo");
+        assert!(conninfo.contains("host=db.example"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("port=5433"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("dbname=postgres"), "conninfo was {conninfo:?}");
+    }
+
+    // Live-PostgreSQL stanza-create through the libpq identity path. Skipped by
+    // default; run with `cargo test -p pgbr-command -- --include-ignored` and
+    // DATABASE_URL pointing at a reachable cluster.
+    #[test]
+    #[ignore = "requires a running PostgreSQL server (set DATABASE_URL)"]
+    fn stanza_create_via_db_path() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+
+        let mut conn = Connection::open(&url).expect("open DATABASE_URL connection");
+        let identity = cluster_identity_from_db(&mut conn).expect("identity from live PG");
+        assert!(!identity.version.is_empty());
+        assert_ne!(identity.header.system_identifier, 0);
+
+        // Full create through the public entry point, which routes to the DB
+        // path because DATABASE_URL is set.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo_s = Posix::new(repo.path());
+        let pg_s = Posix::new(pg.path());
+        let cfg = config_with_stanza(Some("dblive"));
+        create(&cfg, &repo_s, &pg_s).expect("stanza-create via DB path");
+
+        let archive = InfoArchive::load(&repo_s, &archive_info_path("dblive")).expect("archive.info");
+        assert_eq!(archive.db_system_id, identity.header.system_identifier);
+        assert_eq!(archive.db_version, identity.version);
     }
 }
