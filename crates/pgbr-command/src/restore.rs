@@ -69,6 +69,35 @@
 //! "unsupported" error and the link is counted in [`RestoreOutcome::skipped_links`]
 //! instead. Successful re-creations are counted in [`RestoreOutcome::links_created`].
 //!
+//! # Tablespace remapping
+//!
+//! A tablespace is stored under `pg_tblspc/<oid>` as a symlink whose recorded
+//! destination is the external path the tablespace lived at. On restore, the
+//! destination of every `pg_tblspc/<oid>` link can be redirected:
+//!
+//! - `--tablespace-map=<oid>=<path>` remaps one specific tablespace's
+//!   destination directory.
+//! - `--tablespace-map-all=<prefix>` puts *every* tablespace under
+//!   `<prefix>/<tablespace-name>`, where the name is the last path component of
+//!   the link's recorded destination.
+//!
+//! Precedence is explicit `--tablespace-map` entry > `--tablespace-map-all`
+//! prefix > the manifest's recorded destination. The pure
+//! [`resolve_tablespace_target`] function does the resolution and is wired into
+//! the symlink-creation path. Links that are not tablespace links
+//! (`pg_tblspc/<oid>`) keep their recorded destination unchanged.
+//!
+//! # Selective database restore (`--db-include` / `--db-exclude`)
+//!
+//! `--db-include` restores ONLY the named databases; `--db-exclude` restores all
+//! databases EXCEPT the named ones. The two are mutually exclusive (supplying
+//! both is a [`CommandError::Other`]). A database's files live under
+//! `base/<db-oid>/` and, for tablespace-resident databases, under
+//! `pg_tblspc/<ts>/PG_*/<db-oid>/`. The [`database_included`] predicate extracts
+//! the db-oid from such paths and applies the include/exclude lists; files that
+//! are not under any database directory (`global/`, `pg_wal/`, top-level config
+//! files, etc.) are ALWAYS restored. Excluded files are simply not copied.
+//!
 //! # Recovery configuration
 //!
 //! After the file copy, restore writes the version-appropriate recovery
@@ -92,8 +121,6 @@
 //!
 //! # Deferred to later commits
 //!
-//! - tablespace remapping (`--tablespace-map` / `--tablespace-map-all`),
-//! - `--db-include` / `--db-exclude` selective database restore,
 //! - `--type=preserve` (leave any existing recovery file untouched) and the full
 //!   `--recovery-option` passthrough — only the target-type-derived settings are
 //!   generated here,
@@ -102,10 +129,11 @@
 //! This is the full raw-restore path; everything above is genuinely out of
 //! scope for the slice, not silently dropped.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
-use pgbr_info::{InfoBackup, InfoError, Manifest, ManifestFile};
+use pgbr_info::{InfoBackup, InfoError, Manifest, ManifestFile, ManifestLink};
 use pgbr_io::{Filter, IoRead, Sha1};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 
@@ -171,6 +199,32 @@ fn delta_enabled(config: &LoadedConfig) -> bool {
         config.options.get(&("delta".to_owned(), None)),
         Some(OptionValue::Boolean(true))
     )
+}
+
+/// The `--tablespace-map` hash (tablespace-id -> new destination path). Absent or
+/// non-hash resolves to an empty map.
+fn tablespace_map(config: &LoadedConfig) -> BTreeMap<String, String> {
+    match config.options.get(&("tablespace-map".to_owned(), None)) {
+        Some(OptionValue::Hash(map)) => map.clone(),
+        _ => BTreeMap::new(),
+    }
+}
+
+/// The `--tablespace-map-all` destination prefix, if supplied.
+fn tablespace_map_all(config: &LoadedConfig) -> Option<String> {
+    match config.options.get(&("tablespace-map-all".to_owned(), None)) {
+        Some(OptionValue::Path(value) | OptionValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// A `--db-include` / `--db-exclude` list option as a vector of strings. Absent
+/// or non-list resolves to an empty vector.
+fn db_list(config: &LoadedConfig, name: &str) -> Vec<String> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::List(values)) => values.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// First `PostgreSQL` major version that drives recovery via GUCs in
@@ -421,6 +475,120 @@ fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
+/// Whether a manifest link is a tablespace link (`…/pg_tblspc/<oid>`). The OID
+/// segment is whatever follows the final `pg_tblspc/` component; pgBackRest
+/// records these as the only links under `pg_tblspc`.
+fn tablespace_oid(link: &ManifestLink) -> Option<&str> {
+    // Links look like `pg_data/pg_tblspc/16395`; split on the `pg_tblspc/`
+    // marker and take the trailing component (the OID directory name).
+    link.path.rsplit_once("pg_tblspc/").map(|(_, oid)| oid)
+}
+
+/// Resolve where a tablespace's `pg_tblspc/<oid>` symlink should point on restore.
+///
+/// Precedence mirrors pgBackRest: an explicit `--tablespace-map=<oid>=<path>`
+/// entry wins; otherwise `--tablespace-map-all=<prefix>` puts the tablespace
+/// under `<prefix>/<tablespace-name>` (the name is the final component of the
+/// link's recorded destination); otherwise the manifest's recorded destination
+/// is used unchanged. Links that are not tablespace links keep their recorded
+/// destination.
+fn resolve_tablespace_target(link: &ManifestLink, map: &BTreeMap<String, String>, map_all: Option<&str>) -> PathBuf {
+    let Some(oid) = tablespace_oid(link) else {
+        // Not a tablespace link: never remapped.
+        return PathBuf::from(&link.destination);
+    };
+
+    // 1. Explicit per-tablespace mapping wins.
+    if let Some(path) = map.get(oid) {
+        return PathBuf::from(path);
+    }
+
+    // 2. `--tablespace-map-all` prefix + the tablespace name (last component of
+    //    the recorded destination).
+    if let Some(prefix) = map_all {
+        let name = Path::new(&link.destination)
+            .file_name()
+            .map_or_else(|| oid.to_owned(), |n| n.to_string_lossy().into_owned());
+        return Path::new(prefix).join(name);
+    }
+
+    // 3. Fall back to the manifest's recorded destination.
+    PathBuf::from(&link.destination)
+}
+
+/// Whether a manifest file belongs to a database that should be restored, given
+/// the resolved `--db-include` / `--db-exclude` lists.
+///
+/// A database's files live under `base/<oid>/…` (default tablespace) and under
+/// `pg_tblspc/<ts>/PG_*/<oid>/…` (a non-default tablespace). The numeric `<oid>`
+/// segment is extracted from such paths:
+///
+/// - When `include` is non-empty, only files whose oid is in `include` are kept.
+/// - When `exclude` is non-empty, files whose oid is in `exclude` are dropped.
+/// - Files that are NOT under a database directory (`global/`, `pg_wal/`,
+///   top-level config files, etc.) are ALWAYS restored.
+///
+/// This slice matches by the numeric oid path segment. Matching a database by
+/// NAME (mapping the name to its oid via the manifest's `db` section) is a
+/// future refinement.
+fn database_included(file_path: &str, include: &[String], exclude: &[String]) -> bool {
+    let Some(oid) = database_oid(file_path) else {
+        // Not a per-database file: always restored regardless of the filters.
+        return true;
+    };
+
+    if !include.is_empty() {
+        return include.iter().any(|name| name == oid);
+    }
+    if !exclude.is_empty() {
+        return !exclude.iter().any(|name| name == oid);
+    }
+    // Neither filter set: everything is included.
+    true
+}
+
+/// Extract the database oid segment from a manifest file path, if it is a
+/// per-database file. Recognises `base/<oid>/…` and the tablespace equivalent
+/// `pg_tblspc/<ts>/PG_*/<oid>/…`. A leading prefix such as `pg_data/` is
+/// tolerated. Returns `None` for files that are not under a database directory.
+fn database_oid(file_path: &str) -> Option<&str> {
+    let segments: Vec<&str> = file_path.split('/').collect();
+
+    for (i, seg) in segments.iter().enumerate() {
+        match *seg {
+            // `base/<oid>/…` — the oid is the component right after `base`, and
+            // there must be at least one more component (the relation file).
+            "base" => {
+                if let Some(oid) = segments.get(i + 1)
+                    && segments.len() > i + 2
+                    && is_numeric(oid)
+                {
+                    return Some(oid);
+                }
+            }
+            // `pg_tblspc/<ts>/PG_<ver>_<cat>/<oid>/…` — the oid is two
+            // components after the `PG_*` version directory.
+            _ if seg.starts_with("PG_") => {
+                if let Some(oid) = segments.get(i + 1)
+                    && segments.len() > i + 2
+                    && is_numeric(oid)
+                {
+                    return Some(oid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Whether every character of `s` is an ASCII digit (and `s` is non-empty) — a
+/// `PostgreSQL` oid directory name.
+fn is_numeric(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Resolve the single backup to restore, returning its label and its
 /// `[backup:current]` metadata entry.
 ///
@@ -522,6 +690,21 @@ fn copy_file(
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
     let delta = delta_enabled(config);
+
+    // Selective-restore filters. `--db-include` and `--db-exclude` are mutually
+    // exclusive: a database cannot be both kept-only and dropped.
+    let db_include = db_list(config, "db-include");
+    let db_exclude = db_list(config, "db-exclude");
+    if !db_include.is_empty() && !db_exclude.is_empty() {
+        return Err(CommandError::Other(
+            "db-include and db-exclude are mutually exclusive".to_owned(),
+        ));
+    }
+
+    // Tablespace remapping inputs (used in the symlink-creation pass).
+    let ts_map = tablespace_map(config);
+    let ts_map_all = tablespace_map_all(config);
+
     let (label, metadata, info) = select_backup(config, repo, stanza)?;
 
     // The transform the restored backup applied — read from the recorded
@@ -550,6 +733,12 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     let mut files_skipped = 0;
     for file in &manifest.files {
         let dst = PathBuf::from(&file.path);
+
+        // Selective restore: drop files belonging to a database the
+        // include/exclude filters exclude. Non-database files always pass.
+        if !database_included(&file.path, &db_include, &db_exclude) {
+            continue;
+        }
 
         if delta && target_matches(pg, &dst, file) {
             files_skipped += 1;
@@ -606,7 +795,11 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         {
             pg.create_path(parent, true)?;
         }
-        match pg.create_symlink(&link_path, Path::new(&link.destination)) {
+        // Tablespace links (`pg_tblspc/<oid>`) may be redirected by
+        // `--tablespace-map` / `--tablespace-map-all`; other links keep their
+        // recorded destination.
+        let target = resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref());
+        match pg.create_symlink(&link_path, &target) {
             Ok(()) => links_created += 1,
             Err(_) => skipped_links += 1,
         }
@@ -2043,5 +2236,269 @@ mod tests {
             };
             assert_eq!(restored.as_slice(), expected, "incr restore mismatch for {rel}");
         }
+    }
+
+    // ---- tablespace remapping ----------------------------------------------
+
+    /// A tablespace link `pg_data/pg_tblspc/<oid>` with the given recorded
+    /// destination.
+    fn ts_link(oid: &str, destination: &str) -> ManifestLink {
+        ManifestLink {
+            path: format!("pg_data/pg_tblspc/{oid}"),
+            destination: destination.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tablespace_explicit_map_wins() {
+        // An explicit --tablespace-map entry for the oid wins over both
+        // --tablespace-map-all and the recorded destination.
+        let link = ts_link("16395", "/original/ts_loc");
+        let mut map = BTreeMap::new();
+        map.insert("16395".to_owned(), "/explicit/here".to_owned());
+
+        let target = super::resolve_tablespace_target(&link, &map, Some("/all/prefix"));
+        assert_eq!(target, Path::new("/explicit/here"));
+    }
+
+    #[test]
+    fn tablespace_map_all_prefix() {
+        // With no explicit entry, --tablespace-map-all puts the tablespace under
+        // <prefix>/<tablespace-name>, where the name is the last component of
+        // the recorded destination.
+        let link = ts_link("16395", "/original/ts_loc");
+        let map = BTreeMap::new();
+
+        let target = super::resolve_tablespace_target(&link, &map, Some("/all/prefix"));
+        assert_eq!(target, Path::new("/all/prefix/ts_loc"));
+    }
+
+    #[test]
+    fn tablespace_falls_back_to_manifest_target() {
+        // No map and no map-all: the recorded destination is used unchanged.
+        let link = ts_link("16395", "/original/ts_loc");
+        let map = BTreeMap::new();
+
+        let target = super::resolve_tablespace_target(&link, &map, None);
+        assert_eq!(target, Path::new("/original/ts_loc"));
+
+        // A non-tablespace link is never remapped, even when a map-all is set.
+        let other = ManifestLink {
+            path: "pg_data/pg_wal".to_owned(),
+            destination: "/var/lib/pg_wal".to_owned(),
+        };
+        let remapped = super::resolve_tablespace_target(&other, &map, Some("/all/prefix"));
+        assert_eq!(
+            remapped,
+            Path::new("/var/lib/pg_wal"),
+            "non-tablespace links must not be remapped"
+        );
+    }
+
+    #[test]
+    fn restore_remaps_tablespace_symlink() {
+        // End-to-end: a manifest with a pg_tblspc/<oid> link and a
+        // --tablespace-map entry re-creates the symlink at the mapped path.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let new_loc = pg.path().join("remapped_ts");
+        let new_loc_str = new_loc.to_string_lossy().into_owned();
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["pg_data", "pg_data/pg_tblspc"],
+            &[("pg_data/pg_tblspc/16395", "/original/ts_loc")],
+        );
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![(
+                ("tablespace-map", None),
+                OptionValue::Hash({
+                    let mut m = BTreeMap::new();
+                    m.insert("16395".to_owned(), new_loc_str.clone());
+                    m
+                }),
+            )],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1);
+
+        let read = std::fs::read_link(pg.path().join("pg_data/pg_tblspc/16395")).expect("read_link");
+        assert_eq!(read, Path::new(&new_loc_str), "symlink must point at the mapped destination");
+    }
+
+    // ---- selective database restore ----------------------------------------
+
+    #[test]
+    fn database_included_keeps_only_included_oid() {
+        let include = vec!["16384".to_owned()];
+        let exclude: Vec<String> = Vec::new();
+
+        // Included oid kept; other db dropped.
+        assert!(super::database_included("base/16384/1259", &include, &exclude));
+        assert!(!super::database_included("base/1/1259", &include, &exclude));
+        // Tablespace-resident db file is matched by oid too.
+        assert!(super::database_included(
+            "pg_tblspc/16400/PG_16_202307071/16384/2619",
+            &include,
+            &exclude
+        ));
+        assert!(!super::database_included(
+            "pg_tblspc/16400/PG_16_202307071/1/2619",
+            &include,
+            &exclude
+        ));
+        // Non-database files are always kept.
+        assert!(super::database_included("global/pg_control", &include, &exclude));
+        assert!(super::database_included("PG_VERSION", &include, &exclude));
+        assert!(super::database_included(
+            "pg_wal/000000010000000000000001",
+            &include,
+            &exclude
+        ));
+    }
+
+    #[test]
+    fn database_included_drops_excluded_oid() {
+        let include: Vec<String> = Vec::new();
+        let exclude = vec!["1".to_owned()];
+
+        // Excluded oid dropped; everything else kept.
+        assert!(!super::database_included("base/1/1259", &include, &exclude));
+        assert!(super::database_included("base/16384/1259", &include, &exclude));
+        // Tablespace-resident excluded db dropped.
+        assert!(!super::database_included(
+            "pg_tblspc/16400/PG_16_202307071/1/2619",
+            &include,
+            &exclude
+        ));
+        // Non-database files always kept.
+        assert!(super::database_included("global/pg_control", &include, &exclude));
+    }
+
+    #[test]
+    fn database_included_no_filters_keeps_everything() {
+        let none: Vec<String> = Vec::new();
+        assert!(super::database_included("base/1/1259", &none, &none));
+        assert!(super::database_included("base/16384/1259", &none, &none));
+        assert!(super::database_included("global/pg_control", &none, &none));
+    }
+
+    #[test]
+    fn database_included_both_set_is_rejected_upstream() {
+        // The predicate itself never sees both lists set — restore_inner errors
+        // first. Prove restore_inner rejects the combination.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["pg_data"], &[]);
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![
+                (("db-include", None), OptionValue::List(vec!["16384".to_owned()])),
+                (("db-exclude", None), OptionValue::List(vec!["1".to_owned()])),
+            ],
+        );
+        let err = restore_inner(&cfg, &repo_s, &pg_s).expect_err("both filters must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("mutually exclusive"), "unexpected message: {msg}"),
+            other => panic!("expected Other(mutually exclusive), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_with_db_include_skips_other_databases() {
+        // End-to-end-ish: files under base/1/, base/16384/, and
+        // global/pg_control. --db-include=16384 restores base/16384 + global
+        // but not base/1.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let db1 = b"database 1 relation data".as_slice();
+        let db_keep = b"database 16384 relation data".as_slice();
+        let control = b"global control file bytes".as_slice();
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[
+                ("base/1/1259", db1, Some(sha1_hex(db1))),
+                ("base/16384/1259", db_keep, Some(sha1_hex(db_keep))),
+                ("global/pg_control", control, Some(sha1_hex(control))),
+            ],
+            &["base", "base/1", "base/16384", "global"],
+            &[],
+        );
+
+        let cfg = restore_cfg(
+            stanza,
+            vec![(("db-include", None), OptionValue::List(vec!["16384".to_owned()]))],
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        // base/16384 + global restored; base/1 skipped.
+        assert_eq!(outcome.files_restored, 2, "only the included db + global restore");
+
+        assert!(
+            pg_s.exists(Path::new("base/16384/1259")).unwrap(),
+            "included database must be restored"
+        );
+        assert!(
+            pg_s.exists(Path::new("global/pg_control")).unwrap(),
+            "non-database file must always be restored"
+        );
+        assert!(
+            !pg_s.exists(Path::new("base/1/1259")).unwrap(),
+            "excluded database must not be restored"
+        );
+    }
+
+    #[test]
+    fn restore_with_db_exclude_skips_excluded_database() {
+        // The mirror of the include test: --db-exclude=1 restores everything
+        // except base/1.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let db1 = b"database 1 relation data".as_slice();
+        let db_keep = b"database 16384 relation data".as_slice();
+        let control = b"global control file bytes".as_slice();
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[
+                ("base/1/1259", db1, Some(sha1_hex(db1))),
+                ("base/16384/1259", db_keep, Some(sha1_hex(db_keep))),
+                ("global/pg_control", control, Some(sha1_hex(control))),
+            ],
+            &["base", "base/1", "base/16384", "global"],
+            &[],
+        );
+
+        let cfg = restore_cfg(stanza, vec![(("db-exclude", None), OptionValue::List(vec!["1".to_owned()]))]);
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.files_restored, 2, "all but the excluded db restore");
+
+        assert!(pg_s.exists(Path::new("base/16384/1259")).unwrap());
+        assert!(pg_s.exists(Path::new("global/pg_control")).unwrap());
+        assert!(
+            !pg_s.exists(Path::new("base/1/1259")).unwrap(),
+            "excluded database must not be restored"
+        );
     }
 }
