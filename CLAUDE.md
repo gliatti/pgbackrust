@@ -4,198 +4,92 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-pgBackRest is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) is **rewriting the codebase entirely in Rust** under `crates/`. PRs target `eol`.
+pgBackRest is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `eol`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
 
-The previous plan — 215 phased issues, each porting one `.c` file behind an FFI shim with C-Rust differential tests — was retired in May 2026 after ~50 phases. The FFI bookkeeping cost (cbindgen glue, double type definitions, shims, differential tests, Cargo↔Meson plumbing) outweighed the benefit, and pgBackRest having no upstream changes to absorb removed the main reason to keep the C tree alive during the migration. The new plan is a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
+The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrest` binary (from `crates/pgbr-cli`). There is no C left to build.
 
-### Migration approach (read this before writing code)
+What remains before the migration is fully "done":
 
-- **The C tree under `src/` is the reference being ported, not a long-term coexistence target.** It is being deleted.
-- New code goes into `crates/` as idiomatic Rust. Do not write new C, do not extend the FFI shim layer, do not add new `#[no_mangle] extern "C"` exports unless they replace something already on the FFI boundary.
-- Replace memory contexts / `OBJ_NEW_BEGIN` ceremony / `FUNCTION_LOG_*` boilerplate with the Rust equivalents (`Result`, `Drop`, lifetimes, `tracing` or plain `log`, `#[cfg(test)] mod tests`). The C conventions documented below describe the source being read, not a style to imitate in Rust.
-- The `pgbackrest/test/test.pl` Perl harness is kept as the integration-test driver; per-module unit tests migrate from `test/src/module/<path>Test.c` into `#[cfg(test)] mod tests` inside the owning crate.
-- `src/build/` (the C code generator that emits `config.auto.*`, `parse.auto.c.inc`, `help.auto.*`, error tables, PG interface tables) **stays alive** until `src/` is removed — it keeps producing the C-side auto files for the C build during the transition, no port needed. `crates/pgbr-build` is a separate, parallel Rust library that parses the same input files (`src/build/{config/config.yaml, error/error.yaml, help/help.xml, postgres/postgres.yaml}`) into typed Rust structs consumed by `pgbr-config`, `pgbr-postgres`, etc. Once `src/` is gone, the C generator and the auto files go with it; `pgbr-build` is what remains.
-- End state: `src/`, `meson.build`, `meson_options.txt`, `cbindgen.toml`, and `crates/pgbr-ffi` are removed.
+- **`test/` + `test.pl`** — the Perl integration-test harness and the orphaned C unit tests under `test/src/module/` are C-era and still need to be retired / rewired to drive the Rust binary. This is the last big piece.
+- Assorted docs (`CODING.md`, `CONTRIBUTING.md`, `README.md`, `doc/`) still describe the C project and have not been rewritten.
 
 ## Docker dev environment (REQUIRED — Rust is not installed locally)
 
-All Rust compilation, `cargo` commands, the Meson C build, and `pgbackrest/test/test.pl` runs go through the `pgbackrust-dev` Docker image defined in `Dockerfile.dev` and orchestrated by `docker-compose.yml`. **Do not install Rust on the host.**
+All `cargo` commands run through the `pgbackrust-dev` Docker image defined in `Dockerfile.dev` and orchestrated by `docker-compose.yml`. **Do not install Rust on the host.**
 
 Pinned versions (refresh deliberately, not silently):
 
 - Debian 13 trixie (13.4)
 - Rust 1.95.0 stable (rustup, components: rustfmt, clippy)
-- cbindgen 0.29.2
-- Meson 1.11.x (apt) + ninja
-- libpq from Debian (PostgreSQL 18 client)
+- Native libs linked by crates: libpq (pgbr-db), libssh2 (pgbr-storage sftp), zlib/bz2/lz4/zstd (pgbr-compress)
 
 Common invocations (all from repo root):
 
 ```
-docker compose build dev                                     # build the image (first time only)
-docker compose run --rm cargo check --workspace              # quick type-check
-docker compose run --rm cargo test --workspace               # run Rust tests
-docker compose run --rm cargo fmt --check                    # rustfmt verify
-docker compose run --rm cargo clippy --workspace -- -D warnings
-docker compose run --rm cargo run -p pgbr-naming             # run a specific crate binary
-docker compose run --rm meson setup build                    # configure the C build
-docker compose run --rm meson compile -C build               # build the C target
-docker compose run --rm test-pl --gen-check                  # regenerate-check the auto files
-docker compose run --rm test-pl --code-format-check          # uncrustify check
+docker compose build dev                                          # build the image (first time only)
+docker compose run --rm cargo check --workspace                   # quick type-check
+docker compose run --rm cargo test --workspace                    # run all tests
+docker compose run --rm cargo fmt --check                         # rustfmt verify
+docker compose run --rm cargo clippy --workspace --all-targets -- -D warnings
+docker compose run --rm cargo run -p pgbr-cli -- info             # run the pgbackrest binary
 ```
 
-The first build of the image takes a few minutes. Cargo registry, git cache and `target/` live in named volumes (`cargo-registry`, `cargo-git`, `rust-target`) so subsequent `cargo` runs are fast. To wipe them: `docker compose down -v`.
+The first build of the image takes a few minutes. Cargo registry, git cache and `target/` live in named volumes (`cargo-registry`, `cargo-git`, `rust-target`) so subsequent `cargo` runs are fast. To wipe them: `docker compose down -v`. The `dev` service stays up (`sleep infinity`) so you can `docker compose exec dev bash` for an interactive shell.
 
-The `dev` service stays up (`sleep infinity`) so you can `docker compose exec dev bash` for an interactive shell.
+## The gate (run before every commit)
 
-## Rust workspace (target build)
+```
+docker compose run --rm dev cargo fmt --check
+docker compose run --rm dev cargo clippy --workspace --all-targets -- -D warnings
+docker compose run --rm dev cargo test --workspace
+```
 
-The migration target is `cargo build --workspace --release`, which produces the `pgbackrest` binary from the crates under `crates/`.
+**Use `--all-targets`** — without it clippy skips `#[cfg(test)]` code and test-only lint regressions slip through. The workspace lints (`[workspace.lints]` in the root `Cargo.toml`) deny `clippy::all` and warn `pedantic` + `nursery`, all hardened to errors by `-D warnings`. `unwrap_used` / `expect_used` / `panic` are warned in production code; every crate root carries `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]` so tests may use those idioms freely. Config lives in `rustfmt.toml` and `clippy.toml`.
 
-Existing crates (canonical Rust implementations):
+## Rust workspace
+
+`cargo build --workspace --release` builds everything; the `pgbackrest` binary comes from `crates/pgbr-cli`. Crates:
 
 - `pgbr-core` — string, blob, memory primitives, log formatting, debug, stack trace, object base
-- `pgbr-error` — error types, format, retry, panic/THROW bridge
-- `pgbr-compress` — gz / bz2 / lz4 / zst compress + decompress filters
-- `pgbr-crypto` — xxhash and other crypto primitives
+- `pgbr-error` — typed `Error` / `ErrorType` (generated from `error.yaml` by `build.rs`), format, retry
 - `pgbr-encode` — hex / base64 encoders
+- `pgbr-crypto` — xxhash
+- `pgbr-compress` — gz / bz2 / lz4 / zst compress + decompress, exposed as `pgbr_io::Filter` adapters (`filter` module)
 - `pgbr-regex` — regex wrapper
-- `pgbr-postgres` — PostgreSQL version-aware interface (in progress; CRC-32C only at present)
-- `pgbr-build` — typed parsers for `src/build/{config/config.yaml, error/error.yaml, help/help.xml, postgres/postgres.yaml}`. Lives in parallel with the C generator at `src/build/`; the latter keeps emitting `*.auto.{h,c.inc}` for the C build until `src/` is removed
-- `pgbr-config` — full configuration loading pipeline. Modules: `types` (`OptionType`, `ConfigCommandRole`, `LockType`, `OptionGroup`, `OptionSection`, `DefaultType`), `command` (`CfgCommand`), `option` (`CfgOption`, `ResolvedCommandUsage`, `ResolvedDepend`), `compile` (`Cfg`, `compile()` lowering with inheritance + `+role`/`+inherit`/`-command` shortcut expansion + topological-sort cycle detection), `value` (`OptionValue`, `parse_value()` for boolean/integer/size/time/path/string/list/hash), `cli` (`parse_cli` argv tokenizer + `resolve_cli` Cfg-aware resolution), `ini` (`parse_ini` for `pgbackrest.conf`), `merge` (`load_config` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range/depend validation)
-- `pgbr-io` — I/O traits (`IoRead`, `IoWrite`), in-memory implementations (`MemRead`, `MemWrite`), file-backed `FileRead`/`FileWrite`, and `FilterChain` for byte-stream transforms. Production filters live in their crates (`pgbr-compress`, `pgbr-crypto`, …) and plug in via the `Filter` trait
-- `pgbr-storage` — `Storage` trait + `Posix` backend backed by `std::fs`. Other backends (s3/azure/gcs/cifs/sftp) deferred
-- `pgbr-db` — safe libpq wrapper: `Connection::{open, execute, query}`, `QueryResult`, `Drop` impls calling `PQfinish`/`PQclear`. `Connection` is `!Send`
-- `pgbr-protocol` — JSON-line message types (`Request`, `Response { Ok | Err }`) + codec (`read_message`/`write_message`) over `pgbr_io::IoRead`/`IoWrite`. Transport, parallel dispatcher, and helpers deferred
-- `pgbr-postgres` — `crc32c_one` + `version` registry of supported PG major-version metadata (`CATALOG_VERSION_NO`, `PG_CONTROL_VERSION`, `XLOG_BLCKSZ`, `BLCKSZ` for PG 9.6 .. 18) with `by_label` / `by_catalog_version_no` lookups. Per-version on-disk struct layouts (`ControlFileData`, page header) deferred
-- `pgbr-ffi` — transitional C↔Rust glue, scheduled for removal once `src/` is gone
-
-Planned crates (created when their porting work starts, to keep the workspace honest about what exists):
-
-- `pgbr-info` — on-disk info files (archive.info, backup.info, manifest, infoPg)
-- `pgbr-command` — per-command implementations (`backup`, `restore`, `archive/get`, `archive/push`, `expire`, `verify`, `info`, `stanza/*`, `repo/*`, `check`, `annotate`, `manifest`, `control/*`, `server/*`)
-- `pgbr-naming` — naming-helpers crate (only re-create if the port actually needs a separate crate)
-
-## C build (transitional — being removed)
-
-The current `pgbackrest` binary is still built by **Meson** (see `meson.build`, `meson_options.txt`) while subsystems are being ported. Native dependencies: libssl (>=1.1.1), libpq, libxml-2.0, liblz4, libyaml, libbz2, zlib; libssh2 and libzstd are optional. C99, warning_level=2.
-
-```
-meson setup build
-meson compile -C build
-```
-
-A separate `src/build/` C target is a **code generator** that emits auto files (`config.auto.h`, `parse.auto.c.inc`, `help.auto.c.inc`, error / postgres interface files) consumed by the main build. Auto files are checked in but regenerated by:
-
-```
-pgbackrest/test/test.pl --gen-only
-```
-
-Both `meson.build` and `src/build/` are scheduled for deletion once `crates/pgbr-build` produces the same auto files and the Cargo build is the canonical one.
-
-## Test harness (Perl-driven)
-
-All testing — unit tests, code formatting, code generation, coverage, integration — flows through `test/test.pl`. There is **no separate `make test`**.
-
-Common invocations:
-
-```
-pgbackrest/test/test.pl --dry-run                        # list available tests
-pgbackrest/test/test.pl --module=common --test=wait      # run a single test
-pgbackrest/test/test.pl --module=postgres                # run all tests in a module
-pgbackrest/test/test.pl --module=common --test=wait --run=2  # run a single sub-run
-pgbackrest/test/test.pl --module=command --test=check --vm=u22       # run inside a Docker VM
-pgbackrest/test/test.pl --vm-build --vm=u22              # build the test container
-pgbackrest/test/test.pl --build-only                     # build the binary, no tests
-pgbackrest/test/test.pl --code-format                    # apply uncrustify (CAN OVERWRITE FILES)
-pgbackrest/test/test.pl --code-format-check              # check formatting only
-pgbackrest/test/test.pl --gen-only                       # regenerate auto files
-pgbackrest/test/test.pl --gen-check                      # CI: verify auto files are up to date
-```
-
-Useful flags: `--vm-out` (stream output), `--no-cleanup` (preserve `test/test-0` for debugging — only with `--run`), `--no-valgrind`, `--no-coverage`, `--no-optimize`. Coverage report lands at `test/result/coverage.html`. Each file listed under `coverage:` in `test/define.yaml` must reach 100% coverage or the harness errors with `[125] is not fully covered`.
-
-`test/define.yaml` is the source of truth for what tests exist, how many `testBegin()` runs each test file has, and which source files each test must cover. **Edit it whenever you add/remove a `testBegin()` block or a new test file.**
-
-## Documentation build
-
-```
-pgbackrest/doc/doc.pl --out=html              # full build (Docker for live examples)
-pgbackrest/doc/doc.pl --out=html --no-exe     # skip executing code elements (fast preview)
-```
-
-Output: `doc/output/html/`. The `[028]` cache-invalid error during regeneration is benign.
+- `pgbr-build` — typed parsers for the four pgBackRest definition files, which are embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files themselves live in `crates/pgbr-build/inputs/`
+- `pgbr-config` — full configuration pipeline: `types`, `command` (`CfgCommand`), `option` (`CfgOption`), `compile` (`Cfg`, inheritance + `+role`/`+inherit`/`-command` expansion), `value` (`OptionValue`, `parse_value`), `cli` (`parse_cli` + `resolve_cli`), `ini` (`parse_ini`), `merge` (`load_config` / `load_config_with_context` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range/depend validation + dynamic & per-flavor defaults)
+- `pgbr-io` — `IoRead`/`IoWrite` traits (with `Box<dyn>`/`&mut` blanket impls + `copy`), `MemRead`/`MemWrite`, `FileRead`/`FileWrite`, `FilterChain`, and the `filter` module (`Sha1`, `Sha256`, `Size`, `Cipher` AES-256-CBC)
+- `pgbr-storage` — `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2)
+- `pgbr-db` — safe libpq wrapper (`Connection`, `QueryResult`); `Connection` is `!Send`
+- `pgbr-protocol` — JSON-line `Request` / `Response` message types + `read_message`/`write_message` codec
+- `pgbr-postgres` — `crc32c_one`, `version` registry (PG 9.6 .. 18), `control` (`pg_control` header + per-version field offsets), `page` (`pg_checksum_page`)
+- `pgbr-info` — on-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 `format`
+- `pgbr-command` — every command + the `dispatch` entry: backup (full/diff/incr), restore (+ delta + reference resolution), archive-push/get, expire (backup + WAL retention), verify, check, info, stanza-create/delete/upgrade, repo-ls/get/put/rm, annotate, manifest, start/stop, server/server-ping (TCP + TLS), help, version; plus the shared `pipeline::RepoTransform` (compress + encrypt)
+- `pgbr-cli` — the `pgbackrest` binary: parse argv → load `config.yaml` + `pgbackrest.conf` → resolve → `pgbr_command::dispatch`
 
 ## Adding a configuration option
 
-Two files are edited by hand; everything else is regenerated.
+Two hand-written files under `crates/pgbr-build/inputs/`:
 
-1. `src/build/config/config.yaml` — defines the option (type, commands, command-roles, group, defaults, allow-list, secrets). Sections: command-line-only options omit `section:`; configuration-file options set `section: global` or `stanza`. Group options like `repo` index to `repo1-foo`, `repo2-foo`, etc. Enum constants are derived: `repo-path` → `cfgOptRepoPath`.
-2. `src/build/help/help.xml` — required `<option>` entry with `<summary>` (must end with a period), `<text>`, `<example>`. Missing help blocks the build.
+1. `config.yaml` — defines the option (type, commands, command-roles, group, defaults, allow-list, secrets). Command-line-only options omit `section:`; config-file options set `section: global` or `stanza`. Group options like `repo` index to `repo1-foo`, `repo2-foo`, etc.
+2. `help.xml` — an `<option>` entry with `<summary>` (ending in a period), `<text>`, `<example>`.
 
-Then `test.pl --gen-only` regenerates `config.auto.h` and `parse.auto.c.inc`, and `--module=command --test=help` validates the help output.
+These are embedded into `pgbr-build` at compile time, so a plain `cargo build` picks up the change. `pgbr-config` (option model) and the `help` command consume them automatically; add tests in `pgbr-config` for new resolution behavior.
 
-## C code architecture (reference for what's being ported)
+## Testing
 
-The C code under `src/` is what the rewrite is porting **from** — the conventions below describe how to read that code, not a style to imitate in Rust. The Rust port uses idiomatic Rust (Result, Drop, lifetimes, no manual memory contexts).
+`cargo test --workspace` runs all unit + integration tests. Per-module tests live in `#[cfg(test)] mod tests` inside the owning crate (migrated from the old `test/src/module/*Test.c`). Cloud-backend and DB round-trip tests that need a live endpoint are `#[ignore]`d and gated on env vars (`PGBR_S3_*`, `PGBR_AZURE_*`, `PGBR_GCS_*`, `PGBR_SFTP_*`, `DATABASE_URL`).
 
-The C codebase is C99, written in an **object-oriented style** with explicit memory contexts. Public structs are exposed via a `Pub` suffix and inline `THIS_PUB(Type)` getters. Constructors are `xxxNew()`, destructors `xxxFree()`. The object pointer is always called `this`.
-
-### Top-level layout (`src/`)
-
-- `main.c` — entry point. Wires up storage helpers (Azure/CIFS/GCS/S3, optional SFTP), error handlers, then dispatches to a command implementation based on parsed config.
-- `command/` — one subdirectory per user command (`backup`, `restore`, `archive/get`, `archive/push`, `expire`, `verify`, `info`, `stanza/*`, `repo/*`, `check`, `annotate`, `manifest`, `control/*`, `server/*`, plus the protocol-internal `local/` and `remote/`). Each is its own object with a `cmdXxx()` entry called from `main.c`.
-- `common/` — foundational utilities: memory contexts (`memContext.h`), error/exception (`error/`), debug/log (`debug.h`, `log.h`), I/O filter chain (`io/`), encoding, regex, types (`type/string.h`, `keyValue`, `pack`, `variant`, `stringId`, etc.), crypto, compression filters.
-- `config/` — option parsing and configuration model. `config.auto.h` and `parse.auto.c.inc` are generated from `src/build/config/config.yaml`.
-- `info/` — on-disk info files (archive.info, backup.info, manifest, infoPg). These describe the repository state.
-- `protocol/` — local/remote process protocol and parallel job dispatch (`parallel.c`, `client.c`, `server.c`). Used by the `local`/`remote` commands and by parallel WAL push/get and backup/restore.
-- `storage/` — pluggable storage backends behind a common `Storage` interface: `posix/`, `s3/`, `azure/`, `gcs/`, `cifs/`, `sftp/`. Each has a `*Helper` registered in `main.c`'s `storageHelperList`.
-- `db/` — PostgreSQL client wrapper around libpq, plus a protocol layer so a remote process can answer DB questions on behalf of the main process.
-- `postgres/` — version-aware Postgres interface. `postgres/version.auto.h` and `postgres/interface/*` define per-version structs (control file, page header, tablespace map, etc.) for the ten supported PG versions.
-- `build/` — separate C executable that runs at build time to generate auto files from yaml/xml inputs. Has its own `main.c`, parses `config.yaml`, `help.xml`, error definitions, and PG interface metadata, and renders them to `*.auto.h` / `*.auto.c.inc` / `parse.auto.c.inc`. The build code reuses `common/` from the main tree.
-
-### Memory contexts (critical to understand)
-
-All allocation goes through a hierarchical memory context (`src/common/memContext.h`). Two patterns dominate:
-
-- `OBJ_NEW_BEGIN(MyObj) { *this = (MyObj){ ... }; } OBJ_NEW_END();` — long-lived object construction. Memory is owned by the object and freed when `objFree(this)` is called.
-- `MEM_CONTEXT_TEMP_BEGIN() { ... } MEM_CONTEXT_TEMP_END();` — function-scope scratch allocations, freed at block exit. To return a value to the caller, switch with `MEM_CONTEXT_PRIOR_BEGIN { result = strDup(...); } MEM_CONTEXT_PRIOR_END();` so the duplicate lives in the caller's context.
-
-Get this wrong and you either leak (allocating in the wrong context) or use-after-free (returning a pointer that gets freed at `MEM_CONTEXT_TEMP_END()`).
-
-### Function logging / debugging
-
-Every non-trivial function declares its parameters via `FUNCTION_LOG_BEGIN(level)` + `FUNCTION_LOG_PARAM(TYPE, name)` + `FUNCTION_LOG_END()` (production) or `FUNCTION_TEST_BEGIN()` + `FUNCTION_TEST_PARAM(...)` + `FUNCTION_TEST_END()` (compiled out of release). Use `FUNCTION_TEST_PARAM` for secrets even inside a `FUNCTION_LOG_*` block. Returns mirror this with `FUNCTION_LOG_RETURN(TYPE, value)` / `FUNCTION_TEST_RETURN(TYPE, value)`. Custom types provide `FUNCTION_LOG_<TYPE>_TYPE` and `FUNCTION_LOG_<TYPE>_FORMAT` macros and a `xxxToLog()` rendering function.
-
-`ASSERT(expr)` is development-only (compiled out in release). Use `CHECK(ErrorType, cond, "msg")` for runtime invariants that must hold in production.
-
-### Test code conventions
-
-Tests live under `test/src/module/<same path as src/>` with `Test.c` suffix (e.g. `src/command/expire/expire.c` → `test/src/module/command/expireTest.c`). Test runs are introduced by `if (testBegin("functionName()")) { ... }`; sub-tests by `TEST_TITLE("...")`. Setup/cleanup uses `HRN_*` macros (`HRN_CFG_LOAD`, `HRN_STORAGE_PUT`, `HRN_PQ_SCRIPT_*`, `HRN_FORK_*`); assertions use `TEST_*` macros (`TEST_RESULT_STR`, `TEST_RESULT_UINT`, `TEST_RESULT_VOID`, `TEST_ERROR`, `TEST_RESULT_LOG`). **Do not use `HRN_*` for assertions or `TEST_*` for setup.** Any log output produced by tested code must be consumed by `TEST_RESULT_LOG[_FMT]` before the test ends.
-
-The libpq shim (`test/src/common/harnessPq.h`) lets tests script PG client interactions without a live cluster. `harnessFork.h` enables parent/child coordination for testing locks and protocol code.
-
-## Coding standards
-
-For Rust code under `crates/` the gates are `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`. Configuration lives in `rustfmt.toml` and `clippy.toml`.
-
-For the remaining C code under `src/` (read-only reference + transitional fixes only), the rules below from `CODING.md` apply:
-
-- Indentation: 4 spaces, no tabs (except `Makefile`-class files).
-- Hard 132-char line limit. Wrap after the first `(` for function calls; after a complete sub-expression for conditionals.
-- Inline comments start at column 69.
-- Public function comments live in `.h`; static-function and implementation notes live in `.c`.
-- Naming: `camelCase` for variables / enum elements, `UpperCamelCase` for types, `ALL_CAPS_SNAKE` for `#define`s and macros, `xxxNew`/`xxxFree` (never Create/Destroy), `Begin`/`End` (never Start/Finish). Avoid loop variables named `i`, `j`.
-- Externed strings: `STRING_DECLARE` in the header, `STRING_EXTERN` in the C file, with the `#define`'d value padded to column 69.
-- Variadic functions are implemented via macros + a `<Func>Param` struct (e.g. `storagePathCreateP(...)`); macro names are exempt from the all-caps rule for these wrappers.
-- Errors / warnings: lowercase, no terminal punctuation. Hints: `HINT: ` prefix, sentence case, terminal punctuation.
-- `// {uncoverable - reason}` and `// {uncovered - reason}` annotate code that coverage cannot reach; subsequent lines use `// {+uncoverable}` / `// {+uncovered}`. Use sparingly outside `common/`.
-- Run `pgbackrest/test/test.pl --code-format` before committing — uncrustify config is `test/uncrustify.cfg`.
+The legacy `test/test.pl` Perl harness and the C unit tests under `test/src/` are **not wired into the Rust build** and are pending retirement/rewrite — do not rely on them.
 
 ## CI gating
 
-`.github/workflows/test.yml` is the canonical list of vm codes (e.g. `u22`, `rh8`) consumable by `--vm=`. C-side gates (`--gen-check`, `--code-format-check`) run in CI; PRs fail if auto files drift or C formatting violates `uncrustify.cfg`. Rust-side gates (`cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`) run alongside. Pull requests target the **`eol`** branch.
+`.github/workflows/test.yml` runs the Rust gate (fmt check, clippy `--all-targets -D warnings`, `cargo test --workspace`) on pushes/PRs to `eol` and on `**-ci` / `**-cig` branches. Pull requests target **`eol`**.
 
 ## Tip: branches ending in `-cig` push to GitHub Actions
 
-Renaming a branch to end in `-cig` and pushing it to your fork triggers the CI test matrix — useful for running the full suite without opening a PR.
+Renaming a branch to end in `-cig` (or `-ci`) and pushing it to your fork triggers the CI workflow — useful for running the gate without opening a PR.
+
+## History
+
+The C source this was ported from lived under `src/` (removed in the dismantling commits; recoverable from git history). The original plan was a 215-phase incremental port behind an FFI shim with C↔Rust differential tests; that was retired after ~50 phases in favour of a single big-bang rewrite (epic #238). If you need to consult the original C for behavioural reference, check out a pre-dismantling commit or pgBackRest 2.58.0 upstream.
