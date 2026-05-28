@@ -33,7 +33,7 @@ use pgbr_compress::filter::{
 };
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::FilterChain;
-use pgbr_io::filter::Cipher;
+use pgbr_io::filter::{Cipher, CipherDigest, CipherMode};
 
 /// Compression codec applied to a repo file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,13 @@ pub struct RepoTransform {
     pub compress_level: i32,
     /// `Some(pass)` enables AES-256-CBC with that password; `None` means no
     /// encryption.
+    ///
+    /// Under the real two-level key scheme this is a resolved sub-key — the
+    /// repo sub-key (for WAL / manifest) or a per-backup sub-key (for backup
+    /// file data) — rather than the raw user passphrase. The cipher digest is
+    /// selected by which builder produced the chain (see
+    /// [`RepoTransform::forward_chain`] for the legacy MD5 path and
+    /// [`RepoTransform::forward_chain_keyed`] for the pgBackRest SHA-1 path).
     pub cipher_pass: Option<String>,
 }
 
@@ -171,6 +178,40 @@ impl RepoTransform {
             compress_level,
             cipher_pass,
         }
+    }
+
+    /// Build a key-managed transform for the real two-level encryption scheme.
+    ///
+    /// `cipher_pass` is a **resolved sub-key** — the repository sub-key (for WAL
+    /// archive / manifest files) or a per-backup sub-key (for a backup's file
+    /// data), as produced by [`pgbr_info::RepoKeys`]. Pair it with the keyed
+    /// chain builders ([`RepoTransform::forward_chain_keyed`] /
+    /// [`reverse_chain_keyed`](Self::reverse_chain_keyed)) so the cipher uses
+    /// pgBackRest's default SHA-1 KDF, making the repo bytes byte-compatible
+    /// with a pgBackRest C repository.
+    ///
+    /// `compress_type` / `compress_level` come from the resolved options; pass
+    /// `None` for `cipher_pass` to layer compression only.
+    #[must_use]
+    pub const fn with_key(compress_type: CompressType, compress_level: i32, cipher_pass: Option<String>) -> Self {
+        Self {
+            compress_type,
+            compress_level,
+            cipher_pass,
+        }
+    }
+
+    /// Take the compression settings resolved from `config` but override the
+    /// encryption key with `sub_key` (a resolved repo / backup sub-key).
+    /// `sub_key = None` disables encryption. Use with the keyed chain builders.
+    ///
+    /// This is the bridge backup / restore use: compression is read from the
+    /// command options while the cipher key comes from the resolved key chain
+    /// rather than the raw user passphrase.
+    #[must_use]
+    pub fn from_options_with_key(config: &LoadedConfig, sub_key: Option<String>) -> Self {
+        let base = Self::from_options(config);
+        Self::with_key(base.compress_type, base.compress_level, sub_key)
     }
 
     /// Reconstruct the transform from the values recorded in a backup's
@@ -228,12 +269,43 @@ impl RepoTransform {
         self.compress_type.suffix()
     }
 
-    /// Build the forward (backup-side) filter chain: compress **then** encrypt.
+    /// Build the forward (backup-side) filter chain: compress **then** encrypt,
+    /// using the legacy MD5 KDF (`openssl enc` default). Preserved byte-for-byte
+    /// for callers built the old way.
     ///
     /// An empty chain (no compression, no cipher) passes bytes through
     /// unchanged, preserving the raw-copy behaviour.
     #[must_use]
     pub fn forward_chain(&self) -> FilterChain {
+        self.forward_chain_with_digest(CipherDigest::Md5)
+    }
+
+    /// Build the reverse (restore-side) filter chain: decrypt **then**
+    /// decompress — the exact inverse of [`RepoTransform::forward_chain`]
+    /// (legacy MD5 KDF).
+    #[must_use]
+    pub fn reverse_chain(&self) -> FilterChain {
+        self.reverse_chain_with_digest(CipherDigest::Md5)
+    }
+
+    /// Build the forward chain for the real two-level key scheme: compress
+    /// **then** encrypt with pgBackRest's default **SHA-1** KDF. Pair this with
+    /// a [`cipher_pass`](Self::cipher_pass) that is a resolved sub-key (see
+    /// [`RepoTransform::with_key`]) so the repo bytes match a pgBackRest C
+    /// repository.
+    #[must_use]
+    pub fn forward_chain_keyed(&self) -> FilterChain {
+        self.forward_chain_with_digest(CipherDigest::Sha1)
+    }
+
+    /// Reverse of [`RepoTransform::forward_chain_keyed`] (SHA-1 KDF).
+    #[must_use]
+    pub fn reverse_chain_keyed(&self) -> FilterChain {
+        self.reverse_chain_with_digest(CipherDigest::Sha1)
+    }
+
+    /// Shared forward-chain builder parameterised by the KDF `digest`.
+    fn forward_chain_with_digest(&self, digest: CipherDigest) -> FilterChain {
         let mut chain = FilterChain::new();
         match self.compress_type {
             CompressType::None => {}
@@ -243,18 +315,16 @@ impl RepoTransform {
             CompressType::Zst => chain.push(ZstCompress::new(self.compress_level)),
         }
         if let Some(pass) = &self.cipher_pass {
-            chain.push(Cipher::encrypt(pass.as_bytes()));
+            chain.push(Cipher::new(CipherMode::Encrypt, digest, pass.as_bytes()));
         }
         chain
     }
 
-    /// Build the reverse (restore-side) filter chain: decrypt **then**
-    /// decompress — the exact inverse of [`RepoTransform::forward_chain`].
-    #[must_use]
-    pub fn reverse_chain(&self) -> FilterChain {
+    /// Shared reverse-chain builder parameterised by the KDF `digest`.
+    fn reverse_chain_with_digest(&self, digest: CipherDigest) -> FilterChain {
         let mut chain = FilterChain::new();
         if let Some(pass) = &self.cipher_pass {
-            chain.push(Cipher::decrypt(pass.as_bytes()));
+            chain.push(Cipher::new(CipherMode::Decrypt, digest, pass.as_bytes()));
         }
         match self.compress_type {
             CompressType::None => {}
@@ -267,7 +337,7 @@ impl RepoTransform {
     }
 
     /// Run `input` through this transform's [`forward_chain`](Self::forward_chain),
-    /// returning the repo-side bytes.
+    /// returning the repo-side bytes (legacy MD5 KDF).
     ///
     /// # Errors
     ///
@@ -277,13 +347,34 @@ impl RepoTransform {
     }
 
     /// Run `input` (repo-side bytes) through this transform's
-    /// [`reverse_chain`](Self::reverse_chain), returning the recovered plaintext.
+    /// [`reverse_chain`](Self::reverse_chain), returning the recovered plaintext
+    /// (legacy MD5 KDF).
     ///
     /// # Errors
     ///
     /// Propagates any [`pgbr_io::IoError`] raised by a filter in the chain.
     pub fn apply_reverse(&self, input: &[u8]) -> Result<Vec<u8>, pgbr_io::IoError> {
         run_chain(&mut self.reverse_chain(), input)
+    }
+
+    /// Run `input` through the key-managed forward chain
+    /// ([`forward_chain_keyed`](Self::forward_chain_keyed), SHA-1 KDF).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`pgbr_io::IoError`] raised by a filter in the chain.
+    pub fn apply_forward_keyed(&self, input: &[u8]) -> Result<Vec<u8>, pgbr_io::IoError> {
+        run_chain(&mut self.forward_chain_keyed(), input)
+    }
+
+    /// Run `input` through the key-managed reverse chain
+    /// ([`reverse_chain_keyed`](Self::reverse_chain_keyed), SHA-1 KDF).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`pgbr_io::IoError`] raised by a filter in the chain.
+    pub fn apply_reverse_keyed(&self, input: &[u8]) -> Result<Vec<u8>, pgbr_io::IoError> {
+        run_chain(&mut self.reverse_chain_keyed(), input)
     }
 }
 
@@ -500,6 +591,53 @@ mod tests {
         }
         // Unrecognised degrades to none.
         assert_eq!(CompressType::from_str_id("xz"), CompressType::None);
+    }
+
+    #[test]
+    fn keyed_chain_round_trips_with_sha1() {
+        let transform = RepoTransform::with_key(CompressType::Gz, 6, Some("aRepoSubKey==".to_owned()));
+        assert!(transform.is_encrypted());
+        assert_eq!(transform.repo_suffix(), ".gz");
+
+        let input = b"compress with gz, then encrypt under the resolved sub-key (SHA-1 KDF)";
+        let repo = transform.apply_forward_keyed(input).unwrap();
+        assert_ne!(repo, input);
+        let recovered = transform.apply_reverse_keyed(&repo).unwrap();
+        assert_eq!(recovered, input);
+    }
+
+    #[test]
+    fn keyed_and_legacy_chains_differ_in_bytes() {
+        // The same sub-key under SHA-1 (keyed) vs MD5 (legacy) must produce
+        // ciphertext that does NOT cross-decrypt — they use different KDFs.
+        let transform = RepoTransform::with_key(CompressType::None, 0, Some("k".to_owned()));
+        let keyed = transform.apply_forward_keyed(b"payload payload payload").unwrap();
+        // Reversing the keyed bytes with the legacy (MD5) chain must fail.
+        assert!(transform.apply_reverse(&keyed).is_err(), "MD5 must not decrypt SHA-1 bytes");
+        // But the keyed reverse recovers it.
+        assert_eq!(transform.apply_reverse_keyed(&keyed).unwrap(), b"payload payload payload");
+    }
+
+    #[test]
+    fn with_key_none_disables_encryption() {
+        let transform = RepoTransform::with_key(CompressType::None, 0, None);
+        assert!(!transform.is_encrypted());
+        let input = b"no key -> identity";
+        assert_eq!(transform.apply_forward_keyed(input).unwrap(), input);
+    }
+
+    #[test]
+    fn from_options_with_key_takes_compression_from_options() {
+        let cfg = cfg(vec![(("compress-type", None), OptionValue::StringId("zst".to_owned()))]);
+        let transform = RepoTransform::from_options_with_key(&cfg, Some("subkey".to_owned()));
+        assert_eq!(transform.compress_type, CompressType::Zst);
+        assert_eq!(transform.compress_level, 3, "zst default level from options");
+        assert_eq!(transform.cipher_pass.as_deref(), Some("subkey"));
+
+        let input = b"zstandard then sha1-keyed encryption, reversed cleanly cleanly cleanly";
+        let repo = transform.apply_forward_keyed(input).unwrap();
+        let recovered = transform.apply_reverse_keyed(&repo).unwrap();
+        assert_eq!(recovered, input);
     }
 
     #[test]

@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_db::Connection;
-use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup};
+use pgbr_info::{CipherType, DbHistoryEntry, InfoArchive, InfoBackup, cipher_pass_gen};
+use pgbr_io::IoRead;
 use pgbr_postgres::control::{PgControlHeader, decode_pg_control_header, header_version};
 use pgbr_postgres::version::by_catalog_version_no;
 use pgbr_storage::{Storage, StorageError};
@@ -72,6 +73,65 @@ fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
     config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })
+}
+
+/// The resolved repository cipher configuration for repo index 1.
+///
+/// `repo-cipher-type` is a `repo`-group `string-id`; `repo-cipher-pass` is the
+/// user passphrase (a secure string). The group index for the first (and only)
+/// repository is `1`, matching pgBackRest's default-first-index resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoCipherConfig {
+    cipher_type: CipherType,
+    /// The user passphrase (`repo-cipher-pass`); required when encrypted.
+    user_pass: Option<String>,
+}
+
+impl RepoCipherConfig {
+    /// Read the repository cipher configuration from the resolved options.
+    fn from_config(config: &LoadedConfig) -> Self {
+        let cipher_type = repo_string_id(config, "repo-cipher-type").map_or(CipherType::None, CipherType::from_str_id);
+        let user_pass = repo_string(config, "repo-cipher-pass")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Self { cipher_type, user_pass }
+    }
+
+    /// The passphrase under which info files are encrypted, or `None` when the
+    /// repository is unencrypted.
+    fn passphrase(&self) -> Option<&str> {
+        if self.cipher_type.is_encrypted() {
+            self.user_pass.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Validate that an encrypted repository has a passphrase configured.
+    fn require_passphrase(&self) -> Result<(), CommandError> {
+        if self.cipher_type.is_encrypted() && self.user_pass.as_deref().is_none_or(str::is_empty) {
+            return Err(CommandError::MissingOption {
+                option: "repo-cipher-pass".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Fetch a `repo`-group `StringId` option (index 1).
+fn repo_string_id<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(1))) {
+        Some(OptionValue::StringId(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Fetch a `repo`-group `String` option (index 1).
+fn repo_string<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(1))) {
+        Some(OptionValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
 }
 
 /// Read `global/pg_control` from the PG data directory and resolve its
@@ -286,8 +346,10 @@ pub fn create(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let stanza = require_stanza(config)?;
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
+    let cipher = RepoCipherConfig::from_config(config);
+    cipher.require_passphrase()?;
     let identity = resolve_cluster_identity(config, pg_storage)?;
-    create_with_identity(stanza, repo_storage, identity)?;
+    create_with_identity(stanza, repo_storage, identity, &cipher)?;
     Ok(())
 }
 
@@ -295,13 +357,22 @@ pub fn create(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
 #[cfg(test)]
 fn create_inner(stanza: &str, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<CreateOutcome, CommandError> {
     let identity = read_cluster_identity(pg_storage)?;
-    create_with_identity(stanza, repo_storage, identity)
+    create_with_identity(
+        stanza,
+        repo_storage,
+        identity,
+        &RepoCipherConfig {
+            cipher_type: CipherType::None,
+            user_pass: None,
+        },
+    )
 }
 
 fn create_with_identity(
     stanza: &str,
     repo_storage: &dyn Storage,
     identity: ClusterIdentity,
+    cipher: &RepoCipherConfig,
 ) -> Result<CreateOutcome, CommandError> {
     let archive_info_path = archive_info_path(stanza);
     let backup_info_path = backup_info_path(stanza);
@@ -319,6 +390,17 @@ fn create_with_identity(
             db_version: identity.version.clone(),
         },
     );
+
+    // For an encrypted repository, generate a fresh random sub-key per info
+    // file (archive + backup get *distinct* sub-keys, matching pgBackRest's
+    // two `cipherPassGen` calls in `cmdStanzaCreate`). The sub-key is stored in
+    // the file's [cipher] section and the whole file is then encrypted under
+    // the user passphrase.
+    let (archive_cipher_pass, backup_cipher_pass) = if cipher.cipher_type.is_encrypted() {
+        (Some(cipher_pass_gen()), Some(cipher_pass_gen()))
+    } else {
+        (None, None)
+    };
 
     let archive = InfoArchive {
         backrest_format: BACKREST_FORMAT,
@@ -344,17 +426,36 @@ fn create_with_identity(
     repo_storage.create_path(&PathBuf::from(format!("archive/{stanza}")), true)?;
     repo_storage.create_path(&PathBuf::from(format!("backup/{stanza}")), true)?;
 
+    let passphrase = cipher.passphrase();
     archive
-        .save(repo_storage, &archive_info_path)
+        .save_keyed(repo_storage, &archive_info_path, passphrase, archive_cipher_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
     backup
-        .save(repo_storage, &backup_info_path)
+        .save_keyed(repo_storage, &backup_info_path, passphrase, backup_cipher_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
 
     Ok(CreateOutcome {
         db_version: identity.version,
         db_system_id: header.system_identifier,
     })
+}
+
+/// `true` when the info file at `path` is encrypted, detected by pgBackRest's
+/// `"Salted__"` cipher header at the start of the file.
+fn info_file_is_encrypted(storage: &dyn Storage, path: &Path) -> Result<bool, CommandError> {
+    let mut reader = storage.open_read(path)?;
+    let mut head = [0u8; 8];
+    let mut filled = 0;
+    // Read up to 8 bytes (the magic length); a shorter file simply isn't
+    // encrypted in this format.
+    while filled < head.len() {
+        let n = reader.read(&mut head[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled == head.len() && &head == b"Salted__")
 }
 
 fn archive_info_path(stanza: &str) -> PathBuf {
@@ -415,8 +516,10 @@ pub fn upgrade(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
     let stanza = require_stanza(config)?;
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
+    let cipher = RepoCipherConfig::from_config(config);
+    cipher.require_passphrase()?;
     let identity = resolve_cluster_identity(config, pg_storage)?;
-    upgrade_with_identity(stanza, repo_storage, identity)?;
+    upgrade_with_identity(stanza, repo_storage, identity, &cipher)?;
     Ok(())
 }
 
@@ -424,13 +527,22 @@ pub fn upgrade(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
 #[cfg(test)]
 fn upgrade_inner(stanza: &str, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<UpgradeOutcome, CommandError> {
     let identity = read_cluster_identity(pg_storage)?;
-    upgrade_with_identity(stanza, repo_storage, identity)
+    upgrade_with_identity(
+        stanza,
+        repo_storage,
+        identity,
+        &RepoCipherConfig {
+            cipher_type: CipherType::None,
+            user_pass: None,
+        },
+    )
 }
 
 fn upgrade_with_identity(
     stanza: &str,
     repo_storage: &dyn Storage,
     identity: ClusterIdentity,
+    cipher: &RepoCipherConfig,
 ) -> Result<UpgradeOutcome, CommandError> {
     let archive_info_path = archive_info_path(stanza);
     let backup_info_path = backup_info_path(stanza);
@@ -441,8 +553,23 @@ fn upgrade_with_identity(
         ));
     }
 
-    let mut archive = InfoArchive::load(repo_storage, &archive_info_path).map_err(|err| CommandError::Other(err.to_string()))?;
-    let mut backup = InfoBackup::load(repo_storage, &backup_info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+    // The cipher type must not change between create and upgrade: encryption is
+    // a stanza-create-time decision. Detect the *on-disk* encryption state up
+    // front (by the pgBackRest cipher header) and refuse to "add" encryption to
+    // an existing unencrypted repository, or "drop" it from an encrypted one,
+    // before attempting a decrypt that would otherwise fail cryptically.
+    let on_disk_encrypted = info_file_is_encrypted(repo_storage, &archive_info_path)?;
+    if on_disk_encrypted != cipher.cipher_type.is_encrypted() {
+        return Err(CommandError::Other(
+            "repo-cipher-type does not match the existing repository; encryption must be set at stanza-create".to_owned(),
+        ));
+    }
+
+    let passphrase = cipher.passphrase();
+    let (mut archive, archive_cipher_pass) = InfoArchive::load_keyed(repo_storage, &archive_info_path, passphrase)
+        .map_err(|err| CommandError::Other(err.to_string()))?;
+    let (mut backup, backup_cipher_pass) =
+        InfoBackup::load_keyed(repo_storage, &backup_info_path, passphrase).map_err(|err| CommandError::Other(err.to_string()))?;
 
     let header = identity.header;
     let changed = archive.db_system_id != header.system_identifier || archive.db_version != identity.version;
@@ -475,11 +602,12 @@ fn upgrade_with_identity(
     backup.db_control_version = header.pg_control_version;
     backup.history.insert(next_id, new_entry);
 
+    // Preserve the existing repo sub-keys across the upgrade.
     archive
-        .save(repo_storage, &archive_info_path)
+        .save_keyed(repo_storage, &archive_info_path, passphrase, archive_cipher_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
     backup
-        .save(repo_storage, &backup_info_path)
+        .save_keyed(repo_storage, &backup_info_path, passphrase, backup_cipher_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
 
     Ok(UpgradeOutcome {
@@ -535,6 +663,19 @@ mod tests {
             ("lock-path".to_owned(), None),
             OptionValue::Path(lock_path.to_string_lossy().into_owned()),
         );
+        cfg
+    }
+
+    /// `config_with_stanza` plus `repo1-cipher-type=aes-256-cbc` +
+    /// `repo1-cipher-pass`, exercising the encrypted info-file path.
+    fn config_with_cipher(stanza: Option<&str>, pass: &str) -> LoadedConfig {
+        let mut cfg = config_with_stanza(stanza);
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options
+            .insert(("repo-cipher-pass".to_owned(), Some(1)), OptionValue::String(pass.to_owned()));
         cfg
     }
 
@@ -619,6 +760,113 @@ mod tests {
         assert_eq!(backup.db_catalog_version, v.catalog_version_no);
         assert_eq!(backup.db_control_version, v.pg_control_version);
         assert!(backup.current.is_empty());
+    }
+
+    #[test]
+    fn stanza_create_encrypted_stores_repo_subkey() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let v = &SUPPORTED[0];
+        let system_id: u64 = 0x0a0b_0c0d;
+        write_pg_control(&pg_s, system_id, v);
+
+        let cfg = config_with_cipher(Some("enc"), "user-passphrase");
+        create(&cfg, &repo_s, &pg_s).expect("encrypted stanza-create should succeed");
+
+        // The on-disk info files must NOT be plaintext (they start with the
+        // pgBackRest cipher header) and must NOT be loadable without the pass.
+        let raw = {
+            let mut r = repo_s.open_read(&archive_info_path("enc")).unwrap();
+            r.read_all().unwrap()
+        };
+        assert_eq!(&raw[..8], b"Salted__", "encrypted info file uses pgBackRest framing");
+        assert!(
+            InfoArchive::load(&repo_s, &archive_info_path("enc")).is_err(),
+            "plain load of an encrypted file must fail"
+        );
+
+        // The .copy mirror is written too.
+        assert!(
+            repo_s.exists(Path::new("archive/enc/archive.info.copy")).unwrap(),
+            "archive.info.copy must exist"
+        );
+        assert!(
+            repo_s.exists(Path::new("backup/enc/backup.info.copy")).unwrap(),
+            "backup.info.copy must exist"
+        );
+
+        // Decrypting with the user passphrase recovers a [cipher] sub-key in
+        // each info file, and the two sub-keys differ (distinct cipherPassGen).
+        let (archive, arc_sub) = InfoArchive::load_keyed(&repo_s, &archive_info_path("enc"), Some("user-passphrase")).unwrap();
+        let (_backup, bak_sub) = InfoBackup::load_keyed(&repo_s, &backup_info_path("enc"), Some("user-passphrase")).unwrap();
+        let arc_sub = arc_sub.expect("archive carries a repo sub-key");
+        let bak_sub = bak_sub.expect("backup carries a repo sub-key");
+        assert_eq!(arc_sub.len(), 64, "sub-key is 64 base64 chars");
+        assert_eq!(bak_sub.len(), 64);
+        assert_ne!(arc_sub, bak_sub, "archive and backup get distinct sub-keys");
+        assert_eq!(archive.db_system_id, system_id);
+    }
+
+    #[test]
+    fn stanza_create_encrypted_without_pass_errors() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+
+        // cipher-type set but no cipher-pass.
+        let mut cfg = config_with_stanza(Some("enc"));
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        let err = create(&cfg, &repo_s, &pg_s).expect_err("encrypted create needs a passphrase");
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
+            other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stanza_upgrade_encrypted_round_trips() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let system_id: u64 = 55;
+        write_pg_control(&pg_s, system_id, &SUPPORTED[0]);
+
+        let cfg = config_with_cipher(Some("enc"), "pw");
+        create(&cfg, &repo_s, &pg_s).expect("encrypted create");
+
+        // The repo sub-key recorded at create time.
+        let (_arc, sub_before) = InfoArchive::load_keyed(&repo_s, &archive_info_path("enc"), Some("pw")).unwrap();
+        let sub_before = sub_before.unwrap();
+
+        // A version change upgrades while preserving encryption + the sub-key.
+        write_pg_control(&pg_s, system_id, &SUPPORTED[1]);
+        upgrade(&cfg, &repo_s, &pg_s).expect("encrypted upgrade");
+
+        let (archive, sub_after) = InfoArchive::load_keyed(&repo_s, &archive_info_path("enc"), Some("pw")).unwrap();
+        assert_eq!(archive.db_version, SUPPORTED[1].label);
+        assert_eq!(archive.db_id, 2);
+        assert_eq!(
+            sub_after.as_deref(),
+            Some(sub_before.as_str()),
+            "sub-key preserved across upgrade"
+        );
+    }
+
+    #[test]
+    fn stanza_upgrade_cipher_mismatch_errors() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+
+        // Create UNENCRYPTED.
+        let cfg = config_with_stanza(Some("plain"));
+        create(&cfg, &repo_s, &pg_s).expect("unencrypted create");
+
+        // Now try to upgrade while *adding* encryption.
+        let enc_cfg = config_with_cipher(Some("plain"), "pw");
+        let err = upgrade(&enc_cfg, &repo_s, &pg_s).expect_err("adding encryption on upgrade must fail");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("stanza-create"), "message was {msg:?}"),
+            other => panic!("expected Other(cipher mismatch), got {other:?}"),
+        }
     }
 
     #[test]
