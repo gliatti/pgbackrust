@@ -8,11 +8,16 @@
 //!
 //! pgBackRest's gcs backend authenticates several ways: a service-account key
 //! (JWT → `OAuth2` bearer token), an auto-discovered GCE instance token, and a
-//! pre-supplied bearer token. This backend implements the **bearer-token** path
-//! ([`GcsAuth::Token`]): every request carries an `Authorization: Bearer
-//! <token>` header. The [`GcsAuth`] enum is left open so service-account JWT
-//! (RS256) auth — which needs an RSA signing dependency and a token-refresh
-//! flow — can be added later without changing the public surface.
+//! pre-supplied bearer token. This backend implements two of them:
+//!
+//! - [`GcsAuth::Token`] — a pre-supplied `OAuth2` access token, sent verbatim as
+//!   `Authorization: Bearer <token>`.
+//! - [`GcsAuth::ServiceAccount`] — a service-account key (client email + RS256
+//!   PEM private key). A short-lived JWT assertion is built and signed with the
+//!   private key ([`build_signed_jwt`]), exchanged at the `OAuth2` token endpoint
+//!   for an access token ([`Gcs::exchange_jwt`]), and the access token is cached
+//!   until just before its expiry. Mirrors `storageGcsAuthService` /
+//!   `storageGcsAuthJwt` in the C `src/storage/gcs/storage.c`.
 //!
 //! ## Addressing
 //!
@@ -31,30 +36,121 @@
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use pgbr_io::{IoError, IoRead, IoWrite};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use serde::{Deserialize, Serialize};
 
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 /// Default GCS XML/JSON API endpoint base URL.
 const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 
+/// Default `OAuth2` token-exchange endpoint for the service-account JWT flow.
+/// Public so callers building a `GcsAuth::ServiceAccount` can use the standard
+/// endpoint without hard-coding the URL.
+pub const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+
+/// `OAuth2` scope requested for the service-account access token: read/write to
+/// Cloud Storage, matching what pgBackRest's gcs driver requests.
+const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+
+/// Lifetime (seconds) of the signed JWT assertion. Google caps this at one hour.
+const JWT_LIFETIME_SECS: i64 = 3600;
+
+/// Refresh the cached access token this many seconds before its stated expiry,
+/// to avoid using a token that lapses mid-request.
+const TOKEN_REFRESH_SLACK_SECS: i64 = 60;
+
 /// Authentication mechanism for a [`Gcs`] backend.
-///
-/// Only the pre-supplied bearer-token path is implemented for now. The enum is
-/// non-exhaustive in spirit — service-account JWT auth is a planned follow-up.
 #[derive(Debug, Clone)]
 pub enum GcsAuth {
     /// A pre-acquired `OAuth2` access token, sent verbatim as the bearer token in
     /// the `Authorization: Bearer <token>` header.
     Token(String),
-    // TODO: service-account JWT auth. Load a service-account key file, build an
-    // RS256-signed JWT assertion, exchange it at the OAuth2 token endpoint for a
-    // short-lived access token, and refresh on expiry. Mirrors
-    // `storageGcsAuthService` / `storageGcsAuthJwt` in `src/storage/gcs/storage.c`.
-    // Requires an RSA signing dependency, so it is deferred.
+    /// A service-account key. An RS256-signed JWT assertion is built from these
+    /// fields, exchanged at `token_uri` for a short-lived `OAuth2` access token,
+    /// and the access token is then used as the bearer token (cached to its
+    /// expiry).
+    ServiceAccount {
+        /// Service-account email, used as the JWT `iss` (and `sub`) claim.
+        client_email: String,
+        /// RS256 PEM private key from the service-account key JSON
+        /// (`private_key`), used to sign the JWT assertion.
+        private_key_pem: String,
+        /// `OAuth2` token-exchange endpoint, usually
+        /// `https://oauth2.googleapis.com/token`. Used as the JWT `aud` claim
+        /// and as the POST target.
+        token_uri: String,
+    },
+}
+
+/// A cached `OAuth2` access token plus the Unix-epoch second at which it expires.
+#[derive(Debug, Clone)]
+struct CachedToken {
+    access_token: String,
+    expires_at: i64,
+}
+
+/// The subset of the `OAuth2` token-exchange JSON response this backend needs.
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    /// Lifetime in seconds from the moment of issue.
+    expires_in: i64,
+}
+
+/// JWT claims for the service-account `jwt-bearer` assertion.
+#[derive(Debug, Serialize)]
+struct JwtClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+}
+
+/// Build and RS256-sign the `OAuth2` JWT assertion for a service account.
+///
+/// Produces the compact JWS `base64url(header).base64url(claims).base64url(sig)`
+/// with header `{"alg":"RS256","typ":"JWT"}` and claims
+/// `{iss, scope, aud, iat: now_unix, exp: now_unix + 3600}`. The signature is
+/// `RS256` (RSASSA-PKCS1-v1_5 over SHA-256) under `private_key_pem`.
+///
+/// Pure and deterministic given `now_unix`, so it is unit-testable without any
+/// network access.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Backend`] if `private_key_pem` is not a valid RSA PEM
+/// private key or the JWT cannot be encoded.
+pub fn build_signed_jwt(
+    client_email: &str,
+    scope: &str,
+    aud: &str,
+    now_unix: i64,
+    private_key_pem: &str,
+) -> Result<String, StorageError> {
+    let header = Header::new(Algorithm::RS256);
+    let claims = JwtClaims {
+        iss: client_email,
+        scope,
+        aud,
+        iat: now_unix,
+        exp: now_unix + JWT_LIFETIME_SECS,
+    };
+    let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|err| StorageError::Backend {
+        path: PathBuf::new(),
+        message: format!("invalid service-account RSA private key: {err}"),
+    })?;
+    jsonwebtoken::encode(&header, &claims, &key).map_err(|err| StorageError::Backend {
+        path: PathBuf::new(),
+        message: format!("failed to sign service-account JWT: {err}"),
+    })
 }
 
 /// Immutable configuration for a [`Gcs`] backend.
@@ -68,8 +164,8 @@ pub struct GcsConfig {
     /// Optional endpoint base URL including scheme. Defaults to
     /// `https://storage.googleapis.com`.
     pub endpoint: Option<String>,
-    /// Pre-acquired `OAuth2` access token used for bearer-token auth.
-    pub token: String,
+    /// Authentication mechanism (bearer token or service-account key).
+    pub auth: GcsAuth,
 }
 
 /// Google Cloud Storage backend speaking the XML API over a synchronous
@@ -84,6 +180,10 @@ pub struct Gcs {
     endpoint: String,
     auth: GcsAuth,
     agent: ureq::Agent,
+    /// Cached service-account access token, shared across clones so a refresh by
+    /// one clone is visible to the others. `None` for the [`GcsAuth::Token`]
+    /// path, which never refreshes.
+    token_cache: Arc<Mutex<Option<CachedToken>>>,
 }
 
 impl Gcs {
@@ -105,8 +205,9 @@ impl Gcs {
         Self {
             bucket: config.bucket,
             endpoint,
-            auth: GcsAuth::Token(config.token),
+            auth: config.auth,
             agent,
+            token_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -133,11 +234,95 @@ impl Gcs {
     }
 
     /// Build the `Authorization` header `(name, value)` pair for the configured
-    /// auth mechanism. Factored out so the bearer-token formatting is unit
-    /// testable without a live request.
-    fn auth_header(&self) -> (String, String) {
+    /// auth mechanism.
+    ///
+    /// For [`GcsAuth::Token`] this is infallible string formatting. For
+    /// [`GcsAuth::ServiceAccount`] it returns the cached access token, performing
+    /// a JWT-bearer token exchange first if the cache is empty or stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] if a service-account token exchange is
+    /// required and fails (signing, transport, or a non-2xx token response).
+    fn auth_header(&self) -> Result<(String, String), StorageError> {
+        let token = self.bearer_token()?;
+        Ok(("Authorization".to_string(), format!("Bearer {token}")))
+    }
+
+    /// Resolve the bearer token to send: the verbatim token for
+    /// [`GcsAuth::Token`], or a fresh-enough cached access token for
+    /// [`GcsAuth::ServiceAccount`] (refreshed via [`Self::exchange_jwt`] when the
+    /// cache is empty or within [`TOKEN_REFRESH_SLACK_SECS`] of expiry).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] if a service-account refresh is needed
+    /// and fails.
+    fn bearer_token(&self) -> Result<String, StorageError> {
         match &self.auth {
-            GcsAuth::Token(token) => ("Authorization".to_string(), format!("Bearer {token}")),
+            GcsAuth::Token(token) => Ok(token.clone()),
+            GcsAuth::ServiceAccount {
+                client_email,
+                private_key_pem,
+                token_uri,
+            } => {
+                let now = now_unix();
+                // Fast path: a cached token that is still comfortably valid.
+                {
+                    let cache = self.token_cache.lock().map_err(|_| poisoned_cache_error())?;
+                    if let Some(cached) = cache.as_ref().filter(|c| c.expires_at - TOKEN_REFRESH_SLACK_SECS > now) {
+                        return Ok(cached.access_token.clone());
+                    }
+                }
+
+                // Slow path: build + sign a JWT and exchange it for a token.
+                let jwt = build_signed_jwt(client_email, STORAGE_SCOPE, token_uri, now, private_key_pem)?;
+                let response = self.exchange_jwt(token_uri, &jwt)?;
+                let cached = CachedToken {
+                    access_token: response.access_token,
+                    expires_at: now + response.expires_in,
+                };
+                let access_token = cached.access_token.clone();
+                {
+                    let mut cache = self.token_cache.lock().map_err(|_| poisoned_cache_error())?;
+                    *cache = Some(cached);
+                }
+                Ok(access_token)
+            }
+        }
+    }
+
+    /// POST a signed JWT assertion to `token_uri` and parse the access token out
+    /// of the `OAuth2` JSON response.
+    ///
+    /// The body is the standard `urn:ietf:params:oauth:grant-type:jwt-bearer`
+    /// form: `grant_type=<grant>&assertion=<jwt>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] on transport failure, a non-2xx status,
+    /// or a response body that cannot be parsed into a [`TokenResponse`].
+    fn exchange_jwt(&self, token_uri: &str, jwt: &str) -> Result<TokenResponse, StorageError> {
+        let backend = |message: String| StorageError::Backend {
+            path: PathBuf::new(),
+            message,
+        };
+        let form = [
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", jwt),
+        ];
+        match self.agent.post(token_uri).send_form(&form) {
+            Ok(resp) => {
+                let body = resp
+                    .into_string()
+                    .map_err(|err| backend(format!("reading token response: {err}")))?;
+                serde_json::from_str::<TokenResponse>(&body).map_err(|err| backend(format!("parsing token response: {err}")))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = resp.into_string().unwrap_or_default();
+                Err(backend(format!("token exchange failed with status {code}: {detail}")))
+            }
+            Err(ureq::Error::Transport(transport)) => Err(backend(format!("token exchange transport error: {transport}"))),
         }
     }
 
@@ -147,6 +332,23 @@ impl Gcs {
         let raw = path.to_string_lossy();
         let normalised = raw.replace('\\', "/");
         normalised.trim_start_matches('/').to_string()
+    }
+}
+
+/// Current wall-clock time as Unix epoch seconds (saturating to 0 before the
+/// epoch). Used for JWT `iat`/`exp` and token-cache expiry checks.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Error returned when the shared token-cache mutex has been poisoned (a thread
+/// panicked while holding it). Treated as a backend failure rather than a panic.
+fn poisoned_cache_error() -> StorageError {
+    StorageError::Backend {
+        path: PathBuf::new(),
+        message: "gcs token cache mutex poisoned".to_string(),
     }
 }
 
@@ -381,7 +583,7 @@ impl Gcs {
     /// PUT an object body to `key`.
     fn put_object(&self, key: &str, body: &[u8]) -> Result<(), StorageError> {
         let url = self.object_url(key);
-        let (auth_name, auth_value) = self.auth_header();
+        let (auth_name, auth_value) = self.auth_header()?;
         let req = self.agent.put(&url).set(&auth_name, &auth_value);
         match req.send_bytes(body) {
             Ok(_) => Ok(()),
@@ -415,7 +617,7 @@ impl Storage for Gcs {
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
-        let (auth_name, auth_value) = self.auth_header();
+        let (auth_name, auth_value) = self.auth_header()?;
         let req = self.agent.head(&url).set(&auth_name, &auth_value);
         match req.call() {
             Ok(resp) => {
@@ -439,7 +641,7 @@ impl Storage for Gcs {
         }
 
         let url = self.bucket_url();
-        let (auth_name, auth_value) = self.auth_header();
+        let (auth_name, auth_value) = self.auth_header()?;
         let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
         if !prefix.is_empty() {
             // ureq percent-encodes the query value for the wire request.
@@ -475,7 +677,7 @@ impl Storage for Gcs {
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
-        let (auth_name, auth_value) = self.auth_header();
+        let (auth_name, auth_value) = self.auth_header()?;
         let req = self.agent.get(&url).set(&auth_name, &auth_value);
         match req.call() {
             Ok(resp) => {
@@ -505,7 +707,7 @@ impl Storage for Gcs {
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
         let key = Self::key_for(path);
         let url = self.object_url(&key);
-        let (auth_name, auth_value) = self.auth_header();
+        let (auth_name, auth_value) = self.auth_header()?;
         let req = self.agent.delete(&url).set(&auth_name, &auth_value);
         match req.call() {
             Ok(_) => Ok(()),
@@ -573,13 +775,19 @@ mod tests {
         GcsConfig {
             bucket: "examplebucket".to_string(),
             endpoint: None,
-            token: "ya29.EXAMPLE_ACCESS_TOKEN".to_string(),
+            auth: GcsAuth::Token("ya29.EXAMPLE_ACCESS_TOKEN".to_string()),
         }
     }
 
     fn test_gcs() -> Gcs {
         Gcs::new(test_config())
     }
+
+    /// A deterministic 2048-bit RSA private key in PKCS#8 PEM, generated solely
+    /// for tests (not a real credential). Used to exercise [`build_signed_jwt`]
+    /// and signature verification without contacting Google.
+    const TEST_RSA_PRIVATE_KEY_PEM: &str = include_str!("../tests/data/test_rsa_private_key.pem");
+    const TEST_RSA_PUBLIC_KEY_PEM: &str = include_str!("../tests/data/test_rsa_public_key.pem");
 
     #[test]
     fn object_url_building() {
@@ -605,7 +813,7 @@ mod tests {
     #[test]
     fn auth_header_is_bearer_token() {
         let gcs = test_gcs();
-        let (name, value) = gcs.auth_header();
+        let (name, value) = gcs.auth_header().unwrap();
         assert_eq!(name, "Authorization");
         assert_eq!(value, "Bearer ya29.EXAMPLE_ACCESS_TOKEN");
     }
@@ -703,15 +911,113 @@ mod tests {
         assert_eq!(parse_http_date_secs("garbage"), None);
     }
 
-    /// Integration test against a real bucket. Skipped unless the `PGBR_GCS_*`
-    /// env vars are set. Run with `cargo test -p pgbr-storage -- --ignored`.
+    /// Decode a JWT segment from base64url (no padding) into bytes.
+    fn b64url_decode(segment: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment)
+            .expect("valid base64url segment")
+    }
+
+    #[test]
+    fn jwt_has_three_segments_and_rs256_header() {
+        let now = 1_700_000_000;
+        let jwt = build_signed_jwt(
+            "svc@example.iam.gserviceaccount.com",
+            STORAGE_SCOPE,
+            DEFAULT_TOKEN_URI,
+            now,
+            TEST_RSA_PRIVATE_KEY_PEM,
+        )
+        .unwrap();
+
+        // A compact JWS has exactly three dot-separated base64url segments.
+        let segments: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(segments.len(), 3, "JWT must have header.claims.signature");
+        assert!(!segments[2].is_empty(), "signature segment must be present");
+
+        // Header decodes to {"alg":"RS256","typ":"JWT"}.
+        let header: serde_json::Value = serde_json::from_slice(&b64url_decode(segments[0])).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["typ"], "JWT");
+
+        // Claims carry iss/scope/aud and the iat/exp window we set.
+        let claims: serde_json::Value = serde_json::from_slice(&b64url_decode(segments[1])).unwrap();
+        assert_eq!(claims["iss"], "svc@example.iam.gserviceaccount.com");
+        assert_eq!(claims["scope"], STORAGE_SCOPE);
+        assert_eq!(claims["aud"], DEFAULT_TOKEN_URI);
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + JWT_LIFETIME_SECS);
+    }
+
+    #[test]
+    fn jwt_signature_verifies_with_public_key() {
+        use jsonwebtoken::{DecodingKey, Validation};
+
+        let now = now_unix();
+        let jwt = build_signed_jwt(
+            "svc@example.iam.gserviceaccount.com",
+            STORAGE_SCOPE,
+            DEFAULT_TOKEN_URI,
+            now,
+            TEST_RSA_PRIVATE_KEY_PEM,
+        )
+        .unwrap();
+
+        // Verify the RS256 signature against the matching public key. This proves
+        // the signing pipeline is correct, not merely self-consistent.
+        let decoding_key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY_PEM.as_bytes()).unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[DEFAULT_TOKEN_URI]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(&jwt, &decoding_key, &validation).unwrap();
+        assert_eq!(decoded.claims["iss"], "svc@example.iam.gserviceaccount.com");
+        assert_eq!(decoded.claims["scope"], STORAGE_SCOPE);
+    }
+
+    #[test]
+    fn jwt_rejects_invalid_private_key() {
+        let err = build_signed_jwt(
+            "svc@example.iam.gserviceaccount.com",
+            STORAGE_SCOPE,
+            DEFAULT_TOKEN_URI,
+            0,
+            "-----BEGIN PRIVATE KEY-----\nnot a real key\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap_err();
+        match err {
+            StorageError::Backend { message, .. } => assert!(message.contains("invalid service-account RSA private key")),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_account_config_is_accepted() {
+        // A ServiceAccount-configured backend builds without contacting Google;
+        // the token exchange is deferred until the first request.
+        let config = GcsConfig {
+            bucket: "examplebucket".to_string(),
+            endpoint: None,
+            auth: GcsAuth::ServiceAccount {
+                client_email: "svc@example.iam.gserviceaccount.com".to_string(),
+                private_key_pem: TEST_RSA_PRIVATE_KEY_PEM.to_string(),
+                token_uri: DEFAULT_TOKEN_URI.to_string(),
+            },
+        };
+        let gcs = Gcs::new(config);
+        assert_eq!(gcs.bucket(), "examplebucket");
+        assert!(matches!(gcs.auth, GcsAuth::ServiceAccount { .. }));
+    }
+
+    /// Integration test against a real bucket using a bearer token. Skipped
+    /// unless the `PGBR_GCS_*` env vars are set. Run with
+    /// `cargo test -p pgbr-storage -- --ignored`.
     #[test]
     #[ignore = "requires a live GCS bucket and PGBR_GCS_* env vars"]
     fn gcs_round_trip() {
         let config = GcsConfig {
             bucket: std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
             endpoint: std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
-            token: std::env::var("PGBR_GCS_TEST_TOKEN").expect("PGBR_GCS_TEST_TOKEN"),
+            auth: GcsAuth::Token(std::env::var("PGBR_GCS_TEST_TOKEN").expect("PGBR_GCS_TEST_TOKEN")),
         };
         let gcs = Gcs::new(config);
 
@@ -728,6 +1034,38 @@ mod tests {
 
         let mut reader = gcs.open_read(key).unwrap();
         assert_eq!(reader.read_all().unwrap(), b"hello gcs");
+
+        gcs.remove(key, true).unwrap();
+        assert!(!gcs.exists(key).unwrap());
+    }
+
+    /// Integration test of the full service-account JWT → access-token →
+    /// read/write round trip. Skipped unless the `PGBR_GCS_SA_*` env vars are
+    /// set. Run with `cargo test -p pgbr-storage -- --ignored`.
+    #[test]
+    #[ignore = "requires a live GCS bucket and PGBR_GCS_SA_* env vars"]
+    fn gcs_service_account_round_trip() {
+        let config = GcsConfig {
+            bucket: std::env::var("PGBR_GCS_TEST_BUCKET").expect("PGBR_GCS_TEST_BUCKET"),
+            endpoint: std::env::var("PGBR_GCS_TEST_ENDPOINT").ok(),
+            auth: GcsAuth::ServiceAccount {
+                client_email: std::env::var("PGBR_GCS_SA_CLIENT_EMAIL").expect("PGBR_GCS_SA_CLIENT_EMAIL"),
+                private_key_pem: std::env::var("PGBR_GCS_SA_PRIVATE_KEY").expect("PGBR_GCS_SA_PRIVATE_KEY"),
+                token_uri: std::env::var("PGBR_GCS_SA_TOKEN_URI").unwrap_or_else(|_| DEFAULT_TOKEN_URI.to_string()),
+            },
+        };
+        let gcs = Gcs::new(config);
+
+        let key = Path::new("pgbr-storage-sa-round-trip.txt");
+        {
+            let mut writer = gcs.open_write(key).unwrap();
+            writer.write(b"hello service account").unwrap();
+            writer.close().unwrap();
+        }
+
+        assert!(gcs.exists(key).unwrap());
+        let mut reader = gcs.open_read(key).unwrap();
+        assert_eq!(reader.read_all().unwrap(), b"hello service account");
 
         gcs.remove(key, true).unwrap();
         assert!(!gcs.exists(key).unwrap());

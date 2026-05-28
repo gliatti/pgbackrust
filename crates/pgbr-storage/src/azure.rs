@@ -2,10 +2,21 @@
 //!
 //! Implements the [`Storage`] trait over the Azure Blob REST API using the same
 //! synchronous [`ureq`] HTTP client as the S3 backend (blocking, no async
-//! runtime). The correctness-critical piece is **Shared Key** request signing,
-//! which is unit-tested both for the exact `StringToSign` byte layout and for
-//! the `base64(HMAC-SHA256(account_key, …))` pipeline against an independently
-//! computed value.
+//! runtime).
+//!
+//! ## Authentication
+//!
+//! Two methods are supported, selected by [`AzureAuth`]:
+//!
+//! - [`AzureAuth::SharedKey`] — the account key signs each request. This is the
+//!   correctness-critical path: it is unit-tested both for the exact
+//!   `StringToSign` byte layout and for the
+//!   `base64(HMAC-SHA256(account_key, …))` pipeline against an independently
+//!   computed value.
+//! - [`AzureAuth::Sas`] — a user-supplied Shared Access Signature token (a
+//!   pre-signed query string). With SAS there is no `Authorization` header to
+//!   compute; the SAS token is appended to each request URL's query string
+//!   instead (see [`append_sas`]).
 //!
 //! ## Addressing
 //!
@@ -37,19 +48,39 @@ type HmacSha256 = Hmac<Sha256>;
 /// mandatory `x-ms-version` header and included in the signature.
 const API_VERSION: &str = "2021-08-06";
 
+/// Resolved authentication mechanism for an [`Azure`] backend.
+///
+/// Mirrors pgBackRest's two azure auth modes: Shared Key (the account key signs
+/// requests) and SAS (a pre-signed token appended to request URLs).
+#[derive(Debug, Clone)]
+pub enum AzureAuth {
+    /// The decoded (raw bytes) account key, used to HMAC-sign each request's
+    /// `StringToSign` into a `SharedKey <account>:<signature>` header.
+    SharedKey(Vec<u8>),
+    /// A Shared Access Signature token: the query-string portion of a SAS URL,
+    /// e.g. `sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=…` (with or without a
+    /// leading `?`). It is appended to each request URL instead of computing an
+    /// `Authorization` header.
+    Sas(String),
+}
+
 /// Immutable configuration for an [`Azure`] backend.
 ///
 /// Mirrors the credential / addressing inputs the C `storage/azure` driver
-/// takes (Shared Key auth), minus the live HTTP agent (which [`Azure::new`]
-/// constructs).
+/// takes, minus the live HTTP agent (which [`Azure::new`] constructs). Supply
+/// exactly one of `account_key_base64` (Shared Key) or `sas_token` (SAS).
 #[derive(Debug, Clone)]
 pub struct AzureConfig {
     /// Storage account name, e.g. `myaccount`.
     pub account: String,
     /// Blob container name.
     pub container: String,
-    /// Account key, base64-encoded (as Azure presents it in the portal).
-    pub account_key_base64: String,
+    /// Account key, base64-encoded (as Azure presents it in the portal). Used
+    /// for Shared Key auth. Mutually exclusive with `sas_token`.
+    pub account_key_base64: Option<String>,
+    /// A SAS token query string (the part after `?` in a SAS URL). Used for SAS
+    /// auth. Mutually exclusive with `account_key_base64`.
+    pub sas_token: Option<String>,
     /// Optional endpoint base URL including scheme. Defaults to
     /// `https://<account>.blob.core.windows.net`.
     pub endpoint: Option<String>,
@@ -66,7 +97,7 @@ pub struct AzureConfig {
 pub struct Azure {
     account: String,
     container: String,
-    key: Vec<u8>,
+    auth: AzureAuth,
     endpoint: String,
     agent: ureq::Agent,
 }
@@ -77,8 +108,9 @@ impl Azure {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Backend`] if `account_key_base64` is not valid
-    /// base64.
+    /// Returns [`StorageError::Backend`] if neither (or both) of
+    /// `account_key_base64` / `sas_token` is supplied, or if
+    /// `account_key_base64` is not valid base64.
     pub fn new(config: AzureConfig) -> Result<Self, StorageError> {
         Self::with_agent(config, ureq::agent())
     }
@@ -87,15 +119,31 @@ impl Azure {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Backend`] if `account_key_base64` is not valid
-    /// base64.
+    /// Returns [`StorageError::Backend`] if neither (or both) of
+    /// `account_key_base64` / `sas_token` is supplied, or if
+    /// `account_key_base64` is not valid base64.
     pub fn with_agent(config: AzureConfig, agent: ureq::Agent) -> Result<Self, StorageError> {
-        let key = BASE64
-            .decode(config.account_key_base64.trim())
-            .map_err(|err| StorageError::Backend {
-                path: PathBuf::new(),
-                message: format!("invalid base64 account key: {err}"),
-            })?;
+        let backend = |message: String| StorageError::Backend {
+            path: PathBuf::new(),
+            message,
+        };
+        let auth = match (config.account_key_base64, config.sas_token) {
+            (Some(key_b64), None) => {
+                let key = BASE64
+                    .decode(key_b64.trim())
+                    .map_err(|err| backend(format!("invalid base64 account key: {err}")))?;
+                AzureAuth::SharedKey(key)
+            }
+            (None, Some(sas)) => AzureAuth::Sas(sas),
+            (Some(_), Some(_)) => {
+                return Err(backend(
+                    "exactly one of account_key_base64 or sas_token must be set, not both".to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(backend("one of account_key_base64 or sas_token must be set".to_string()));
+            }
+        };
         let endpoint = config
             .endpoint
             .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", config.account))
@@ -104,7 +152,7 @@ impl Azure {
         Ok(Self {
             account: config.account,
             container: config.container,
-            key,
+            auth,
             endpoint,
             agent,
         })
@@ -204,8 +252,9 @@ impl Azure {
         )
     }
 
-    /// Compute the `Authorization: SharedKey <account>:<signature>` header
-    /// value for a request.
+    /// Compute the `Authorization: SharedKey <account>:<signature>` header value
+    /// for a request, or `None` when SAS auth is in effect (SAS carries its
+    /// signature in the URL, so no `Authorization` header is sent).
     fn authorization(
         &self,
         method: &str,
@@ -213,10 +262,24 @@ impl Azure {
         content_type: &str,
         ms_headers: &[(String, String)],
         canonicalized_resource: &str,
-    ) -> String {
-        let to_sign = Self::string_to_sign(method, content_length, content_type, ms_headers, canonicalized_resource);
-        let signature = BASE64.encode(hmac_sha256(&self.key, to_sign.as_bytes()));
-        format!("SharedKey {}:{signature}", self.account)
+    ) -> Option<String> {
+        match &self.auth {
+            AzureAuth::SharedKey(key) => {
+                let to_sign = Self::string_to_sign(method, content_length, content_type, ms_headers, canonicalized_resource);
+                let signature = BASE64.encode(hmac_sha256(key, to_sign.as_bytes()));
+                Some(format!("SharedKey {}:{signature}", self.account))
+            }
+            AzureAuth::Sas(_) => None,
+        }
+    }
+
+    /// Final request URL for `base_url`: unchanged for Shared Key auth, or with
+    /// the SAS token appended to the query string for SAS auth.
+    fn request_url(&self, base_url: &str) -> String {
+        match &self.auth {
+            AzureAuth::SharedKey(_) => base_url.to_string(),
+            AzureAuth::Sas(sas) => append_sas(base_url, sas),
+        }
     }
 
     /// Build the mandatory `x-ms-date` + `x-ms-version` headers for "now".
@@ -336,6 +399,41 @@ fn parse_list_blobs(xml: &str) -> Result<Vec<ListEntry>, String> {
     Ok(entries)
 }
 
+/// Append a SAS token query string to `base_url`.
+///
+/// Chooses the correct separator: `?` if the URL has no query yet, `&` if it
+/// already does (e.g. the list operation carries `?restype=container&comp=list`).
+/// Any leading `?` on the SAS token is stripped so it is not duplicated. Pure so
+/// the join logic is unit-testable without a live request.
+#[must_use]
+pub fn append_sas(base_url: &str, sas_token: &str) -> String {
+    let sas = sas_token.trim().trim_start_matches('?');
+    if sas.is_empty() {
+        return base_url.to_string();
+    }
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    format!("{base_url}{separator}{sas}")
+}
+
+/// Percent-encode a query-parameter value (RFC 3986 `pchar`-safe set). Only the
+/// unreserved characters `A-Z a-z 0-9 - _ . ~` are passed through; everything
+/// else — including `/` in a blob prefix — is `%XX`-encoded. Matches how a URL
+/// query value must be escaped on the wire.
+fn percent_encode_query(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 /// HMAC-SHA256 of `data` under `key`, returned as 32 bytes.
 ///
 /// `new_from_slice` is infallible for HMAC — it accepts keys of any length, so
@@ -417,12 +515,14 @@ impl Azure {
         let resource = self.canonicalized_resource(key, &[]);
         let authorization = self.authorization("PUT", &content_length, "", &ms_headers, &resource);
 
-        let url = self.blob_url(key);
+        let url = self.request_url(&self.blob_url(key));
         let mut req = self.agent.put(&url).set("Content-Length", &content_length);
         for (name, value) in &ms_headers {
             req = req.set(name, value);
         }
-        req = req.set("Authorization", &authorization);
+        if let Some(authorization) = &authorization {
+            req = req.set("Authorization", authorization);
+        }
 
         match req.send_bytes(body) {
             Ok(_) => Ok(()),
@@ -459,12 +559,14 @@ impl Storage for Azure {
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("HEAD", "", "", &ms_headers, &resource);
 
-        let url = self.blob_url(&key);
+        let url = self.request_url(&self.blob_url(&key));
         let mut req = self.agent.head(&url);
         for (name, value) in &ms_headers {
             req = req.set(name, value);
         }
-        req = req.set("Authorization", &authorization);
+        if let Some(authorization) = &authorization {
+            req = req.set("Authorization", authorization);
+        }
 
         match req.call() {
             Ok(resp) => {
@@ -500,17 +602,22 @@ impl Storage for Azure {
         let resource = self.canonicalized_resource("", &query);
         let authorization = self.authorization("GET", "", "", &ms_headers, &resource);
 
-        let url = format!("{}/{}", self.endpoint, self.container);
-        let mut req = self.agent.get(&url);
-        // Query string sent on the wire (URL order, percent-encoded prefix).
-        req = req.query("restype", "container").query("comp", "list");
+        // Build the wire URL with the operation query string ourselves so the
+        // SAS token (if any) can be appended after it via `request_url`. The
+        // prefix value is percent-encoded the same way ureq's `.query()` would.
+        let mut base_url = format!("{}/{}?restype=container&comp=list", self.endpoint, self.container);
         if !prefix.is_empty() {
-            req = req.query("prefix", &prefix);
+            base_url.push_str("&prefix=");
+            base_url.push_str(&percent_encode_query(&prefix));
         }
+        let url = self.request_url(&base_url);
+        let mut req = self.agent.get(&url);
         for (name, value) in &ms_headers {
             req = req.set(name, value);
         }
-        req = req.set("Authorization", &authorization);
+        if let Some(authorization) = &authorization {
+            req = req.set("Authorization", authorization);
+        }
 
         let body = match req.call() {
             Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
@@ -544,12 +651,14 @@ impl Storage for Azure {
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("GET", "", "", &ms_headers, &resource);
 
-        let url = self.blob_url(&key);
+        let url = self.request_url(&self.blob_url(&key));
         let mut req = self.agent.get(&url);
         for (name, value) in &ms_headers {
             req = req.set(name, value);
         }
-        req = req.set("Authorization", &authorization);
+        if let Some(authorization) = &authorization {
+            req = req.set("Authorization", authorization);
+        }
 
         match req.call() {
             Ok(resp) => {
@@ -582,12 +691,14 @@ impl Storage for Azure {
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("DELETE", "", "", &ms_headers, &resource);
 
-        let url = self.blob_url(&key);
+        let url = self.request_url(&self.blob_url(&key));
         let mut req = self.agent.delete(&url);
         for (name, value) in &ms_headers {
             req = req.set(name, value);
         }
-        req = req.set("Authorization", &authorization);
+        if let Some(authorization) = &authorization {
+            req = req.set("Authorization", authorization);
+        }
 
         match req.call() {
             Ok(_) => Ok(()),
@@ -736,13 +847,35 @@ mod tests {
             account: "devstoreaccount1".to_string(),
             container: "mycontainer".to_string(),
             // "0123456789" base64-encoded — a deterministic, non-secret test key.
-            account_key_base64: "MDEyMzQ1Njc4OQ==".to_string(),
+            account_key_base64: Some("MDEyMzQ1Njc4OQ==".to_string()),
+            sas_token: None,
+            endpoint: None,
+        }
+    }
+
+    /// A SAS-configured test config (no account key). The token is a fixed,
+    /// non-secret fixture; the `sig` value is illustrative, not a real HMAC.
+    fn sas_config() -> AzureConfig {
+        AzureConfig {
+            account: "devstoreaccount1".to_string(),
+            container: "mycontainer".to_string(),
+            account_key_base64: None,
+            sas_token: Some("sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=ABC%2Bdef123".to_string()),
             endpoint: None,
         }
     }
 
     fn test_azure() -> Azure {
         Azure::new(test_config()).unwrap()
+    }
+
+    /// Extract the decoded Shared Key bytes from a backend, panicking if it is
+    /// not Shared-Key-configured. Test-only helper.
+    fn shared_key_bytes(azure: &Azure) -> &[u8] {
+        match &azure.auth {
+            AzureAuth::SharedKey(key) => key,
+            AzureAuth::Sas(_) => panic!("expected SharedKey auth"),
+        }
     }
 
     /// Anchor #1: pin the exact `StringToSign` byte layout for a fixed request.
@@ -789,11 +922,13 @@ mod tests {
         assert_eq!(to_sign, expected);
 
         // (b) Independently-verified HMAC + base64 pipeline.
-        let signature = BASE64.encode(hmac_sha256(&azure.key, b"hello"));
+        let signature = BASE64.encode(hmac_sha256(shared_key_bytes(&azure), b"hello"));
         assert_eq!(signature, "p1l1ggO/CZANAwoL/KMDTa3KSMTQnQJ3Tv67ZE9SXZQ=");
 
         // And the full Authorization header is well-formed.
-        let auth = azure.authorization("GET", "", "", &ms_headers, &resource);
+        let auth = azure
+            .authorization("GET", "", "", &ms_headers, &resource)
+            .expect("Shared Key auth produces an Authorization header");
         assert!(auth.starts_with("SharedKey devstoreaccount1:"));
     }
 
@@ -840,11 +975,119 @@ mod tests {
     #[test]
     fn invalid_base64_key_is_rejected() {
         let mut config = test_config();
-        config.account_key_base64 = "not valid base64!!!".to_string();
+        config.account_key_base64 = Some("not valid base64!!!".to_string());
         match Azure::new(config).err() {
             Some(StorageError::Backend { message, .. }) => assert!(message.contains("invalid base64")),
             other => panic!("expected Backend error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn requires_exactly_one_auth_method() {
+        // Neither set.
+        let mut none_config = test_config();
+        none_config.account_key_base64 = None;
+        none_config.sas_token = None;
+        match Azure::new(none_config).err() {
+            Some(StorageError::Backend { message, .. }) => assert!(message.contains("must be set")),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+
+        // Both set.
+        let mut both_config = test_config();
+        both_config.sas_token = Some("sv=2021-08-06&sig=x".to_string());
+        match Azure::new(both_config).err() {
+            Some(StorageError::Backend { message, .. }) => assert!(message.contains("not both")),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_key_path_still_works() {
+        // Regression guard: a Shared-Key backend resolves to SharedKey auth,
+        // produces an Authorization header, and appends nothing to the URL.
+        let azure = test_azure();
+        assert!(matches!(azure.auth, AzureAuth::SharedKey(_)));
+
+        let ms_headers = fixed_ms_headers();
+        let resource = azure.canonicalized_resource("dir/blob.bin", &[]);
+        assert!(azure.authorization("GET", "", "", &ms_headers, &resource).is_some());
+
+        // Shared Key leaves the request URL untouched (no SAS appended).
+        let base = azure.blob_url("dir/blob.bin");
+        assert_eq!(azure.request_url(&base), base);
+    }
+
+    /// Fixed `x-ms-*` headers for tests that don't care about the live clock.
+    fn fixed_ms_headers() -> Vec<(String, String)> {
+        vec![
+            ("x-ms-date".to_string(), "Fri, 01 Jan 2021 00:00:00 GMT".to_string()),
+            ("x-ms-version".to_string(), "2021-08-06".to_string()),
+        ]
+    }
+
+    #[test]
+    fn sas_url_appends_token() {
+        // No existing query → join with '?'.
+        let plain = "https://devstoreaccount1.blob.core.windows.net/mycontainer/blob.bin";
+        assert_eq!(
+            append_sas(plain, "sv=2021-08-06&sig=abc"),
+            "https://devstoreaccount1.blob.core.windows.net/mycontainer/blob.bin?sv=2021-08-06&sig=abc"
+        );
+
+        // Existing query (the list op) → join with '&'.
+        let listing = "https://devstoreaccount1.blob.core.windows.net/mycontainer?restype=container&comp=list";
+        assert_eq!(
+            append_sas(listing, "sv=2021-08-06&sig=abc"),
+            "https://devstoreaccount1.blob.core.windows.net/mycontainer?restype=container&comp=list&sv=2021-08-06&sig=abc"
+        );
+
+        // A leading '?' on the SAS token is stripped, not duplicated.
+        assert_eq!(
+            append_sas(plain, "?sv=2021-08-06&sig=abc"),
+            format!("{plain}?sv=2021-08-06&sig=abc")
+        );
+
+        // An empty SAS token leaves the URL unchanged.
+        assert_eq!(append_sas(plain, ""), plain);
+    }
+
+    #[test]
+    fn sas_auth_appends_to_request_urls_and_skips_authorization() {
+        let azure = Azure::new(sas_config()).unwrap();
+        assert!(matches!(azure.auth, AzureAuth::Sas(_)));
+
+        // SAS auth produces no Authorization header.
+        let ms_headers = fixed_ms_headers();
+        let resource = azure.canonicalized_resource("dir/blob.bin", &[]);
+        assert!(azure.authorization("GET", "", "", &ms_headers, &resource).is_none());
+
+        // A plain blob URL gets the SAS token after a '?'.
+        let blob = azure.request_url(&azure.blob_url("dir/blob.bin"));
+        assert_eq!(
+            blob,
+            "https://devstoreaccount1.blob.core.windows.net/mycontainer/dir/blob.bin\
+             ?sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=ABC%2Bdef123"
+        );
+
+        // A URL that already carries a query gets the SAS token after a '&'.
+        let listing = azure.request_url(&format!(
+            "{}/{}?restype=container&comp=list",
+            azure.endpoint(),
+            azure.container()
+        ));
+        assert_eq!(
+            listing,
+            "https://devstoreaccount1.blob.core.windows.net/mycontainer\
+             ?restype=container&comp=list&sv=2021-08-06&ss=b&srt=co&sp=rwdlac&sig=ABC%2Bdef123"
+        );
+    }
+
+    #[test]
+    fn percent_encode_query_escapes_slash() {
+        assert_eq!(percent_encode_query("archive/sub/"), "archive%2Fsub%2F");
+        assert_eq!(percent_encode_query("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(percent_encode_query("x y+z"), "x%20y%2Bz");
     }
 
     #[test]
@@ -940,7 +1183,8 @@ mod tests {
         let config = AzureConfig {
             account: std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
             container: std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
-            account_key_base64: std::env::var("PGBR_AZURE_KEY").expect("PGBR_AZURE_KEY"),
+            account_key_base64: Some(std::env::var("PGBR_AZURE_KEY").expect("PGBR_AZURE_KEY")),
+            sas_token: None,
             endpoint: std::env::var("PGBR_AZURE_ENDPOINT").ok(),
         };
         let azure = Azure::new(config).unwrap();
@@ -958,6 +1202,36 @@ mod tests {
 
         let mut reader = azure.open_read(key).unwrap();
         assert_eq!(reader.read_all().unwrap(), b"hello azure");
+
+        azure.remove(key, true).unwrap();
+        assert!(!azure.exists(key).unwrap());
+    }
+
+    /// Integration test against a real account using a SAS token. Skipped unless
+    /// the `PGBR_AZURE_*` + `PGBR_AZURE_SAS` env vars are set. Run with
+    /// `cargo test -p pgbr-storage -- --ignored`.
+    #[test]
+    #[ignore = "requires a live Azure account and PGBR_AZURE_SAS env var"]
+    fn azure_sas_round_trip() {
+        let config = AzureConfig {
+            account: std::env::var("PGBR_AZURE_ACCOUNT").expect("PGBR_AZURE_ACCOUNT"),
+            container: std::env::var("PGBR_AZURE_CONTAINER").expect("PGBR_AZURE_CONTAINER"),
+            account_key_base64: None,
+            sas_token: Some(std::env::var("PGBR_AZURE_SAS").expect("PGBR_AZURE_SAS")),
+            endpoint: std::env::var("PGBR_AZURE_ENDPOINT").ok(),
+        };
+        let azure = Azure::new(config).unwrap();
+
+        let key = Path::new("pgbr-storage-sas-round-trip.txt");
+        {
+            let mut writer = azure.open_write(key).unwrap();
+            writer.write(b"hello sas").unwrap();
+            writer.close().unwrap();
+        }
+
+        assert!(azure.exists(key).unwrap());
+        let mut reader = azure.open_read(key).unwrap();
+        assert_eq!(reader.read_all().unwrap(), b"hello sas");
 
         azure.remove(key, true).unwrap();
         assert!(!azure.exists(key).unwrap());

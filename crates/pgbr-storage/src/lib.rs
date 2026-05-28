@@ -34,7 +34,7 @@ pub mod posix;
 pub mod s3;
 pub mod sftp;
 
-pub use crate::azure::{Azure, AzureConfig};
+pub use crate::azure::{Azure, AzureAuth, AzureConfig};
 pub use crate::cifs::Cifs;
 pub use crate::gcs::{Gcs, GcsAuth, GcsConfig};
 pub use crate::posix::Posix;
