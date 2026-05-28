@@ -28,13 +28,6 @@ services:
       RUSTUP_HOME: /rustup
     entrypoint: ["cargo"]
 
-  meson:
-    image: pgbackrust-dev:latest
-    working_dir: /work/pgbackrust
-    volumes:
-      - .:/work/pgbackrust
-    entrypoint: ["meson"]
-
   test-pl:
     image: pgbackrust-dev:latest
     working_dir: /work
