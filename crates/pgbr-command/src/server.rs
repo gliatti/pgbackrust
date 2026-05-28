@@ -50,6 +50,7 @@
 //! - [`ping`] uses TLS when a CA file (`tls-server-ca-file`) is configured,
 //!   otherwise falls back to plain TCP.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
@@ -59,8 +60,10 @@ use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::{IoError, IoRead, IoWrite};
 use pgbr_storage::Storage;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, RootCertStore, ServerConfig, ServerConnection, SideData, StreamOwned,
+    SupportedCipherSuite,
 };
 
 use crate::CommandError;
@@ -486,6 +489,419 @@ fn root_store_from_ca(ca_path: &str) -> Result<RootCertStore, CommandError> {
     Ok(roots)
 }
 
+/// The X.509 OID for the subject Common Name attribute (`2.5.4.3`), DER-encoded
+/// as the contents of an OBJECT IDENTIFIER: `55 04 03`.
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+
+/// `tls-server-auth` wildcard stanza: an authorized client CN mapped to `*` is
+/// permitted to act for **any** stanza.
+const AUTH_STANZA_WILDCARD: &str = "*";
+
+/// Parse the `tls-server-auth` mapping (a `<cn> = <stanza>[,<stanza>...]`
+/// hash, where each value is a comma-separated stanza list) into a CN ->
+/// stanza-list map.
+///
+/// pgBackRest's `tls-server-auth` is a `hash` option: each key is a client
+/// certificate Common Name and each value is the stanza (or comma-separated set
+/// of stanzas, or `*` for all) that client may operate on. C reference:
+/// `cfgOptionKvGet(cfgOptTlsServerAuth)` consumed in `src/command/server/server.c`.
+///
+/// Stanza tokens are trimmed and empty tokens dropped; a `*` token anywhere in a
+/// value authorizes every stanza (see [`cn_authorized_for_stanza`]).
+fn parse_tls_server_auth(map: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (cn, stanzas) in map {
+        let list: Vec<String> = stanzas
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        out.insert(cn.clone(), list);
+    }
+    out
+}
+
+/// Read the resolved `tls-server-auth` hash option into the CN -> stanza-list
+/// map, returning an empty map when the option is absent.
+fn tls_server_auth(config: &LoadedConfig) -> BTreeMap<String, Vec<String>> {
+    match config.options.get(&("tls-server-auth".to_owned(), None)) {
+        Some(OptionValue::Hash(map)) => parse_tls_server_auth(map),
+        _ => BTreeMap::new(),
+    }
+}
+
+/// Decide whether the client certificate Common Name `cn` is authorized to act
+/// on `stanza` per the parsed `tls-server-auth` map.
+///
+/// A CN is authorized when it has an entry in the map and that entry either
+/// lists `stanza` explicitly or carries the [`AUTH_STANZA_WILDCARD`] (`*`)
+/// token. An unknown CN is never authorized. A `None` stanza (the connecting
+/// client did not request one) is authorized only by `*`.
+#[must_use]
+fn cn_authorized_for_stanza(auth: &BTreeMap<String, Vec<String>>, cn: &str, stanza: Option<&str>) -> bool {
+    match auth.get(cn) {
+        None => false,
+        Some(stanzas) => {
+            if stanzas.iter().any(|s| s == AUTH_STANZA_WILDCARD) {
+                return true;
+            }
+            stanza.is_some_and(|want| stanzas.iter().any(|s| s == want))
+        }
+    }
+}
+
+/// One DER TLV element: its tag, the byte range of its *contents* within the
+/// parent slice, and the offset just past the whole element.
+struct Tlv {
+    tag: u8,
+    /// Start offset of the contents (value) within the parent slice.
+    content_start: usize,
+    /// End offset of the contents (exclusive) within the parent slice.
+    content_end: usize,
+    /// Offset just past this whole element (tag + length + contents).
+    next: usize,
+}
+
+/// Parse one DER TLV element from `der` starting at `pos`, returning its tag,
+/// content range, and the offset past it. Supports short-form and the long-form
+/// length encoding X.509 certs use; returns `None` on a truncated / malformed
+/// header.
+fn read_tlv(der: &[u8], pos: usize) -> Option<Tlv> {
+    let tag = *der.get(pos)?;
+    let len_byte = *der.get(pos + 1)?;
+    let (len, header) = if len_byte & 0x80 == 0 {
+        // Short form: the low 7 bits are the length.
+        (len_byte as usize, 2usize)
+    } else {
+        // Long form: low 7 bits give the number of subsequent length bytes.
+        let num = (len_byte & 0x7f) as usize;
+        if num == 0 || num > 4 {
+            return None;
+        }
+        let mut len = 0usize;
+        for k in 0..num {
+            len = (len << 8) | (*der.get(pos + 2 + k)? as usize);
+        }
+        (len, 2 + num)
+    };
+    let content_start = pos + header;
+    let content_end = content_start.checked_add(len)?;
+    if content_end > der.len() {
+        return None;
+    }
+    Some(Tlv {
+        tag,
+        content_start,
+        content_end,
+        next: content_end,
+    })
+}
+
+/// Extract the subject Common Name (CN) from a DER-encoded X.509 certificate.
+///
+/// Navigates the certificate structure to the `subject` field — the issuer also
+/// carries a CN and appears *first* in the `TBSCertificate`, so a naive
+/// first-CN scan would return the issuer's name. The walk descends
+/// `Certificate -> TBSCertificate`, skips the optional `[0] version`,
+/// `serialNumber`, `signature`, `issuer`, and `validity` fields in order, and
+/// then scans the `subject` `Name` for the CN attribute (OID `2.5.4.3`).
+///
+/// Returns `None` if the structure cannot be navigated or no CN is found in the
+/// subject.
+#[must_use]
+fn extract_cn_from_cert(der: &[u8]) -> Option<String> {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let cert = read_tlv(der, 0)?;
+    let tbs = read_tlv(der, cert.content_start)?;
+    let mut pos = tbs.content_start;
+    let tbs_end = tbs.content_end;
+
+    // [0] EXPLICIT version (context tag 0xA0) is optional — skip it when present.
+    let first = read_tlv(der, pos)?;
+    if first.tag == 0xA0 {
+        pos = first.next;
+    }
+
+    // Skip serialNumber, signature (AlgId), issuer, validity — four elements —
+    // to land on the subject Name.
+    for _ in 0..4 {
+        let tlv = read_tlv(der, pos)?;
+        if tlv.next > tbs_end {
+            return None;
+        }
+        pos = tlv.next;
+    }
+
+    // `subject` is the next element: a SEQUENCE of RDNs. Scan it for the CN.
+    let subject = read_tlv(der, pos)?;
+    scan_name_for_cn(&der[subject.content_start..subject.content_end])
+}
+
+/// Scan a DER-encoded `Name` (the contents of the subject / issuer SEQUENCE)
+/// for the Common Name attribute (OID `2.5.4.3`) and return its value.
+fn scan_name_for_cn(name: &[u8]) -> Option<String> {
+    // Recognised ASN.1 directory-string tags a CN value may carry.
+    const STRING_TAGS: &[u8] = &[0x13, 0x0c, 0x16, 0x14, 0x1e];
+    // The DER short-form length byte for the CN OID contents (3 bytes).
+    const OID_LEN_BYTE: u8 = 0x03;
+
+    let mut i = 0usize;
+    while i + 2 + OID_COMMON_NAME.len() < name.len() {
+        // An OID is tag 0x06, then a length byte, then the OID bytes. Match the
+        // 3-byte CN OID encoded with the short-form length 0x03.
+        if name[i] == 0x06 && name[i + 1] == OID_LEN_BYTE && &name[i + 2..i + 2 + OID_COMMON_NAME.len()] == OID_COMMON_NAME {
+            // The value follows the OID: <string-tag> <len> <bytes...>.
+            let value_tag_at = i + 2 + OID_COMMON_NAME.len();
+            if value_tag_at + 1 < name.len() && STRING_TAGS.contains(&name[value_tag_at]) {
+                let len = name[value_tag_at + 1] as usize;
+                let start = value_tag_at + 2;
+                if start + len <= name.len() {
+                    // BMPString (0x1e) is UTF-16BE; the rest are byte strings we
+                    // decode lossily as UTF-8.
+                    let bytes = &name[start..start + len];
+                    let value = if name[value_tag_at] == 0x1e {
+                        decode_bmp_string(bytes)
+                    } else {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    };
+                    return Some(value);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode a `BMPString` (UTF-16 big-endian) into a `String`, lossily.
+fn decode_bmp_string(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Map a `tls-cipher-12` / `tls-cipher-13` option value (a colon- or
+/// comma-separated cipher-suite name list) to the matching rustls
+/// [`SupportedCipherSuite`]s, in the configured order.
+///
+/// Names are matched case-insensitively against rustls's suite names (e.g.
+/// `TLS13_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`).
+/// Unrecognised names are skipped (best-effort), so a value that names no known
+/// suite yields an empty list and the caller keeps rustls's defaults.
+fn cipher_suites_from(value: &str) -> Vec<SupportedCipherSuite> {
+    let wanted: Vec<String> = value
+        .split([':', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect();
+
+    let mut out = Vec::new();
+    for name in &wanted {
+        for suite in rustls::crypto::ring::ALL_CIPHER_SUITES {
+            if format!("{:?}", suite.suite()).to_ascii_uppercase() == *name {
+                out.push(*suite);
+            }
+        }
+    }
+    out
+}
+
+/// Collect the rustls cipher suites selected by the configured `tls-cipher-12`
+/// and `tls-cipher-13` options, concatenated (12 then 13). An empty result means
+/// no cipher option was set (or none matched), so callers keep rustls defaults.
+fn configured_cipher_suites(config: &LoadedConfig) -> Vec<SupportedCipherSuite> {
+    let mut suites = Vec::new();
+    for name in ["tls-cipher-12", "tls-cipher-13"] {
+        if let Some(value) = option_path(config, name) {
+            suites.extend(cipher_suites_from(&value));
+        }
+    }
+    suites
+}
+
+/// Build a rustls [`ServerConfig`] presenting `cert_chain` + `private_key`.
+///
+/// When `client_ca` is `Some`, a [`WebPkiClientVerifier`] built from those CA
+/// roots is installed so connecting clients **must** present a certificate
+/// signed by the CA (mutual TLS). When it is `None` the server accepts any
+/// client without a certificate (`with_no_client_auth`), preserving the
+/// non-mTLS fallback. `cipher_suites`, when non-empty, restricts the negotiated
+/// suites; otherwise rustls defaults apply.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the client verifier cannot be built from the CA
+/// roots, the crypto provider rejects the restricted cipher suites, or the
+/// cert / key pair is invalid.
+fn build_server_config(
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    client_ca: Option<RootCertStore>,
+    cipher_suites: &[SupportedCipherSuite],
+) -> Result<ServerConfig, CommandError> {
+    ensure_crypto_provider();
+
+    let builder = if cipher_suites.is_empty() {
+        ServerConfig::builder()
+    } else {
+        let provider = rustls::crypto::CryptoProvider {
+            cipher_suites: cipher_suites.to_vec(),
+            ..rustls::crypto::ring::default_provider()
+        };
+        ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| CommandError::Other(format!("tls server provider: {e}")))?
+    };
+
+    let config = match client_ca {
+        Some(roots) => {
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| CommandError::Other(format!("tls client verifier: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    config
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| CommandError::Other(format!("tls server config: {e}")))
+}
+
+/// Build a rustls [`ClientConfig`] trusting the CA roots in `roots`.
+///
+/// When `client_auth` is `Some((chain, key))` the client presents that
+/// certificate (mutual TLS) via `with_client_auth_cert`; otherwise it connects
+/// without a client certificate. `cipher_suites`, when non-empty, restricts the
+/// negotiated suites.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the provider rejects the restricted cipher
+/// suites or the client certificate / key is invalid.
+fn build_client_config(
+    roots: RootCertStore,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    cipher_suites: &[SupportedCipherSuite],
+) -> Result<ClientConfig, CommandError> {
+    ensure_crypto_provider();
+
+    let builder = if cipher_suites.is_empty() {
+        ClientConfig::builder()
+    } else {
+        let provider = rustls::crypto::CryptoProvider {
+            cipher_suites: cipher_suites.to_vec(),
+            ..rustls::crypto::ring::default_provider()
+        };
+        ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| CommandError::Other(format!("tls client provider: {e}")))?
+    };
+
+    let builder = builder.with_root_certificates(roots);
+
+    match client_auth {
+        Some((chain, key)) => builder
+            .with_client_auth_cert(chain, key)
+            .map_err(|e| CommandError::Other(format!("tls client auth cert: {e}"))),
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Build a mutual-TLS [`ClientConfig`] from PEM **file paths**, for the
+/// `repo-host-type=tls` / `pg-host-type=tls` worker transport.
+///
+/// Trusts the CA in `ca_file`, and — when `cert_file` and `key_file` are both
+/// `Some` — presents that client certificate (the mutual-TLS leg the peer
+/// `pgbackrest server` authorizes by Common Name). `cipher_names`, when
+/// non-empty, is a `tls-cipher-12` / `tls-cipher-13` style suite list that
+/// restricts the negotiated ciphers.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if a PEM file cannot be read / parsed, the provider
+/// rejects the restricted cipher suites, or the client certificate / key is
+/// invalid.
+pub fn build_client_config_from_files(
+    ca_file: &str,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+    cipher_names: &[String],
+) -> Result<ClientConfig, CommandError> {
+    let roots = root_store_from_ca(ca_file)?;
+
+    let client_auth = match (cert_file, key_file) {
+        (Some(cert), Some(key)) => Some((load_cert_chain(cert)?, load_private_key(key)?)),
+        _ => None,
+    };
+
+    let mut suites = Vec::new();
+    for value in cipher_names {
+        suites.extend(cipher_suites_from(value));
+    }
+
+    build_client_config(roots, client_auth, &suites)
+}
+
+/// Connect a TLS client to `addr` and return the established [`StreamOwned`].
+///
+/// SNI is presented and the server certificate validated against `server_name`;
+/// the returned single bidirectional encrypted stream is what the caller adapts
+/// to whatever reader / writer the protocol layer needs. Used by the
+/// `repo-host-type=tls` / `pg-host-type=tls` worker transport to reach the
+/// peer's running `pgbackrest server`.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the connection cannot be made, `server_name` is
+/// not a valid DNS name, or the TLS handshake fails.
+pub fn connect_tls_stream(
+    addr: &str,
+    server_name: &str,
+    client_config: Arc<ClientConfig>,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, CommandError> {
+    let name = ServerName::try_from(server_name.to_owned())
+        .map_err(|e| CommandError::Other(format!("invalid server name `{server_name}`: {e}")))?;
+    let stream = TcpStream::connect(addr).map_err(|e| CommandError::Other(format!("tcp connect {addr}: {e}")))?;
+    let conn = ClientConnection::new(client_config, name).map_err(|e| CommandError::Other(format!("tls client new: {e}")))?;
+    Ok(StreamOwned::new(conn, stream))
+}
+
+/// Authorize a completed-handshake server-side TLS connection against the
+/// `tls-server-auth` map, returning the client CN on success.
+///
+/// When `auth` is empty no authorization is enforced (the non-mTLS / no-auth
+/// path): `Ok(None)` is returned. Otherwise the client must have presented a
+/// certificate; its CN is extracted and checked with
+/// [`cn_authorized_for_stanza`]. An unauthorized or certificate-less connection
+/// yields [`CommandError::Other`] so the caller closes it.
+fn authorize_client(
+    conn: &ServerConnection,
+    auth: &BTreeMap<String, Vec<String>>,
+    stanza: Option<&str>,
+) -> Result<Option<String>, CommandError> {
+    if auth.is_empty() {
+        return Ok(None);
+    }
+    let certs = conn
+        .peer_certificates()
+        .ok_or_else(|| CommandError::Other("tls auth: client presented no certificate".to_owned()))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| CommandError::Other("tls auth: empty client certificate chain".to_owned()))?;
+    let cn = extract_cn_from_cert(leaf.as_ref())
+        .ok_or_else(|| CommandError::Other("tls auth: client certificate has no Common Name".to_owned()))?;
+    if cn_authorized_for_stanza(auth, &cn, stanza) {
+        Ok(Some(cn))
+    } else {
+        Err(CommandError::Other(format!(
+            "tls auth: client CN `{cn}` is not authorized for stanza `{}`",
+            stanza.unwrap_or("<none>")
+        )))
+    }
+}
+
 /// Accept a single TCP connection on `listener`, perform the rustls server
 /// handshake from `cert_chain` + `private_key`, wrap the resulting stream in
 /// [`TlsIo`], and drive [`serve`].
@@ -502,13 +918,7 @@ pub fn serve_tls(
     cert_chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
 ) -> Result<(), CommandError> {
-    ensure_crypto_provider();
-
-    let server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)
-        .map_err(|e| CommandError::Other(format!("tls server config: {e}")))?;
-    let server_config = Arc::new(server_config);
+    let server_config = Arc::new(build_server_config(cert_chain, private_key, None, &[])?);
 
     let (stream, _peer) = listener
         .accept()
@@ -525,6 +935,80 @@ pub fn serve_tls(
     Ok(())
 }
 
+/// Accept one TLS connection on `listener` and serve the **storage** protocol.
+///
+/// This is the server side of the `repo-host-type=tls` / `pg-host-type=tls`
+/// transport — the same protocol the SSH `--remote` worker serves, but over a
+/// mutual-TLS socket. A remote pgBackRest connects presenting its client
+/// certificate; the handshake validates it against the configured client CA, and
+/// the certificate's CN is checked against `auth` for `stanza`. An authorized
+/// connection is served from a [`Posix`](pgbr_storage::Posix) rooted at `root`
+/// via the shared worker handler, so the peer can drive every `storage-*`
+/// request as well as `noOp` / `exit`. C reference:
+/// `src/command/server/server.c`.
+///
+/// When `auth` is empty, authorization is skipped (the server still presents its
+/// own certificate but does not require / inspect a client one) — preserving the
+/// no-mTLS fallback while still serving the storage protocol.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] on an accept failure, an invalid cert/key, a TLS
+/// handshake failure, or a CN that is not authorized for `stanza`; plus whatever
+/// the worker serve loop returns.
+pub fn serve_tls_storage(
+    listener: &TcpListener,
+    server_config: Arc<ServerConfig>,
+    auth: &BTreeMap<String, Vec<String>>,
+    stanza: Option<&str>,
+    root: &std::path::Path,
+) -> Result<(), CommandError> {
+    let (stream, _peer) = listener
+        .accept()
+        .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+
+    let mut conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
+
+    // Complete the handshake before inspecting the peer certificate: rustls only
+    // populates `peer_certificates()` once the handshake has progressed far
+    // enough to receive the client's Certificate message.
+    conn.complete_io(&mut TcpHandshake(&stream))
+        .map_err(|e| CommandError::Other(format!("tls handshake: {e}")))?;
+
+    // Authorize the client CN against `tls-server-auth` for the requested
+    // stanza; a failure closes the connection (the `?` drops `conn` / the
+    // socket).
+    let _cn = authorize_client(&conn, auth, stanza)?;
+
+    let io = SharedTlsIo::new(TlsServerIo::new(StreamOwned::new(conn, stream)));
+    let mut reader = io.clone_handle();
+    let mut writer = io.clone_handle();
+    crate::worker::serve_worker(root, &mut reader, &mut writer)?;
+    let _ = writer.close();
+    Ok(())
+}
+
+/// Minimal [`Read`] + [`Write`] shim over a borrowed [`TcpStream`], so
+/// [`ServerConnection::complete_io`] can drive the handshake without taking
+/// ownership of the socket (which is moved into the [`StreamOwned`] afterwards).
+struct TcpHandshake<'a>(&'a TcpStream);
+
+impl Read for TcpHandshake<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for TcpHandshake<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
 /// Connect a [`TcpStream`] to `addr`, perform the rustls client handshake with
 /// a [`ClientConfig`] trusting the CA in `ca_file`, wrap the stream in
 /// [`TlsIo`], and run [`ping_exchange`].
@@ -538,12 +1022,21 @@ pub fn serve_tls(
 /// loaded, `server_name` is not a valid DNS name, the TLS handshake fails, or
 /// whatever [`ping_exchange`] returns.
 pub fn ping_tls(addr: &str, server_name: &str, ca_file: &str) -> Result<(), CommandError> {
-    ensure_crypto_provider();
-
     let roots = root_store_from_ca(ca_file)?;
-    let client_config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let client_config = Arc::new(client_config);
+    let client_config = Arc::new(build_client_config(roots, None, &[])?);
+    ping_with_client_config(addr, server_name, client_config)
+}
 
+/// Run [`ping_exchange`] over a TLS client connection built from
+/// `client_config`, connecting to `addr` and presenting SNI / validating the
+/// server cert against `server_name`.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the connection cannot be made, `server_name` is
+/// not a valid DNS name, the TLS handshake fails, or whatever [`ping_exchange`]
+/// returns.
+fn ping_with_client_config(addr: &str, server_name: &str, client_config: Arc<ClientConfig>) -> Result<(), CommandError> {
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|e| CommandError::Other(format!("invalid server name `{server_name}`: {e}")))?;
 
@@ -594,24 +1087,52 @@ fn option_path(config: &LoadedConfig, name: &str) -> Option<String> {
     }
 }
 
-/// `server` — listen for protocol connections from remote pgBackRest
-/// processes and drive [`serve`] per connection.
+/// Resolve the filesystem root the `server` should serve the storage protocol
+/// from, preferring `pg-path` / `pg1-path` then `repo-path` / `repo1-path`,
+/// defaulting to the current directory when none is set.
+///
+/// A connecting `repo-host-type=tls` / `pg-host-type=tls` worker reaches the
+/// repository or PG data directory through this root, mirroring the SSH worker's
+/// [`worker_root`](crate::worker) selection.
+fn server_root(config: &LoadedConfig) -> std::path::PathBuf {
+    for name in ["pg-path", "pg1-path", "repo-path", "repo1-path"] {
+        if let Some(p) = config
+            .options
+            .get(&(name.to_owned(), None))
+            .or_else(|| config.options.get(&(name.to_owned(), Some(1))))
+            .and_then(|v| match v {
+                OptionValue::Path(p) | OptionValue::String(p) if !p.is_empty() => Some(p.clone()),
+                _ => None,
+            })
+        {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    std::path::PathBuf::from(".")
+}
+
+/// `server` — listen for protocol connections from remote pgBackRest processes
+/// and serve the storage / liveness protocol per connection.
 ///
 /// The bind address comes from `tls-server-address` / `tls-server-port`
 /// (default `127.0.0.1:8432`).
 ///
 /// **Transport selection:** if both `tls-server-cert-file` and
-/// `tls-server-key-file` are configured, the cert chain + private key are
-/// loaded from those PEM files and the connection is served over TLS via
-/// [`serve_tls`]. Otherwise the server falls back to plain TCP via
-/// [`serve_tcp`]. The transport-agnostic [`serve`] core is identical on both
-/// paths.
+/// `tls-server-key-file` are configured, the cert chain + private key are loaded
+/// and the connection is served over TLS. When a client CA
+/// (`tls-server-ca-file`) is **also** configured, mutual TLS is required: a
+/// [`WebPkiClientVerifier`] forces the client to present a certificate signed by
+/// that CA, and the certificate's Common Name is authorized against
+/// `tls-server-auth` for the stanza via [`serve_tls_storage`]. The configured
+/// `tls-cipher-12` / `tls-cipher-13` suites, when set, restrict the negotiated
+/// ciphers. Without a CA the server presents its cert but accepts any client.
+/// With no cert/key at all it falls back to plain TCP.
 ///
 /// # Errors
 ///
-/// Propagates whatever [`serve_tls`] / [`serve_tcp`] return (bind / accept
-/// failures, invalid cert/key, TLS handshake errors, or a protocol / write
-/// error from [`serve`]).
+/// Propagates whatever the TLS / TCP serve paths return (bind / accept
+/// failures, invalid cert/key, TLS handshake / authorization errors, or a
+/// protocol / write error from the serve loop).
 pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let addr = server_address(config);
 
@@ -622,8 +1143,18 @@ pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), 
         (Some(cert_file), Some(key_file)) => {
             let cert_chain = load_cert_chain(&cert_file)?;
             let private_key = load_private_key(&key_file)?;
+            let ciphers = configured_cipher_suites(config);
+
+            // A configured client CA turns on mutual TLS + CN authorization.
+            let client_ca = option_path(config, "tls-server-ca-file")
+                .map(|ca| root_store_from_ca(&ca))
+                .transpose()?;
+
+            let server_config = Arc::new(build_server_config(cert_chain, private_key, client_ca, &ciphers)?);
+            let auth = tls_server_auth(config);
+            let root = server_root(config);
             let listener = TcpListener::bind(&addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
-            serve_tls(&listener, cert_chain, private_key)
+            serve_tls_storage(&listener, server_config, &auth, config.stanza.as_deref(), &root)
         }
         _ => serve_tcp(&addr),
     }
@@ -1069,5 +1600,341 @@ mod tests {
             OptionValue::String("example.com".to_owned()),
         )]);
         assert_eq!(server_host(&with_host), "example.com");
+    }
+
+    // --- tls-server-auth CN -> stanza parsing + authorization ----------------
+
+    fn auth_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn parse_tls_server_auth_splits_and_trims() {
+        let parsed = parse_tls_server_auth(&auth_map(&[
+            ("client-a", "demo"),
+            ("client-b", " s1 , s2 ,, s3 "),
+            ("client-c", "*"),
+        ]));
+        assert_eq!(parsed["client-a"], vec!["demo".to_owned()]);
+        // Empty tokens dropped, surrounding whitespace trimmed.
+        assert_eq!(parsed["client-b"], vec!["s1".to_owned(), "s2".to_owned(), "s3".to_owned()]);
+        assert_eq!(parsed["client-c"], vec!["*".to_owned()]);
+    }
+
+    #[test]
+    fn cn_authorized_for_exact_stanza() {
+        let auth = parse_tls_server_auth(&auth_map(&[("client-a", "demo")]));
+        // Authorized: the CN is listed for that exact stanza.
+        assert!(cn_authorized_for_stanza(&auth, "client-a", Some("demo")));
+        // Wrong stanza: same CN but a stanza it is not authorized for.
+        assert!(!cn_authorized_for_stanza(&auth, "client-a", Some("other")));
+        // Unknown CN: never authorized.
+        assert!(!cn_authorized_for_stanza(&auth, "client-x", Some("demo")));
+        // No requested stanza without a wildcard: not authorized.
+        assert!(!cn_authorized_for_stanza(&auth, "client-a", None));
+    }
+
+    #[test]
+    fn cn_authorized_by_wildcard_for_any_stanza() {
+        let auth = parse_tls_server_auth(&auth_map(&[("admin", "*")]));
+        assert!(cn_authorized_for_stanza(&auth, "admin", Some("anything")));
+        assert!(cn_authorized_for_stanza(&auth, "admin", Some("else")));
+        // The wildcard even authorizes a connection that names no stanza.
+        assert!(cn_authorized_for_stanza(&auth, "admin", None));
+        // A different, unlisted CN is still rejected.
+        assert!(!cn_authorized_for_stanza(&auth, "intruder", Some("anything")));
+    }
+
+    #[test]
+    fn cn_authorized_with_multiple_stanzas() {
+        let auth = parse_tls_server_auth(&auth_map(&[("multi", "s1,s2")]));
+        assert!(cn_authorized_for_stanza(&auth, "multi", Some("s1")));
+        assert!(cn_authorized_for_stanza(&auth, "multi", Some("s2")));
+        assert!(!cn_authorized_for_stanza(&auth, "multi", Some("s3")));
+    }
+
+    #[test]
+    fn tls_server_auth_reads_hash_option() {
+        let mut map = BTreeMap::new();
+        map.insert("cn1".to_owned(), "demo".to_owned());
+        let config = config_with(vec![(("tls-server-auth", None), OptionValue::Hash(map))]);
+        let auth = tls_server_auth(&config);
+        assert_eq!(auth["cn1"], vec!["demo".to_owned()]);
+        // Absent option yields an empty map (no authorization enforced).
+        assert!(tls_server_auth(&config_with(vec![])).is_empty());
+    }
+
+    // --- CN extraction from a real certificate -------------------------------
+
+    #[test]
+    fn extract_cn_from_generated_cert() {
+        // Generate a cert whose subject CN is a known value, DER-encode it, and
+        // confirm the minimal DER scan recovers that CN.
+        let mut params = rcgen::CertificateParams::new(vec!["host.example.com".to_owned()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "pg-primary.example.com");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der();
+        assert_eq!(extract_cn_from_cert(der.as_ref()).as_deref(), Some("pg-primary.example.com"));
+    }
+
+    #[test]
+    fn extract_cn_returns_none_without_cn() {
+        // Random bytes carry no CN OID.
+        assert_eq!(extract_cn_from_cert(&[0x30, 0x03, 0x02, 0x01, 0x05]), None);
+    }
+
+    #[test]
+    fn extract_cn_returns_subject_not_issuer() {
+        // A CA-signed leaf carries the issuer CN *before* the subject CN in the
+        // DER. The walk must return the subject (`leaf.example`), never the
+        // issuer (`shared-ca`).
+        let (_ca, _server_cert, _server_key, client_cert_pem, _client_key) = shared_ca_pair("server.local", "leaf.example");
+        let leaf = cert_chain_from_pem(&client_cert_pem);
+        let cn = extract_cn_from_cert(leaf[0].as_ref());
+        assert_eq!(cn.as_deref(), Some("leaf.example"));
+    }
+
+    #[test]
+    fn decode_bmp_string_round_trips_ascii() {
+        // UTF-16BE encoding of "ok".
+        assert_eq!(decode_bmp_string(&[0x00, b'o', 0x00, b'k']), "ok");
+    }
+
+    // --- cipher suite mapping ------------------------------------------------
+
+    #[test]
+    fn cipher_suites_from_known_names() {
+        let suites = cipher_suites_from("TLS13_AES_256_GCM_SHA384:TLS13_AES_128_GCM_SHA256");
+        assert_eq!(suites.len(), 2, "both named TLS 1.3 suites should map");
+        assert_eq!(format!("{:?}", suites[0].suite()), "TLS13_AES_256_GCM_SHA384");
+    }
+
+    #[test]
+    fn cipher_suites_from_skips_unknown() {
+        // An unknown name yields no suite; a value naming none is empty so the
+        // caller keeps rustls defaults.
+        assert!(cipher_suites_from("NOT_A_REAL_CIPHER").is_empty());
+        assert!(cipher_suites_from("").is_empty());
+    }
+
+    #[test]
+    fn configured_cipher_suites_concatenates_12_and_13() {
+        let config = config_with(vec![
+            (
+                ("tls-cipher-12", None),
+                OptionValue::String("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_owned()),
+            ),
+            (
+                ("tls-cipher-13", None),
+                OptionValue::String("TLS13_AES_256_GCM_SHA384".to_owned()),
+            ),
+        ]);
+        let suites = configured_cipher_suites(&config);
+        assert_eq!(suites.len(), 2);
+    }
+
+    // --- config builders -----------------------------------------------------
+
+    #[test]
+    fn build_client_config_with_and_without_auth() {
+        // A self-signed cert doubles as the CA. Build a client config with no
+        // client auth, then one presenting the same cert as a client cert.
+        let (cert_pem, key_pem) = self_signed_localhost();
+        let mut roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&cert_pem) {
+            roots.add(c).unwrap();
+        }
+        // No client auth.
+        build_client_config(roots, None, &[]).expect("client config without auth");
+
+        // With client auth.
+        let mut roots2 = RootCertStore::empty();
+        for c in cert_chain_from_pem(&cert_pem) {
+            roots2.add(c).unwrap();
+        }
+        let chain = cert_chain_from_pem(&cert_pem);
+        let key = private_key_from_pem(&key_pem);
+        build_client_config(roots2, Some((chain, key)), &[]).expect("client config with auth");
+    }
+
+    #[test]
+    fn build_server_config_with_client_verifier() {
+        // With a client CA the server config installs a client-cert verifier
+        // (mutual TLS); without one it accepts any client.
+        let (cert_pem, key_pem) = self_signed_localhost();
+        let mut roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&cert_pem) {
+            roots.add(c).unwrap();
+        }
+        build_server_config(
+            cert_chain_from_pem(&cert_pem),
+            private_key_from_pem(&key_pem),
+            Some(roots),
+            &[],
+        )
+        .expect("mTLS server config");
+
+        build_server_config(cert_chain_from_pem(&cert_pem), private_key_from_pem(&key_pem), None, &[])
+            .expect("no-mTLS server config");
+    }
+
+    // --- live mutual-TLS storage round trip ----------------------------------
+
+    #[test]
+    fn mtls_storage_round_trip_authorized_cn() {
+        // End-to-end mutual TLS: a server presents a CA-signed cert and requires
+        // a client cert signed by the same CA; the client CN `client.example`
+        // is authorized for stanza `demo`. The client drives a storage round
+        // trip over TLS, proving the storage protocol runs over the authorized
+        // mTLS transport.
+        run_mtls_round_trip("client.example", Some("demo"), true);
+    }
+
+    #[test]
+    fn mtls_storage_round_trip_rejects_unauthorized_cn() {
+        // The client CN is not in `tls-server-auth`, so the server closes the
+        // connection after the handshake; the client's first storage request
+        // fails (no successful round trip).
+        run_mtls_round_trip("intruder.example", Some("demo"), false);
+    }
+
+    #[test]
+    fn mtls_storage_round_trip_rejects_wrong_stanza() {
+        // The CN is authorized, but only for stanza `demo`; requesting `other`
+        // is rejected.
+        run_mtls_round_trip("client.example", Some("other"), false);
+    }
+
+    /// Issue a CA plus a server leaf and a client leaf all signed by that one CA.
+    /// Returns `(ca_pem, server_cert_pem, server_key_pem, client_cert_pem,
+    /// client_key_pem)` with the client cert carrying CN `client_cn` and the
+    /// server cert a `localhost` SAN.
+    fn shared_ca_pair(server_cn: &str, client_cn: &str) -> (String, String, String, String, String) {
+        let mut authority_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        authority_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        authority_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "shared-ca");
+        let authority_key = rcgen::KeyPair::generate().unwrap();
+        let authority_cert = authority_params.self_signed(&authority_key).unwrap();
+
+        let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        server_params.distinguished_name.push(rcgen::DnType::CommonName, server_cn);
+        let server_keypair = rcgen::KeyPair::generate().unwrap();
+        let server_cert = server_params
+            .signed_by(&server_keypair, &authority_cert, &authority_key)
+            .unwrap();
+
+        let mut client_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        client_params.distinguished_name.push(rcgen::DnType::CommonName, client_cn);
+        let client_keypair = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params
+            .signed_by(&client_keypair, &authority_cert, &authority_key)
+            .unwrap();
+
+        (
+            authority_cert.pem(),
+            server_cert.pem(),
+            server_keypair.serialize_pem(),
+            client_cert.pem(),
+            client_keypair.serialize_pem(),
+        )
+    }
+
+    /// Run a full mutual-TLS storage round trip with the given client CN /
+    /// requested stanza. `expect_ok` asserts whether the client's storage
+    /// request round trip should succeed (authorized) or fail (rejected).
+    ///
+    /// The client drives the storage protocol directly over the TLS stream via a
+    /// [`ProtocolClient`] (issuing a `storage-exists` request) rather than
+    /// through [`RemoteStorage`], whose `Storage` impl requires `Send` reader /
+    /// writer that the `Rc`-backed [`SharedTlsIo`] does not provide — the
+    /// `Send`-able transport lives in the `pgbr-cli` crate. This still exercises
+    /// the mTLS handshake, CN authorization, and the server's storage serve loop.
+    fn run_mtls_round_trip(client_cn: &str, stanza: Option<&str>, expect_ok: bool) {
+        use pgbr_protocol::ProtocolClient;
+        use pgbr_storage::remote::command::EXISTS;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) = shared_ca_pair("server.local", client_cn);
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        // Server config: present the server cert, require client certs signed by
+        // the shared CA, authorize CN `client.example` for stanza `demo`.
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("client.example".to_owned(), vec!["demo".to_owned()]);
+        let stanza_owned = stanza.map(str::to_owned);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server =
+            std::thread::spawn(move || serve_tls_storage(&listener, server_config, &auth, stanza_owned.as_deref(), &root_path));
+
+        // Client: trust the CA, present the client cert.
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let addr = format!("127.0.0.1:{port}");
+        let connect = || -> Result<(), CommandError> {
+            let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config))?;
+            stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let io = SharedTlsIo::new(TlsClientIo::new(stream));
+            let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+            // A storage round trip: `storage-exists` on a missing path returns
+            // Ok(false) when authorized, or errors (the server closed the
+            // connection) when the CN was rejected.
+            let outcome = client
+                .execute(&Request {
+                    cmd: EXISTS.to_owned(),
+                    param: vec![serde_json::Value::String("nope.txt".to_owned())],
+                })
+                .map(|_| ())
+                .map_err(|e| CommandError::Other(format!("{e}")));
+            // On the authorized path, shut the protocol down cleanly (exit +
+            // close_notify) so the server's serve loop ends and joins without a
+            // truncation error; ignore failures (the rejected path is already
+            // torn down).
+            let _ = client.close();
+            outcome
+        };
+
+        let result = connect();
+        let server_result = server.join().expect("server thread panicked");
+        if expect_ok {
+            server_result.expect("authorized server should serve the storage round trip");
+            result.expect("authorized client should complete a storage round trip");
+        } else {
+            // The rejected client must not complete a round trip; the server
+            // either rejected the CN (Err) or saw the connection drop.
+            assert!(result.is_err(), "unauthorized client must not complete a round trip");
+        }
     }
 }

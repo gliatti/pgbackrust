@@ -39,8 +39,10 @@ use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_protocol::PGBACKREST_PROGRAM;
 use pgbr_storage::{Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage};
 
+use std::sync::Arc;
+
 use crate::CliRunError;
-use crate::remote_storage::RemoteProcessStorage;
+use crate::remote_storage::{RemoteProcessStorage, RemoteTlsStorage};
 
 /// The `pgbackrest` command the spawned worker is invoked with, in the
 /// `<command>:remote` form so the child's [`pgbr_command::worker::is_worker`]
@@ -58,6 +60,19 @@ const DEFAULT_REPO_PATH: &str = "/var/lib/pgbackrest";
 
 /// Default `repo-type` (matches `config.yaml`'s `repo-type` default).
 const DEFAULT_REPO_TYPE: &str = "posix";
+
+/// Default `repo-host-type` / `pg-host-type` (matches `config.yaml`): the SSH
+/// transport.
+const DEFAULT_HOST_TYPE: &str = "ssh";
+
+/// The TLS host transport: connect to the peer's running `pgbackrest server`
+/// over mutual TLS instead of spawning a worker over SSH.
+const HOST_TYPE_TLS: &str = "tls";
+
+/// Default `tls-server-port` the peer `pgbackrest server` listens on (matches
+/// `config.yaml`'s `tls-server-port` default), used as the TLS transport port
+/// when no `tls-server-port` is configured.
+const DEFAULT_TLS_PORT: u16 = 8432;
 
 /// Group index of the `pg`-family options the PG backend reads. The PG cluster
 /// is not part of the repository fan-out, so it stays at the first index.
@@ -213,20 +228,54 @@ pub fn build_pg_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunEr
     Ok(Box::new(Posix::new(root)))
 }
 
+/// Build the inter-host storage transport for `host`, selecting SSH or TLS by
+/// the `<family>-host-type` option (default `ssh`).
+///
+/// `family` is `"repo"` or `"pg"`. For `ssh` (the default) a `pgbackrest` worker
+/// is spawned on the host over SSH and proxied via [`RemoteProcessStorage`]
+/// (see [`build_ssh_host_storage`]). For `tls` a mutual-TLS connection is opened
+/// to the host's running `pgbackrest server` and the same storage protocol is
+/// run over it via [`RemoteTlsStorage`] (see [`build_tls_host_storage`]).
+/// Mirrors the `ssh` / `tls` branches of the C `protocolRemoteParam` in
+/// `src/protocol/helper.c`.
+///
+/// # Errors
+///
+/// Returns [`CliRunError::Protocol`] if the SSH worker cannot be spawned or the
+/// TLS connection / handshake fails, [`CliRunError::Command`] if a required TLS
+/// option (e.g. `<family>-host-ca-file`) is missing or invalid, or
+/// [`CliRunError::StorageConfig`] for an unrecognised host-type.
+fn build_remote_host_storage(
+    cfg: &LoadedConfig,
+    host: &str,
+    family: &str,
+    path_flag: &str,
+    remote_path: &Path,
+    index: u32,
+) -> Result<Box<dyn Storage>, CliRunError> {
+    let host_type = string_option(cfg, &format!("{family}-host-type"), index).unwrap_or_else(|| DEFAULT_HOST_TYPE.to_owned());
+
+    match host_type.as_str() {
+        DEFAULT_HOST_TYPE => build_ssh_host_storage(cfg, host, family, path_flag, remote_path, index),
+        HOST_TYPE_TLS => build_tls_host_storage(cfg, host, family, index),
+        other => Err(CliRunError::StorageConfig(format!(
+            "unrecognised {family}-host-type `{other}` (expected ssh or tls)"
+        ))),
+    }
+}
+
 /// Spawn a `pgbackrest` worker on `host` over SSH and wrap it in a
 /// [`RemoteProcessStorage`] proxy.
 ///
-/// `family` is `"repo"` or `"pg"`, selecting which `*-host-{user,port,cmd}`
-/// option family supplies the SSH user / port and the remote `pgbackrest`
-/// program path. The worker is invoked as
+/// The `*-host-{user,port,cmd}` family supplies the SSH user / port and the
+/// remote `pgbackrest` program path. The worker is invoked as
 /// `<host-cmd> <command>:remote --stanza=<s> --<path_flag>=<remote_path>`, so it
-/// roots at `remote_path` and serves the storage protocol on its stdio. Mirrors
-/// the C `protocolRemoteParam` / `storageRemoteNew` in `src/protocol/helper.c`.
+/// roots at `remote_path` and serves the storage protocol on its stdio.
 ///
 /// # Errors
 ///
 /// Returns [`CliRunError::Protocol`] if the `ssh` process cannot be spawned.
-fn build_remote_host_storage(
+fn build_ssh_host_storage(
     cfg: &LoadedConfig,
     host: &str,
     family: &str,
@@ -254,6 +303,54 @@ fn build_remote_host_storage(
 
     let storage = RemoteProcessStorage::spawn_ssh(host, ssh_port, ssh_user.as_deref(), &remote_program, &remote_args)
         .map_err(CliRunError::Protocol)?;
+    Ok(Box::new(storage))
+}
+
+/// Resolve the TLS host transport's connect address `<host>:<port>` from the
+/// `tls-server-port` option (default [`DEFAULT_TLS_PORT`]) — pgBackRest connects
+/// to the peer's `pgbackrest server` listener, whose port is `tls-server-port`.
+fn tls_host_address(cfg: &LoadedConfig, host: &str) -> String {
+    let port = integer_option(cfg, "tls-server-port", 1)
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(DEFAULT_TLS_PORT);
+    format!("{host}:{port}")
+}
+
+/// Open a mutual-TLS connection to `host`'s running `pgbackrest server` and wrap
+/// it in a [`RemoteTlsStorage`] proxy running the same storage protocol.
+///
+/// The `<family>-host-ca-file` (required) is the CA the client trusts for the
+/// server certificate; `<family>-host-cert-file` / `<family>-host-key-file`
+/// (both required for mutual TLS) are the client certificate the peer authorizes
+/// by its Common Name against `tls-server-auth`. `tls-cipher-12` /
+/// `tls-cipher-13`, when set, restrict the negotiated ciphers. The peer serves a
+/// `pgbackrest server` rooted at its configured path, so no remote argv / root
+/// is passed here (unlike the SSH worker).
+///
+/// # Errors
+///
+/// Returns [`CliRunError::Command`] when a required `*-host-{ca,cert,key}-file`
+/// is missing or a PEM file is invalid, and [`CliRunError::Protocol`] when the
+/// TLS connection or handshake fails.
+fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u32) -> Result<Box<dyn Storage>, CliRunError> {
+    let ca_file = string_option(cfg, &format!("{family}-host-ca-file"), index)
+        .ok_or_else(|| CliRunError::StorageConfig(format!("{family}-host-type=tls requires {family}-host-ca-file")))?;
+    let cert_file = string_option(cfg, &format!("{family}-host-cert-file"), index);
+    let key_file = string_option(cfg, &format!("{family}-host-key-file"), index);
+
+    // The allowed-cipher option values, in 1.2-then-1.3 order; empty when unset
+    // so the peer / rustls defaults apply.
+    let cipher_names: Vec<String> = ["tls-cipher-12", "tls-cipher-13"]
+        .into_iter()
+        .filter_map(|name| string_option(cfg, name, 1))
+        .collect();
+
+    let client_config =
+        pgbr_command::server::build_client_config_from_files(&ca_file, cert_file.as_deref(), key_file.as_deref(), &cipher_names)
+            .map_err(CliRunError::Command)?;
+
+    let addr = tls_host_address(cfg, host);
+    let storage = RemoteTlsStorage::connect(&addr, host, Arc::new(client_config)).map_err(CliRunError::Protocol)?;
     Ok(Box::new(storage))
 }
 
@@ -454,7 +551,8 @@ mod tests {
     use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
 
     use super::{
-        active_repo_index, build_all_repo_storages, build_pg_storage, build_repo_storage, configured_repo_indexes, sftp_config_from,
+        active_repo_index, build_all_repo_storages, build_pg_storage, build_repo_storage, configured_repo_indexes,
+        sftp_config_from, tls_host_address,
     };
     use crate::CliRunError;
     use pgbr_storage::SftpAuth;
@@ -939,5 +1037,132 @@ mod tests {
         assert!(repo2.path().join("f2.txt").exists());
         assert!(!repo1.path().join("f2.txt").exists(), "repo1 must not get repo2's file");
         assert!(!repo2.path().join("f1.txt").exists(), "repo2 must not get repo1's file");
+    }
+
+    // -----------------------------------------------------------------------
+    // host-type=tls / host-type=ssh routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tls_host_address_uses_tls_server_port() {
+        // No tls-server-port → the default 8432.
+        let c = cfg("info", &[]);
+        assert_eq!(tls_host_address(&c, "backup.example.com"), "backup.example.com:8432");
+
+        // An explicit tls-server-port is honoured.
+        let c2 = cfg("info", &[("tls-server-port", None, OptionValue::Integer(9999))]);
+        assert_eq!(tls_host_address(&c2, "backup.example.com"), "backup.example.com:9999");
+    }
+
+    #[test]
+    fn repo_host_type_tls_routes_to_tls_transport() {
+        // `repo-host` + `repo-host-type=tls` must take the TLS transport, not the
+        // SSH worker spawn. With no server listening the connect fails — but the
+        // failure must come from the TLS path: a `Protocol` connect error (no
+        // peer) or a `Command`/`StorageConfig` from a missing/invalid cert
+        // option. It must NEVER be `NotSupportedYet`, and (since a CA file is
+        // supplied that does not exist) it must surface the TLS-side error rather
+        // than spawning ssh.
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
+                (
+                    "repo-host-ca-file",
+                    Some(1),
+                    OptionValue::String("/no/such/ca.pem".to_owned()),
+                ),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            // A bad CA path surfaces as a Command error (PEM read failure) from
+            // the TLS client-config builder.
+            Err(CliRunError::Command(_) | CliRunError::Protocol(_) | CliRunError::StorageConfig(_)) => {}
+            Err(CliRunError::NotSupportedYet(msg)) => panic!("repo-host-type=tls must not be NotSupportedYet: {msg}"),
+            Ok(_) => panic!("expected a TLS-transport error (no server listening), got Ok(storage)"),
+            Err(other) => panic!("expected TLS-path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_host_type_tls_requires_ca_file() {
+        // `repo-host-type=tls` without `repo-host-ca-file` is a configuration
+        // error (the client cannot validate the server without a CA).
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Err(CliRunError::StorageConfig(msg)) => assert!(msg.contains("repo-host-ca-file"), "msg was {msg}"),
+            Ok(_) => panic!("expected StorageConfig(ca-file required), got Ok(storage)"),
+            Err(other) => panic!("expected StorageConfig(ca-file required), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_host_type_tls_routes_to_tls_transport() {
+        // The pg side honours `pg-host-type=tls` symmetrically.
+        let config = cfg(
+            "backup",
+            &[
+                ("pg-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
+                ("pg-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
+                ("pg-host-ca-file", Some(1), OptionValue::String("/no/such/ca.pem".to_owned())),
+                (
+                    "pg-path",
+                    Some(1),
+                    OptionValue::Path("/var/lib/postgresql/16/main".to_owned()),
+                ),
+            ],
+        );
+        match build_pg_storage(&config) {
+            Err(CliRunError::Command(_) | CliRunError::Protocol(_) | CliRunError::StorageConfig(_)) => {}
+            Err(CliRunError::NotSupportedYet(msg)) => panic!("pg-host-type=tls must not be NotSupportedYet: {msg}"),
+            Ok(_) => panic!("expected a TLS-transport error (no server listening), got Ok(storage)"),
+            Err(other) => panic!("expected TLS-path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_host_type_ssh_still_spawns_worker() {
+        // The default `ssh` host-type (explicitly set) keeps the SSH worker
+        // spawn path: either Ok (ssh on PATH) or Protocol (ssh absent), never
+        // the TLS path's CA-file error nor NotSupportedYet.
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("ssh".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Ok(_) | Err(CliRunError::Protocol(_)) => {}
+            // `Box<dyn Storage>` is not Debug, so the Err is formatted only here.
+            Err(other) => panic!("expected SSH spawn outcome (Ok or Protocol), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_host_type_unknown_errors() {
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("h".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("carrier-pigeon".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Err(CliRunError::StorageConfig(msg)) => assert!(msg.contains("carrier-pigeon"), "msg was {msg}"),
+            Ok(_) => panic!("expected StorageConfig(unknown host-type), got Ok(storage)"),
+            Err(other) => panic!("expected StorageConfig(unknown host-type), got {other:?}"),
+        }
     }
 }
