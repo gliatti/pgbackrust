@@ -184,16 +184,18 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_implemented_path_for_server() {
-        // `server` still needs a TLS transport; its dispatcher entry returns
-        // the generic `NotYetImplemented` (the tested protocol core lives in
-        // `server::serve` / `server::ping_exchange`).
-        let cfg = fake_config("server", None, None);
+    fn server_ping_dispatches_to_real_implementation() {
+        // `server-ping` now drives a real TCP client (`server::ping_tcp`):
+        // dispatching it with nothing listening on the default address
+        // surfaces a connect failure (`CommandError::Other`), not the generic
+        // `NotYetImplemented` stub. The transport-agnostic protocol core lives
+        // in `server::serve` / `server::ping_exchange`.
+        let cfg = fake_config("server-ping", None, None);
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("server is not yet implemented");
+        let err = dispatch(&cfg, &repo_s, &pg_s).expect_err("server-ping with no server must fail to connect");
         match err {
-            CommandError::NotYetImplemented { command } => assert_eq!(command, "server"),
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            CommandError::Other(msg) => assert!(msg.contains("tcp connect"), "message was {msg:?}"),
+            other => panic!("expected Other(tcp connect), got {other:?}"),
         }
     }
 
