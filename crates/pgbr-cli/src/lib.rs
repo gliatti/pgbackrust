@@ -426,16 +426,16 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_implemented_command_returns_exit_2() {
-        // `verify` is a real command whose Rust implementation is still a
-        // stub (returns `NotYetImplemented`), and it needs only repo-path —
-        // satisfiable from the CLI alone. The dispatch step should map the
-        // stub to exit code 2. If `load_config` rejects the invocation first
-        // (a pre-existing pgbr-config default-validation quirk, not pgbr-cli's
-        // concern), accept the `Load` error instead.
-        match run(["verify", "--stanza=demo", "--repo1-path=/tmp/repo"]) {
-            Ok(2) | Err(CliRunError::Load(_)) => {}
-            other => panic!("expected Ok(2) or Load error, got {other:?}"),
+    fn verify_command_dispatches_end_to_end() {
+        // Every command is implemented now (no `NotYetImplemented` left), and
+        // the literal-default + depend-gating fixes let the real config.yaml
+        // resolve. `verify` against an uninitialized repo therefore reaches its
+        // implementation and yields a command-level outcome (Ok exit code, or a
+        // `Command` error) — never a config-resolution failure.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        match run(["verify", "--stanza=demo", &format!("--repo1-path={}", tmp.path().display())]) {
+            Ok(_) | Err(CliRunError::Command(_)) => {}
+            other => panic!("verify should dispatch to its implementation, got {other:?}"),
         }
     }
 

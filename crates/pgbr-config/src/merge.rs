@@ -242,6 +242,12 @@ pub fn load_config_with_context(
     // the default later.
     let mut deferred_flavor: Vec<DeferredFlavorDefault> = Vec::new();
 
+    // Keys whose value came from an explicit source (CLI or INI), as opposed to
+    // a default. The depend pass gates on this: an option with an unsatisfied
+    // `depend:` is silently dropped when it was only defaulted (the option is
+    // inactive), but is an error when the user set it explicitly.
+    let mut explicit: BTreeSet<(String, Option<u32>)> = BTreeSet::new();
+
     for (name, opt) in &cfg.options {
         if !opt.commands.contains_key(&cli.command) {
             continue;
@@ -277,6 +283,9 @@ pub fn load_config_with_context(
             } else {
                 lookup_ini(name, idx, opt, ini, &cli, opt.option_type, stanza.as_deref())?
             };
+            // Whether the value (if any) comes from an explicit source rather
+            // than a default — drives depend gating below.
+            let is_explicit = cli_value.is_some() || ini_value.is_some();
             // A per-flavor sequence default is deferred to pass two so the
             // flavor source is resolved first; everything else resolves now.
             let mut deferred = false;
@@ -297,6 +306,9 @@ pub fn load_config_with_context(
 
             if let Some(value) = final_value {
                 validate_value(&value, opt, usage, name, idx)?;
+                if is_explicit {
+                    explicit.insert(key.clone());
+                }
                 options.insert(key, value);
             } else if !deferred && opt.required && (usage.required != Some(false)) {
                 // A deferred flavor default isn't "missing" yet — pass two
@@ -329,7 +341,7 @@ pub fn load_config_with_context(
         }
     }
 
-    validate_depends(&options, cfg, &cli.command)?;
+    apply_depends(&mut options, &explicit, cfg, &cli.command)?;
 
     Ok(LoadedConfig {
         command: cli.command,
@@ -550,7 +562,22 @@ fn option_value_match_candidates(v: &OptionValue) -> Vec<String> {
     }
 }
 
-fn validate_depends(options: &BTreeMap<(String, Option<u32>), OptionValue>, cfg: &Cfg, command: &str) -> Result<(), LoadError> {
+/// Gate options on their `depend:` constraint.
+///
+/// An option whose dependency is not satisfied is *inactive*: if its value was
+/// only a default it is silently dropped (matching pgBackRest, where e.g.
+/// `repo-azure-*` defaults never apply unless `repo-type=azure`); if the user
+/// set it *explicitly* (CLI/INI) it is a [`LoadError::DependNotSatisfied`].
+/// Options whose dependency is satisfied (or that have no `depend:`) are kept.
+fn apply_depends(
+    options: &mut BTreeMap<(String, Option<u32>), OptionValue>,
+    explicit: &BTreeSet<(String, Option<u32>)>,
+    cfg: &Cfg,
+    command: &str,
+) -> Result<(), LoadError> {
+    // Collect first (can't mutate `options` while iterating its keys).
+    let mut drop_keys: Vec<(String, Option<u32>)> = Vec::new();
+
     for (name, idx) in options.keys() {
         let Some(opt) = cfg.options.get(name) else {
             continue;
@@ -582,41 +609,53 @@ fn validate_depends(options: &BTreeMap<(String, Option<u32>), OptionValue>, cfg:
             .map(|l| l.iter().filter_map(value_to_match_str).collect())
             .unwrap_or_default();
 
-        match dep_value {
-            None => {
-                // Depended option has no resolved value.
-                if depend.default.is_some() {
-                    // Lenient: dep is unsatisfied but tolerated. Future,
-                    // type-aware substitution will plug in `depend.default`.
-                    continue;
-                }
-                return Err(LoadError::DependNotSatisfied {
-                    option: name.clone(),
-                    group_index: *idx,
-                    depend_option: depend.option.clone(),
-                    depend_value: "unset".to_owned(),
-                    depend_list: depend_list_strs,
-                });
-            }
-            Some(v) => {
-                if depend.list.is_none() {
-                    // Bare `depend: <name>` — satisfied iff dep has any value.
-                    continue;
-                }
+        // Determine whether the dependency is satisfied. Bare `depend: <name>`
+        // is satisfied by any value; a listed depend needs the value in the list.
+        let satisfied = dep_value.is_some_and(|v| {
+            depend.list.is_none() || {
                 let candidates = option_value_match_candidates(v);
-                if candidates.iter().any(|c| depend_list_strs.iter().any(|d| d == c)) {
-                    continue;
-                }
-                let value_str = candidates.first().cloned().unwrap_or_else(|| "<opaque>".to_owned());
-                return Err(LoadError::DependNotSatisfied {
-                    option: name.clone(),
-                    group_index: *idx,
-                    depend_option: depend.option.clone(),
-                    depend_value: value_str,
-                    depend_list: depend_list_strs,
-                });
+                candidates.iter().any(|c| depend_list_strs.iter().any(|d| d == c))
             }
+        });
+        if satisfied {
+            continue;
         }
+
+        // `depend: {..., default: x}` tolerates an unsatisfied dependency: the
+        // option keeps its value rather than erroring or being dropped.
+        // (Type-aware substitution of `depend.default` is a future refinement.)
+        if depend.default.is_some() {
+            continue;
+        }
+
+        let key = (name.clone(), *idx);
+        if explicit.contains(&key) {
+            // The user set this explicitly but the dependency isn't met → error.
+            let depend_value = dep_value.map_or_else(
+                || "unset".to_owned(),
+                |v| {
+                    option_value_match_candidates(v)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "<opaque>".to_owned())
+                },
+            );
+            return Err(LoadError::DependNotSatisfied {
+                option: name.clone(),
+                group_index: *idx,
+                depend_option: depend.option.clone(),
+                depend_value,
+                depend_list: depend_list_strs,
+            });
+        }
+        // Defaulted value with an unsatisfied dependency → the option is
+        // inactive; drop it. (`depend.default` substitution stays a future
+        // refinement; for now an inactive option simply has no value.)
+        drop_keys.push(key);
+    }
+
+    for key in drop_keys {
+        options.remove(&key);
     }
     Ok(())
 }
@@ -651,12 +690,57 @@ fn resolve_default(
         // resolved default. The caller can still set one explicitly.
         _ => return Ok(None),
     };
+
+    // `default-type: literal` defaults are C string-concatenation expressions
+    // that the deleted C generator used to expand (e.g.
+    // `CFGOPTDEF_CONFIG_PATH "/" PROJECT_CONFIG_FILE`). Expand them here so the
+    // resolved value is a concrete string rather than raw C-macro text.
+    let scalar = if opt.default_type == Some(DefaultType::Literal) {
+        expand_literal_default(&scalar)
+    } else {
+        scalar
+    };
+
     let value = parse_value(opt.option_type, &scalar).map_err(|error| LoadError::ValueParse {
         option: option_name.to_owned(),
         group_index,
         error,
     })?;
     Ok(Some(value))
+}
+
+/// Resolve a C preprocessor identifier used in a `default-type: literal`
+/// default to its string value. The C build generator expanded these when it
+/// emitted the auto files; the Rust pipeline reads the raw `config.yaml`, so
+/// the expansion happens here. Values mirror pgBackRest's `PROJECT_CONFIG_*`
+/// (`src/version.h`) and the `CFGOPTDEF_CONFIG_PATH` define.
+fn literal_macro_value(ident: &str) -> Option<&'static str> {
+    match ident {
+        "CFGOPTDEF_CONFIG_PATH" => Some("/etc/pgbackrest"),
+        "PROJECT_CONFIG_FILE" => Some("pgbackrest.conf"),
+        "PROJECT_CONFIG_INCLUDE_PATH" => Some("conf.d"),
+        _ => None,
+    }
+}
+
+/// Expand a `default-type: literal` default — a C string-concatenation
+/// expression of whitespace-separated tokens, each either a `"..."` string
+/// literal (taken verbatim, without the quotes) or a macro identifier resolved
+/// via [`literal_macro_value`]. Unknown identifiers are kept verbatim so a
+/// missing macro surfaces as a visible (and typically invalid) value rather
+/// than silent corruption.
+fn expand_literal_default(raw: &str) -> String {
+    let mut out = String::new();
+    for token in raw.split_whitespace() {
+        if let Some(inner) = token.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            out.push_str(inner);
+        } else if let Some(val) = literal_macro_value(token) {
+            out.push_str(val);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
 }
 
 /// Resolve a `default-type: dynamic` default. The `bin` tag yields the
@@ -1248,6 +1332,82 @@ option:
                 assert_eq!(depend_option, "gamma");
             }
             other => panic!("expected DependNotSatisfied(gamma), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defaulted_option_with_unsatisfied_depend_is_dropped_not_errored() {
+        // `extra` has a default AND depends on `kind` being `special`. With
+        // `kind` left at its `normal` default, `extra` is inactive: its default
+        // must NOT apply and must NOT raise DependNotSatisfied (mirrors
+        // config.yaml's cloud options like repo-azure-* under repo-type=posix).
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  kind:
+    type: string-id
+    default: normal
+    command:
+      backup: {}
+  extra:
+    type: string
+    default: fallback
+    depend:
+      option: kind
+      list:
+        - special
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let loaded = load_config(resolved, &crate::ini::IniFile::default(), &cfg)
+            .expect("a defaulted option with an unsatisfied depend must not error");
+        assert!(
+            !loaded.options.contains_key(&("extra".to_owned(), None)),
+            "inactive defaulted option must be dropped from the resolved set"
+        );
+    }
+
+    #[test]
+    fn literal_default_expands_c_macro_expressions() {
+        assert_eq!(expand_literal_default("CFGOPTDEF_CONFIG_PATH"), "/etc/pgbackrest");
+        assert_eq!(
+            expand_literal_default("CFGOPTDEF_CONFIG_PATH \"/\" PROJECT_CONFIG_FILE"),
+            "/etc/pgbackrest/pgbackrest.conf"
+        );
+        assert_eq!(
+            expand_literal_default("CFGOPTDEF_CONFIG_PATH \"/\" PROJECT_CONFIG_INCLUDE_PATH"),
+            "/etc/pgbackrest/conf.d"
+        );
+    }
+
+    #[test]
+    fn real_config_info_resolves_end_to_end() {
+        // Guards the two binary-blocking bugs: literal-macro defaults
+        // (`config-path` etc.) and depend-gating on cloud-option defaults.
+        // `pgbackrest info --stanza=demo --repo1-path=/tmp/x` must fully resolve.
+        let parsed = pgbr_build::parse_config(pgbr_build::inputs::CONFIG_YAML).unwrap();
+        let cfg = crate::compile::compile(&parsed).unwrap();
+        let cli = parse_cli(["info", "--stanza=demo", "--repo1-path=/tmp/x"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let loaded =
+            load_config(resolved, &crate::ini::IniFile::default(), &cfg).expect("info must resolve against the real config.yaml");
+        // No resolved value may carry unexpanded C-macro text (the literal-default bug).
+        for ((name, _), value) in &loaded.options {
+            if let OptionValue::Path(s) | OptionValue::String(s) | OptionValue::StringId(s) = value {
+                assert!(
+                    !s.contains("CFGOPTDEF") && !s.contains("PROJECT_"),
+                    "option `{name}` has an unexpanded literal default: {s:?}"
+                );
+            }
         }
     }
 
