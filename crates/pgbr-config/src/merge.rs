@@ -25,8 +25,40 @@ use crate::cli::ResolvedCli;
 use crate::compile::Cfg;
 use crate::ini::{IniFile, IniSection};
 use crate::option::CfgOption;
-use crate::types::{ConfigCommandRole, OptionGroup, OptionType};
+use crate::types::{ConfigCommandRole, DefaultType, OptionGroup, OptionType};
 use crate::value::{OptionValue, ValueError, parse_value};
+
+/// The `default:` tag (used with `default-type: dynamic`) whose value is the
+/// running executable's path — i.e. `argv[0]`. In `config.yaml` the `cmd`,
+/// `pg-host-cmd`, and `repo-host-cmd` options all carry `default: bin`.
+const DYNAMIC_TAG_BIN: &str = "bin";
+
+/// Fallback used for the `bin` dynamic default when the [`RuntimeContext`]
+/// doesn't carry an executable path.
+const DYNAMIC_BIN_FALLBACK: &str = "pgbackrest";
+
+/// The option whose resolved value selects the "flavor" entry of a per-flavor
+/// sequence default (e.g. `compress-level`'s `[{gz: 6}, {zst: 3}, …]` is keyed
+/// by the value of `compress-type`).
+const FLAVOR_SOURCE_OPTION: &str = "compress-type";
+
+/// Flavor used when [`FLAVOR_SOURCE_OPTION`] has no resolved value. Matches
+/// `compress-type`'s own scalar default in `config.yaml`.
+const FLAVOR_DEFAULT: &str = "gz";
+
+/// Runtime values that feed dynamic default resolution.
+///
+/// `default-type: dynamic` options carry a tag (e.g. `bin`) instead of a
+/// literal default; the real value is computed from the running process. This
+/// struct threads those runtime inputs into [`load_config_with_context`].
+/// Fields beyond `exe_path` (e.g. a resolved `PostgreSQL` version) can be
+/// added here as more dynamic tags are implemented.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeContext {
+    /// Path of the running pgBackRest executable (`argv[0]`). Used by the
+    /// `bin` dynamic default. `None` falls back to `"pgbackrest"`.
+    pub exe_path: Option<String>,
+}
 
 /// Final, fully merged configuration for one `pgbackrest <command>`
 /// invocation.
@@ -155,7 +187,13 @@ impl fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 /// Merge a [`ResolvedCli`], an [`IniFile`], and the defaults from a
-/// compiled [`Cfg`] into a final [`LoadedConfig`].
+/// compiled [`Cfg`] into a final [`LoadedConfig`], using a default
+/// [`RuntimeContext`].
+///
+/// This is a thin wrapper over [`load_config_with_context`] retained so
+/// existing callers (e.g. `pgbr-cli`) compile unchanged. Dynamic defaults
+/// that need runtime inputs (the `bin` executable path) fall back to their
+/// documented defaults when called this way.
 ///
 /// # Errors
 ///
@@ -163,12 +201,46 @@ impl std::error::Error for LoadError {}
 /// option is missing, or when an INI section references an unknown option
 /// key (typo / dropped option).
 pub fn load_config(cli: ResolvedCli, ini: &IniFile, cfg: &Cfg) -> Result<LoadedConfig, LoadError> {
+    load_config_with_context(cli, ini, cfg, &RuntimeContext::default())
+}
+
+/// Merge a [`ResolvedCli`], an [`IniFile`], and the defaults from a
+/// compiled [`Cfg`] into a final [`LoadedConfig`], resolving dynamic and
+/// per-flavor defaults using `ctx`.
+///
+/// Resolution runs in two passes so that flavor-dependent defaults (e.g.
+/// `compress-level`, whose default depends on the resolved `compress-type`)
+/// can read the value of their flavor-source option after it has been
+/// resolved:
+///
+/// 1. Every option whose default is *not* a per-flavor sequence is resolved.
+/// 2. Per-flavor sequence defaults are resolved against the now-populated
+///    options map (the flavor source falls back to [`FLAVOR_DEFAULT`] when
+///    unset).
+///
+/// # Errors
+///
+/// Returns [`LoadError`] when an INI value fails to parse, when a required
+/// option is missing, or when an INI section references an unknown option
+/// key (typo / dropped option).
+pub fn load_config_with_context(
+    cli: ResolvedCli,
+    ini: &IniFile,
+    cfg: &Cfg,
+    ctx: &RuntimeContext,
+) -> Result<LoadedConfig, LoadError> {
     let stanza = extract_stanza(&cli);
     let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
 
     // Discover indices for each grouped option from CLI + every INI section
     // by scanning the raw keys.
     let group_indices = discover_group_indices(&cli, ini, cfg);
+
+    // Per-flavor sequence defaults are deferred to a second pass so the
+    // flavor-source option (e.g. `compress-type`) is already resolved when
+    // their default is selected. Each entry records the data needed to finish
+    // the default later.
+    let mut deferred_flavor: Vec<DeferredFlavorDefault> = Vec::new();
 
     for (name, opt) in &cfg.options {
         if !opt.commands.contains_key(&cli.command) {
@@ -205,23 +277,55 @@ pub fn load_config(cli: ResolvedCli, ini: &IniFile, cfg: &Cfg) -> Result<LoadedC
             } else {
                 lookup_ini(name, idx, opt, ini, &cli, opt.option_type, stanza.as_deref())?
             };
+            // A per-flavor sequence default is deferred to pass two so the
+            // flavor source is resolved first; everything else resolves now.
+            let mut deferred = false;
             let final_value = if let Some(v) = cli_value {
                 Some(v)
             } else if let Some(v) = ini_value {
                 Some(v)
+            } else if let Some(seq) = flavor_sequence_default(opt, usage) {
+                deferred_flavor.push(DeferredFlavorDefault {
+                    key: key.clone(),
+                    sequence: seq,
+                });
+                deferred = true;
+                None
             } else {
-                resolve_default(opt, usage, name, idx)?
+                resolve_default(opt, usage, name, idx, ctx)?
             };
 
             if let Some(value) = final_value {
                 validate_value(&value, opt, usage, name, idx)?;
                 options.insert(key, value);
-            } else if opt.required && (usage.required != Some(false)) {
+            } else if !deferred && opt.required && (usage.required != Some(false)) {
+                // A deferred flavor default isn't "missing" yet — pass two
+                // will fill it. Only error for genuinely unresolved options.
                 return Err(LoadError::Required {
                     option: name.clone(),
                     group_index: idx,
                 });
             }
+        }
+    }
+
+    // Pass two: resolve per-flavor sequence defaults against the resolved
+    // flavor-source value.
+    for deferred in &deferred_flavor {
+        let (name, idx) = &deferred.key;
+        let Some(opt) = cfg.options.get(name) else {
+            continue;
+        };
+        let usage = &opt.commands[&cli.command];
+        let flavor = resolved_flavor(&options);
+        if let Some(value) = pick_flavor_default(&deferred.sequence, &flavor, opt.option_type, name, *idx)? {
+            validate_value(&value, opt, usage, name, *idx)?;
+            options.insert(deferred.key.clone(), value);
+        } else if opt.required && (usage.required != Some(false)) {
+            return Err(LoadError::Required {
+                option: name.clone(),
+                group_index: *idx,
+            });
         }
     }
 
@@ -234,6 +338,12 @@ pub fn load_config(cli: ResolvedCli, ini: &IniFile, cfg: &Cfg) -> Result<LoadedC
         options,
         params: cli.params,
     })
+}
+
+/// A per-flavor sequence default whose resolution is deferred to pass two.
+struct DeferredFlavorDefault {
+    key: (String, Option<u32>),
+    sequence: Vec<serde_yml::Value>,
 }
 
 fn extract_stanza(cli: &ResolvedCli) -> Option<String> {
@@ -498,15 +608,23 @@ fn resolve_default(
     usage: &crate::option::ResolvedCommandUsage,
     option_name: &str,
     group_index: Option<u32>,
+    ctx: &RuntimeContext,
 ) -> Result<Option<OptionValue>, LoadError> {
     // Per-command default first, then option-level default.
     let raw = usage.default.as_ref().or(opt.default.as_ref());
     let Some(raw) = raw else {
         return Ok(None);
     };
-    // Only handle scalar defaults — per-flavor list defaults (compress-level
-    // and friends) are deferred until the consumer that needs them
-    // (a flavor-aware lookup is wider than the scope of this merge step).
+
+    // `default-type: dynamic`: the `default:` holds a tag naming a runtime
+    // value, not a literal. Resolve recognised tags from the context.
+    if opt.default_type == Some(DefaultType::Dynamic) {
+        return Ok(resolve_dynamic_default(raw, ctx));
+    }
+
+    // Only handle scalar defaults here. Per-flavor sequence defaults are
+    // resolved by the caller's second pass (see `flavor_sequence_default` /
+    // `pick_flavor_default`).
     let scalar = match raw {
         serde_yml::Value::String(s) => s.clone(),
         serde_yml::Value::Bool(b) => b.to_string(),
@@ -521,6 +639,99 @@ fn resolve_default(
         error,
     })?;
     Ok(Some(value))
+}
+
+/// Resolve a `default-type: dynamic` default. The `bin` tag yields the
+/// executable path from `ctx` (falling back to [`DYNAMIC_BIN_FALLBACK`]).
+/// Unrecognised tags stay unresolved (returning `None`) rather than erroring,
+/// so new dynamic tags can be added incrementally.
+fn resolve_dynamic_default(raw: &serde_yml::Value, ctx: &RuntimeContext) -> Option<OptionValue> {
+    let serde_yml::Value::String(tag) = raw else {
+        // TODO: non-string dynamic tags (none exist in config.yaml today).
+        return None;
+    };
+    match tag.as_str() {
+        DYNAMIC_TAG_BIN => Some(OptionValue::String(
+            ctx.exe_path.clone().unwrap_or_else(|| DYNAMIC_BIN_FALLBACK.to_owned()),
+        )),
+        // TODO: other dynamic tags (e.g. environment- or option-derived
+        // defaults) resolve here as they're ported.
+        _ => None,
+    }
+}
+
+/// If `opt`'s default (per-command override first, then option-level) is a
+/// per-flavor sequence — a YAML sequence of single-key maps like
+/// `[{gz: 6}, {zst: 3}]` — return the sequence so the caller can defer its
+/// resolution until the flavor source is known. Returns `None` for any other
+/// default shape (including dynamic, handled elsewhere).
+fn flavor_sequence_default(opt: &CfgOption, usage: &crate::option::ResolvedCommandUsage) -> Option<Vec<serde_yml::Value>> {
+    if opt.default_type == Some(DefaultType::Dynamic) {
+        return None;
+    }
+    let raw = usage.default.as_ref().or(opt.default.as_ref())?;
+    let serde_yml::Value::Sequence(items) = raw else {
+        return None;
+    };
+    // Confirm every entry is a single-key map; otherwise it's not a per-flavor
+    // sequence and we leave it to the existing (scalar-only) path.
+    if items.is_empty()
+        || !items
+            .iter()
+            .all(|item| matches!(item, serde_yml::Value::Mapping(m) if m.len() == 1))
+    {
+        return None;
+    }
+    Some(items.clone())
+}
+
+/// The current flavor used to select a per-flavor default — the resolved
+/// value of [`FLAVOR_SOURCE_OPTION`] (`compress-type`), or [`FLAVOR_DEFAULT`]
+/// when it isn't set.
+fn resolved_flavor(options: &BTreeMap<(String, Option<u32>), OptionValue>) -> String {
+    options
+        .get(&(FLAVOR_SOURCE_OPTION.to_owned(), None))
+        .and_then(option_value_to_match_str)
+        .unwrap_or_else(|| FLAVOR_DEFAULT.to_owned())
+}
+
+/// Pick the entry of a per-flavor sequence whose single key matches `flavor`
+/// and parse its value as `option_type`. Returns `None` when no entry matches.
+fn pick_flavor_default(
+    sequence: &[serde_yml::Value],
+    flavor: &str,
+    option_type: OptionType,
+    option_name: &str,
+    group_index: Option<u32>,
+) -> Result<Option<OptionValue>, LoadError> {
+    for item in sequence {
+        let serde_yml::Value::Mapping(map) = item else {
+            continue;
+        };
+        let Some((key, value)) = map.iter().next() else {
+            continue;
+        };
+        let key_matches = match key {
+            serde_yml::Value::String(s) => s == flavor,
+            _ => false,
+        };
+        if !key_matches {
+            continue;
+        }
+        let scalar = match value {
+            serde_yml::Value::String(s) => s.clone(),
+            serde_yml::Value::Bool(b) => b.to_string(),
+            serde_yml::Value::Number(n) => n.to_string(),
+            _ => return Ok(None),
+        };
+        let parsed = parse_value(option_type, &scalar).map_err(|error| LoadError::ValueParse {
+            option: option_name.to_owned(),
+            group_index,
+            error,
+        })?;
+        return Ok(Some(parsed));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1020,5 +1231,190 @@ option:
             }
             other => panic!("expected DependNotSatisfied(gamma), got {other:?}"),
         }
+    }
+
+    // ---- dynamic and per-flavor defaults -----------------------------------
+
+    /// Config with a `default-type: dynamic` option (`cmd`, like config.yaml's
+    /// real `cmd`/`*-host-cmd` options) whose `default:` is the `bin` tag.
+    fn dynamic_cfg() -> Cfg {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  cmd:
+    type: string
+    default-type: dynamic
+    default: bin
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        crate::compile::compile(&parse_config(yaml).unwrap()).unwrap()
+    }
+
+    /// Config mirroring `compress-level`'s per-flavor sequence default keyed by
+    /// `compress-type`.
+    fn flavor_cfg() -> Cfg {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  compress-type:
+    type: string-id
+    default: gz
+    command:
+      backup: {}
+  compress-level:
+    type: integer
+    required: false
+    default:
+      - gz: 6
+      - zst: 3
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        crate::compile::compile(&parse_config(yaml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn dynamic_bin_default_uses_exe_path() {
+        let cfg = dynamic_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ctx = RuntimeContext {
+            exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+        };
+        let r = load_config_with_context(resolved, &crate::ini::IniFile::default(), &cfg, &ctx).unwrap();
+        assert_eq!(
+            r.options[&("cmd".into(), None)],
+            OptionValue::String("/usr/bin/pgbackrest".into())
+        );
+    }
+
+    #[test]
+    fn dynamic_bin_default_falls_back_when_no_exe_path() {
+        let cfg = dynamic_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        // Default context => no exe path => falls back to "pgbackrest".
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("cmd".into(), None)], OptionValue::String("pgbackrest".into()));
+    }
+
+    #[test]
+    fn dynamic_unknown_tag_stays_unresolved() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  weird:
+    type: string
+    required: false
+    default-type: dynamic
+    default: not-a-known-tag
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        // Unrecognised dynamic tag => no value, but no error either.
+        assert!(!r.options.contains_key(&("weird".into(), None)));
+    }
+
+    #[test]
+    fn per_flavor_default_picks_matching_compress_type() {
+        // compress-type = zst => compress-level default is 3.
+        let cfg = flavor_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-type=zst"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(3));
+
+        // compress-type = gz => compress-level default is 6.
+        let cfg = flavor_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-type=gz"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(6));
+    }
+
+    #[test]
+    fn per_flavor_default_defaults_flavor_when_unset() {
+        // No compress-type on the CLI: it resolves to its own default `gz`,
+        // so compress-level's flavor falls back to gz => 6.
+        let cfg = flavor_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("compress-type".into(), None)], OptionValue::StringId("gz".into()));
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(6));
+    }
+
+    #[test]
+    fn per_flavor_default_uses_fallback_when_source_has_no_default() {
+        // compress-type here has NO scalar default, so it resolves to nothing;
+        // the flavor falls back to the documented `gz` => compress-level = 6.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  compress-type:
+    type: string-id
+    required: false
+    command:
+      backup: {}
+  compress-level:
+    type: integer
+    required: false
+    default:
+      - gz: 6
+      - zst: 3
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert!(!r.options.contains_key(&("compress-type".into(), None)));
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(6));
+    }
+
+    #[test]
+    fn load_config_unchanged_for_scalar_defaults() {
+        // The original scalar-default path is untouched: buffer-size default
+        // 1MiB still applies via plain `load_config`.
+        let r = load(&["backup", "--stanza=demo", "--pg1-path=/data"], "").unwrap();
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(1024 * 1024));
+        assert_eq!(
+            r.options[&("log-level-file".into(), None)],
+            OptionValue::StringId("info".into())
+        );
+        assert_eq!(
+            r.options[&("repo-path".into(), Some(1))],
+            OptionValue::Path("/var/lib/pgbackrest".into())
+        );
     }
 }

@@ -29,7 +29,7 @@ pub use crate::cli::{CliError, CliInput, CliModifier, CliOptionEntry, CliResolve
 pub use crate::command::CfgCommand;
 pub use crate::compile::{Cfg, CompileError, compile};
 pub use crate::ini::{IniError, IniFile, IniSection, parse_ini};
-pub use crate::merge::{LoadError, LoadedConfig, load_config};
+pub use crate::merge::{LoadError, LoadedConfig, RuntimeContext, load_config, load_config_with_context};
 pub use crate::option::{CfgOption, ResolvedCommandUsage, ResolvedDepend};
 pub use crate::types::{ConfigCommandRole, DefaultType, LockType, OptionGroup, OptionSection, OptionType};
 pub use crate::value::{OptionValue, ValueError, parse_value};
