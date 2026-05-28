@@ -891,6 +891,7 @@ dependencies = [
  "pgbr-info",
  "pgbr-io",
  "pgbr-postgres",
+ "pgbr-protocol",
  "pgbr-storage",
  "serde_yml",
  "tempfile",

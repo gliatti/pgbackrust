@@ -16,8 +16,10 @@ use pgbr_config::{
     Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, RuntimeContext, compile,
     load_config_with_context, parse_cli, parse_ini, resolve_cli,
 };
+use pgbr_protocol::ProtocolError;
 use pgbr_storage::StorageError;
 
+pub mod remote_storage;
 mod storage_helper;
 
 /// The pgBackRest schema (`config.yaml`), embedded at compile time by
@@ -81,10 +83,12 @@ pub enum CliRunError {
     /// `Azure::new` with a malformed base64 account key).
     Storage(StorageError),
     /// A capability whose building blocks exist but whose wiring into the
-    /// binary is a follow-up (inter-host SSH operation via `repo-host` /
-    /// `pg-host`; SFTP / GCS service-account selection). Honest placeholder
-    /// rather than a silent fallback.
+    /// binary is a follow-up (SFTP / GCS service-account selection). Honest
+    /// placeholder rather than a silent fallback.
     NotSupportedYet(String),
+    /// Spawning or driving the inter-host worker process failed (e.g. `ssh`
+    /// could not be launched when `repo-host` / `pg-host` is set).
+    Protocol(ProtocolError),
     /// A per-command implementation failed. `NotYetImplemented` is handled
     /// inline (exit 2); every other [`pgbr_command::CommandError`] surfaces
     /// here.
@@ -106,6 +110,7 @@ impl std::fmt::Display for CliRunError {
             Self::StorageConfig(msg) => write!(f, "storage configuration error: {msg}"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::NotSupportedYet(msg) => write!(f, "not supported yet: {msg}"),
+            Self::Protocol(e) => write!(f, "remote worker: {e}"),
             Self::Command(e) => write!(f, "{e}"),
         }
     }
@@ -122,8 +127,8 @@ impl CliRunError {
     ///   [`Self::NotSupportedYet`]) → [`EXIT_CODE_CONFIG_ERROR`] (27). These all
     ///   stem from the resolved invocation asking for something the binary
     ///   can't satisfy from config.
-    /// - runtime command failures ([`Self::Command`], [`Self::Storage`]) →
-    ///   [`EXIT_CODE_RUNTIME_ERROR`] (1).
+    /// - runtime command failures ([`Self::Command`], [`Self::Storage`],
+    ///   [`Self::Protocol`]) → [`EXIT_CODE_RUNTIME_ERROR`] (1).
     /// - internal / embedded-schema errors ([`Self::ConfigYaml`],
     ///   [`Self::Compile`], [`Self::Cli`]) → [`EXIT_CODE_INTERNAL_ERROR`] (1).
     ///
@@ -139,7 +144,7 @@ impl CliRunError {
             | Self::ReadConfigFile { .. }
             | Self::StorageConfig(_)
             | Self::NotSupportedYet(_) => EXIT_CODE_CONFIG_ERROR,
-            Self::Command(_) | Self::Storage(_) => EXIT_CODE_RUNTIME_ERROR,
+            Self::Command(_) | Self::Storage(_) | Self::Protocol(_) => EXIT_CODE_RUNTIME_ERROR,
             Self::ConfigYaml(_) | Self::Compile(_) | Self::Cli(_) => EXIT_CODE_INTERNAL_ERROR,
         }
     }
@@ -204,9 +209,61 @@ where
         Err(err) => return Err(CliRunError::CliResolve(err)),
     };
 
+    // Worker invocation (`<command>:remote` / `<command>:local`): this process
+    // was spawned by a parent pgbackrest (over SSH or locally) to serve the
+    // storage protocol on its stdin/stdout. Route to the worker BEFORE the full
+    // config merge + command dispatch: a worker is handed every option it needs
+    // explicitly on the argv (the parent builds them), so it does not need the
+    // embedded `config.yaml` defaults — and resolving directly from the CLI
+    // sidesteps the full-config default validation the parent already passed.
+    let worker_cfg = worker_loaded_config(&resolved);
+    if pgbr_command::worker::is_worker(&worker_cfg) {
+        return finish_dispatch(pgbr_command::worker::run_worker_stdio(&worker_cfg));
+    }
+
     let loaded = load_resolved(resolved, &cfg, ctx)?;
 
     dispatch_loaded(&loaded)
+}
+
+/// Build a minimal [`LoadedConfig`] straight from a [`ResolvedCli`], without the
+/// INI merge or the embedded-`config.yaml` default resolution.
+///
+/// Used only on the worker path: the worker reads its root (`pg1-path` /
+/// `repo1-path`) and role from the options the parent passed explicitly on the
+/// argv, so the heavier [`load_config_with_context`] merge (which would re-apply
+/// — and validate — every default) is neither needed nor wanted here.
+///
+/// One normalisation is applied: the parent passes the worker's root as the
+/// grouped `--repo1-path` / `--pg1-path`, which `resolve_cli` keys as
+/// `("repo-path", Some(1))` / `("pg-path", Some(1))`. The worker side
+/// (`pgbr_command::worker::run_worker_stdio`) looks the root up under the
+/// *ungrouped* `("repo-path", None)` / `("pg-path", None)` keys, so mirror the
+/// grouped value into the ungrouped key it reads.
+fn worker_loaded_config(resolved: &ResolvedCli) -> LoadedConfig {
+    let stanza = resolved.options.get(&("stanza".to_owned(), None)).and_then(|v| match v {
+        OptionValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+
+    let mut options = resolved.options.clone();
+    for name in ["repo-path", "pg-path"] {
+        let grouped = (name.to_owned(), Some(1));
+        let ungrouped = (name.to_owned(), None);
+        if !options.contains_key(&ungrouped)
+            && let Some(value) = options.get(&grouped).cloned()
+        {
+            options.insert(ungrouped, value);
+        }
+    }
+
+    LoadedConfig {
+        command: resolved.command.clone(),
+        command_role: resolved.command_role,
+        stanza,
+        options,
+        params: resolved.params.clone(),
+    }
 }
 
 /// Build storage (as needed) and dispatch `loaded` to its command, mapping the

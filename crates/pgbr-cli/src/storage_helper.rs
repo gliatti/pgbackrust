@@ -5,9 +5,10 @@
 //! Routing (per the C reference):
 //!
 //! - If `repo-host` (resp. `pg-host`) is set the storage is *remote* — driven
-//!   over an SSH tunnel by the protocol layer. That spawn wiring is not yet
-//!   ported into the binary, so we return [`CliRunError::NotSupportedYet`] with
-//!   an honest message rather than silently falling back to local posix.
+//!   over an SSH tunnel by the protocol layer. We spawn a `pgbackrest` worker
+//!   on that host (`ssh <host> pgbackrest <command>:remote …`, see
+//!   [`crate::remote_storage`]) and proxy every [`Storage`] call to it through
+//!   [`pgbr_storage::remote::RemoteStorage`]. C ref: `src/protocol/helper.c`.
 //! - Otherwise the repo backend is selected by `repo-type` (default `posix`):
 //!   `posix`/`cifs` are filesystem-rooted at `repo-path`; `s3`/`azure`/`gcs`
 //!   are built from their `repo-*` option families. The pg backend is always a
@@ -17,12 +18,24 @@
 //! …) with a fallback to the ungrouped key, matching how the rest of the
 //! binary reads grouped options.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_protocol::PGBACKREST_PROGRAM;
 use pgbr_storage::{Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, Posix, S3, S3Config, Storage};
 
 use crate::CliRunError;
+use crate::remote_storage::RemoteProcessStorage;
+
+/// The `pgbackrest` command the spawned worker is invoked with, in the
+/// `<command>:remote` form so the child's [`pgbr_command::worker::is_worker`]
+/// recognises the `Remote` command role and serves the storage protocol on its
+/// stdio. `backup` is used because it declares the `remote` role and accepts
+/// both `repo-path` and `pg-path`, so one worker command covers both the repo
+/// and PG roots. The worker bypasses the full-config default validation
+/// (see [`crate::run_with_context`]), so only the role + the explicitly passed
+/// `--stanza` / `--<repo|pg>1-path` matter.
+const WORKER_COMMAND_REMOTE: &str = "backup:remote";
 
 /// Default `repo-path` when the option is absent (matches `config.yaml`'s
 /// `repo-path` default).
@@ -34,26 +47,24 @@ const DEFAULT_REPO_TYPE: &str = "posix";
 /// Build the repository [`Storage`] backend from the resolved config.
 ///
 /// Selects the backend from `repo-type` (default `posix`) and constructs it
-/// from the matching `repo-*` option family. Remote (`repo-host`) is reported
-/// as [`CliRunError::NotSupportedYet`].
+/// from the matching `repo-*` option family. When `repo-host` is set the
+/// repository lives on another host: a `pgbackrest` worker is spawned there over
+/// SSH and every [`Storage`] call is proxied to it (see
+/// [`build_remote_host_storage`]).
 ///
 /// # Errors
 ///
-/// Returns [`CliRunError::NotSupportedYet`] when `repo-host` is set (inter-host
-/// SSH is not wired into the binary yet), [`CliRunError::StorageConfig`] when a
-/// required cloud option is missing or `repo-type` is unrecognised, and
-/// [`CliRunError::Storage`] when a backend constructor itself rejects the
-/// config.
+/// Returns [`CliRunError::Protocol`] when the inter-host worker (`ssh …`) cannot
+/// be spawned, [`CliRunError::StorageConfig`] when a required cloud option is
+/// missing or `repo-type` is unrecognised, and [`CliRunError::Storage`] when a
+/// backend constructor itself rejects the config.
 pub fn build_repo_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunError> {
-    // Inter-host operation: repo lives behind an SSH tunnel. The protocol /
-    // remote-storage building blocks exist (pgbr_storage::remote,
-    // pgbr_protocol) but the spawn wiring is a follow-up — be honest about it.
+    // Inter-host operation: the repo lives on another host. Spawn a pgbackrest
+    // worker there over SSH and proxy storage to it. The worker is rooted at the
+    // remote `repo1-path`, which the worker side resolves from the same option.
     if let Some(host) = string_option(cfg, "repo-host") {
-        return Err(CliRunError::NotSupportedYet(format!(
-            "repo-host={host}: inter-host SSH operation is not wired into the binary yet \
-             (the remote building blocks exist in pgbr-storage::remote / pgbr-protocol, \
-             but the SSH spawn wiring is a follow-up)"
-        )));
+        let path = path_option(cfg, "repo-path").unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_PATH));
+        return build_remote_host_storage(cfg, &host, "repo", "repo1-path", &path);
     }
 
     let repo_type = string_option(cfg, "repo-type").unwrap_or_else(|| DEFAULT_REPO_TYPE.to_owned());
@@ -82,26 +93,71 @@ pub fn build_repo_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRun
 }
 
 /// Build the `PostgreSQL` data-directory [`Storage`] backend from the resolved
-/// config: a [`Posix`] store rooted at `pg-path`.
+/// config: a [`Posix`] store rooted at `pg-path`, or — when `pg-host` is set — a
+/// proxy to a `pgbackrest` worker spawned on that host over SSH (see
+/// [`build_remote_host_storage`]).
 ///
 /// # Errors
 ///
-/// Returns [`CliRunError::NotSupportedYet`] when `pg-host` is set (inter-host
-/// SSH is not wired into the binary yet) and [`CliRunError::StorageConfig`]
-/// when `pg-path` is absent (every PG-touching command requires it; commands
-/// that never touch PG storage are routed before this is called).
+/// Returns [`CliRunError::Protocol`] when the inter-host worker (`ssh …`) cannot
+/// be spawned, [`CliRunError::StorageConfig`] when `pg-path` is absent (every
+/// PG-touching command requires it; commands that never touch PG storage are
+/// routed before this is called).
 pub fn build_pg_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunError> {
-    if let Some(host) = string_option(cfg, "pg-host") {
-        return Err(CliRunError::NotSupportedYet(format!(
-            "pg-host={host}: inter-host SSH operation is not wired into the binary yet \
-             (the remote building blocks exist in pgbr-storage::remote / pgbr-protocol, \
-             but the SSH spawn wiring is a follow-up)"
-        )));
-    }
-
+    // Inter-host operation: the PG data dir lives on another host. The worker is
+    // rooted at the remote `pg1-path`. `pg-path` is required regardless so the
+    // worker has a root to serve and the option carries to the remote argv.
     let root = path_option(cfg, "pg-path")
         .ok_or_else(|| CliRunError::StorageConfig("pg-path is required to build PG storage but is not set".to_owned()))?;
+
+    if let Some(host) = string_option(cfg, "pg-host") {
+        return build_remote_host_storage(cfg, &host, "pg", "pg1-path", &root);
+    }
+
     Ok(Box::new(Posix::new(root)))
+}
+
+/// Spawn a `pgbackrest` worker on `host` over SSH and wrap it in a
+/// [`RemoteProcessStorage`] proxy.
+///
+/// `family` is `"repo"` or `"pg"`, selecting which `*-host-{user,port,cmd}`
+/// option family supplies the SSH user / port and the remote `pgbackrest`
+/// program path. The worker is invoked as
+/// `<host-cmd> <command>:remote --stanza=<s> --<path_flag>=<remote_path>`, so it
+/// roots at `remote_path` and serves the storage protocol on its stdio. Mirrors
+/// the C `protocolRemoteParam` / `storageRemoteNew` in `src/protocol/helper.c`.
+///
+/// # Errors
+///
+/// Returns [`CliRunError::Protocol`] if the `ssh` process cannot be spawned.
+fn build_remote_host_storage(
+    cfg: &LoadedConfig,
+    host: &str,
+    family: &str,
+    path_flag: &str,
+    remote_path: &Path,
+) -> Result<Box<dyn Storage>, CliRunError> {
+    // SSH connection params from the matching `*-host-{user,port,cmd}` family.
+    let ssh_user = string_option(cfg, &format!("{family}-host-user"));
+    let ssh_port = integer_option(cfg, &format!("{family}-host-port")).and_then(|p| u16::try_from(p).ok());
+    // The remote `pgbackrest` program path. `*-host-cmd` is a `default-type:
+    // dynamic` "bin" option that resolves to the *local* exe path; on the remote
+    // host the same install path is the usual convention, falling back to the
+    // bare `pgbackrest` program name found on the remote PATH.
+    let remote_program = string_option(cfg, &format!("{family}-host-cmd")).unwrap_or_else(|| PGBACKREST_PROGRAM.to_owned());
+
+    // Remote worker argv: the worker role command plus the stanza and the root
+    // path the worker should serve. The worker side reads `pg1-path` /
+    // `repo1-path` to pick its root, so pass exactly the one for this family.
+    let mut remote_args = vec![WORKER_COMMAND_REMOTE.to_owned()];
+    if let Some(stanza) = &cfg.stanza {
+        remote_args.push(format!("--stanza={stanza}"));
+    }
+    remote_args.push(format!("--{path_flag}={}", remote_path.display()));
+
+    let storage = RemoteProcessStorage::spawn_ssh(host, ssh_port, ssh_user.as_deref(), &remote_program, &remote_args)
+        .map_err(CliRunError::Protocol)?;
+    Ok(Box::new(storage))
 }
 
 /// Build the [`S3`] backend from the `repo-s3-*` / `repo-storage-*` options.
@@ -218,6 +274,18 @@ fn string_option(cfg: &LoadedConfig, name: &str) -> Option<String> {
 /// Read a `path` option as a [`PathBuf`], preferring the group-index-1 entry.
 fn path_option(cfg: &LoadedConfig, name: &str) -> Option<PathBuf> {
     string_option(cfg, name).map(PathBuf::from)
+}
+
+/// Read an `integer` option as an [`i64`], preferring the group-index-1 entry.
+/// Returns `None` when absent or not an integer-typed value.
+fn integer_option(cfg: &LoadedConfig, name: &str) -> Option<i64> {
+    cfg.options
+        .get(&(name.to_owned(), Some(1)))
+        .or_else(|| cfg.options.get(&(name.to_owned(), None)))
+        .and_then(|v| match v {
+            OptionValue::Integer(i) => Some(*i),
+            _ => None,
+        })
 }
 
 /// Read a required string option, erroring with a clear message when absent.
@@ -372,18 +440,27 @@ mod tests {
     }
 
     #[test]
-    fn remote_host_returns_not_supported_yet() {
+    fn remote_host_spawns_worker_not_not_supported() {
+        // `repo-host` now spawns an `ssh <host> pgbackrest backup:remote …`
+        // worker and proxies storage to it, instead of the old
+        // `NotSupportedYet` placeholder. The spawn itself either succeeds (ssh
+        // on PATH) and yields a constructed `RemoteProcessStorage`, or fails to
+        // launch `ssh` (`Protocol`) when ssh is absent (e.g. the minimal dev
+        // image). Either outcome proves the placeholder is gone and the SSH
+        // spawn path is wired; what must NOT happen is `NotSupportedYet`.
         let config = cfg(
             "info",
-            &[("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned()))],
+            &[
+                ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
         );
         match build_repo_storage(&config) {
+            Ok(_) | Err(CliRunError::Protocol(_)) => {}
             Err(CliRunError::NotSupportedYet(msg)) => {
-                assert!(msg.contains("repo-host"), "msg was {msg}");
-                assert!(msg.contains("SSH"), "msg was {msg}");
+                panic!("repo-host must no longer be NotSupportedYet, got: {msg}")
             }
-            Err(other) => panic!("expected NotSupportedYet, got {other:?}"),
-            Ok(_) => panic!("expected NotSupportedYet, got Ok(storage)"),
+            Err(other) => panic!("expected Ok(storage) or Protocol(spawn) error, got {other:?}"),
         }
     }
 
@@ -411,15 +488,45 @@ mod tests {
     }
 
     #[test]
-    fn pg_host_returns_not_supported_yet() {
+    fn pg_host_spawns_worker_not_not_supported() {
+        // `pg-host` (with the required `pg-path`) spawns an
+        // `ssh <host> pgbackrest backup:remote …` worker rather than returning
+        // the old `NotSupportedYet` placeholder. As with the repo case, the
+        // spawn either succeeds or fails to launch `ssh` — never
+        // `NotSupportedYet`.
+        let config = cfg(
+            "backup",
+            &[
+                ("pg-host", Some(1), OptionValue::String("db.example.com".to_owned())),
+                (
+                    "pg-path",
+                    Some(1),
+                    OptionValue::Path("/var/lib/postgresql/16/main".to_owned()),
+                ),
+            ],
+        );
+        match build_pg_storage(&config) {
+            Ok(_) | Err(CliRunError::Protocol(_)) => {}
+            Err(CliRunError::NotSupportedYet(msg)) => {
+                panic!("pg-host must no longer be NotSupportedYet, got: {msg}")
+            }
+            Err(other) => panic!("expected Ok(storage) or Protocol(spawn) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_host_without_pg_path_still_requires_path() {
+        // Even on the remote path, `pg-path` is required so the worker has a
+        // root to serve and the option carries to the remote argv.
         let config = cfg(
             "backup",
             &[("pg-host", Some(1), OptionValue::String("db.example.com".to_owned()))],
         );
         match build_pg_storage(&config) {
-            Err(CliRunError::NotSupportedYet(msg)) => assert!(msg.contains("pg-host"), "msg was {msg}"),
-            Err(other) => panic!("expected NotSupportedYet, got {other:?}"),
-            Ok(_) => panic!("expected NotSupportedYet, got Ok(storage)"),
+            Err(CliRunError::StorageConfig(msg)) => assert!(msg.contains("pg-path"), "msg was {msg}"),
+            // `Box<dyn Storage>` is not Debug, so handle Ok without formatting it.
+            Ok(_) => panic!("expected StorageConfig(pg-path required), got Ok(storage)"),
+            Err(other) => panic!("expected StorageConfig(pg-path required), got {other:?}"),
         }
     }
 }

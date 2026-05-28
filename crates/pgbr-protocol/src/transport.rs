@@ -471,6 +471,21 @@ impl ProcessClient {
         self.client.execute(request)
     }
 
+    /// Split the spawned worker into its [`Child`] handle and the
+    /// [`ProtocolClient`] running over the child's piped stdin/stdout.
+    ///
+    /// This lets a caller hand the [`ProtocolClient`] to something that needs a
+    /// `ProtocolClient` directly (e.g. `pgbr_storage::remote::RemoteStorage`)
+    /// while retaining the [`Child`] so the pipes stay live for as long as the
+    /// proxy is used. Whoever keeps the [`Child`] is responsible for reaping it
+    /// (drop, [`Child::wait`], or [`Child::kill`]) once the protocol writer has
+    /// been closed and dropped — see [`ProcessClient::shutdown`] for the
+    /// in-order teardown this module performs itself.
+    #[must_use]
+    pub fn into_parts(self) -> (Child, ProtocolClient<PipeRead<ChildStdout>, PipeWrite<ChildStdin>>) {
+        (self.child, self.client)
+    }
+
     /// Send the `exit` handshake, wait for the child to terminate, and return
     /// its exit status.
     ///
