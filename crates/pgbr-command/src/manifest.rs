@@ -142,6 +142,7 @@ mod tests {
                     timestamp: 1_704_110_400,
                     checksum: Some("e1f2c3d4".to_owned()),
                     checksum_page: None,
+                    reference: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -149,6 +150,7 @@ mod tests {
                     timestamp: 1_704_110_400,
                     checksum: Some("a0b1c2d3".to_owned()),
                     checksum_page: Some(true),
+                    reference: None,
                 },
             ],
             paths: vec![ManifestPath {

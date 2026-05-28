@@ -87,6 +87,12 @@ struct FileValue {
     checksum: Option<String>,
     #[serde(rename = "checksum-page", default, skip_serializing_if = "Option::is_none")]
     checksum_page: Option<bool>,
+    /// Label of the backup the file's bytes actually live in. `None` for a file
+    /// copied into *this* backup; `Some(label)` for a file a differential /
+    /// incremental backup defers to an earlier backup. Absent from the JSON when
+    /// `None`, so full-backup manifests render byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
 }
 
 /// JSON shape of a `[target:link]` value.
@@ -108,6 +114,10 @@ pub struct ManifestFile {
     pub checksum: Option<String>,
     /// Whether page-checksum validation was applied to this file. `None` when absent.
     pub checksum_page: Option<bool>,
+    /// Backup the file's bytes are stored in. `None` when this backup holds the
+    /// bytes itself; `Some(label)` when a differential / incremental backup
+    /// references an earlier backup's copy instead of re-copying the file.
+    pub reference: Option<String>,
 }
 
 /// One path (directory) entry in `[target:path]`.
@@ -236,6 +246,7 @@ impl Manifest {
                     timestamp: value.timestamp,
                     checksum: value.checksum,
                     checksum_page: value.checksum_page,
+                    reference: value.reference,
                 });
             }
         }
@@ -294,6 +305,7 @@ impl Manifest {
                 timestamp: entry.timestamp,
                 checksum: entry.checksum.clone(),
                 checksum_page: entry.checksum_page,
+                reference: entry.reference.clone(),
             };
             let json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
             file.set(TARGET_FILE_SECTION, &entry.path, json);
@@ -354,6 +366,7 @@ mod tests {
                     timestamp: 1_704_110_400,
                     checksum: Some("e1f2c3d4".to_owned()),
                     checksum_page: None,
+                    reference: None,
                 },
                 ManifestFile {
                     path: "pg_data/base/1/1259".to_owned(),
@@ -361,6 +374,7 @@ mod tests {
                     timestamp: 1_704_110_400,
                     checksum: Some("a0b1c2d3".to_owned()),
                     checksum_page: Some(true),
+                    reference: None,
                 },
             ],
             paths: vec![ManifestPath {
@@ -398,6 +412,67 @@ mod tests {
         assert_eq!(found.size, 8192);
         assert_eq!(found.checksum_page, Some(true));
         assert!(manifest.file("pg_data/does/not/exist").is_none());
+    }
+
+    #[test]
+    fn manifest_file_reference_round_trips() {
+        // A manifest with one referenced file (bytes live in an earlier backup)
+        // and one self-contained file must render and re-parse with the
+        // reference preserved, and the un-referenced file must render WITHOUT a
+        // `reference` key (so full-backup manifests stay byte-unchanged).
+        let manifest = Manifest {
+            backup_label: "20240101-120000F_20240102-120000D".to_owned(),
+            backup_type: "diff".to_owned(),
+            timestamp_start: 1_704_196_800,
+            timestamp_stop: 1_704_196_810,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![
+                ManifestFile {
+                    path: "pg_data/unchanged".to_owned(),
+                    size: 5,
+                    timestamp: 1_704_110_400,
+                    checksum: Some("deadbeef".to_owned()),
+                    checksum_page: None,
+                    reference: Some("20240101-120000F".to_owned()),
+                },
+                ManifestFile {
+                    path: "pg_data/changed".to_owned(),
+                    size: 7,
+                    timestamp: 1_704_196_800,
+                    checksum: Some("cafebabe".to_owned()),
+                    checksum_page: None,
+                    reference: None,
+                },
+            ],
+            paths: vec![ManifestPath {
+                path: "pg_data".to_owned(),
+            }],
+            links: Vec::new(),
+        };
+
+        let text = manifest.to_text();
+        // The referenced file carries a "reference" key; the self-contained one does not.
+        assert!(
+            text.contains("\"reference\":\"20240101-120000F\""),
+            "referenced file must record its reference: {text}"
+        );
+        let changed_line = text
+            .lines()
+            .find(|line| line.starts_with("pg_data/changed="))
+            .expect("changed file line");
+        assert!(
+            !changed_line.contains("reference"),
+            "un-referenced file must omit the reference key: {changed_line}"
+        );
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed, manifest);
+        assert_eq!(
+            parsed.file("pg_data/unchanged").unwrap().reference.as_deref(),
+            Some("20240101-120000F")
+        );
+        assert_eq!(parsed.file("pg_data/changed").unwrap().reference, None);
     }
 
     #[test]
