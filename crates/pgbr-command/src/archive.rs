@@ -635,6 +635,52 @@ pub fn prefetch_get_spool(
     Ok(prefetched)
 }
 
+/// Locate `segment` in the repository archive and return its **plaintext**
+/// bytes, transparently decompressing whatever stored form is present.
+///
+/// The stored form is discovered exactly as [`fetch_from_repo`] does: the
+/// plaintext `archive/<stanza>/<segment>` is preferred, then each compression
+/// suffix (`.gz`, `.zst`, `.bz2`, `.lz4`) is probed; a matched compressed form
+/// is run through the matching decompress filter. Returns `Ok(None)` when no
+/// stored form exists, so a caller (e.g. `archive-copy`) can decide whether a
+/// missing segment is an error.
+///
+/// This is a read-only sibling of the WAL-fetch path, factored out so the
+/// backup command can pull a required WAL segment out of the archive without a
+/// PG-data destination. It does not take the archive lock (the caller already
+/// holds the backup lock) and never writes anything.
+///
+/// # Errors
+///
+/// - [`CommandError::Io`] if a matched compressed form fails to decompress.
+/// - [`CommandError::Storage`] / [`CommandError::Io`] if a repository read fails.
+pub(crate) fn read_archived_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<Option<Vec<u8>>, CommandError> {
+    let plaintext = repo_segment_path(stanza, segment);
+    let (source, suffix) = if repo.exists(&plaintext)? {
+        (plaintext, "")
+    } else {
+        let mut found = None;
+        for suffix in COMPRESS_SUFFIXES {
+            let candidate = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+            if repo.exists(&candidate)? {
+                found = Some((candidate, *suffix));
+                break;
+            }
+        }
+        match found {
+            Some(pair) => pair,
+            None => return Ok(None),
+        }
+    };
+
+    let stored = read_segment(repo, &source)?;
+    let bytes = match decompress_filter_for(suffix) {
+        Some(mut filter) => run_filter(filter.as_mut(), &stored)?,
+        None => stored,
+    };
+    Ok(Some(bytes))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -648,7 +694,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandError, drain_push_spool, get, get_in_dir, prefetch_get_spool, push, push_out_dir, status_error_path, status_ok_path,
+        CommandError, drain_push_spool, get, get_in_dir, prefetch_get_spool, push, push_out_dir, read_archived_segment,
+        status_error_path, status_ok_path,
     };
 
     const SEGMENT: &str = "000000010000000000000001";
@@ -1307,5 +1354,36 @@ mod tests {
             CommandError::Storage(_) => {}
             other => panic!("expected Storage(not found), got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // read_archived_segment (used by backup archive-copy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_archived_segment_returns_plaintext() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        assert_eq!(bytes.as_deref(), Some(WAL_BODY), "plaintext segment returned as-is");
+    }
+
+    #[test]
+    fn read_archived_segment_decompresses_stored_form() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        // Only the gz form exists; the helper must transparently decompress it.
+        let compressed = run(GzCompress::new(super::default_level("gz"), false), WAL_BODY);
+        put(&repo_s, &format!("archive/demo/{SEGMENT}.gz"), &compressed);
+
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        assert_eq!(bytes.as_deref(), Some(WAL_BODY), "gz segment decompressed to plaintext");
+    }
+
+    #[test]
+    fn read_archived_segment_absent_is_none() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        assert_eq!(bytes, None, "a segment not in the archive yields None");
     }
 }

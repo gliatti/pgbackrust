@@ -89,6 +89,99 @@ pub fn lsn_text_to_wal_segment(timeline: u32, lsn_text: &str, wal_segment_size: 
     Some(lsn_to_wal_segment(timeline, lsn, wal_segment_size))
 }
 
+/// Size, in bytes, of a `PostgreSQL` "logical xlog file": the 4 GiB span the
+/// low (`LLLLLLLL`) component of a WAL segment name addresses before the high
+/// (`HHHHHHHH`) component rolls over.
+///
+/// A WAL segment number is split across two 32-bit halves of the file name; the
+/// low half counts segments within a 4 GiB logical file and the high half counts
+/// logical files. Every supported `wal_segment_size` (1 MiB .. 1 GiB, all powers
+/// of two) divides this evenly, so the number of segments per logical file is
+/// exactly `LOGICAL_XLOG_FILE_SIZE / wal_segment_size` (256 for the 16 MiB
+/// default). C reference: `XLogSegmentsPerXLogId` in
+/// `src/include/access/xlog_internal.h`.
+const LOGICAL_XLOG_FILE_SIZE: u64 = 0x1_0000_0000;
+
+/// Number of WAL segments per logical xlog file for a given `wal_segment_size`.
+///
+/// `LOGICAL_XLOG_FILE_SIZE / wal_segment_size` (256 for the 16 MiB default),
+/// matching `PostgreSQL`'s `XLogSegmentsPerXLogId`. A `wal_segment_size` of 0 is
+/// treated as the 16 MiB default so the function never divides by zero.
+#[must_use]
+pub const fn segments_per_logical_file(wal_segment_size: u64) -> u64 {
+    let seg_size = if wal_segment_size == 0 {
+        WAL_SEGMENT_SIZE_DEFAULT
+    } else {
+        wal_segment_size
+    };
+    LOGICAL_XLOG_FILE_SIZE / seg_size
+}
+
+/// Parse a 24-hex-digit WAL segment file name into its `(timeline, high, low)`
+/// components.
+///
+/// The three components are the leading 8 hex digits (timeline), the middle 8
+/// (the high half of the segment number) and the trailing 8 (the low half).
+/// Returns `None` when the name is not exactly 24 ASCII-hex characters.
+#[must_use]
+pub fn parse_wal_segment(name: &str) -> Option<(u32, u32, u32)> {
+    if name.len() != 24 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let timeline = u32::from_str_radix(&name[0..8], 16).ok()?;
+    let high = u32::from_str_radix(&name[8..16], 16).ok()?;
+    let low = u32::from_str_radix(&name[16..24], 16).ok()?;
+    Some((timeline, high, low))
+}
+
+/// Enumerate every WAL segment file name from `start` through `stop` inclusive,
+/// on the segment range's timeline, given the cluster's `wal_segment_size`.
+///
+/// `start` and `stop` are 24-hex-digit segment names (as produced by
+/// [`lsn_to_wal_segment`]). The range walks the segment number (the
+/// `(high, low)` pair) one segment at a time: the low (`LLLLLLLL`) component
+/// counts within a 4 GiB logical file and rolls over to 0, incrementing the high
+/// (`HHHHHHHH`) component, once it reaches `segments_per_logical_file - 1`. This
+/// is exactly `PostgreSQL`'s `XLByteToSeg` / `XLogFileName` segment ordering, so
+/// the enumeration covers every segment a backup needs to be made consistent
+/// (`backup-archive-start` .. `backup-archive-stop`), including a roll-over
+/// across the high half. C reference: the `walSegmentRange()` loop in
+/// `src/command/backup/backup.c`.
+///
+/// Returns `None` when either name is malformed, when the two names are on
+/// different timelines (a range cannot span a timeline switch), when `stop`
+/// precedes `start`, or when `wal_segment_size` yields no segments per logical
+/// file. The timeline embedded in every returned name is the timeline of `start`.
+#[must_use]
+pub fn wal_segment_range(start: &str, stop: &str, wal_segment_size: u64) -> Option<Vec<String>> {
+    let (start_tli, start_hi, start_lo) = parse_wal_segment(start)?;
+    let (stop_tli, stop_hi, stop_lo) = parse_wal_segment(stop)?;
+    if start_tli != stop_tli {
+        return None;
+    }
+    let per_file = segments_per_logical_file(wal_segment_size);
+    if per_file == 0 {
+        return None;
+    }
+
+    // Collapse each name into a single 64-bit segment number so the range is a
+    // simple inclusive integer walk. The high half counts logical files (each
+    // holding `per_file` segments), the low half counts segments within one.
+    let start_segno = u64::from(start_hi) * per_file + u64::from(start_lo);
+    let stop_segno = u64::from(stop_hi) * per_file + u64::from(stop_lo);
+    if stop_segno < start_segno {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    for segno in start_segno..=stop_segno {
+        let high = u32::try_from(segno / per_file).ok()?;
+        let low = u32::try_from(segno % per_file).ok()?;
+        out.push(format!("{start_tli:08X}{high:08X}{low:08X}"));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -176,5 +269,130 @@ mod tests {
             Some("000000010000000000000001".to_owned())
         );
         assert_eq!(lsn_text_to_wal_segment(1, "garbage", WAL_SEGMENT_SIZE_DEFAULT), None);
+    }
+
+    #[test]
+    fn segments_per_logical_file_matches_postgres() {
+        // 4 GiB / segment size: 256 at the 16 MiB default, scaling with the size.
+        assert_eq!(segments_per_logical_file(WAL_SEGMENT_SIZE_DEFAULT), 256);
+        assert_eq!(segments_per_logical_file(0), 256, "0 falls back to the default");
+        assert_eq!(segments_per_logical_file(1024 * 1024), 4096, "1 MiB segments");
+        assert_eq!(segments_per_logical_file(0x4000_0000), 4, "1 GiB segments");
+    }
+
+    #[test]
+    fn parse_wal_segment_splits_three_components() {
+        assert_eq!(parse_wal_segment("000000010000000200000003"), Some((1, 2, 3)));
+        assert_eq!(parse_wal_segment("0000002A000000FF000000FE"), Some((0x2A, 0xFF, 0xFE)));
+        // Wrong length / non-hex are rejected.
+        assert_eq!(parse_wal_segment("00000001"), None, "too short");
+        assert_eq!(parse_wal_segment("0000000100000002000000030"), None, "too long");
+        assert_eq!(parse_wal_segment("00000001000000020000000g"), None, "non-hex");
+    }
+
+    #[test]
+    fn wal_segment_range_single_segment() {
+        // start == stop yields exactly that one segment.
+        let seg = "000000010000000000000001";
+        assert_eq!(
+            wal_segment_range(seg, seg, WAL_SEGMENT_SIZE_DEFAULT),
+            Some(vec![seg.to_owned()])
+        );
+    }
+
+    #[test]
+    fn wal_segment_range_consecutive_within_logical_file() {
+        // 0x01 .. 0x03 within logical file 0 (16 MiB segments).
+        let range = wal_segment_range(
+            "000000010000000000000001",
+            "000000010000000000000003",
+            WAL_SEGMENT_SIZE_DEFAULT,
+        )
+        .expect("range");
+        assert_eq!(
+            range,
+            vec![
+                "000000010000000000000001".to_owned(),
+                "000000010000000000000002".to_owned(),
+                "000000010000000000000003".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wal_segment_range_wraps_across_high_half() {
+        // The default 16 MiB layout has 256 segments per logical file, so the
+        // low component runs 00..FF then rolls over to 00 with the high component
+        // incrementing. Walk from the last segment of logical file 0 (..0000 00FF)
+        // through the first two of logical file 1 (..0001 0000, ..0001 0001).
+        let range = wal_segment_range(
+            "0000000100000000000000FF",
+            "000000010000000100000001",
+            WAL_SEGMENT_SIZE_DEFAULT,
+        )
+        .expect("range across the high half");
+        assert_eq!(
+            range,
+            vec![
+                "0000000100000000000000FF".to_owned(),
+                "000000010000000100000000".to_owned(),
+                "000000010000000100000001".to_owned(),
+            ],
+            "low half must roll over and bump the high half"
+        );
+    }
+
+    #[test]
+    fn wal_segment_range_wraps_with_non_default_size() {
+        // 1 GiB segments => 4 segments per logical file (low runs 0..3).
+        let seg_size = 0x4000_0000;
+        let range = wal_segment_range("000000010000000000000003", "000000010000000100000000", seg_size).expect("range");
+        assert_eq!(
+            range,
+            vec!["000000010000000000000003".to_owned(), "000000010000000100000000".to_owned(),],
+            "the low half wraps at 4 for 1 GiB segments"
+        );
+    }
+
+    #[test]
+    fn wal_segment_range_rejects_bad_input() {
+        // stop before start.
+        assert_eq!(
+            wal_segment_range(
+                "000000010000000000000005",
+                "000000010000000000000001",
+                WAL_SEGMENT_SIZE_DEFAULT
+            ),
+            None,
+            "stop before start"
+        );
+        // Different timelines.
+        assert_eq!(
+            wal_segment_range(
+                "000000010000000000000001",
+                "000000020000000000000002",
+                WAL_SEGMENT_SIZE_DEFAULT
+            ),
+            None,
+            "range cannot span timelines"
+        );
+        // Malformed name.
+        assert_eq!(
+            wal_segment_range("not-a-segment", "000000010000000000000001", WAL_SEGMENT_SIZE_DEFAULT),
+            None
+        );
+    }
+
+    #[test]
+    fn wal_segment_range_carries_start_timeline() {
+        // The timeline of every returned name is the start timeline (post-failover
+        // lines are addressed by their own timeline id).
+        let range = wal_segment_range(
+            "0000000A0000000000000001",
+            "0000000A0000000000000002",
+            WAL_SEGMENT_SIZE_DEFAULT,
+        )
+        .expect("range");
+        assert!(range.iter().all(|s| s.starts_with("0000000A")), "{range:?}");
     }
 }
