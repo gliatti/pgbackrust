@@ -373,8 +373,8 @@ mod tests {
         assert_eq!(page_checksum_valid(&page, 5), Some(false));
     }
 
-    /// Build a page with a structurally-sane header: pd_lower past the header,
-    /// pd_upper / pd_special at the page end, and an LSN of `lsn`.
+    /// Build a page with a structurally-sane header: `pd_lower` past the header,
+    /// `pd_upper` / `pd_special` at the page end, and an LSN of `lsn`.
     fn header_page(lsn: u64, pd_lower: u16, pd_upper: u16, pd_special: u16) -> Vec<u8> {
         let mut page = vec![0u8; BLCKSZ];
         let xlogid = u32::try_from(lsn >> 32).unwrap_or(u32::MAX);

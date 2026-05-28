@@ -233,7 +233,7 @@ pub struct BackupBracket {
 /// All three booleans default to `true` (the option model's defaults). The
 /// DB-free test wrappers pass [`IntegrityChecks::disabled`] so the existing
 /// file-copy-only tests are byte-for-byte unchanged (they have no live cluster
-/// to check archive_mode against and no archive to wait on).
+/// to check `archive_mode` against and no archive to wait on).
 #[derive(Debug, Clone, Copy)]
 struct IntegrityChecks {
     /// `archive-check`: after `pg_backup_stop`, verify the required WAL segments
@@ -251,12 +251,12 @@ struct IntegrityChecks {
 
 impl IntegrityChecks {
     /// All checks off — the DB-free file-copy test path.
-    fn disabled() -> Self {
+    const fn disabled() -> Self {
         Self {
             archive_check: false,
             archive_mode_check: false,
             page_header_check: false,
-            archive_timeout: std::time::Duration::from_secs(60),
+            archive_timeout: std::time::Duration::from_mins(1),
         }
     }
 
@@ -474,7 +474,7 @@ fn is_relation_segment_name(name: &str) -> bool {
 ///   [`pgbr_postgres::page::pg_checksum_page`] computes for `block_no`, **and**
 /// - when `check_header` is set (`page-header-check`), its header bookkeeping is
 ///   structurally sane per [`pgbr_postgres::page::page_header_valid`]
-///   (pd_lower/upper/special bounds; `pd_lsn` is not bounded here because the
+///   (`pd_lower`/`pd_upper`/`pd_special` bounds; `pd_lsn` is not bounded here because the
 ///   backup-stop LSN is not threaded into the per-file copy path).
 ///
 /// A page whose length is not exactly `PAGE_SIZE` is treated as invalid (it
@@ -831,7 +831,7 @@ fn archive_timeout(config: &LoadedConfig) -> std::time::Duration {
     match config.options.get(&("archive-timeout".to_owned(), None)) {
         Some(OptionValue::Time(ms)) => std::time::Duration::from_millis(*ms),
         Some(OptionValue::Integer(secs)) if *secs >= 0 => std::time::Duration::from_secs(u64::try_from(*secs).unwrap_or(60)),
-        _ => std::time::Duration::from_secs(60),
+        _ => std::time::Duration::from_mins(1),
     }
 }
 
@@ -4993,7 +4993,7 @@ mod tests {
 
     // ---- page-header-check -------------------------------------------------
 
-    /// Like [`valid_page`] but with a structurally-**invalid** header: pd_lower
+    /// Like [`valid_page`] but with a structurally-**invalid** header: `pd_lower`
     /// is set *inside* the page header (impossible), while the checksum is still
     /// computed over the page so the checksum itself validates.
     fn corrupt_header_page(block_no: u32) -> Vec<u8> {

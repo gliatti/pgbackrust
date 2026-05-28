@@ -309,6 +309,26 @@ fn spool_out_backlog_bytes(spool: &dyn Storage, stanza: &str) -> u64 {
         .sum()
 }
 
+/// Total size, in bytes, of every staged WAL segment in the async get *in*
+/// spool — the backlog measured against `archive-get-queue-max` so the
+/// prefetch loop does not overrun the cap. A missing spool dir contributes 0.
+fn spool_in_backlog_bytes(spool: &dyn Storage, stanza: &str) -> u64 {
+    let in_dir = get_in_dir(stanza);
+    let Ok(entries) = spool.list(&in_dir) else {
+        return 0;
+    };
+    entries
+        .iter()
+        .filter(|info| {
+            info.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.ends_with(STATUS_EXT_OK) && !name.ends_with(STATUS_EXT_ERROR))
+        })
+        .map(|info| info.size)
+        .sum()
+}
+
 /// Whether the unarchived-WAL backlog has reached `archive-push-queue-max`.
 ///
 /// Returns `true` when a `queue_max` limit is configured **and** `backlog`
@@ -453,10 +473,7 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     let backlog = if async_enabled {
         // Resolve the spool here so the backlog can be measured even before the
         // async staging path runs.
-        match spool_path(config) {
-            Some(spool_root) => spool_out_backlog_bytes(&Posix::new(spool_root), stanza),
-            None => 0,
-        }
+        spool_path(config).map_or(0, |spool_root| spool_out_backlog_bytes(&Posix::new(spool_root), stanza))
     } else if let Some(parent) = Path::new(wal_source).parent().filter(|p| !p.as_os_str().is_empty()) {
         wal_backlog_bytes(pg_storage, parent)
     } else {
@@ -1743,8 +1760,8 @@ mod tests {
     fn wal_backlog_sums_only_segment_named_files() {
         let (_repo, pg_dir, _repo_s, pg_s) = posix_pair();
         // Two valid 24-hex WAL segments and one non-segment file in pg_wal.
-        put(&pg_s, "pg_wal/000000010000000000000001", &vec![0u8; 100]);
-        put(&pg_s, "pg_wal/000000010000000000000002", &vec![0u8; 200]);
+        put(&pg_s, "pg_wal/000000010000000000000001", &[0u8; 100]);
+        put(&pg_s, "pg_wal/000000010000000000000002", &[0u8; 200]);
         put(&pg_s, "pg_wal/archive_status", b"not-a-segment");
         let _ = &pg_dir;
         let backlog = wal_backlog_bytes(&pg_s, Path::new("pg_wal"));
@@ -1983,7 +2000,7 @@ mod tests {
             "000000010000000000000003",
         ];
         for seg in &segs {
-            put(&repo_s, &format!("archive/demo/{seg}"), &vec![7u8; 100]);
+            put(&repo_s, &format!("archive/demo/{seg}"), &[7u8; 100]);
         }
         let requested: Vec<String> = segs.iter().map(|s| (*s).to_owned()).collect();
 
@@ -2017,7 +2034,7 @@ mod tests {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         let (_spool, spool_s) = spool_storage();
         for seg in ["000000010000000000000001", "000000010000000000000002"] {
-            put(&repo_s, &format!("archive/demo/{seg}"), &vec![7u8; 100]);
+            put(&repo_s, &format!("archive/demo/{seg}"), &[7u8; 100]);
         }
         let requested = vec!["000000010000000000000001".to_owned(), "000000010000000000000002".to_owned()];
         let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, None).expect("prefetch");
