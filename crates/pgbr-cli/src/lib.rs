@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use pgbr_config::{
     Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, RuntimeContext, compile,
-    env_values_from_process, load_config_with_env, parse_cli, parse_ini, resolve_cli,
+    env_values_from_process, load_config_with_env_multi, parse_cli, parse_ini, resolve_cli,
 };
 use pgbr_protocol::ProtocolError;
 use pgbr_storage::StorageError;
@@ -28,6 +28,20 @@ const CONFIG_YAML: &str = pgbr_build::inputs::CONFIG_YAML;
 
 /// Default path to `pgbackrest.conf` if `--config` is not supplied.
 const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrest/pgbackrest.conf";
+
+/// Default base config directory (the `config-path` option's default), used to
+/// derive the include-path default `<config-path>/conf.d` when neither
+/// `--config-include-path` nor `--config-path` is supplied. Mirrors
+/// `CFGOPTDEF_CONFIG_PATH` in `config.yaml`.
+const DEFAULT_CONFIG_DIR: &str = "/etc/pgbackrest";
+
+/// Sub-directory of `config-path` scanned for additional `*.conf` files when
+/// `--config-include-path` is not supplied. Mirrors `PROJECT_CONFIG_INCLUDE_PATH`.
+const DEFAULT_INCLUDE_SUBDIR: &str = "conf.d";
+
+/// Extension of the include files loaded from the config-include-path. Only
+/// entries ending in `.conf` are read (matching pgBackRest's `cfgLoad`).
+const INCLUDE_FILE_EXT: &str = ".conf";
 
 /// Process exit code for configuration / option errors.
 ///
@@ -373,21 +387,30 @@ fn load_static_cfg() -> Result<Cfg, CliRunError> {
     compile(&parsed).map_err(CliRunError::Compile)
 }
 
-/// Read `pgbackrest.conf` (falling back to an empty INI when absent), collect
-/// the `PGBACKREST_<OPTION>` environment variables, and merge them with
-/// `resolved` and the runtime `ctx` into a [`LoadedConfig`]. Shared by
+/// Read the main `pgbackrest.conf` plus every `*.conf` under the
+/// config-include-path (falling back to an empty INI when the main file is
+/// absent and to no extra files when the include dir is absent), collect the
+/// `PGBACKREST_<OPTION>` environment variables, and merge them with `resolved`
+/// and the runtime `ctx` into a [`LoadedConfig`]. Shared by
 /// [`run_with_context`] and [`resolve_only`].
 ///
 /// The five-source precedence is CLI > ENV > stanza:cmd > stanza > global:cmd >
-/// global > default, matching pgBackRest (`src/main.c` / `src/config/parse.c`):
-/// the process environment is read via [`env_values_from_process`] and slotted
-/// between the CLI and the config file by [`load_config_with_env`].
+/// global > default, matching pgBackRest (`src/config/load.c` / `cfgLoad`): the
+/// process environment is read via [`env_values_from_process`] and slotted
+/// between the CLI and the config files by [`load_config_with_env_multi`]. The
+/// main config file and the include files are all "config file" level; the
+/// include files are loaded *after* the main file, so a value they set wins for
+/// the same key (pgBackRest's documented load order).
 fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError> {
     // Determine the config file path. `--config=<path>` lives in
     // `resolved.options[("config", None)]`. Fall back to the default.
     let config_path = config_file_path(&resolved);
 
-    let ini = match std::fs::read_to_string(&config_path) {
+    // Config sources in load order: the main config file first, then the
+    // include files. A later source's value wins for the same key.
+    let mut inis: Vec<IniFile> = Vec::new();
+
+    let main_ini = match std::fs::read_to_string(&config_path) {
         Ok(text) => parse_ini(&text).map_err(CliRunError::Ini)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => IniFile::default(),
         Err(error) => {
@@ -397,12 +420,96 @@ fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Resu
             });
         }
     };
+    inis.push(main_ini);
+
+    // Scan the config-include-path for `*.conf` files and append each parsed
+    // file (sorted by name for determinism) after the main config.
+    inis.extend(load_include_files(&resolved)?);
 
     // `PGBACKREST_<OPTION>` environment variables: the env source sits below the
-    // CLI but above the config file in precedence.
+    // CLI but above the config files in precedence.
     let env = env_values_from_process(cfg);
 
-    load_config_with_env(resolved, &env, &ini, cfg, ctx).map_err(CliRunError::Load)
+    load_config_with_env_multi(resolved, &env, &inis, cfg, ctx).map_err(CliRunError::Load)
+}
+
+/// Resolve the config-include-path and parse every `*.conf` file in it into an
+/// ordered list of [`IniFile`]s (sorted by file name for deterministic merge
+/// order).
+///
+/// The include path is `--config-include-path` if supplied on the CLI,
+/// otherwise `<config-path>/conf.d` where `<config-path>` is `--config-path`
+/// (CLI) or [`DEFAULT_CONFIG_DIR`]. pgBackRest scans the include path even when
+/// `--config` is given explicitly — the include path is its own option — so the
+/// scan always runs.
+///
+/// A missing include directory is **not** an error (it just yields no extra
+/// files). A malformed include file **is** an error (surfaced as
+/// [`CliRunError::Ini`]); a non-NotFound I/O error reading the dir or a file is
+/// surfaced as [`CliRunError::ReadConfigFile`].
+fn load_include_files(resolved: &ResolvedCli) -> Result<Vec<IniFile>, CliRunError> {
+    let include_path = config_include_path(resolved);
+
+    let entries = match std::fs::read_dir(&include_path) {
+        Ok(entries) => entries,
+        // A missing include directory is a no-op (no extra config files).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CliRunError::ReadConfigFile {
+                path: include_path,
+                error,
+            });
+        }
+    };
+
+    // Collect candidate `*.conf` files, then sort by file name so the merge
+    // order is deterministic regardless of directory iteration order.
+    let mut conf_files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| CliRunError::ReadConfigFile {
+            path: include_path.clone(),
+            error,
+        })?;
+        let path = entry.path();
+        // Take regular files whose name ends in `.conf`. Directories and other
+        // entries (even if their name ends in `.conf`) are skipped.
+        let is_conf = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(INCLUDE_FILE_EXT));
+        if is_conf && entry.file_type().is_ok_and(|t| t.is_file()) {
+            conf_files.push(path);
+        }
+    }
+    conf_files.sort();
+
+    let mut inis: Vec<IniFile> = Vec::with_capacity(conf_files.len());
+    for path in conf_files {
+        let text = std::fs::read_to_string(&path).map_err(|error| CliRunError::ReadConfigFile {
+            path: path.clone(),
+            error,
+        })?;
+        inis.push(parse_ini(&text).map_err(CliRunError::Ini)?);
+    }
+    Ok(inis)
+}
+
+/// Resolve the directory scanned for additional `*.conf` config files.
+///
+/// `--config-include-path` wins when supplied. Otherwise it is
+/// `<config-path>/conf.d`, where `<config-path>` is `--config-path` (CLI) or
+/// the [`DEFAULT_CONFIG_DIR`] default. Only CLI-supplied values are consulted
+/// here (defaults from `config.yaml` are applied later, in the merge), so the
+/// fallbacks mirror those defaults explicitly.
+fn config_include_path(resolved: &ResolvedCli) -> PathBuf {
+    if let Some(OptionValue::Path(p) | OptionValue::String(p)) = resolved.options.get(&("config-include-path".to_owned(), None)) {
+        return PathBuf::from(p);
+    }
+    let base = match resolved.options.get(&("config-path".to_owned(), None)) {
+        Some(OptionValue::Path(p) | OptionValue::String(p)) => p.clone(),
+        _ => DEFAULT_CONFIG_DIR.to_owned(),
+    };
+    PathBuf::from(base).join(DEFAULT_INCLUDE_SUBDIR)
 }
 
 /// Run parse + resolve + load and return the merged [`LoadedConfig`].
@@ -575,6 +682,137 @@ mod tests {
             !matches!(result, Err(CliRunError::ReadConfigFile { .. })),
             "missing config file should fall back to empty INI, got {result:?}",
         );
+    }
+
+    #[test]
+    fn missing_include_dir_is_a_no_op() {
+        // A `--config-include-path` pointing at a nonexistent directory must
+        // yield no extra config files (not an error). `load_include_files`
+        // returns an empty Vec for ENOENT.
+        let cfg = load_static_cfg().expect("config compiles");
+        let cli = pgbr_config::parse_cli(["info", "--config-include-path=/definitely/missing/conf.d"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        let inis = super::load_include_files(&resolved).expect("missing include dir must not error");
+        assert!(inis.is_empty(), "a missing include dir yields no config files");
+    }
+
+    #[test]
+    fn include_path_defaults_to_config_path_conf_d() {
+        // With neither `--config-include-path` nor `--config-path`, the include
+        // path defaults to `<DEFAULT_CONFIG_DIR>/conf.d`.
+        let cfg = load_static_cfg().expect("config compiles");
+        let cli = pgbr_config::parse_cli(["info"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        assert_eq!(
+            super::config_include_path(&resolved),
+            std::path::PathBuf::from("/etc/pgbackrest/conf.d"),
+        );
+
+        // `--config-path` redirects the default include dir under it.
+        let cli = pgbr_config::parse_cli(["info", "--config-path=/custom/cfg"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        assert_eq!(
+            super::config_include_path(&resolved),
+            std::path::PathBuf::from("/custom/cfg/conf.d"),
+        );
+
+        // Explicit `--config-include-path` wins over the derived default.
+        let cli = pgbr_config::parse_cli(["info", "--config-include-path=/somewhere/else"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        assert_eq!(
+            super::config_include_path(&resolved),
+            std::path::PathBuf::from("/somewhere/else"),
+        );
+    }
+
+    /// Resolve the merged options for a `--config-include-path` scan
+    /// deterministically: scan the include dir via [`super::load_include_files`]
+    /// (which never reads the process environment) and feed the resulting INI
+    /// sources through the multi-source merge with an explicit empty env. This
+    /// avoids the live-environment race that `resolve_only` is subject to (the
+    /// `PGBACKREST_*` var set by `env_var_takes_effect` can leak across
+    /// concurrently-running tests), while still exercising the real include-file
+    /// loading + ordering + merge.
+    fn resolve_include_repo_path(confd: &std::path::Path, main_ini: &str) -> Option<OptionValue> {
+        let cfg = load_static_cfg().expect("config compiles");
+        let args = [
+            "info".to_owned(),
+            "--stanza=demo".to_owned(),
+            format!("--config-include-path={}", confd.display()),
+        ];
+        let cli = pgbr_config::parse_cli(args).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+
+        let mut inis = vec![pgbr_config::parse_ini(main_ini).unwrap()];
+        inis.extend(super::load_include_files(&resolved).expect("include files load"));
+
+        let loaded = pgbr_config::load_config_with_env_multi(
+            resolved,
+            &pgbr_config::EnvValues::new(),
+            &inis,
+            &cfg,
+            &RuntimeContext {
+                exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+            },
+        )
+        .expect("merge resolves");
+        loaded.options.get(&("repo-path".to_owned(), Some(1))).cloned()
+    }
+
+    #[test]
+    fn include_file_value_loaded_and_overrides_main_config() {
+        // A `*.conf` file under the include path is loaded and merged after the
+        // main config: its value for the same key wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).expect("mkdir conf.d");
+        // An include file overrides the main config's repo1-path.
+        std::fs::write(confd.join("10-override.conf"), b"[global]\nrepo1-path=/from/include\n").expect("write inc1");
+
+        // Main config sets repo1-path to one place; the include file overrides it.
+        let resolved = resolve_include_repo_path(&confd, "[global]\nrepo1-path=/from/main\n");
+        assert_eq!(
+            resolved,
+            Some(OptionValue::Path("/from/include".to_owned())),
+            "the include file's repo1-path must override the main config",
+        );
+    }
+
+    #[test]
+    fn include_files_sorted_so_last_wins() {
+        // Two include files set the same key; the later-sorted file wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).expect("mkdir conf.d");
+        std::fs::write(confd.join("00-first.conf"), b"[global]\nrepo1-path=/first\n").expect("write a");
+        std::fs::write(confd.join("99-last.conf"), b"[global]\nrepo1-path=/last\n").expect("write b");
+        // A non-.conf file must be ignored even though it sets the key.
+        std::fs::write(confd.join("ignored.txt"), b"[global]\nrepo1-path=/ignored\n").expect("write c");
+
+        // No main config value: the lexicographically last *.conf wins, .txt is ignored.
+        let resolved = resolve_include_repo_path(&confd, "");
+        assert_eq!(
+            resolved,
+            Some(OptionValue::Path("/last".to_owned())),
+            "the lexicographically last *.conf file wins, .txt is ignored",
+        );
+    }
+
+    #[test]
+    fn malformed_include_file_is_an_error() {
+        // A structurally invalid include file surfaces as an Ini error, not a
+        // silent skip.
+        let cfg = load_static_cfg().expect("config compiles");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).expect("mkdir conf.d");
+        // A key/value outside any `[section]` is a parse error.
+        std::fs::write(confd.join("bad.conf"), b"repo1-path=/no-section\n").expect("write bad");
+
+        let cli = pgbr_config::parse_cli(["info".to_owned(), format!("--config-include-path={}", confd.display())]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        let err = super::load_include_files(&resolved).expect_err("malformed include file must error");
+        assert!(matches!(err, CliRunError::Ini(_)), "expected an Ini error, got {err:?}");
     }
 
     #[test]
