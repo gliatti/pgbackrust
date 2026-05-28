@@ -157,6 +157,17 @@ pub trait BackupControl {
     ///
     /// Surfaces query / parse failures as [`CommandError::Other`].
     fn timeline(&mut self) -> Result<u32, CommandError>;
+
+    /// The cluster's `archive_mode` setting (`"on"`, `"off"`, or `"always"`).
+    ///
+    /// Mirrors `SELECT setting FROM pg_settings WHERE name = 'archive_mode'`.
+    /// `backup` / `check` read this for `archive-mode-check`: WAL archiving must
+    /// be enabled or a backup cannot rely on its required WAL reaching the repo.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces query failures as [`CommandError::Other`].
+    fn archive_mode(&mut self) -> Result<String, CommandError>;
 }
 
 /// Build the `pg_backup_start` / `pg_start_backup` SQL for a given server
@@ -344,6 +355,14 @@ impl BackupControl for LibpqBackupControl {
             .value(0, 0)
             .and_then(|s| s.trim().parse::<u32>().ok())
             .ok_or_else(|| CommandError::Other("could not read timeline_id from pg_control_checkpoint()".to_owned()))
+    }
+
+    fn archive_mode(&mut self) -> Result<String, CommandError> {
+        let result = self
+            .conn
+            .query("select setting from pg_catalog.pg_settings where name = 'archive_mode'")
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+        Ok(result.value(0, 0).unwrap_or_default().trim().to_owned())
     }
 }
 
