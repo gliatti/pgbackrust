@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 pgbr-build = { path = "../pgbr-build" }
+pgbr-compress = { path = "../pgbr-compress" }
 pgbr-config = { path = "../pgbr-config" }
 pgbr-error = { path = "../pgbr-error" }
 pgbr-info = { path = "../pgbr-info" }

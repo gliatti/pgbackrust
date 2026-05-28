@@ -538,6 +538,7 @@ name = "pgbr-command"
 version = "0.1.0"
 dependencies = [
  "pgbr-build",
+ "pgbr-compress",
  "pgbr-config",
  "pgbr-error",
  "pgbr-info",
