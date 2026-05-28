@@ -18,22 +18,32 @@
 //!   [`mod@version`]) and, for the implemented layouts, the fuller
 //!   [`control::PgControlData`] (checkpoint LSN, [`control::DbState`],
 //!   page size, WAL segment size).
+//!   page size, WAL segment size). [`control::identify`] decodes raw bytes
+//!   and resolves them straight to a [`mod@version`] `VersionInterface`.
 //! - [`mod@page`]: the FNV-1a-based 16-bit data-page checksum `PostgreSQL`
 //!   stores in `pd_checksum`, used by backup's `--checksum-page` validation
 //!   ([`pg_checksum_page`], [`stored_checksum`], [`page_checksum_valid`]).
+//! - [`mod@tablespace`]: parser for the `PG_<version>_<catalog>` version
+//!   subdirectory `PostgreSQL` creates inside a tablespace location
+//!   ([`parse_tablespace_dir_name`], [`identify_tablespace_dir_name`]).
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod control;
 pub mod page;
+pub mod tablespace;
 pub mod version;
 
 pub use control::{
     DbState, PgControlData, PgControlError, PgControlHeader, decode_pg_control_data, decode_pg_control_header, header_version,
-    read_pg_control_data, read_pg_control_header,
+    identify, read_pg_control_data, read_pg_control_header,
 };
 pub use page::{page_checksum_valid, pg_checksum_page, stored_checksum};
-pub use version::{SUPPORTED, VersionInterface, by_catalog_version_no, by_label};
+pub use tablespace::{TablespaceDirName, identify_tablespace_dir_name, parse_tablespace_dir_name};
+pub use version::{
+    SUPPORTED, VersionInterface, by_catalog_version_no, by_label, pg_control_version_to_pg_version,
+    pg_version_to_pg_control_version,
+};
 
 const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;
 

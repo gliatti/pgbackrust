@@ -125,6 +125,46 @@ pub fn by_catalog_version_no(catalog_version_no: u32) -> Option<&'static Version
     SUPPORTED.iter().find(|v| v.catalog_version_no == catalog_version_no)
 }
 
+/// Map a `pg_control_version` to the matching `PostgreSQL` major-version
+/// label (`"9.6"`, `"10"`, …, `"18"`).
+///
+/// `pg_control_version` is **not** a unique key for a PG major: a single
+/// on-disk control format spans several releases when the catalog evolves
+/// without changing `ControlFileData` — most notably `1300`, which covers
+/// PG 13, 14, 15 and 16. This returns the label of the *first* matching
+/// [`SUPPORTED`] entry (lowest major), which is fine for the
+/// human-readable / layout-selection uses that key off the control format
+/// alone. To pin a decoded `pg_control` to one exact major, match on the
+/// `catalog_version_no` instead (see [`by_catalog_version_no`] and
+/// [`crate::control::identify`]).
+///
+/// Provenance: the per-version `PG_CONTROL_VERSION` defines live in the
+/// vendored `src/postgres/interface/version.vendor.h` (mirroring upstream
+/// `src/include/catalog/pg_control.h`); the C side resolves a version to
+/// its control number via `pgControlVersion()` in
+/// `src/postgres/interface.c`.
+#[must_use]
+pub fn pg_control_version_to_pg_version(pg_control_version: u32) -> Option<&'static str> {
+    SUPPORTED
+        .iter()
+        .find(|v| v.pg_control_version == pg_control_version)
+        .map(|v| v.label)
+}
+
+/// Map a `PostgreSQL` major-version label (`"9.6"`, `"10"`, …, `"18"`) to
+/// its `pg_control_version`.
+///
+/// Inverse of [`pg_control_version_to_pg_version`] (modulo that function's
+/// many-to-one collapse: distinct labels such as `"13"`..`"16"` all map
+/// back to the same `1300`). Returns `None` for an unrecognised label.
+///
+/// Provenance: same as [`pg_control_version_to_pg_version`] — mirrors the C
+/// `pgControlVersion()` in `src/postgres/interface.c`.
+#[must_use]
+pub fn pg_version_to_pg_control_version(label: &str) -> Option<u32> {
+    by_label(label).map(|v| v.pg_control_version)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -175,5 +215,47 @@ mod tests {
             assert_eq!(entry.block_size, 8192, "{} block_size", entry.label);
             assert_eq!(entry.wal_block_size, 8192, "{} wal_block_size", entry.label);
         }
+    }
+
+    #[test]
+    fn pg_version_round_trips_through_control_version() {
+        // For every supported label, label -> control_version ->
+        // *some* label that itself maps back to the same control_version.
+        for entry in SUPPORTED {
+            let ctrl = pg_version_to_pg_control_version(entry.label).expect("label maps to a control version");
+            assert_eq!(ctrl, entry.pg_control_version, "{} control version", entry.label);
+
+            let label = pg_control_version_to_pg_version(ctrl).expect("control version maps to a label");
+            // The reverse may collapse to the lowest-major label sharing
+            // this control version (e.g. 1300 -> "13"), so re-resolve and
+            // compare the control versions rather than the labels.
+            assert_eq!(
+                pg_version_to_pg_control_version(label),
+                Some(ctrl),
+                "{} reverse-mapped label shares the control version",
+                entry.label,
+            );
+        }
+    }
+
+    #[test]
+    fn shared_control_version_resolves_to_lowest_major() {
+        // 1300 spans PG 13–16; the lookup returns the first (lowest) major.
+        assert_eq!(pg_control_version_to_pg_version(1300), Some("13"));
+        // Single-major control versions resolve unambiguously.
+        assert_eq!(pg_control_version_to_pg_version(960), Some("9.6"));
+        assert_eq!(pg_control_version_to_pg_version(1002), Some("10"));
+        assert_eq!(pg_control_version_to_pg_version(1100), Some("11"));
+        assert_eq!(pg_control_version_to_pg_version(1201), Some("12"));
+        assert_eq!(pg_control_version_to_pg_version(1700), Some("17"));
+        assert_eq!(pg_control_version_to_pg_version(1800), Some("18"));
+    }
+
+    #[test]
+    fn unknown_control_version_and_label_return_none() {
+        assert_eq!(pg_control_version_to_pg_version(0), None);
+        assert_eq!(pg_control_version_to_pg_version(9999), None);
+        assert_eq!(pg_version_to_pg_control_version("8.4"), None);
+        assert_eq!(pg_version_to_pg_control_version(""), None);
     }
 }

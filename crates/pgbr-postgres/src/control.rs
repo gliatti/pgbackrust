@@ -459,6 +459,36 @@ pub fn decode_pg_control_data(bytes: &[u8]) -> Result<PgControlData, PgControlEr
     Ok(data)
 }
 
+/// Decode `pg_control` bytes and resolve them to the matching
+/// [`VersionInterface`].
+///
+/// A convenience over [`decode_pg_control_data`] that additionally returns
+/// the [`VersionInterface`] the decoded header belongs to. Resolution is
+/// driven by `catalog_version_no` (the unique per-major key) cross-checked
+/// against `pg_control_version` — exactly the validation
+/// [`decode_pg_control_header`] already performs, so any buffer that
+/// decodes successfully also identifies.
+///
+/// Returns `None` when:
+///
+/// - the buffer is too short or its `(pg_control_version,
+///   catalog_version_no)` pair is unknown / mismatched (i.e. whenever
+///   [`decode_pg_control_data`] would error), or
+/// - the catalog version somehow fails to resolve to a registry entry
+///   (unreachable for a buffer that decoded successfully, since the decode
+///   path validates the pair against [`crate::version::SUPPORTED`]).
+///
+/// Use this to take raw `global/pg_control` bytes and obtain both the
+/// concrete PG major (`VersionInterface`) and the decoded fields in one
+/// call. Where finer error reporting is wanted, call
+/// [`decode_pg_control_data`] directly and inspect the [`PgControlError`].
+#[must_use]
+pub fn identify(bytes: &[u8]) -> Option<(&'static VersionInterface, PgControlData)> {
+    let data = decode_pg_control_data(bytes).ok()?;
+    let version = header_version(&data.header)?;
+    Some((version, data))
+}
+
 /// Largest number of bytes [`read_pg_control_data`] pulls from a stream
 /// before decoding. Comfortably covers every implemented layout's
 /// highest field offset.
@@ -870,6 +900,60 @@ mod tests {
         let data = decode_pg_control_data(&header_only).expect("header-only decodes");
         assert_eq!(data.data_checksum_version, None);
         assert_eq!(data.page_checksums_enabled(), None);
+    }
+
+    #[test]
+    fn identify_round_trips_header_to_version_interface() {
+        // A bare 16-byte header for each supported version identifies to
+        // that version's VersionInterface, with extra fields None (the
+        // buffer never reaches their offsets).
+        let system_id: u64 = 0x1357_9bdf_0246_8ace;
+        for v in SUPPORTED {
+            let bytes = synth_header(v, system_id);
+            let (resolved, data) = identify(&bytes).unwrap_or_else(|| panic!("{} identifies", v.label));
+            assert_eq!(resolved.label, v.label, "{} identify label", v.label);
+            assert_eq!(
+                resolved.catalog_version_no, v.catalog_version_no,
+                "{} identify catalog",
+                v.label
+            );
+            assert_eq!(data.header.system_identifier, system_id, "{} identify system_id", v.label);
+            assert_eq!(
+                data.header.pg_control_version, v.pg_control_version,
+                "{} identify pg_control_version",
+                v.label
+            );
+        }
+    }
+
+    #[test]
+    fn identify_returns_full_fields_for_complete_buffer() {
+        // A complete v1300 buffer identifies to PG 13 (the lowest major
+        // sharing 1300) but, crucially, identify resolves the *exact* major
+        // via catalog_version_no — PG 16's catalog here — and also surfaces
+        // the decoded extra fields.
+        let buf = synth_data("16", 6 /* DB_IN_PRODUCTION */, 0xabc_def0, 8192, 16 * 1024 * 1024, 1);
+        let (resolved, data) = identify(&buf).expect("complete v1300 buffer identifies");
+        assert_eq!(resolved.label, "16", "catalog_version_no pins the exact major");
+        assert_eq!(resolved.pg_control_version, 1300);
+        assert_eq!(data.checkpoint, Some(0xabc_def0));
+        assert_eq!(data.state, Some(DbState::InProduction));
+        assert_eq!(data.block_size, Some(8192));
+        assert_eq!(data.wal_segment_size, Some(16 * 1024 * 1024));
+        assert_eq!(data.data_checksum_version, Some(1));
+        assert_eq!(data.page_checksums_enabled(), Some(true));
+    }
+
+    #[test]
+    fn identify_returns_none_for_unknown_or_short() {
+        // Too short.
+        assert!(identify(&[0u8; 8]).is_none());
+
+        // A valid header with a flipped catalog that resolves to nothing.
+        let v = &SUPPORTED[0];
+        let mut bytes = synth_header(v, 0);
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(identify(&bytes).is_none());
     }
 
     #[test]
