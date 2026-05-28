@@ -29,9 +29,11 @@ use pgbr_io::{IoError, IoRead, IoWrite};
 
 pub mod cifs;
 pub mod posix;
+pub mod s3;
 
 pub use crate::cifs::Cifs;
 pub use crate::posix::Posix;
+pub use crate::s3::{S3, S3Config};
 
 /// Metadata about an entry in a storage backend.
 #[derive(Debug, Clone, PartialEq, Eq)]

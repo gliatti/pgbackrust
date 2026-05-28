@@ -11,6 +11,10 @@ repository.workspace = true
 [dependencies]
 pgbr-error = { path = "../pgbr-error" }
 pgbr-io = { path = "../pgbr-io" }
+ureq = "2"
+quick-xml = "0.38"
+sha2 = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
