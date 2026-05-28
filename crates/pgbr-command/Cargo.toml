@@ -16,6 +16,10 @@ fs2 = "0.4"
 pgbr-build = { path = "../pgbr-build" }
 pgbr-compress = { path = "../pgbr-compress" }
 pgbr-config = { path = "../pgbr-config" }
+# libpq wrapper: lets stanza-create/upgrade learn the cluster identity from a
+# live PostgreSQL connection (server_version_num + pg_control_system()) instead
+# of only reading global/pg_control off disk.
+pgbr-db = { path = "../pgbr-db" }
 pgbr-error = { path = "../pgbr-error" }
 pgbr-info = { path = "../pgbr-info" }
 pgbr-io = { path = "../pgbr-io" }
