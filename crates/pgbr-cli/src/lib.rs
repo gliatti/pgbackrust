@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use pgbr_config::{
     Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, RuntimeContext, compile,
-    load_config_with_context, parse_cli, parse_ini, resolve_cli,
+    env_values_from_process, load_config_with_env, parse_cli, parse_ini, resolve_cli,
 };
 use pgbr_protocol::ProtocolError;
 use pgbr_storage::StorageError;
@@ -331,9 +331,15 @@ fn load_static_cfg() -> Result<Cfg, CliRunError> {
     compile(&parsed).map_err(CliRunError::Compile)
 }
 
-/// Read `pgbackrest.conf` (falling back to an empty INI when absent) and merge
-/// it with `resolved` and the runtime `ctx` into a [`LoadedConfig`]. Shared by
+/// Read `pgbackrest.conf` (falling back to an empty INI when absent), collect
+/// the `PGBACKREST_<OPTION>` environment variables, and merge them with
+/// `resolved` and the runtime `ctx` into a [`LoadedConfig`]. Shared by
 /// [`run_with_context`] and [`resolve_only`].
+///
+/// The five-source precedence is CLI > ENV > stanza:cmd > stanza > global:cmd >
+/// global > default, matching pgBackRest (`src/main.c` / `src/config/parse.c`):
+/// the process environment is read via [`env_values_from_process`] and slotted
+/// between the CLI and the config file by [`load_config_with_env`].
 fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError> {
     // Determine the config file path. `--config=<path>` lives in
     // `resolved.options[("config", None)]`. Fall back to the default.
@@ -350,7 +356,11 @@ fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Resu
         }
     };
 
-    load_config_with_context(resolved, &ini, cfg, ctx).map_err(CliRunError::Load)
+    // `PGBACKREST_<OPTION>` environment variables: the env source sits below the
+    // CLI but above the config file in precedence.
+    let env = env_values_from_process(cfg);
+
+    load_config_with_env(resolved, &env, &ini, cfg, ctx).map_err(CliRunError::Load)
 }
 
 /// Run parse + resolve + load and return the merged [`LoadedConfig`].
@@ -388,6 +398,12 @@ mod tests {
     use super::{
         CliRunError, EXIT_CODE_CONFIG_ERROR, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_RUNTIME_ERROR, load_static_cfg, resolve_only, run,
     };
+
+    /// Serializes the one test that mutates the process-global environment
+    /// (`env_var_takes_effect`). Holding it across the set -> read -> unset
+    /// window keeps the `PGBACKREST_*` var from leaking into any other test
+    /// that reads the live environment through `run` / `resolve_only`.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn static_cfg_compiles() {
@@ -600,6 +616,60 @@ option:
         assert!(
             super::env_context().exe_path.is_some_and(|p| !p.is_empty()),
             "env_context() should carry the running executable path",
+        );
+    }
+
+    #[test]
+    fn env_var_takes_effect() {
+        // A `PGBACKREST_<OPTION>` environment variable set in the process must
+        // flow through `run` / `resolve_only` and land on the resolved option,
+        // proving the binary feeds the live environment through
+        // `env_values_from_process` + `load_config_with_env`. Here the env source
+        // *supplies* `repo1-path` (no CLI `--repo1-path`), so the resolved value
+        // must equal the env value.
+        //
+        // The environment is process-global. ENV_TEST_LOCK serializes this test
+        // against itself (so a re-run / future second env test can't interleave
+        // their set/unset windows). The other tests in this binary read the live
+        // environment via `run` / `resolve_only` without taking the lock, but the
+        // `PGBACKREST_REPO1_PATH` we set is harmless if it briefly leaks: every
+        // such test either passes an explicit `--repo1-path` (CLI overrides the
+        // env source) or tolerates a `Load` / `Command` outcome regardless of the
+        // resolved repo path. set_var / remove_var are `unsafe` in edition 2024;
+        // the lib's `forbid(unsafe_code)` is `not(test)`, so this is allowed under
+        // `#[cfg(test)]`.
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let repo_path = repo.path().display().to_string();
+
+        // SAFETY: edition-2024 `set_var` is unsafe purely because of the
+        // data-race hazard with concurrent env access; this test keeps the window
+        // short and the value benign (see the leak note above).
+        unsafe {
+            std::env::set_var("PGBACKREST_REPO1_PATH", &repo_path);
+        }
+
+        // `--config` points at a guaranteed-absent file so the host's
+        // `/etc/pgbackrest` (if any) can't shadow the env value; the loader
+        // falls back to an empty INI. `info` is repo-only and resolves cleanly.
+        let result = resolve_only(
+            ["--config=/definitely/missing/pgbackrest.conf", "info", "--stanza=demo"],
+            &RuntimeContext {
+                exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+            },
+        );
+
+        // SAFETY: same short, benign-value window as the set above.
+        unsafe {
+            std::env::remove_var("PGBACKREST_REPO1_PATH");
+        }
+
+        let loaded = result.expect("info should resolve with repo-path supplied via env");
+        assert_eq!(
+            loaded.options.get(&("repo-path".to_owned(), Some(1))),
+            Some(&OptionValue::Path(repo_path)),
+            "the PGBACKREST_REPO1_PATH env value should resolve onto repo1-path",
         );
     }
 
