@@ -19,6 +19,18 @@
 //! derives from the PG version + system id is likewise simplified to a flat
 //! `archive/<stanza>/<segment>` layout for now.
 //!
+//! ## Multiple repositories
+//!
+//! pgBackRest copies every WAL segment into **every** configured repository: a
+//! segment is only "archived" once it is present on all of them. [`push`] takes
+//! a slice of repository [`Storage`] backends (one per configured repo, built by
+//! the CLI's `build_all_repo_storages`) and fans the copy out to each — if any
+//! repository write fails the whole command fails (the segment is not safely
+//! archived). [`get`] is the dual: it tries each repository in order and serves
+//! the segment from the first that has it. C ref:
+//! `src/command/archive/push/push.c` (`archivePushFile` over `repoIdxList`) and
+//! `src/command/archive/get/get.c`.
+//!
 //! ## Asynchronous (spool) mode (`--archive-async`)
 //!
 //! With `--archive-async` the foreground `archive-push` does not push the WAL
@@ -215,7 +227,7 @@ fn status_error_path(stanza: &str, segment: &str) -> PathBuf {
 }
 
 /// `archive-push` — copy a completed WAL segment from the PG data directory
-/// into the repository at `archive/<stanza>/<segment><suffix>`.
+/// into **every** configured repository at `archive/<stanza>/<segment><suffix>`.
 ///
 /// `config.params[0]` is the WAL source path (relative to the PG data dir,
 /// resolved against `pg_storage`); the segment basename is taken from it.
@@ -223,18 +235,30 @@ fn status_error_path(stanza: &str, segment: &str) -> PathBuf {
 /// compress filter and stored with the codec's extension (`.gz`/`.bz2`/
 /// `.lz4`/`.zst`); `compress-type=none` stores the raw bytes with no suffix.
 ///
+/// `repo_storages` is the list of repository backends — one per configured
+/// repository. The segment is read from PG and compressed once, then written
+/// to each repository in turn; the segment is only considered archived when it
+/// has reached all of them, so the first per-repository write failure fails the
+/// whole command. At least one repository must be supplied.
+///
 /// # Errors
 ///
 /// - [`CommandError::MissingOption`] with `"stanza"` if `config.stanza` is
 ///   `None`, or `"<wal-source>"` if no positional source path was supplied.
-/// - [`CommandError::Other`] if the source path has no file-name component.
+/// - [`CommandError::Other`] if the source path has no file-name component or
+///   `repo_storages` is empty.
 /// - [`CommandError::Io`] if the configured compress filter fails.
-/// - [`CommandError::Storage`] / [`CommandError::Io`] if the read from PG or
-///   the write into the repository fails.
-pub fn push(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+/// - [`CommandError::Storage`] / [`CommandError::Io`] if the read from PG or a
+///   write into any repository fails.
+pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })?;
+    if repo_storages.is_empty() {
+        return Err(CommandError::Other(
+            "archive-push requires at least one repository".to_owned(),
+        ));
+    }
     // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
     let _locks = acquire_command_lock(config, LockType::Archive)?;
     let wal_source = config.params.first().ok_or_else(|| CommandError::MissingOption {
@@ -249,6 +273,8 @@ pub fn push(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn 
     // Asynchronous mode: stage the segment in the spool out/ directory and let
     // the background drain move it to the repository. Before staging, consume
     // any status file the drain left for this segment from the previous call.
+    // The spool stages a single plaintext copy regardless of repo count; the
+    // background drain fans it out (a future protocol handler runs the drain).
     if archive_async(config) {
         let spool_root = spool_path(config).ok_or_else(|| CommandError::MissingOption {
             option: "spool-path".to_owned(),
@@ -263,8 +289,13 @@ pub fn push(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn 
         None => bytes,
     };
 
+    // Fan the (single, already-compressed) copy out to every repository. The
+    // segment is only archived once it has reached all of them.
     let dest = repo_segment_path(stanza, &format!("{segment}{}", compress_suffix(config)));
-    write_segment(&stored, repo_storage, &dest)
+    for repo in repo_storages {
+        write_segment(&stored, *repo, &dest)?;
+    }
+    Ok(())
 }
 
 /// Foreground half of asynchronous `archive-push`.
@@ -400,14 +431,18 @@ fn drain_one(
     write_segment(&stored, repo_storage, &dest)
 }
 
-/// `archive-get` — copy a WAL segment from the repository back into the PG
+/// `archive-get` — copy a WAL segment from a repository back into the PG
 /// data directory, transparently decompressing it.
 ///
 /// `config.params[0]` is the segment name; `config.params[1]` is the
 /// destination path (relative to the PG data dir, resolved against
 /// `pg_storage`).
 ///
-/// The stored form is discovered by probing: the plaintext
+/// `repo_storages` is the list of repository backends — one per configured
+/// repository. The repositories are tried in order and the segment is served
+/// from the first that has it (a segment archived to all repositories may only
+/// have reached some of them after a partial failure). Within each repository
+/// the stored form is discovered by probing: the plaintext
 /// `archive/<stanza>/<segment>` is preferred, then each compression suffix
 /// (`.gz`, `.zst`, `.bz2`, `.lz4`) is tried via [`Storage::exists`]. When a
 /// compressed form is found it is run through the matching decompress filter
@@ -419,14 +454,18 @@ fn drain_one(
 /// - [`CommandError::MissingOption`] with `"stanza"` if `config.stanza` is
 ///   `None`, `"<wal-segment>"` if no segment name was supplied, or
 ///   `"<destination>"` if no destination path was supplied.
+/// - [`CommandError::Other`] if `repo_storages` is empty.
 /// - [`CommandError::Io`] if a matched compressed form fails to decompress.
-/// - [`CommandError::Storage`] / [`CommandError::Io`] if no stored form is
-///   found (surfaces as [`pgbr_storage::StorageError::NotFound`] on the
-///   plaintext path) or the write into PG fails.
-pub fn get(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+/// - [`CommandError::Storage`] / [`CommandError::Io`] if no repository holds the
+///   segment (surfaces as [`pgbr_storage::StorageError::NotFound`] on the last
+///   repository's plaintext path) or the write into PG fails.
+pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })?;
+    if repo_storages.is_empty() {
+        return Err(CommandError::Other("archive-get requires at least one repository".to_owned()));
+    }
     // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
     let _locks = acquire_command_lock(config, LockType::Archive)?;
     let segment = config.params.first().ok_or_else(|| CommandError::MissingOption {
@@ -449,7 +488,33 @@ pub fn get(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn S
         }
     }
 
-    fetch_from_repo(repo_storage, pg_storage, stanza, segment, Path::new(dest))
+    // Try each repository in order; serve from the first that has the segment.
+    // Only the final repository's NotFound surfaces (the canonical "no archive"
+    // error); earlier NotFounds just advance to the next repository.
+    let last = repo_storages.len() - 1;
+    for (idx, repo) in repo_storages.iter().enumerate() {
+        if idx == last || repo_has_segment(*repo, stanza, segment)? {
+            return fetch_from_repo(*repo, pg_storage, stanza, segment, Path::new(dest));
+        }
+    }
+    // Unreachable: the loop always returns on the last repository, but keep a
+    // defensive error so the function is total.
+    Err(CommandError::Other("archive-get found no repository to read from".to_owned()))
+}
+
+/// Whether `repo` holds `segment` for `stanza` in any stored form (plaintext or
+/// a compressed suffix). Used by [`get`] to pick the first repository that has
+/// the segment.
+fn repo_has_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<bool, CommandError> {
+    if repo.exists(&repo_segment_path(stanza, segment))? {
+        return Ok(true);
+    }
+    for suffix in COMPRESS_SUFFIXES {
+        if repo.exists(&repo_segment_path(stanza, &format!("{segment}{suffix}")))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Synchronous repository fetch of `segment` into `dest` on `pg_storage`.
@@ -675,7 +740,7 @@ mod tests {
         put(&pg_s, &wal_source, WAL_BODY);
 
         let cfg = fake_config(Some("demo"), vec![wal_source]);
-        push(&cfg, &repo_s, &pg_s).expect("push should succeed");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         let dest = format!("archive/demo/{SEGMENT}");
         assert!(
@@ -689,7 +754,7 @@ mod tests {
     fn archive_push_missing_stanza_errors() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let cfg = fake_config(None, vec![format!("pg_wal/{SEGMENT}")]);
-        let err = push(&cfg, &repo_s, &pg_s).expect_err("push must require a stanza");
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("push must require a stanza");
         match err {
             CommandError::MissingOption { option } => assert_eq!(option, "stanza"),
             other => panic!("expected MissingOption(stanza), got {other:?}"),
@@ -700,7 +765,7 @@ mod tests {
     fn archive_push_missing_param_errors() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let cfg = fake_config(Some("demo"), Vec::new());
-        let err = push(&cfg, &repo_s, &pg_s).expect_err("push must require a wal source");
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("push must require a wal source");
         match err {
             CommandError::MissingOption { option } => assert_eq!(option, "<wal-source>"),
             other => panic!("expected MissingOption(<wal-source>), got {other:?}"),
@@ -714,7 +779,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
-        get(&cfg, &repo_s, &pg_s).expect("get should succeed");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "pg copy should match repo bytes");
@@ -746,14 +811,14 @@ mod tests {
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
         assert!(expected_lock.exists(), "archive lock file must appear while held");
 
-        let err = push(&cfg, &repo_s, &pg_s).expect_err("push must fail while the archive lock is held");
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("push must fail while the archive lock is held");
         assert!(
             err.to_string().contains("another archive is running"),
             "unexpected error: {err}"
         );
 
         drop(held);
-        push(&cfg, &repo_s, &pg_s).expect("push succeeds once the lock is free");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push succeeds once the lock is free");
     }
 
     #[test]
@@ -767,14 +832,14 @@ mod tests {
         let cfg = fake_config_locked(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], lock_dir.path());
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
-        let err = get(&cfg, &repo_s, &pg_s).expect_err("get must fail while the archive lock is held");
+        let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get must fail while the archive lock is held");
         assert!(
             err.to_string().contains("another archive is running"),
             "unexpected error: {err}"
         );
 
         drop(held);
-        get(&cfg, &repo_s, &pg_s).expect("get succeeds once the lock is free");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get succeeds once the lock is free");
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
     }
 
@@ -782,7 +847,7 @@ mod tests {
     fn archive_get_unknown_segment_errors_with_storage() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), format!("pg_wal/{SEGMENT}")]);
-        let err = get(&cfg, &repo_s, &pg_s).expect_err("get of an absent segment must fail");
+        let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get of an absent segment must fail");
         match err {
             CommandError::Storage(_) => {}
             other => panic!("expected Storage error, got {other:?}"),
@@ -798,7 +863,7 @@ mod tests {
         // Explicit `compress-type=none` must store the segment unchanged with
         // no suffix, exactly like the implicit-default path.
         let cfg = fake_config_compress(Some("demo"), vec![wal_source], "none");
-        push(&cfg, &repo_s, &pg_s).expect("push should succeed");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         let dest = format!("archive/demo/{SEGMENT}");
         assert!(
@@ -819,7 +884,7 @@ mod tests {
         put(&pg_s, &wal_source, WAL_BODY);
 
         let cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
-        push(&cfg, &repo_s, &pg_s).expect("push should succeed");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         let dest = format!("archive/demo/{SEGMENT}.gz");
         assert!(
@@ -844,13 +909,13 @@ mod tests {
         put(&pg_s, &wal_source, WAL_BODY);
 
         let push_cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
-        push(&push_cfg, &repo_s, &pg_s).expect("push should succeed");
+        push(&push_cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         // Recover into a fresh PG target; compress-type on get is irrelevant
         // (the stored form is discovered by probing).
         let dest = "pg_wal/recovered".to_owned();
         let get_cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
-        get(&get_cfg, &repo_s, &pg_s).expect("get should succeed");
+        get(&get_cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
 
         assert!(
             pg_s.exists(Path::new(&dest)).expect("exists"),
@@ -869,7 +934,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
-        get(&cfg, &repo_s, &pg_s).expect("get should find and decompress the .zst form");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should find and decompress the .zst form");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "recovered WAL should equal the plaintext");
@@ -890,7 +955,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
-        get(&cfg, &repo_s, &pg_s).expect("get should succeed");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
 
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "plaintext form should be used when both exist");
     }
@@ -923,7 +988,7 @@ mod tests {
         // Foreground async push only stages into the spool out/ dir; nothing
         // reaches the repo yet.
         let cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
-        push(&cfg, &repo_s, &pg_s).expect("async push should stage to spool");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async push should stage to spool");
 
         let staged = format!("archive/demo/out/{SEGMENT}");
         assert!(
@@ -972,7 +1037,7 @@ mod tests {
         // The foreground push should consume the .ok and return success
         // immediately, without re-staging the segment.
         let cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
-        push(&cfg, &repo_s, &pg_s).expect("async push should consume the prior .ok status");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async push should consume the prior .ok status");
 
         assert!(
             !spool_s
@@ -999,7 +1064,7 @@ mod tests {
         put(&spool_s, &format!("archive/demo/out/{SEGMENT}.error"), b"repo unreachable");
 
         let cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
-        let err = push(&cfg, &repo_s, &pg_s).expect_err("a prior .error status must surface as an error");
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("a prior .error status must surface as an error");
         match err {
             CommandError::Other(msg) => assert!(msg.contains("repo unreachable"), "message should be surfaced: {msg}"),
             other => panic!("expected Other(error message), got {other:?}"),
@@ -1036,7 +1101,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_async(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], spool.path());
-        get(&cfg, &repo_s, &pg_s).expect("async get should serve the pre-fetched segment");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async get should serve the pre-fetched segment");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "served WAL should equal the pre-fetched bytes");
@@ -1058,7 +1123,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_async(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], spool.path());
-        get(&cfg, &repo_s, &pg_s).expect("async get should fall back to a synchronous repo fetch");
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async get should fall back to a synchronous repo fetch");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "fetched WAL should equal the repo bytes");
@@ -1118,5 +1183,129 @@ mod tests {
             expected,
             "repo copy should be the gz-compressed WAL"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple repositories
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn archive_push_fans_out_to_all_repos() {
+        // A single WAL segment must reach EVERY configured repository.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("multi-repo push should succeed");
+
+        let dest = format!("archive/demo/{SEGMENT}");
+        for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s)] {
+            assert!(
+                repo.exists(Path::new(&dest)).expect("exists"),
+                "segment should land in {label}"
+            );
+            assert_eq!(read(repo, &dest), WAL_BODY, "{label} copy should match source bytes");
+        }
+    }
+
+    #[test]
+    fn archive_push_fails_if_any_repo_write_fails() {
+        // If one repository cannot be written, the whole push fails (the segment
+        // is not safely archived).
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let bad = tempfile::tempdir().expect("bad repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        // Block repo2 by placing a file where the `archive` directory must go.
+        std::fs::write(bad.path().join("archive"), b"not a dir").expect("write blocker");
+        let bad_s = Posix::new(bad.path());
+        let pg_s = Posix::new(pg.path());
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        push(&cfg, &[&repo1_s as &dyn Storage, &bad_s as &dyn Storage], &pg_s)
+            .expect_err("push must fail when any repository write fails");
+    }
+
+    #[test]
+    fn archive_push_empty_repo_set_errors() {
+        let pg_dir = tempfile::tempdir().expect("pg tempdir");
+        let pg_s = Posix::new(pg_dir.path());
+        let cfg = fake_config(Some("demo"), vec![format!("pg_wal/{SEGMENT}")]);
+        let err = push(&cfg, &[], &pg_s).expect_err("empty repo set must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("at least one repository"), "msg was {msg}"),
+            other => panic!("expected Other(at least one repository), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_get_reads_from_first_repo_that_has_segment() {
+        // The segment lives only in repo2; archive-get must fall through repo1
+        // and serve it from repo2.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        // Only repo2 has the segment.
+        put(&repo2_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+
+        let dest = format!("pg_wal/{SEGMENT}");
+        let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("get should serve from repo2");
+
+        assert_eq!(read(&pg_s, &dest), WAL_BODY, "segment should be served from repo2");
+    }
+
+    #[test]
+    fn archive_get_prefers_earlier_repo() {
+        // Both repos have the segment, with different payloads; archive-get must
+        // serve the earliest (repo1).
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        put(&repo1_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo2_s, &format!("archive/demo/{SEGMENT}"), b"repo2 payload");
+
+        let dest = format!("pg_wal/{SEGMENT}");
+        let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("get should succeed");
+
+        assert_eq!(read(&pg_s, &dest), WAL_BODY, "earliest repo (repo1) should win");
+    }
+
+    #[test]
+    fn archive_get_missing_in_all_repos_errors() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        let dest = format!("pg_wal/{SEGMENT}");
+        let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest]);
+        let err = get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect_err("get must fail when no repository has the segment");
+        match err {
+            CommandError::Storage(_) => {}
+            other => panic!("expected Storage(not found), got {other:?}"),
+        }
     }
 }

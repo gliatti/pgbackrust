@@ -21,6 +21,17 @@
 //! The row→identity mapping ([`query_result_to_identity`]) is a pure function
 //! over already-parsed column values, so it is unit-tested without any live
 //! server; [`cluster_identity_from_db`] is the thin libpq adapter around it.
+//!
+//! ## Multiple repositories
+//!
+//! pgBackRest initialises (resp. removes / upgrades) the stanza on **every**
+//! configured repository. [`create`] / [`delete`] / [`upgrade`] take a slice of
+//! `(group_index, repo_storage)` pairs — one per configured repository — and run
+//! the operation against each, reading that repository's own `repoN-cipher-*`
+//! options at its `group_index` so each repository keeps its own (possibly
+//! distinct) encryption settings. The cluster identity is resolved once (it does
+//! not vary by repository) and applied to all. C ref: the `repoIdxList`
+//! iteration in `src/command/stanza/create.c` / `delete.c` / `upgrade.c`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -75,11 +86,11 @@ fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
     })
 }
 
-/// The resolved repository cipher configuration for repo index 1.
+/// The resolved repository cipher configuration for one repository index.
 ///
 /// `repo-cipher-type` is a `repo`-group `string-id`; `repo-cipher-pass` is the
-/// user passphrase (a secure string). The group index for the first (and only)
-/// repository is `1`, matching pgBackRest's default-first-index resolution.
+/// user passphrase (a secure string). Both are read at the repository's own
+/// group index so each configured repository keeps its own encryption settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepoCipherConfig {
     cipher_type: CipherType,
@@ -88,10 +99,11 @@ struct RepoCipherConfig {
 }
 
 impl RepoCipherConfig {
-    /// Read the repository cipher configuration from the resolved options.
-    fn from_config(config: &LoadedConfig) -> Self {
-        let cipher_type = repo_string_id(config, "repo-cipher-type").map_or(CipherType::None, CipherType::from_str_id);
-        let user_pass = repo_string(config, "repo-cipher-pass")
+    /// Read the repository cipher configuration from the resolved options at
+    /// repository group index `index`.
+    fn from_config(config: &LoadedConfig, index: u32) -> Self {
+        let cipher_type = repo_string_id(config, "repo-cipher-type", index).map_or(CipherType::None, CipherType::from_str_id);
+        let user_pass = repo_string(config, "repo-cipher-pass", index)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         Self { cipher_type, user_pass }
@@ -118,17 +130,17 @@ impl RepoCipherConfig {
     }
 }
 
-/// Fetch a `repo`-group `StringId` option (index 1).
-fn repo_string_id<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
-    match config.options.get(&(name.to_owned(), Some(1))) {
+/// Fetch a `repo`-group `StringId` option at group index `index`.
+fn repo_string_id<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(index))) {
         Some(OptionValue::StringId(value)) => Some(value.as_str()),
         _ => None,
     }
 }
 
-/// Fetch a `repo`-group `String` option (index 1).
-fn repo_string<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
-    match config.options.get(&(name.to_owned(), Some(1))) {
+/// Fetch a `repo`-group `String` option at group index `index`.
+fn repo_string<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(index))) {
         Some(OptionValue::String(value)) => Some(value.as_str()),
         _ => None,
     }
@@ -342,14 +354,30 @@ fn resolve_cluster_identity(config: &LoadedConfig, pg_storage: &dyn Storage) -> 
 ///   version is unsupported, or the stanza already exists.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] for repository write
 ///   failures.
-pub fn create(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+pub fn create(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)], pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    if repo_storages.is_empty() {
+        return Err(CommandError::Other(
+            "stanza-create requires at least one repository".to_owned(),
+        ));
+    }
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
-    let cipher = RepoCipherConfig::from_config(config);
-    cipher.require_passphrase()?;
+
+    // Validate every repository's cipher config up front so a missing passphrase
+    // fails before any repository is touched.
+    let mut ciphers = Vec::with_capacity(repo_storages.len());
+    for (index, _) in repo_storages {
+        let cipher = RepoCipherConfig::from_config(config, *index);
+        cipher.require_passphrase()?;
+        ciphers.push(cipher);
+    }
+
+    // The cluster identity does not vary by repository: resolve it once.
     let identity = resolve_cluster_identity(config, pg_storage)?;
-    create_with_identity(stanza, repo_storage, identity, &cipher)?;
+    for ((_, repo_storage), cipher) in repo_storages.iter().zip(&ciphers) {
+        create_with_identity(stanza, *repo_storage, identity.clone(), cipher)?;
+    }
     Ok(())
 }
 
@@ -477,7 +505,7 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 /// - [`CommandError::MissingOption`] if `--stanza` was not supplied.
 /// - [`CommandError::Storage`] if either removal fails for a reason other
 ///   than "missing".
-pub fn delete(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+pub fn delete(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)]) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
@@ -485,8 +513,11 @@ pub fn delete(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), C
     let archive: PathBuf = format!("archive/{stanza}").into();
     let backup: PathBuf = format!("backup/{stanza}").into();
 
-    remove_subtree(repo_storage, &archive)?;
-    remove_subtree(repo_storage, &backup)?;
+    // Remove the stanza from every configured repository (idempotent per repo).
+    for (_, repo_storage) in repo_storages {
+        remove_subtree(*repo_storage, &archive)?;
+        remove_subtree(*repo_storage, &backup)?;
+    }
     Ok(())
 }
 
@@ -512,14 +543,29 @@ fn remove_subtree(storage: &dyn Storage, path: &Path) -> Result<(), CommandError
 ///   version is unsupported, or the stanza was never initialised.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] for repository
 ///   read/write failures.
-pub fn upgrade(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+pub fn upgrade(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)], pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    if repo_storages.is_empty() {
+        return Err(CommandError::Other(
+            "stanza-upgrade requires at least one repository".to_owned(),
+        ));
+    }
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
-    let cipher = RepoCipherConfig::from_config(config);
-    cipher.require_passphrase()?;
+
+    // Validate every repository's cipher config up front.
+    let mut ciphers = Vec::with_capacity(repo_storages.len());
+    for (index, _) in repo_storages {
+        let cipher = RepoCipherConfig::from_config(config, *index);
+        cipher.require_passphrase()?;
+        ciphers.push(cipher);
+    }
+
+    // The cluster identity does not vary by repository: resolve it once.
     let identity = resolve_cluster_identity(config, pg_storage)?;
-    upgrade_with_identity(stanza, repo_storage, identity, &cipher)?;
+    for ((_, repo_storage), cipher) in repo_storages.iter().zip(&ciphers) {
+        upgrade_with_identity(stanza, *repo_storage, identity.clone(), cipher)?;
+    }
     Ok(())
 }
 
@@ -690,11 +736,12 @@ mod tests {
         let cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
-        let err = create(&cfg, &repo_s, &pg_s).expect_err("create must fail while a component lock is held");
+        let err =
+            create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("create must fail while a component lock is held");
         assert!(err.to_string().contains("running"), "unexpected error: {err}");
 
         drop(held);
-        create(&cfg, &repo_s, &pg_s).expect("create succeeds once the locks are free");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("create succeeds once the locks are free");
         assert!(
             !lock_dir.path().join("demo-backup.lock").exists(),
             "lock files must be released after the command returns"
@@ -712,11 +759,11 @@ mod tests {
         cfg.command = "stanza-delete".to_owned();
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
-        let err = delete(&cfg, &repo_s).expect_err("delete must fail while a component lock is held");
+        let err = delete(&cfg, &[(1, &repo_s as &dyn Storage)]).expect_err("delete must fail while a component lock is held");
         assert!(err.to_string().contains("running"), "unexpected error: {err}");
 
         drop(held);
-        delete(&cfg, &repo_s).expect("delete succeeds once the locks are free");
+        delete(&cfg, &[(1, &repo_s as &dyn Storage)]).expect("delete succeeds once the locks are free");
     }
 
     #[test]
@@ -730,11 +777,12 @@ mod tests {
         cfg.command = "stanza-upgrade".to_owned();
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
-        let err = upgrade(&cfg, &repo_s, &pg_s).expect_err("upgrade must fail while a component lock is held");
+        let err =
+            upgrade(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("upgrade must fail while a component lock is held");
         assert!(err.to_string().contains("running"), "unexpected error: {err}");
 
         drop(held);
-        upgrade(&cfg, &repo_s, &pg_s).expect("upgrade succeeds once the locks are free");
+        upgrade(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("upgrade succeeds once the locks are free");
     }
 
     #[test]
@@ -745,7 +793,7 @@ mod tests {
         write_pg_control(&pg_s, system_id, v);
 
         let cfg = config_with_stanza(Some("demo"));
-        create(&cfg, &repo_s, &pg_s).expect("stanza-create should succeed");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("stanza-create should succeed");
 
         let archive = InfoArchive::load(&repo_s, &archive_info_path("demo")).expect("load archive.info");
         assert_eq!(archive.db_system_id, system_id);
@@ -770,7 +818,7 @@ mod tests {
         write_pg_control(&pg_s, system_id, v);
 
         let cfg = config_with_cipher(Some("enc"), "user-passphrase");
-        create(&cfg, &repo_s, &pg_s).expect("encrypted stanza-create should succeed");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("encrypted stanza-create should succeed");
 
         // The on-disk info files must NOT be plaintext (they start with the
         // pgBackRest cipher header) and must NOT be loadable without the pass.
@@ -817,7 +865,7 @@ mod tests {
             ("repo-cipher-type".to_owned(), Some(1)),
             OptionValue::StringId("aes-256-cbc".to_owned()),
         );
-        let err = create(&cfg, &repo_s, &pg_s).expect_err("encrypted create needs a passphrase");
+        let err = create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("encrypted create needs a passphrase");
         match err {
             CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
             other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
@@ -831,7 +879,7 @@ mod tests {
         write_pg_control(&pg_s, system_id, &SUPPORTED[0]);
 
         let cfg = config_with_cipher(Some("enc"), "pw");
-        create(&cfg, &repo_s, &pg_s).expect("encrypted create");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("encrypted create");
 
         // The repo sub-key recorded at create time.
         let (_arc, sub_before) = InfoArchive::load_keyed(&repo_s, &archive_info_path("enc"), Some("pw")).unwrap();
@@ -839,7 +887,7 @@ mod tests {
 
         // A version change upgrades while preserving encryption + the sub-key.
         write_pg_control(&pg_s, system_id, &SUPPORTED[1]);
-        upgrade(&cfg, &repo_s, &pg_s).expect("encrypted upgrade");
+        upgrade(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("encrypted upgrade");
 
         let (archive, sub_after) = InfoArchive::load_keyed(&repo_s, &archive_info_path("enc"), Some("pw")).unwrap();
         assert_eq!(archive.db_version, SUPPORTED[1].label);
@@ -858,11 +906,11 @@ mod tests {
 
         // Create UNENCRYPTED.
         let cfg = config_with_stanza(Some("plain"));
-        create(&cfg, &repo_s, &pg_s).expect("unencrypted create");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("unencrypted create");
 
         // Now try to upgrade while *adding* encryption.
         let enc_cfg = config_with_cipher(Some("plain"), "pw");
-        let err = upgrade(&enc_cfg, &repo_s, &pg_s).expect_err("adding encryption on upgrade must fail");
+        let err = upgrade(&enc_cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("adding encryption on upgrade must fail");
         match err {
             CommandError::Other(msg) => assert!(msg.contains("stanza-create"), "message was {msg:?}"),
             other => panic!("expected Other(cipher mismatch), got {other:?}"),
@@ -875,7 +923,7 @@ mod tests {
         write_pg_control(&pg_s, 1, &SUPPORTED[0]);
 
         let cfg = config_with_stanza(None);
-        let err = create(&cfg, &repo_s, &pg_s).expect_err("stanza-create requires a stanza");
+        let err = create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("stanza-create requires a stanza");
         match err {
             CommandError::MissingOption { option } => assert_eq!(option, "stanza"),
             other => panic!("expected MissingOption, got {other:?}"),
@@ -888,9 +936,9 @@ mod tests {
         write_pg_control(&pg_s, 42, &SUPPORTED[0]);
 
         let cfg = config_with_stanza(Some("demo"));
-        create(&cfg, &repo_s, &pg_s).expect("first create succeeds");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("first create succeeds");
 
-        let err = create(&cfg, &repo_s, &pg_s).expect_err("second create must fail");
+        let err = create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("second create must fail");
         match err {
             CommandError::Other(msg) => assert_eq!(msg, "stanza already exists"),
             other => panic!("expected Other(stanza already exists), got {other:?}"),
@@ -1097,10 +1145,174 @@ mod tests {
         let repo_s = Posix::new(repo.path());
         let pg_s = Posix::new(pg.path());
         let cfg = config_with_stanza(Some("dblive"));
-        create(&cfg, &repo_s, &pg_s).expect("stanza-create via DB path");
+        create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("stanza-create via DB path");
 
         let archive = InfoArchive::load(&repo_s, &archive_info_path("dblive")).expect("archive.info");
         assert_eq!(archive.db_system_id, identity.header.system_identifier);
         assert_eq!(archive.db_version, identity.version);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple repositories
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stanza_create_initializes_every_repo() {
+        // stanza-create must write archive.info + backup.info on EVERY
+        // configured repository.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        write_pg_control(&pg_s, 0x0102_0304, &SUPPORTED[0]);
+
+        let cfg = config_with_stanza(Some("demo"));
+        create(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)], &pg_s)
+            .expect("multi-repo stanza-create should succeed");
+
+        for repo in [&repo1_s, &repo2_s] {
+            let archive = InfoArchive::load(repo, &archive_info_path("demo")).expect("archive.info on each repo");
+            assert_eq!(archive.db_version, SUPPORTED[0].label);
+            assert!(
+                repo.exists(&backup_info_path("demo")).expect("exists"),
+                "backup.info should exist on each repo"
+            );
+        }
+    }
+
+    #[test]
+    fn stanza_create_honors_per_repo_cipher() {
+        // repo1 is unencrypted; repo2 is encrypted with its own repo2-cipher-*.
+        // Each repository must use its own cipher settings.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        write_pg_control(&pg_s, 0x0a0b_0c0d, &SUPPORTED[0]);
+
+        let mut cfg = config_with_stanza(Some("demo"));
+        // repo2 encrypted; repo1 left unencrypted (no repo1-cipher-*).
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(2)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-cipher-pass".to_owned(), Some(2)),
+            OptionValue::String("repo2-pass".to_owned()),
+        );
+
+        create(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)], &pg_s)
+            .expect("multi-repo create with mixed cipher should succeed");
+
+        // repo1: plaintext info file, loadable without a passphrase.
+        assert!(
+            InfoArchive::load(&repo1_s, &archive_info_path("demo")).is_ok(),
+            "repo1 (unencrypted) info must load plainly"
+        );
+
+        // repo2: encrypted (pgBackRest cipher header), not plainly loadable, but
+        // loadable with repo2's passphrase.
+        let raw = {
+            let mut r = repo2_s.open_read(&archive_info_path("demo")).unwrap();
+            r.read_all().unwrap()
+        };
+        assert_eq!(&raw[..8], b"Salted__", "repo2 info must be encrypted");
+        assert!(
+            InfoArchive::load(&repo2_s, &archive_info_path("demo")).is_err(),
+            "plain load of repo2's encrypted file must fail"
+        );
+        assert!(
+            InfoArchive::load_keyed(&repo2_s, &archive_info_path("demo"), Some("repo2-pass")).is_ok(),
+            "repo2 info must load with repo2's passphrase"
+        );
+    }
+
+    #[test]
+    fn stanza_create_missing_pass_on_one_repo_fails_before_writing() {
+        // repo2 declares encryption but no passphrase: the whole command must
+        // fail up front, leaving repo1 untouched.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(2)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+
+        let err = create(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)], &pg_s)
+            .expect_err("missing passphrase on any repo must fail the command");
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
+            other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
+        }
+        assert!(
+            !repo1_s.exists(&archive_info_path("demo")).expect("exists"),
+            "repo1 must be untouched when validation fails up front"
+        );
+    }
+
+    #[test]
+    fn stanza_delete_removes_from_every_repo() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        write_pg_control(&pg_s, 7, &SUPPORTED[0]);
+
+        let mut cfg = config_with_stanza(Some("demo"));
+        create(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)], &pg_s).expect("seed both repos");
+
+        cfg.command = "stanza-delete".to_owned();
+        delete(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)]).expect("delete from both repos");
+
+        for repo in [&repo1_s, &repo2_s] {
+            assert!(
+                !repo.exists(Path::new("archive/demo")).expect("exists"),
+                "archive/demo should be gone from each repo"
+            );
+            assert!(
+                !repo.exists(Path::new("backup/demo")).expect("exists"),
+                "backup/demo should be gone from each repo"
+            );
+        }
+    }
+
+    #[test]
+    fn stanza_upgrade_applies_to_every_repo() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        let system_id: u64 = 99;
+        write_pg_control(&pg_s, system_id, &SUPPORTED[0]);
+
+        let mut cfg = config_with_stanza(Some("demo"));
+        let repo_set: [(u32, &dyn Storage); 2] = [(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)];
+        create(&cfg, &repo_set, &pg_s).expect("seed both repos");
+
+        // Same cluster, new PG version → both repos upgrade to db-id 2.
+        write_pg_control(&pg_s, system_id, &SUPPORTED[1]);
+        cfg.command = "stanza-upgrade".to_owned();
+        upgrade(&cfg, &repo_set, &pg_s).expect("upgrade both repos");
+
+        for repo in [&repo1_s, &repo2_s] {
+            let archive = InfoArchive::load(repo, &archive_info_path("demo")).expect("archive.info");
+            assert_eq!(archive.db_id, 2, "each repo should be upgraded");
+            assert_eq!(archive.db_version, SUPPORTED[1].label);
+        }
     }
 }

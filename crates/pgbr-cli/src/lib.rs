@@ -266,14 +266,32 @@ fn worker_loaded_config(resolved: &ResolvedCli) -> LoadedConfig {
     }
 }
 
+/// Commands that operate on **every** configured repository rather than just the
+/// active one (`--repo`): `archive-push` fans each WAL segment out to all repos,
+/// `archive-get` reads from the first that has the segment, and the stanza
+/// commands initialise / remove / upgrade the stanza on each. For these the CLI
+/// builds one backend per configured repository (see
+/// [`storage_helper::build_all_repo_storages`]) and dispatches through
+/// [`pgbr_command::dispatch_multi`].
+const MULTI_REPO_COMMANDS: &[&str] = &[
+    "archive-push",
+    "archive-get",
+    "stanza-create",
+    "stanza-delete",
+    "stanza-upgrade",
+];
+
 /// Build storage (as needed) and dispatch `loaded` to its command, mapping the
 /// outcome to a process exit code.
 ///
 /// `version` / `help` are informational commands that never touch a repository
 /// or PG data directory, so they short-circuit through a throwaway in-memory
 /// posix backend (rooted at the current directory) without parsing any
-/// `repo-*` / `pg-*` storage options. Every other command builds the real repo
-/// and pg backends from the resolved config via [`storage_helper`].
+/// `repo-*` / `pg-*` storage options. Multi-repository commands (see
+/// [`MULTI_REPO_COMMANDS`]) build one backend per configured repository and
+/// dispatch through [`pgbr_command::dispatch_multi`]. Every other command builds
+/// the active repo + pg backends from the resolved config via [`storage_helper`]
+/// and dispatches through [`pgbr_command::dispatch`].
 fn dispatch_loaded(loaded: &LoadedConfig) -> Result<i32, CliRunError> {
     // Informational commands: no storage needed. Hand them a posix backend
     // rooted at "." so the dispatch signature is satisfied without resolving
@@ -283,13 +301,37 @@ fn dispatch_loaded(loaded: &LoadedConfig) -> Result<i32, CliRunError> {
         return finish_dispatch(pgbr_command::dispatch(loaded, &throwaway, &throwaway));
     }
 
-    // Every other command: build the two storage backends it is handed — one
-    // rooted at the backup repository (selected by `repo-type`), one at the PG
-    // data directory. `build_pg_storage` errors when `pg-path` is required but
-    // absent; repo-only commands that legitimately never touch PG storage are
-    // not in scope to special-case here, so we surface that as a config error.
-    let repo_storage = storage_helper::build_repo_storage(loaded)?;
     let pg_storage = build_pg_storage_or_placeholder(loaded)?;
+
+    // Multi-repository commands: build one backend per configured repository and
+    // dispatch through the index-aware entry point. The active repo (selected by
+    // `--repo`) is the one whose index matches `repo` — or the first configured
+    // when the active index has no backend in the set (it always does, since
+    // `configured_repo_indexes` includes the active index).
+    if MULTI_REPO_COMMANDS.contains(&loaded.command.as_str()) {
+        let all = storage_helper::build_all_repo_storages(loaded)?;
+        let active = storage_helper::active_repo_index(loaded);
+        let active_storage = all
+            .iter()
+            .find(|(idx, _)| *idx == active)
+            .or_else(|| all.first())
+            .map(|(_, s)| s.as_ref())
+            .ok_or_else(|| CliRunError::StorageConfig("no repository is configured".to_owned()))?;
+        let pairs: Vec<(u32, &dyn pgbr_storage::Storage)> = all.iter().map(|(idx, s)| (*idx, s.as_ref())).collect();
+        return finish_dispatch(pgbr_command::dispatch_multi(
+            loaded,
+            active_storage,
+            &pairs,
+            pg_storage.as_ref(),
+        ));
+    }
+
+    // Every other command: build the two storage backends it is handed — one
+    // rooted at the active backup repository (selected by `--repo` / `repo-type`),
+    // one at the PG data directory. `build_pg_storage` errors when `pg-path` is
+    // required but absent; repo-only commands that legitimately never touch PG
+    // storage are handled by `build_pg_storage_or_placeholder` above.
+    let repo_storage = storage_helper::build_repo_storage(loaded)?;
 
     finish_dispatch(pgbr_command::dispatch(loaded, repo_storage.as_ref(), pg_storage.as_ref()))
 }

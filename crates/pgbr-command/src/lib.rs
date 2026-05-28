@@ -101,6 +101,13 @@ impl From<pgbr_io::IoError> for CommandError {
 /// caller wires up real backends (posix / s3 / azure / …); tests use
 /// `Posix` rooted at a `tempfile::TempDir`.
 ///
+/// `repo_storage` is the *active* repository (selected by `--repo`); the
+/// commands that span every repository — `archive-push`/`archive-get` and the
+/// stanza-management commands — are instead handed the full set via
+/// [`dispatch_multi`]. This thin entry point treats the active repository as the
+/// only one, so single-repo callers (and tests) keep a simple two-storage
+/// signature. C ref: the `repoIdxList` iteration in `src/command/*`.
+///
 /// # Errors
 ///
 /// Returns [`CommandError::UnknownCommand`] if the command name is not in
@@ -108,6 +115,35 @@ impl From<pgbr_io::IoError> for CommandError {
 pub fn dispatch(
     config: &pgbr_config::LoadedConfig,
     repo_storage: &dyn pgbr_storage::Storage,
+    pg_storage: &dyn pgbr_storage::Storage,
+) -> Result<(), CommandError> {
+    // The single active repository is treated as the only configured one,
+    // carrying the conventional first index (1) for the stanza commands' per-repo
+    // cipher resolution.
+    dispatch_multi(config, repo_storage, &[(1, repo_storage)], pg_storage)
+}
+
+/// Route a resolved configuration to the matching per-command function, with an
+/// explicit set of *all* configured repositories.
+///
+/// `repo_storage` is the active repository (used by single-repo commands such as
+/// `info`, `expire`, `restore`, the `repo-*` family, …). `repo_storages` is the
+/// full list — one `(group_index, backend)` pair per configured repository —
+/// used by the commands that must touch every repository: `archive-push` fans
+/// each WAL segment out to all of them, `archive-get` reads from the first that
+/// has the segment, and `stanza-create`/`-delete`/`-upgrade` initialise / remove
+/// / upgrade the stanza on each (reading each repository's own `repoN-cipher-*`
+/// at its `group_index`). For a single-repository configuration `repo_storages`
+/// is just `[(1, repo_storage)]`, which is exactly what [`dispatch`] passes.
+///
+/// # Errors
+///
+/// Returns [`CommandError::UnknownCommand`] if the command name is not in
+/// the dispatch table, or whatever the dispatched implementation returns.
+pub fn dispatch_multi(
+    config: &pgbr_config::LoadedConfig,
+    repo_storage: &dyn pgbr_storage::Storage,
+    repo_storages: &[(u32, &dyn pgbr_storage::Storage)],
     pg_storage: &dyn pgbr_storage::Storage,
 ) -> Result<(), CommandError> {
     // The subordinate `local` / `remote` worker roles short-circuit the
@@ -118,14 +154,18 @@ pub fn dispatch(
         return worker::run_worker_stdio(config);
     }
 
+    // The archive commands do not (yet) apply per-repo encryption, so they only
+    // need the backends — drop the indexes into a plain slice.
+    let archive_repos: Vec<&dyn pgbr_storage::Storage> = repo_storages.iter().map(|(_, s)| *s).collect();
+
     match config.command.as_str() {
         "version" => control::version(config),
         "help" => help::help(config),
         "start" => lock::start(config, repo_storage),
         "stop" => lock::stop(config, repo_storage),
-        "stanza-create" => stanza::create(config, repo_storage, pg_storage),
-        "stanza-delete" => stanza::delete(config, repo_storage),
-        "stanza-upgrade" => stanza::upgrade(config, repo_storage, pg_storage),
+        "stanza-create" => stanza::create(config, repo_storages, pg_storage),
+        "stanza-delete" => stanza::delete(config, repo_storages),
+        "stanza-upgrade" => stanza::upgrade(config, repo_storages, pg_storage),
         "info" => info::info(config, repo_storage),
         "repo-ls" => repo::ls(config, repo_storage),
         "repo-get" => repo::get(config, repo_storage),
@@ -133,8 +173,8 @@ pub fn dispatch(
         "repo-rm" => repo::rm(config, repo_storage),
         "backup" => backup::backup(config, repo_storage, pg_storage),
         "restore" => restore::restore(config, repo_storage, pg_storage),
-        "archive-get" => archive::get(config, repo_storage, pg_storage),
-        "archive-push" => archive::push(config, repo_storage, pg_storage),
+        "archive-get" => archive::get(config, &archive_repos, pg_storage),
+        "archive-push" => archive::push(config, &archive_repos, pg_storage),
         "expire" => expire::expire(config, repo_storage),
         "verify" => verify::verify(config, repo_storage),
         "check" => check::check(config, repo_storage, pg_storage),
