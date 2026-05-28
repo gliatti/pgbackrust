@@ -133,15 +133,30 @@
 //! emit `recovery_target_<type> = '<--target value>'` (with `recovery_target_inclusive
 //! = 'false'` when `--target-exclusive` is set for time/lsn/xid); `--type=default`
 //! (or unset) writes only the `restore_command`. `--type=none` writes no recovery
-//! files at all. The generator is the pure [`recovery_files`] function so it is
-//! unit-testable without any storage.
+//! files at all.
+//!
+//! On top of the target type, the recovery-target family is honoured:
+//!
+//! - `--target-action` (`pause` / `promote` / `shutdown`) emits
+//!   `recovery_target_action = '<value>'` whenever the resolved value is not the
+//!   default `pause` (matching the C generator, which suppresses the GUC for the
+//!   default since `PostgreSQL` already pauses).
+//! - `--target-timeline` emits `recovery_target_timeline = '<value>'`. On PG < 12
+//!   the literal value `current` is *not* written (that version defaults to it and
+//!   rejects it as an explicit parameter); on PG >= 12 it is always written. When
+//!   `--target-timeline` is unset, `--type=immediate` on PG >= 12 still emits
+//!   `recovery_target_timeline = 'current'` so recovery does not chase the latest
+//!   timeline it cannot reach (mirrors the C workaround for a `PostgreSQL` bug).
+//!
+//! The generator is the pure [`recovery_files`] function so it is unit-testable
+//! without any storage.
 //!
 //! # Deferred to later commits
 //!
 //! - `--type=preserve` (leave any existing recovery file untouched) and the full
-//!   `--recovery-option` passthrough — only the target-type-derived settings are
-//!   generated here,
-//! - `--target-action` / `--target-timeline` recovery settings.
+//!   `--recovery-option` passthrough — only the resolved recovery-target settings
+//!   (`--type`, `--target`, `--target-exclusive`, `--target-action`,
+//!   `--target-timeline`) are generated here.
 //!
 //! This is the full raw-restore path; everything above is genuinely out of
 //! scope for the slice, not silently dropped.
@@ -334,6 +349,28 @@ fn target_exclusive(config: &LoadedConfig) -> bool {
     )
 }
 
+/// The resolved `--target-action` (`pause` / `promote` / `shutdown`), defaulting
+/// to `pause` when absent (mirrors the option's `default: pause`). The
+/// recovery-config generator emits `recovery_target_action` only when this is not
+/// the default `pause`, exactly like the C generator.
+fn target_action(config: &LoadedConfig) -> &'static str {
+    let raw = match config.options.get(&("target-action".to_owned(), None)) {
+        Some(OptionValue::StringId(value) | OptionValue::String(value)) => value.as_str(),
+        _ => "pause",
+    };
+    match raw {
+        "promote" => "promote",
+        "shutdown" => "shutdown",
+        // `pause` or anything unrecognised: the default (no GUC emitted).
+        _ => "pause",
+    }
+}
+
+/// The resolved `--target-timeline` value, if supplied.
+fn target_timeline(config: &LoadedConfig) -> Option<&str> {
+    string_option(config, "target-timeline")
+}
+
 /// The `restore_command` `PostgreSQL` runs to fetch one archived WAL segment.
 /// `%f` is the segment name `PostgreSQL` substitutes and `"%p"` the destination
 /// path. Mirrors the C generator's
@@ -342,12 +379,29 @@ fn restore_command(stanza: &str) -> String {
     format!("pgbackrest --stanza={stanza} archive-get %f \"%p\"")
 }
 
+/// The resolved recovery-target settings the [`recovery_block`] generator emits,
+/// beyond the always-present `restore_command` / target-type lines. Bundled into a
+/// struct so the signature stays readable as the family grows.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecoverySettings<'a> {
+    /// The `--target` value (used for `time` / `name` / `lsn` / `xid` types).
+    target: Option<&'a str>,
+    /// Whether `--target-exclusive` is set (drives `recovery_target_inclusive`).
+    exclusive: bool,
+    /// The resolved `--target-action` (`pause` / `promote` / `shutdown`); the
+    /// default `pause` suppresses the GUC.
+    action: &'a str,
+    /// The `--target-timeline` value, if supplied.
+    timeline: Option<&'a str>,
+}
+
 /// Render the recovery settings block (a `key = 'value'` line per setting) for the
-/// given PG major version and resolved recovery type. The leading header line
-/// identifies the restore. Always emits `restore_command`; the recovery-target
-/// lines depend on the type. Returns an empty string for [`RecoveryType::None`]
-/// (callers should not write any recovery file in that case).
-fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, target: Option<&str>, exclusive: bool) -> String {
+/// given PG major version, resolved recovery type, and recovery-target settings.
+/// The leading header line identifies the restore. Always emits `restore_command`;
+/// the recovery-target lines depend on the type and settings. Returns an empty
+/// string for [`RecoveryType::None`] (callers should not write any recovery file
+/// in that case).
+fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: RecoverySettings<'_>) -> String {
     use std::fmt::Write as _;
 
     if ty == RecoveryType::None {
@@ -368,15 +422,41 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, target: Option<
             }
         }
         RecoveryType::Target(kind) => {
-            if let Some(value) = target {
+            if let Some(value) = settings.target {
                 let _ = writeln!(out, "recovery_target_{} = '{value}'", kind.guc_suffix());
-                if exclusive && kind.supports_inclusive() {
+                if settings.exclusive && kind.supports_inclusive() {
                     out.push_str("recovery_target_inclusive = 'false'\n");
                 }
             }
         }
         // Default writes only restore_command; None returned early above.
         RecoveryType::Default | RecoveryType::None => {}
+    }
+
+    // recovery_target_action — emitted only when not the default `pause`, mirroring
+    // the C generator (PostgreSQL already pauses at the target by default). The
+    // option's `depend` restricts when it can be set (immediate/lsn/name/time/xid),
+    // so no extra type check is needed here.
+    if settings.action != "pause" {
+        let _ = writeln!(out, "recovery_target_action = '{}'", settings.action);
+    }
+
+    // recovery_target_timeline — when supplied, write it, except that on PG < 12 the
+    // literal `current` is suppressed (that version defaults to it and rejects it as
+    // an explicit parameter). When unset, type=immediate on PG >= 12 still pins the
+    // timeline to `current` so recovery does not chase a `latest` timeline it cannot
+    // reach (the C workaround for a PostgreSQL bug).
+    match settings.timeline {
+        Some(value) => {
+            if db_major >= PG_VERSION_RECOVERY_GUC || value != "current" {
+                let _ = writeln!(out, "recovery_target_timeline = '{value}'");
+            }
+        }
+        None => {
+            if ty == RecoveryType::Immediate && db_major >= PG_VERSION_RECOVERY_GUC {
+                out.push_str("recovery_target_timeline = 'current'\n");
+            }
+        }
     }
 
     out
@@ -408,9 +488,13 @@ fn recovery_files(db_version: &str, stanza: &str, config: &LoadedConfig) -> Vec<
     }
 
     let db_major = db_major_version(db_version);
-    let target = string_option(config, "target");
-    let exclusive = target_exclusive(config);
-    let block = recovery_block(db_major, stanza, ty, target, exclusive);
+    let settings = RecoverySettings {
+        target: string_option(config, "target"),
+        exclusive: target_exclusive(config),
+        action: target_action(config),
+        timeline: target_timeline(config),
+    };
+    let block = recovery_block(db_major, stanza, ty, settings);
 
     if db_major < PG_VERSION_RECOVERY_GUC {
         vec![(PathBuf::from("recovery.conf"), block)]
@@ -1525,6 +1609,19 @@ mod tests {
 
     /// A restore config carrying `--type` (and, optionally, `--target`).
     fn cfg_recovery(stanza: &str, ty: Option<&str>, target: Option<&str>, target_exclusive: bool) -> LoadedConfig {
+        cfg_recovery_full(stanza, ty, target, target_exclusive, None, None)
+    }
+
+    /// Like [`cfg_recovery`] but also threads `--target-action` and
+    /// `--target-timeline` through, for the recovery-target family tests.
+    fn cfg_recovery_full(
+        stanza: &str,
+        ty: Option<&str>,
+        target: Option<&str>,
+        target_exclusive: bool,
+        target_action: Option<&str>,
+        target_timeline: Option<&str>,
+    ) -> LoadedConfig {
         let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
         if let Some(ty) = ty {
             options.insert(("type".to_owned(), None), OptionValue::StringId(ty.to_owned()));
@@ -1534,6 +1631,12 @@ mod tests {
         }
         if target_exclusive {
             options.insert(("target-exclusive".to_owned(), None), OptionValue::Boolean(true));
+        }
+        if let Some(action) = target_action {
+            options.insert(("target-action".to_owned(), None), OptionValue::StringId(action.to_owned()));
+        }
+        if let Some(timeline) = target_timeline {
+            options.insert(("target-timeline".to_owned(), None), OptionValue::String(timeline.to_owned()));
         }
         LoadedConfig {
             command: "restore".to_owned(),
@@ -1674,6 +1777,53 @@ mod tests {
     }
 
     #[test]
+    fn restore_writes_recovery_target_settings_end_to_end() {
+        // End-to-end: a PITR restore with --type=time, --target, --target-exclusive,
+        // --target-action=promote, and --target-timeline=2 writes a
+        // postgresql.auto.conf (PG 14) whose recovery block carries every setting.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let cfg = cfg_recovery_full(
+            stanza,
+            Some("time"),
+            Some("2024-01-01 12:00:00"),
+            true,
+            Some("promote"),
+            Some("2"),
+        );
+        let outcome = restore_inner(&cfg, &repo_s, &pg_s).expect("restore");
+        assert_eq!(
+            outcome.recovery_files_written,
+            vec!["postgresql.auto.conf".to_owned(), "recovery.signal".to_owned()]
+        );
+
+        let contents = {
+            let mut r = pg_s.open_read(Path::new("postgresql.auto.conf")).expect("open auto.conf");
+            String::from_utf8(r.read_all().expect("read auto.conf")).unwrap()
+        };
+        for expected in [
+            "restore_command = 'pgbackrest --stanza=demo archive-get %f \"%p\"'",
+            "recovery_target_time = '2024-01-01 12:00:00'",
+            "recovery_target_inclusive = 'false'",
+            "recovery_target_action = 'promote'",
+            "recovery_target_timeline = '2'",
+        ] {
+            assert!(
+                contents.contains(expected),
+                "recovery block must contain {expected:?}: {contents}"
+            );
+        }
+        // recovery.signal (not standby.signal) for a targeted restore.
+        assert!(pg_s.exists(Path::new("recovery.signal")).unwrap());
+        assert!(!pg_s.exists(Path::new("standby.signal")).unwrap());
+    }
+
+    #[test]
     fn recovery_files_pure_fn() {
         let stanza = "demo";
 
@@ -1728,6 +1878,111 @@ mod tests {
         // none -> nothing.
         let cfg_none = cfg_recovery(stanza, Some("none"), None, false);
         assert!(super::recovery_files("14", stanza, &cfg_none).is_empty());
+    }
+
+    #[test]
+    fn recovery_target_action_passthrough() {
+        let stanza = "demo";
+
+        // --target-action=promote -> recovery_target_action = 'promote'.
+        let cfg_promote = cfg_recovery_full(
+            stanza,
+            Some("time"),
+            Some("2024-01-01 12:00:00"),
+            false,
+            Some("promote"),
+            None,
+        );
+        let promote = super::recovery_files("14", stanza, &cfg_promote);
+        assert!(
+            promote[0].1.contains("recovery_target_action = 'promote'"),
+            "promote action must be written: {}",
+            promote[0].1
+        );
+
+        // --target-action=shutdown -> recovery_target_action = 'shutdown'.
+        let cfg_shutdown = cfg_recovery_full(stanza, Some("immediate"), None, false, Some("shutdown"), None);
+        let shutdown = super::recovery_files("14", stanza, &cfg_shutdown);
+        assert!(
+            shutdown[0].1.contains("recovery_target_action = 'shutdown'"),
+            "shutdown action must be written: {}",
+            shutdown[0].1
+        );
+
+        // The default `pause` (explicit or absent) suppresses the GUC entirely.
+        let cfg_pause = cfg_recovery_full(stanza, Some("time"), Some("2024-01-01 12:00:00"), false, Some("pause"), None);
+        let pause = super::recovery_files("14", stanza, &cfg_pause);
+        assert!(
+            !pause[0].1.contains("recovery_target_action"),
+            "default pause must not write recovery_target_action: {}",
+            pause[0].1
+        );
+        let cfg_absent = cfg_recovery(stanza, Some("time"), Some("2024-01-01 12:00:00"), false);
+        let absent = super::recovery_files("14", stanza, &cfg_absent);
+        assert!(
+            !absent[0].1.contains("recovery_target_action"),
+            "absent target-action must not write recovery_target_action: {}",
+            absent[0].1
+        );
+    }
+
+    #[test]
+    fn recovery_target_timeline_passthrough() {
+        let stanza = "demo";
+
+        // --target-timeline=3 -> recovery_target_timeline = '3' on every version.
+        let cfg_tl = cfg_recovery_full(stanza, Some("time"), Some("2024-01-01 12:00:00"), false, None, Some("3"));
+        let tl14 = super::recovery_files("14", stanza, &cfg_tl);
+        assert!(
+            tl14[0].1.contains("recovery_target_timeline = '3'"),
+            "timeline must be written on PG>=12: {}",
+            tl14[0].1
+        );
+        let tl11 = super::recovery_files("11", stanza, &cfg_tl);
+        assert!(
+            tl11[0].1.contains("recovery_target_timeline = '3'"),
+            "timeline must be written on PG<12: {}",
+            tl11[0].1
+        );
+
+        // The literal `current`: written on PG>=12, suppressed on PG<12 (that
+        // version defaults to current and rejects it as an explicit parameter).
+        let cfg_cur = cfg_recovery_full(stanza, Some("default"), None, false, None, Some("current"));
+        let cur14 = super::recovery_files("14", stanza, &cfg_cur);
+        assert!(
+            cur14[0].1.contains("recovery_target_timeline = 'current'"),
+            "current must be written on PG>=12: {}",
+            cur14[0].1
+        );
+        let cur11 = super::recovery_files("11", stanza, &cfg_cur);
+        assert!(
+            !cur11[0].1.contains("recovery_target_timeline"),
+            "current must be suppressed on PG<12: {}",
+            cur11[0].1
+        );
+    }
+
+    #[test]
+    fn recovery_immediate_pins_timeline_on_pg12() {
+        // type=immediate with no explicit --target-timeline pins the timeline to
+        // `current` on PG>=12 (so recovery does not chase an unreachable latest),
+        // but emits nothing on PG<12 (which defaults to current already).
+        let stanza = "demo";
+        let cfg_imm = cfg_recovery(stanza, Some("immediate"), None, false);
+
+        let imm14 = super::recovery_files("14", stanza, &cfg_imm);
+        assert!(
+            imm14[0].1.contains("recovery_target_timeline = 'current'"),
+            "immediate on PG>=12 must pin timeline to current: {}",
+            imm14[0].1
+        );
+
+        let imm11 = super::recovery_files("11", stanza, &cfg_imm);
+        assert!(
+            !imm11[0].1.contains("recovery_target_timeline"),
+            "immediate on PG<12 must not pin a timeline: {}",
+            imm11[0].1
+        );
     }
 
     // ---- delta restore -----------------------------------------------------
