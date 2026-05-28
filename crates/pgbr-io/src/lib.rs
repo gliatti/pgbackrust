@@ -137,6 +137,81 @@ pub trait IoWrite {
     fn close(&mut self) -> Result<(), IoError>;
 }
 
+// Forwarding impls so the boxed trait objects handed out by
+// `pgbr_storage::Storage::open_read` / `open_write` satisfy `IoRead` /
+// `IoWrite` themselves, and so a `&mut something` can be passed where a
+// generic `R: IoRead` / `W: IoWrite` is expected. The default `read_exact` /
+// `read_all` methods come along for free — they call `read`, which forwards.
+
+impl IoRead for Box<dyn IoRead> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        (**self).read(buf)
+    }
+
+    fn eof(&self) -> bool {
+        (**self).eof()
+    }
+}
+
+impl IoWrite for Box<dyn IoWrite> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        (**self).write(buf)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        (**self).flush()
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        (**self).close()
+    }
+}
+
+impl<R: IoRead + ?Sized> IoRead for &mut R {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        (**self).read(buf)
+    }
+
+    fn eof(&self) -> bool {
+        (**self).eof()
+    }
+}
+
+impl<W: IoWrite + ?Sized> IoWrite for &mut W {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        (**self).write(buf)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        (**self).flush()
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        (**self).close()
+    }
+}
+
+/// Drain `reader` fully into `writer`, returning the number of bytes copied.
+/// Uses a 64 KiB heap buffer. Does NOT flush or close the writer — the
+/// caller owns the writer's lifecycle.
+///
+/// # Errors
+///
+/// Propagates the first [`IoError`] from either side.
+pub fn copy<R: IoRead + ?Sized, W: IoWrite + ?Sized>(reader: &mut R, writer: &mut W) -> Result<u64, IoError> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// In-memory [`IoRead`]. Generic over the backing buffer (`Vec<u8>`,
 /// `&[u8]`, `[u8; N]`, …) so tests can pass either an owned or a borrowed
 /// byte source.
@@ -447,5 +522,49 @@ mod tests {
         chain.process(b"abc", &mut out).unwrap();
         chain.finish(&mut out).unwrap();
         assert_eq!(out, b"abcX");
+    }
+
+    #[test]
+    fn box_dyn_ioread_forwards() {
+        let mut r: Box<dyn IoRead> = Box::new(MemRead::new(b"hello world"));
+        // read_all is a default trait method — exercising it proves both the
+        // forwarding impl and the inherited default method work.
+        assert_eq!(r.read_all().unwrap(), b"hello world");
+        assert!(r.eof());
+    }
+
+    #[test]
+    fn box_dyn_iowrite_forwards() {
+        let mut w: Box<dyn IoWrite> = Box::new(MemWrite::new());
+        assert_eq!(w.write(b"data"), Ok(()));
+        assert_eq!(w.flush(), Ok(()));
+        assert_eq!(w.close(), Ok(()));
+    }
+
+    #[test]
+    fn copy_drains_reader_into_writer() {
+        let mut reader = MemRead::new(b"hello world");
+        let mut writer = MemWrite::new();
+        let n = copy(&mut reader, &mut writer).unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(writer.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn copy_through_boxed_endpoints() {
+        let mut reader: Box<dyn IoRead> = Box::new(MemRead::new(b"abc"));
+        let mut writer: Box<dyn IoWrite> = Box::new(MemWrite::new());
+        let n = copy(&mut reader, &mut writer).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn generic_fn_accepts_mut_ref() {
+        // Takes `R` by value and drains it, so the only way to call this with
+        // `&mut MemRead` is for the `&mut R` blanket impl to satisfy the bound.
+        fn takes<R: IoRead>(mut r: R) -> Vec<u8> {
+            r.read_all().unwrap()
+        }
+        assert_eq!(takes(&mut MemRead::new(b"xyz")), b"xyz");
     }
 }
