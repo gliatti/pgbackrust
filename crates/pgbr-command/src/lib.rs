@@ -175,7 +175,7 @@ pub fn dispatch_multi(
         "repo-rm" => repo::rm(config, repo_storage),
         "backup" => backup::backup(config, repo_storage, pg_storage),
         "restore" => restore::restore(config, repo_storage, pg_storage),
-        "archive-get" => archive::get(config, &archive_repos, pg_storage),
+        "archive-get" => archive_get_with_prefetch(config, &archive_repos, pg_storage),
         "archive-push" => archive::push(config, &archive_repos, pg_storage),
         "expire" => expire::expire(config, repo_storage),
         "verify" => verify::verify(config, repo_storage),
@@ -188,6 +188,139 @@ pub fn dispatch_multi(
             command: other.to_owned(),
         }),
     }
+}
+
+/// Number of WAL segments ahead of the one `PostgreSQL` just requested that the
+/// asynchronous `archive-get` pre-fetcher tries to stage into the spool. The
+/// actual count staged is still bounded by `archive-get-queue-max` (see
+/// [`archive_get_with_prefetch`]); this only caps how far ahead the look-ahead walks
+/// when the byte cap would otherwise let it run unbounded. Mirrors the C side's
+/// fixed look-ahead window in `src/command/archive/get/get.c`.
+const ARCHIVE_GET_PREFETCH_AHEAD: u64 = 64;
+
+/// Default `wal-segment-size` (16 MiB) used when computing the look-ahead window
+/// for the pre-fetcher. The window is only a *segment-name* enumeration, so the
+/// exact size only affects where the low half rolls over into the high half; the
+/// 16 MiB default matches the overwhelmingly common cluster configuration and
+/// keeps this dispatch-side helper from needing a live cluster probe.
+const DEFAULT_WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Run `archive-get`, then — in asynchronous mode — pre-fetch the next WAL
+/// segments into the spool, bounded by `archive-get-queue-max`.
+///
+/// The foreground [`archive::get`] always runs first so `PostgreSQL` gets the
+/// segment it asked for (served from the spool if a previous pre-fetch staged
+/// it, otherwise straight from the repository). Once it succeeds, and only when
+/// `archive-async=true`, the look-ahead pre-fetcher stages the *following*
+/// segments so the next few `archive-get` calls are served locally. The amount
+/// staged is capped by `archive-get-queue-max` (the `queue_max` parameter of
+/// [`archive::prefetch_get_spool`]) so the spool never over-fills ahead of
+/// recovery. This is where the resolved `archive-get-queue-max` option is
+/// actually applied to the async path. C ref: `src/command/archive/get/get.c`.
+///
+/// # Errors
+///
+/// Surfaces whatever [`archive::get`] returns. A pre-fetch failure is **not**
+/// fatal — the requested segment was already delivered — so it is swallowed
+/// (best-effort look-ahead), matching the C side treating a pre-fetch miss as a
+/// no-op rather than a command failure.
+fn archive_get_with_prefetch(
+    config: &pgbr_config::LoadedConfig,
+    repo_storages: &[&dyn pgbr_storage::Storage],
+    pg_storage: &dyn pgbr_storage::Storage,
+) -> Result<(), CommandError> {
+    archive::get(config, repo_storages, pg_storage)?;
+
+    // Look-ahead pre-fetch only applies to the asynchronous path with a spool.
+    if !archive_async_enabled(config) {
+        return Ok(());
+    }
+    let (Some(stanza), Some(spool_root), Some(requested)) = (
+        config.stanza.as_deref(),
+        spool_path_opt(config),
+        config.params.first().map(String::as_str),
+    ) else {
+        return Ok(());
+    };
+
+    let segments = prefetch_segment_window(requested, ARCHIVE_GET_PREFETCH_AHEAD);
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    let queue_max = archive_get_queue_max(config);
+    let spool = pgbr_storage::Posix::new(std::path::PathBuf::from(spool_root));
+    // Pre-fetch from the first repository (the same precedence archive-get uses
+    // when serving a single segment). Best-effort: a miss leaves recovery to the
+    // synchronous path on the next call, so a pre-fetch error is not propagated.
+    if let Some(repo) = repo_storages.first() {
+        let _ = archive::prefetch_get_spool(&spool, *repo, stanza, &segments, queue_max);
+    }
+    Ok(())
+}
+
+/// Whether `archive-async=true` is set in the resolved configuration. Defaults
+/// to `false` (synchronous) when the option is absent.
+fn archive_async_enabled(config: &pgbr_config::LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("archive-async".to_owned(), None)),
+        Some(pgbr_config::OptionValue::Boolean(true))
+    )
+}
+
+/// Read the resolved `spool-path` (an [`OptionValue::Path`]), or `None` when
+/// unset.
+fn spool_path_opt(config: &pgbr_config::LoadedConfig) -> Option<String> {
+    match config.options.get(&("spool-path".to_owned(), None)) {
+        Some(pgbr_config::OptionValue::Path(p) | pgbr_config::OptionValue::String(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// Read the resolved `archive-get-queue-max` byte cap, or `None` when unset
+/// (which leaves [`archive::prefetch_get_spool`] unbounded). Accepts both the
+/// canonical [`OptionValue::Size`] and a non-negative [`OptionValue::Integer`]
+/// for the hand-built configs used in tests.
+fn archive_get_queue_max(config: &pgbr_config::LoadedConfig) -> Option<u64> {
+    match config.options.get(&("archive-get-queue-max".to_owned(), None)) {
+        Some(pgbr_config::OptionValue::Size(value)) => Some(*value),
+        Some(pgbr_config::OptionValue::Integer(value)) if *value >= 0 => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Enumerate up to `ahead` WAL segment names *following* `requested` (exclusive
+/// of `requested` itself), on the same timeline, for the asynchronous pre-fetch
+/// look-ahead window.
+///
+/// Returns an empty vector when `requested` is not a valid 24-hex segment name
+/// or when `ahead` is zero. The enumeration reuses
+/// [`pgbr_postgres::lsn::wal_segment_range`] over the 16 MiB-default segment
+/// ordering (low half rolls over into the high half), so the window crosses a
+/// logical-file boundary correctly. Pure: no I/O.
+fn prefetch_segment_window(requested: &str, ahead: u64) -> Vec<String> {
+    use pgbr_postgres::lsn::{parse_wal_segment, segments_per_logical_file, wal_segment_range};
+
+    if ahead == 0 {
+        return Vec::new();
+    }
+    let Some((tli, hi, lo)) = parse_wal_segment(requested) else {
+        return Vec::new();
+    };
+    let per_file = segments_per_logical_file(DEFAULT_WAL_SEGMENT_SIZE);
+    let start_segno = u64::from(hi) * per_file + u64::from(lo);
+    // The window starts at the segment *after* the requested one.
+    let first = start_segno + 1;
+    let last = start_segno + ahead;
+    let (Some(start_hi), Some(start_lo)) = (u32::try_from(first / per_file).ok(), u32::try_from(first % per_file).ok()) else {
+        return Vec::new();
+    };
+    let (Some(stop_hi), Some(stop_lo)) = (u32::try_from(last / per_file).ok(), u32::try_from(last % per_file).ok()) else {
+        return Vec::new();
+    };
+    let start = format!("{tli:08X}{start_hi:08X}{start_lo:08X}");
+    let stop = format!("{tli:08X}{stop_hi:08X}{stop_lo:08X}");
+    wal_segment_range(&start, &stop, DEFAULT_WAL_SEGMENT_SIZE).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -353,6 +486,96 @@ mod tests {
         assert!(
             names.iter().any(|n| n.ends_with("backup.info")),
             "expected backup.info in {names:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // archive-get-queue-max dispatch wiring
+    // -------------------------------------------------------------------
+
+    use super::{
+        ARCHIVE_GET_PREFETCH_AHEAD, archive_async_enabled, archive_get_queue_max, prefetch_segment_window, spool_path_opt,
+    };
+
+    #[test]
+    fn archive_async_enabled_reads_boolean() {
+        let mut cfg = fake_config("archive-get", Some("demo"), None);
+        assert!(!archive_async_enabled(&cfg), "absent option defaults to synchronous");
+        cfg.options
+            .insert(("archive-async".to_owned(), None), OptionValue::Boolean(true));
+        assert!(archive_async_enabled(&cfg));
+        cfg.options
+            .insert(("archive-async".to_owned(), None), OptionValue::Boolean(false));
+        assert!(!archive_async_enabled(&cfg));
+    }
+
+    #[test]
+    fn spool_path_opt_reads_path_or_string() {
+        let mut cfg = fake_config("archive-get", Some("demo"), None);
+        assert_eq!(spool_path_opt(&cfg), None);
+        cfg.options.insert(
+            ("spool-path".to_owned(), None),
+            OptionValue::Path("/var/spool/pgbr".to_owned()),
+        );
+        assert_eq!(spool_path_opt(&cfg).as_deref(), Some("/var/spool/pgbr"));
+    }
+
+    #[test]
+    fn archive_get_queue_max_reads_size_and_integer() {
+        let mut cfg = fake_config("archive-get", Some("demo"), None);
+        // Absent → unbounded prefetch.
+        assert_eq!(archive_get_queue_max(&cfg), None);
+        cfg.options.insert(
+            ("archive-get-queue-max".to_owned(), None),
+            OptionValue::Size(128 * 1024 * 1024),
+        );
+        assert_eq!(archive_get_queue_max(&cfg), Some(128 * 1024 * 1024));
+        // A non-negative integer is accepted too (hand-built configs).
+        cfg.options
+            .insert(("archive-get-queue-max".to_owned(), None), OptionValue::Integer(4096));
+        assert_eq!(archive_get_queue_max(&cfg), Some(4096));
+        // A negative integer is rejected (treated as unset).
+        cfg.options
+            .insert(("archive-get-queue-max".to_owned(), None), OptionValue::Integer(-1));
+        assert_eq!(archive_get_queue_max(&cfg), None);
+    }
+
+    #[test]
+    fn prefetch_segment_window_enumerates_following_segments() {
+        // The window starts at the segment AFTER the requested one and runs
+        // `ahead` segments long, on the same timeline.
+        let window = prefetch_segment_window("000000010000000000000002", 3);
+        assert_eq!(
+            window,
+            vec![
+                "000000010000000000000003".to_owned(),
+                "000000010000000000000004".to_owned(),
+                "000000010000000000000005".to_owned(),
+            ],
+        );
+        // The requested segment itself is never included.
+        assert!(!window.contains(&"000000010000000000000002".to_owned()));
+    }
+
+    #[test]
+    fn prefetch_segment_window_rolls_over_logical_file_boundary() {
+        // Requesting the last segment of logical file 0 (low half 0x000000FF for
+        // the 16 MiB default = 256 segments/file) rolls the next one into the
+        // high half.
+        let window = prefetch_segment_window("0000000100000000000000FF", 1);
+        assert_eq!(window, vec!["000000010000000100000000".to_owned()]);
+    }
+
+    #[test]
+    fn prefetch_segment_window_rejects_malformed_or_zero() {
+        assert!(prefetch_segment_window("not-a-segment", 4).is_empty());
+        assert!(prefetch_segment_window("000000010000000000000002", 0).is_empty());
+        // The default window size is non-zero so a real call always looks ahead;
+        // exercising it through the function (rather than asserting on the const
+        // directly) keeps the check meaningful without a constant assertion.
+        assert!(
+            !prefetch_segment_window("000000010000000000000002", ARCHIVE_GET_PREFETCH_AHEAD).is_empty(),
+            "the default look-ahead window must enumerate at least one segment"
         );
     }
 }

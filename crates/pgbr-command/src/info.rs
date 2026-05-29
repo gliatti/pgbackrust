@@ -564,9 +564,33 @@ pub fn render_json(stanzas: &[StanzaInfo]) -> String {
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_owned())
 }
 
-/// Whether `--output=json` was requested. Defaults to text for any other
-/// value (the only valid alternative per `config.yaml` is `text`).
+/// Whether the `--report` boolean was requested.
+///
+/// `report` is declared in `config.yaml` as an `internal`, `boolean` option
+/// (default `false`). Upstream pgBackRest scopes it to the `check` command,
+/// where it asks for a machine-readable check report; this fork has no separate
+/// check-report renderer, so for `info` it is wired as an **alias for the JSON
+/// ("report") output** — `--report` (or `--report=y`) selects the structured,
+/// machine-readable rendering exactly as `--output=json` does. This keeps the
+/// option from being a silent no-op while mapping it to the closest equivalent
+/// behaviour the fork supports. See [`want_json`].
+fn want_report(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("report".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Whether the structured (JSON) output was requested.
+///
+/// True when `--output=json` is set, **or** when the `--report` boolean is set
+/// (which this fork aliases to the JSON output for `info`; see [`want_report`]).
+/// Defaults to text for any other `--output` value (the only valid alternative
+/// per `config.yaml` is `text`).
 fn want_json(config: &LoadedConfig) -> bool {
+    if want_report(config) {
+        return true;
+    }
     matches!(
         config.options.get(&("output".to_owned(), None)),
         Some(OptionValue::StringId(v) | OptionValue::String(v)) if v == "json"
@@ -796,7 +820,10 @@ mod tests {
 
     use pgbr_config::OptionValue;
 
-    use super::{CommandError, StanzaStatus, format_timestamp, info, info_inner, render_json, render_set, render_text, want_json};
+    use super::{
+        CommandError, StanzaStatus, format_timestamp, info, info_inner, render_json, render_set, render_text, want_json,
+        want_report,
+    };
 
     fn fake_config(stanza: Option<&str>) -> LoadedConfig {
         LoadedConfig {
@@ -1107,6 +1134,41 @@ mod tests {
         assert_eq!(b["info"]["size"], json!(1_200_000_000_u64));
         assert_eq!(b["info"]["repository"]["size"], json!(67_890));
         assert_eq!(b["prior"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn report_option_selects_json_like_output() {
+        // `--report` (boolean) is aliased to the JSON ("report") output for
+        // `info`: it forces structured rendering even when `--output` is text
+        // or absent.
+        let default_cfg = fake_config(Some("demo"));
+        assert!(!want_report(&default_cfg), "absent report defaults to false");
+        assert!(!want_json(&default_cfg), "no report + no output => text");
+
+        let mut report_cfg = fake_config(Some("demo"));
+        report_cfg
+            .options
+            .insert(("report".to_owned(), None), OptionValue::Boolean(true));
+        assert!(want_report(&report_cfg));
+        assert!(want_json(&report_cfg), "report=true selects the JSON output");
+
+        // report=true overrides an explicit --output=text (the report form is
+        // always machine-readable).
+        let mut report_over_text = fake_config_output(Some("demo"), "text");
+        report_over_text
+            .options
+            .insert(("report".to_owned(), None), OptionValue::Boolean(true));
+        assert!(
+            want_json(&report_over_text),
+            "report=true wins over --output=text for the structured report"
+        );
+
+        // report=false leaves the normal --output handling intact.
+        let mut report_false = fake_config_output(Some("demo"), "text");
+        report_false
+            .options
+            .insert(("report".to_owned(), None), OptionValue::Boolean(false));
+        assert!(!want_json(&report_false), "report=false falls back to --output");
     }
 
     #[test]
