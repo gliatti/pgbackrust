@@ -19,7 +19,7 @@
 //! indices are configured by scanning for `<prefix><N>-` keys across every
 //! section, plus any indices that appear in the CLI input or the env map.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::cli::ResolvedCli;
@@ -506,6 +506,33 @@ fn discover_group_indices(cli: &ResolvedCli, env: &EnvValues, ini: &IniFile, cfg
                 out.entry(canonical).or_default().insert(idx);
             }
         }
+    }
+
+    // Propagate indices across every option in the same `OptionGroup`. Naming
+    // `pg2-host` in the INI must materialise the whole `pg` group at index 2
+    // — including `pg-local`, whose hardcoded default `false` then satisfies
+    // the `pg-host` depend without any explicit `pg2-local=…` key. Without
+    // this, the resolution loop only iterated `pg-local` over indices seen
+    // directly for `pg-local`, leaving `pg-local` materialised only at the
+    // empty-set-fallback index 1 and causing `depend: pg-local` checks at
+    // index >= 2 to fire on an `unset` value.
+    let mut by_group: HashMap<OptionGroup, BTreeSet<u32>> = HashMap::new();
+    for (name, indices) in &out {
+        if let Some(opt) = cfg.options.get(name)
+            && let Some(group) = opt.group
+        {
+            by_group.entry(group).or_default().extend(indices.iter().copied());
+        }
+    }
+    for (name, opt) in &cfg.options {
+        let Some(group) = opt.group else { continue };
+        let Some(group_indices) = by_group.get(&group) else {
+            continue;
+        };
+        if group_indices.is_empty() {
+            continue;
+        }
+        out.entry(name.clone()).or_default().extend(group_indices.iter().copied());
     }
 
     out
@@ -2005,5 +2032,140 @@ option:
         let ini = crate::ini::parse_ini("[global]\nbuffer-size=2MiB\n").unwrap();
         let combined = merge_ini_files(std::slice::from_ref(&ini));
         assert_eq!(combined, ini);
+    }
+
+    /// Regression for the `pg2-host` depend bug: naming any option in a group
+    /// at index N must instantiate the whole group at N, so that defaulted
+    /// siblings (`pg-local` here) materialise at the same index and satisfy
+    /// `depend:` constraints. Before the fix, only the option explicitly
+    /// scraped from the INI received index N — `pg-local` was only filled in
+    /// at the empty-set fallback index 1, leaving `(pg-local, Some(2))` as
+    /// `None` and the `pg-host` depend tripping on an `unset` value at >= 2.
+    #[test]
+    fn grouped_depend_satisfied_at_index_ge_2_via_default() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup:
+  pg: {}
+  repo: {}
+option:
+  pg-local:
+    type: boolean
+    group: pg
+    default: false
+    negate: true
+    command:
+      backup: {}
+  pg-host:
+    type: string
+    group: pg
+    depend:
+      option: pg-local
+      list: [false]
+    command:
+      backup: {}
+  repo-local:
+    type: boolean
+    group: repo
+    default: false
+    negate: true
+    command:
+      backup: {}
+  repo-host:
+    type: string
+    group: repo
+    depend:
+      option: repo-local
+      list: [false]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        // ONLY `pg2-host` (and `repo2-host`) appear in the INI; nothing else
+        // pins index 2 for `pg-local` / `repo-local`. The propagation pass in
+        // `discover_group_indices` must instantiate the rest of the group at
+        // index 2 so the depend defaults satisfy.
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ini = crate::ini::parse_ini("[demo]\npg2-host=secondaire\nrepo2-host=archive\n").unwrap();
+        let r = load_config(resolved, &ini, &cfg).unwrap();
+
+        // The explicit pg2-host value is preserved at (pg-host, Some(2)).
+        assert_eq!(
+            r.options[&("pg-host".into(), Some(2))],
+            OptionValue::String("secondaire".into())
+        );
+        // The defaulted pg-local materialises at the SAME index — that is the
+        // entire point of the fix — and carries its `false` default.
+        assert_eq!(r.options[&("pg-local".into(), Some(2))], OptionValue::Boolean(false));
+        // Symmetric for the `repo` group.
+        assert_eq!(
+            r.options[&("repo-host".into(), Some(2))],
+            OptionValue::String("archive".into())
+        );
+        assert_eq!(r.options[&("repo-local".into(), Some(2))], OptionValue::Boolean(false));
+    }
+
+    /// Negative regression: the group-index propagation must NOT silently
+    /// swallow legitimate depend failures. When the user explicitly sets
+    /// `pg2-local=true` *and* `pg2-host=…`, the depend `pg-local in [false]`
+    /// is genuinely unsatisfied at index 2 and must still raise
+    /// `DependNotSatisfied` — exactly as it would at index 1.
+    #[test]
+    fn grouped_depend_still_fires_when_local_explicit_true() {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup:
+  pg: {}
+option:
+  pg-local:
+    type: boolean
+    group: pg
+    default: false
+    negate: true
+    command:
+      backup: {}
+  pg-host:
+    type: string
+    group: pg
+    depend:
+      option: pg-local
+      list: [false]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ini = crate::ini::parse_ini("[demo]\npg2-local=true\npg2-host=x\n").unwrap();
+        let err = load_config(resolved, &ini, &cfg).unwrap_err();
+        match err {
+            LoadError::DependNotSatisfied {
+                option,
+                group_index,
+                depend_option,
+                depend_value,
+                depend_list,
+            } => {
+                assert_eq!(option, "pg-host");
+                assert_eq!(group_index, Some(2));
+                assert_eq!(depend_option, "pg-local");
+                assert_eq!(depend_value, "true");
+                assert_eq!(depend_list, vec!["false".to_owned()]);
+            }
+            other => panic!("expected DependNotSatisfied at (pg-host, Some(2)), got {other:?}"),
+        }
     }
 }
