@@ -282,7 +282,77 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
     if let Some(user) = opt("pg1-user") {
         parts.push(format!("user={user}"));
     }
+
+    // Connection timeout + TCP keepalive: append the libpq conninfo equivalents
+    // of `db-timeout` and the `tcp-keep-alive-*` family so the live-PG check
+    // honours the configured network tunables. C ref: the keepalive / timeout
+    // wiring in `dbOpen` -> `pgClientOpen` (`src/db/db.c` / `src/postgres/client.c`).
+    parts.extend(conninfo_timeout_keepalive_params(config));
+
     Some(parts.join(" "))
+}
+
+/// Build the libpq `connect_timeout` + keepalive conninfo params from the
+/// resolved options, returned as ready-to-join `key=value` strings.
+///
+/// - `db-timeout` (a [`OptionValue::Time`] in ms) becomes `connect_timeout=<s>`
+///   (libpq's unit is whole seconds; sub-second timeouts round down, with a
+///   floor of 1s so a small but non-zero timeout is not silently disabled).
+/// - `sck-keep-alive` (default true) toggles `keepalives=1`/`0`. When keepalives
+///   are on, `tcp-keep-alive-idle` / `-interval` / `-count` map to
+///   `keepalives_idle` / `keepalives_interval` / `keepalives_count` (seconds /
+///   seconds / probe count) when configured.
+fn conninfo_timeout_keepalive_params(config: &LoadedConfig) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    if let Some(secs) = db_timeout_secs(config) {
+        parts.push(format!("connect_timeout={secs}"));
+    }
+
+    // sck-keep-alive defaults to true (the option model's default); only an
+    // explicit false disables keepalives.
+    let keepalives = !matches!(
+        config.options.get(&("sck-keep-alive".to_owned(), None)),
+        Some(OptionValue::Boolean(false))
+    );
+    parts.push(format!("keepalives={}", u8::from(keepalives)));
+
+    if keepalives {
+        if let Some(idle) = positive_integer_opt(config, "tcp-keep-alive-idle") {
+            parts.push(format!("keepalives_idle={idle}"));
+        }
+        if let Some(interval) = positive_integer_opt(config, "tcp-keep-alive-interval") {
+            parts.push(format!("keepalives_interval={interval}"));
+        }
+        if let Some(count) = positive_integer_opt(config, "tcp-keep-alive-count") {
+            parts.push(format!("keepalives_count={count}"));
+        }
+    }
+
+    parts
+}
+
+/// Resolve `db-timeout` to whole seconds for libpq's `connect_timeout`.
+///
+/// `db-timeout` is a [`OptionValue::Time`] in milliseconds (also accepted as a
+/// bare integer number of seconds). Returns `None` when unset. A configured
+/// timeout below 1s is floored to 1s so it stays enabled (libpq treats
+/// `connect_timeout=0` as "no timeout").
+fn db_timeout_secs(config: &LoadedConfig) -> Option<u64> {
+    match config.options.get(&("db-timeout".to_owned(), None)) {
+        Some(OptionValue::Time(ms)) => Some((*ms / 1000).max(1)),
+        Some(OptionValue::Integer(secs)) if *secs >= 1 => u64::try_from(*secs).ok(),
+        _ => None,
+    }
+}
+
+/// Fetch a positive `Integer` option (no group index), or `None` when unset /
+/// non-positive / not an integer.
+fn positive_integer_opt(config: &LoadedConfig, name: &str) -> Option<i64> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Integer(n)) if *n > 0 => Some(*n),
+        _ => None,
+    }
 }
 
 /// Resolve `--archive-timeout` (a [`OptionValue::Time`] in milliseconds) into a
@@ -667,20 +737,33 @@ fn archive_mode_check(config: &LoadedConfig) -> bool {
 /// # Errors
 ///
 /// Propagates any error from [`run_check`].
-#[allow(clippy::print_stdout)]
 pub fn check(config: &LoadedConfig, repo_storage: &dyn Storage, _pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let report = run_check(config, repo_storage)?;
-    println!(
+    // `check` emits no machine-readable result on stdout; the summary is
+    // human-facing progress, so it is routed to the log sink (stderr) via
+    // `log_info`, leaving stdout free for commands that produce structured data.
+    log_info(&format!(
         "stanza '{}' check ok: db-version={} db-system-id={} repo-writable={} archive-id={} archive-ok={}",
         report.stanza, report.db_version, report.db_system_id, report.repo_writable, report.archive_id, report.archive_ok
-    );
+    ));
     if let Some(pg) = &report.pg {
-        println!(
+        log_info(&format!(
             "  pg check ok: server-version-num={} system-id={} in-recovery={} wal-segment={} archive-wait-ok={}",
             pg.server_version_num, pg.system_id, pg.in_recovery, pg.wal_segment, pg.archive_wait_ok
-        );
+        ));
     }
     Ok(())
+}
+
+/// Emit a human-facing progress line to the log sink (stderr).
+///
+/// pgBackRest routes progress lines to its log (stderr by default), keeping
+/// stdout free for machine-readable command output. The dedicated `pgbr-core`
+/// logger is not reachable from this crate's dependency graph, so this is a thin,
+/// level-prefixed `stderr` writer matching the logger's `INFO: ` convention.
+#[allow(clippy::print_stderr)]
+fn log_info(message: &str) {
+    eprintln!("INFO: {message}");
 }
 
 #[cfg(test)]
@@ -697,8 +780,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CheckDb, CommandError, archive_timeout, check_inner, check_pg, derive_conninfo_with_url, pg_version_label_from_num,
-        wait_for_segment, wal_function_names,
+        CheckDb, CommandError, archive_timeout, check_inner, check_pg, conninfo_timeout_keepalive_params, db_timeout_secs,
+        derive_conninfo_with_url, pg_version_label_from_num, wait_for_segment, wal_function_names,
     };
 
     /// In-memory [`CheckDb`] driving the live-PG flow without a real server.
@@ -1032,6 +1115,71 @@ mod tests {
         let conninfo = derive_conninfo_with_url(&cfg, None).expect("pg1-host present -> conninfo");
         assert!(conninfo.contains("host=db.example"), "conninfo was {conninfo:?}");
         assert!(conninfo.contains("port=5433"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn db_timeout_secs_converts_time_and_floors() {
+        // Unset -> None.
+        let cfg = config_for(Some("demo"));
+        assert_eq!(db_timeout_secs(&cfg), None);
+
+        // 30_000 ms -> 30 s.
+        let mut cfg = config_for(Some("demo"));
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(30_000));
+        assert_eq!(db_timeout_secs(&cfg), Some(30));
+
+        // Sub-second timeout is floored to 1 s so it stays enabled.
+        let mut cfg = config_for(Some("demo"));
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(250));
+        assert_eq!(db_timeout_secs(&cfg), Some(1));
+    }
+
+    #[test]
+    fn conninfo_appends_db_timeout() {
+        let mut cfg = config_for(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(45_000));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo built");
+        assert!(
+            conninfo.contains("connect_timeout=45"),
+            "db-timeout must map to connect_timeout=45: {conninfo:?}"
+        );
+    }
+
+    #[test]
+    fn conninfo_maps_keepalive_options() {
+        let mut cfg = config_for(Some("demo"));
+        cfg.options
+            .insert(("tcp-keep-alive-idle".to_owned(), None), OptionValue::Integer(120));
+        cfg.options
+            .insert(("tcp-keep-alive-interval".to_owned(), None), OptionValue::Integer(30));
+        cfg.options
+            .insert(("tcp-keep-alive-count".to_owned(), None), OptionValue::Integer(5));
+
+        let parts = conninfo_timeout_keepalive_params(&cfg);
+        let joined = parts.join(" ");
+        // sck-keep-alive defaults on -> keepalives=1, and each tcp-keep-alive-*
+        // maps to its libpq counterpart.
+        assert!(joined.contains("keepalives=1"), "{joined:?}");
+        assert!(joined.contains("keepalives_idle=120"), "{joined:?}");
+        assert!(joined.contains("keepalives_interval=30"), "{joined:?}");
+        assert!(joined.contains("keepalives_count=5"), "{joined:?}");
+    }
+
+    #[test]
+    fn conninfo_disables_keepalives_when_sck_keep_alive_off() {
+        let mut cfg = config_for(Some("demo"));
+        cfg.options
+            .insert(("sck-keep-alive".to_owned(), None), OptionValue::Boolean(false));
+        // Even with the per-knob options set, keepalives off -> the knobs are
+        // not emitted and keepalives=0.
+        cfg.options
+            .insert(("tcp-keep-alive-idle".to_owned(), None), OptionValue::Integer(120));
+        let parts = conninfo_timeout_keepalive_params(&cfg);
+        let joined = parts.join(" ");
+        assert!(joined.contains("keepalives=0"), "{joined:?}");
+        assert!(!joined.contains("keepalives_idle"), "knobs suppressed when off: {joined:?}");
     }
 
     #[test]
