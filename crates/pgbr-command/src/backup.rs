@@ -1099,8 +1099,21 @@ fn derive_conninfo_for_index(config: &LoadedConfig, pg_index: u32) -> Option<Str
             _ => None,
         }
     };
-    let host = opt(&format!("pg{pg_index}-host")).or_else(|| opt(&format!("pg{pg_index}-socket-path")))?;
-    let mut parts: Vec<String> = vec![format!("host={host}")];
+    // A `pgN-host` / `pgN-socket-path` names where the server listens; when both
+    // are absent but a local data dir (`pgN-path`) is configured, the cluster is
+    // local and reached through libpq's default unix-socket directory (e.g.
+    // `/var/run/postgresql`) — pgBackRest connects to a local cluster without an
+    // explicit host. So `host` is optional: omit it for the local case.
+    let host = opt(&format!("pg{pg_index}-host")).or_else(|| opt(&format!("pg{pg_index}-socket-path")));
+    if host.is_none() && opt(&format!("pg{pg_index}-path")).is_none() {
+        // Neither a host/socket nor a local data dir: this index is not a
+        // connectable cluster.
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(host) = host {
+        parts.push(format!("host={host}"));
+    }
     if let Some(p) = opt(&format!("pg{pg_index}-port")) {
         parts.push(format!("port={p}"));
     }

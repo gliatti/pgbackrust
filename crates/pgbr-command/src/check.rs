@@ -271,8 +271,18 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
         }
     };
 
-    let host = opt("pg1-host").or_else(|| opt("pg1-socket-path"))?;
-    let mut parts: Vec<String> = vec![format!("host={host}")];
+    // `pg1-host` / `pg1-socket-path` name where the server listens; when both are
+    // absent but a local data dir (`pg1-path`) is configured, the cluster is local
+    // and reached via libpq's default unix-socket directory. So `host` is optional
+    // — omit it for the local case so libpq uses its default socket.
+    let host = opt("pg1-host").or_else(|| opt("pg1-socket-path"));
+    if host.is_none() && opt("pg1-path").is_none() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(host) = host {
+        parts.push(format!("host={host}"));
+    }
     if let Some(p) = opt("pg1-port") {
         parts.push(format!("port={p}"));
     }

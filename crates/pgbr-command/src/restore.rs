@@ -1874,6 +1874,32 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         }
     }
 
+    // 4b. Restore the backup's `backup_label` (and `tablespace_map`) into the
+    //     PGDATA root. pgBackRest stores these at the backup root — they are
+    //     written by `pg_backup_stop`, not captured by the PGDATA walk — so the
+    //     manifest's `[target:file]` set does not list them and the copy loop
+    //     above never restores them. Without `backup_label` present in PGDATA the
+    //     restored cluster reads `pg_control` instead of the backup's start
+    //     checkpoint and recovery aborts with "could not locate a valid
+    //     checkpoint record". A DB-free (control-file-only) backup writes no
+    //     label, so a missing file is expected and not an error.
+    if !dry_run {
+        for name in ["backup_label", "tablespace_map"] {
+            let src = PathBuf::from(format!("backup/{stanza}/{label}/{name}"));
+            match repo.open_read(&src) {
+                Ok(mut reader) => {
+                    let bytes = reader.read_all()?;
+                    let mut writer = pg.open_write(Path::new(name))?;
+                    writer.write(&bytes)?;
+                    writer.flush()?;
+                    log_info(&format!("restore: wrote {name} ({} bytes) into PGDATA", bytes.len()));
+                }
+                Err(StorageError::NotFound { .. }) => {}
+                Err(err) => return Err(CommandError::Storage(err)),
+            }
+        }
+    }
+
     // 5. Write the version-appropriate recovery configuration. The pure
     //    `recovery_files` generator decides which files and contents apply; the
     //    only impure step is appending the block to any existing
