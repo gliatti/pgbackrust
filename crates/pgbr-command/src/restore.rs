@@ -1062,7 +1062,12 @@ fn select_backup(
         other => CommandError::Other(other.to_string()),
     })?;
 
-    if let Some(label) = requested_set(config) {
+    // `--set` defaults to the sentinel `latest` (config.yaml), which means "the
+    // most recent backup" — NOT a literal label. Only an explicit, non-`latest`
+    // label is looked up directly. C ref: restore.c treats `latest` specially.
+    if let Some(label) = requested_set(config)
+        && label != "latest"
+    {
         if let Some(entry) = info.current.get(label) {
             let entry = entry.clone();
             return Ok((label.to_owned(), entry, info));

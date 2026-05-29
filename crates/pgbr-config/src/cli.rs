@@ -109,28 +109,25 @@ where
                 }
                 break;
             }
-            let (key_with_value, has_inline_value) = match after_dashes.split_once('=') {
-                Some((k, v)) => ((k.to_owned(), Some(v.to_owned())), true),
-                None => ((after_dashes.to_owned(), None), false),
+            let (raw_key, inline_value) = match after_dashes.split_once('=') {
+                Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+                None => (after_dashes.to_owned(), None),
             };
-            let (raw_key, inline_value) = key_with_value;
             if raw_key.is_empty() {
                 return Err(CliError::EmptyKey);
             }
             let (modifier, key) = strip_modifier(&raw_key);
-            let value = if has_inline_value {
-                inline_value
-            } else if matches!(modifier, CliModifier::Negate | CliModifier::Reset) {
+            // pgBackRest CLI option VALUES are always given with `=`
+            // (`--type=full`, `--target='...'`); a bare `--option` is a flag
+            // (boolean true, or `--no-`/`--reset-`). Bare tokens that follow are
+            // positionals — the command or a parameter (e.g. the WAL path) — and
+            // must NOT be swallowed as an option value, otherwise
+            // `--delta restore` would treat `restore` as `--delta`'s value and
+            // lose the command. So we never consume the next argv token here.
+            let value = if matches!(modifier, CliModifier::Negate | CliModifier::Reset) {
                 None
-            } else if args.get(i + 1).is_some_and(|next| !next.starts_with("--")) {
-                // A bare boolean option has no following value — distinguish
-                // by whether the next argv token *looks* like another option.
-                // This matches the C parser's behaviour for boolean shorthand.
-                let v = args[i + 1].clone();
-                i += 1;
-                Some(v)
             } else {
-                None
+                inline_value
             };
             out.options.push(CliOptionEntry {
                 raw_key: key.to_owned(),
@@ -457,10 +454,24 @@ option:
     }
 
     #[test]
-    fn parses_separate_value() {
-        let r = parse_cli(["backup", "--stanza", "demo"]).unwrap();
+    fn space_separated_token_is_positional_not_a_value() {
+        // pgBackRest option values use `=`; a bare token after a flag is a
+        // positional, NOT the option's value. `--stanza demo` => `--stanza`
+        // flag (no value) + `demo` as the command.
+        let r = parse_cli(["--stanza", "demo"]).unwrap();
         assert_eq!(r.options[0].raw_key, "stanza");
-        assert_eq!(r.options[0].value.as_deref(), Some("demo"));
+        assert!(r.options[0].value.is_none(), "no space-form value consumption");
+        assert_eq!(r.command.as_deref(), Some("demo"), "the bare token is the command");
+    }
+
+    #[test]
+    fn boolean_flag_before_command_keeps_command() {
+        // Regression: `pgbackrest --stanza=demo --delta restore` must parse the
+        // command as `restore`, not swallow it as `--delta`'s value.
+        let r = parse_cli(["--stanza=demo", "--delta", "restore"]).unwrap();
+        assert_eq!(r.command.as_deref(), Some("restore"));
+        let delta = r.options.iter().find(|o| o.raw_key == "delta").expect("delta present");
+        assert!(delta.value.is_none(), "delta is a bare flag");
     }
 
     #[test]
