@@ -570,6 +570,130 @@ pg principal "$BIN/pg_ctl -D $ALT -m fast -w stop" >/dev/null 2>&1
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w start" >/dev/null 2>&1
 
 ############################################################################
+hd "Scenario 14 — backup-standby=y (KB Exemple 8: backup runs on repo host, files pulled from standby)"
+# Topology: depot=repo host (orchestrator), principal=primary, secondaire=standby
+# streaming from principal. Config on depot has pg1=principal + pg2=secondaire +
+# backup-standby=y. The backup runs pg_backup_start/stop on pg1 (primary) but
+# reads PGDATA files from pg2 (standby) — offloading I/O from the primary while
+# keeping consistency. Exercises gap-B (DB control over a worker) AND the
+# pull-backup file-copy path (read source through a remote pg_storage worker).
+SEC=/var/lib/postgresql/$PGV/secondaire
+reset_principal_cluster
+on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+# Step 1: initial config on depot (pg1 only) so we can take a base backup that
+# the standby will restore from. backup-standby is enabled later, once the
+# standby is up; turning it on now would make `check` fail (no pg2 yet).
+on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-host=principal
+pg1-host-user=postgres
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+# principal also needs a pgbackrest.conf so PG's archive_command (set by
+# reset-cluster) actually pushes WAL to depot, mirroring Scenario 10's setup.
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "stanza-create (backup-standby setup, on depot)" depot "pgbackrest --stanza=demo stanza-create"
+ok "check (initial, no standby)" depot "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator'" >/dev/null
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "initial full backup (primary, no standby yet)" depot "pgbackrest --stanza=demo --type=full backup"
+# Step 2: restore secondaire as a streaming standby from the depot repo.
+on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
+on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+[demo]
+pg1-path=$SEC
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf
+install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest"
+ok "restore --type=standby (on secondaire, from depot)" secondaire \
+  "pgbackrest --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
+pg secondaire "$BIN/pg_ctl -D $SEC -l $SEC/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 5
+in_rec=$(psql_on secondaire 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
+if [ "$in_rec" = "t" ]; then pass "standby is in recovery (streaming from principal)"
+else pg secondaire "tail -25 $SEC/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "standby setup (in_recovery=$in_rec)"; fi
+# More data on primary so the standby backup captures something new (>= 2000 rows).
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1501,2000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+sleep 4
+prows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+srows=$(psql_on secondaire 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$prows" = "2000" ] && [ "$srows" = "2000" ]; then pass "primary + standby caught up (2000 rows each)"
+else fail "replication mismatch (primary=$prows standby=$srows, want 2000/2000)"; fi
+# Step 3: re-config depot with pg1+pg2 + backup-standby=y and take the standby backup.
+on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+backup-standby=y
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-host=principal
+pg1-host-user=postgres
+pg1-path=$PRI
+pg1-port=5433
+pg2-host=secondaire
+pg2-host-user=postgres
+pg2-path=$SEC
+pg2-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "full backup --backup-standby=y (start/stop on pg1, files from pg2)" depot "pgbackrest --stanza=demo --type=full backup"
+out=$(pg depot "pgbackrest --stanza=demo info")
+fulls=$(printf '%s' "$out" | grep -cE 'full backup')
+if [ "$fulls" -ge 2 ]; then pass "info shows $fulls full backups (initial + standby)"
+else fail "info doesn't show >=2 full backups (got $fulls)"; fi
+# Cross-validate: restore the latest (standby) backup on principal, verify 2000 rows.
+pg secondaire "$BIN/pg_ctl -D $SEC -m fast -w stop" >/dev/null 2>&1
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "restore the standby backup (on principal, repo on depot)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "2000" ]; then pass "standby backup restored data (2000 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "standby backup restore (got: $rows)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
