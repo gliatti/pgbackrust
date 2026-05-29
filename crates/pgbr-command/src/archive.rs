@@ -53,7 +53,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use pgbr_compress::{Bz2Decompress, GzDecompress, Lz4Decompress, ZstDecompress};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::InfoArchive;
 use pgbr_io::Filter;
@@ -210,19 +209,6 @@ fn transform_segment(transform: &RepoTransform, bytes: &[u8]) -> Result<Vec<u8>,
     transform.apply_forward_keyed(bytes).map_err(CommandError::from)
 }
 
-/// Build the decompress [`Filter`] matching a stored WAL file `suffix`
-/// (`.gz`/`.bz2`/`.lz4`/`.zst`), or `None` for the plaintext (no-suffix)
-/// case.
-fn decompress_filter_for(suffix: &str) -> Option<Box<dyn Filter>> {
-    match suffix {
-        ".gz" => Some(Box::new(GzDecompress::new(false))),
-        ".bz2" => Some(Box::new(Bz2Decompress::new())),
-        ".lz4" => Some(Box::new(Lz4Decompress::new())),
-        ".zst" => Some(Box::new(ZstDecompress::new())),
-        _ => None,
-    }
-}
-
 /// Run `bytes` through `filter` (process + finish) and return the transformed
 /// output.
 fn run_filter(filter: &mut dyn Filter, bytes: &[u8]) -> Result<Vec<u8>, CommandError> {
@@ -264,6 +250,19 @@ fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
 /// and the `check` command.
 fn archive_id(info: &InfoArchive) -> String {
     format!("{}-{}", info.db_version, info.db_id)
+}
+
+/// Reverse the repo transform a stored WAL segment was written with: decrypt
+/// (under the repo `sub_key`, when the repo is encrypted) then decompress per the
+/// file `suffix`. `CompressType::from_str_id` takes the codec name without the
+/// leading dot (`".gz"` → `"gz"` → `Gz`; `""` → `None`). For an unencrypted repo
+/// `sub_key` is `None`, so this is decompress-only; for a plaintext segment
+/// (empty suffix, no key) the bytes are returned unchanged. Shared by
+/// `read_archived_segment`, `fetch_from_repo`, and `prefetch_get_spool`.
+fn decode_stored_segment(stored: &[u8], suffix: &str, sub_key: Option<&str>) -> Result<Vec<u8>, CommandError> {
+    let compress_type = CompressType::from_str_id(suffix.strip_prefix('.').unwrap_or(suffix));
+    let transform = RepoTransform::with_key(compress_type, 0, sub_key.map(str::to_owned));
+    transform.apply_reverse_keyed(stored).map_err(CommandError::from)
 }
 
 /// Read every byte of `src_path` from `src` storage.
@@ -1042,6 +1041,15 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
     };
     let archive_id = archive_id(&archive_info);
 
+    // Resolve the repo sub-key so an encrypted WAL segment is decrypted (then
+    // decompressed) before being written to PG. `None` for an unencrypted repo
+    // ⇒ the read stays decompress-only. The sub-key is stanza-wide; resolve it
+    // from the first repository (it carries archive.info's [cipher] section).
+    let sub_key = match repo_storages.first() {
+        Some(repo) => crate::cipher::active_sub_key(*repo, config, stanza)?,
+        None => None,
+    };
+
     // Try each repository in order; serve from the first that has the segment.
     // archive-missing-retry: a segment may land in the archive between two
     // lookups (PostgreSQL requests it just as archive-push writes it), so when
@@ -1056,6 +1064,7 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
         &archive_id,
         segment,
         Path::new(dest),
+        sub_key.as_deref(),
         retry,
         RETRY_DELAY,
     )
@@ -1073,6 +1082,7 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 /// probe is repeated once after `delay` (a segment may have been archived in
 /// between); otherwise — or if it is still absent after the retry — the canonical
 /// `NotFound` from the last repository's plaintext path surfaces.
+#[allow(clippy::too_many_arguments)]
 fn fetch_segment_with_retry(
     repo_storages: &[&dyn Storage],
     pg_storage: &dyn Storage,
@@ -1080,13 +1090,14 @@ fn fetch_segment_with_retry(
     archive_id: &str,
     segment: &str,
     dest: &Path,
+    sub_key: Option<&str>,
     retry: bool,
     delay: std::time::Duration,
 ) -> Result<(), CommandError> {
     // First pass: serve from any repository that already has the segment.
     for repo in repo_storages {
         if repo_has_segment(*repo, stanza, archive_id, segment)? {
-            return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest);
+            return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest, sub_key);
         }
     }
 
@@ -1095,7 +1106,7 @@ fn fetch_segment_with_retry(
         std::thread::sleep(delay);
         for repo in repo_storages {
             if repo_has_segment(*repo, stanza, archive_id, segment)? {
-                return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest);
+                return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest, sub_key);
             }
         }
     }
@@ -1106,7 +1117,7 @@ fn fetch_segment_with_retry(
     let last = repo_storages
         .last()
         .ok_or_else(|| CommandError::Other("archive-get found no repository to read from".to_owned()))?;
-    fetch_from_repo(*last, pg_storage, stanza, archive_id, segment, dest)
+    fetch_from_repo(*last, pg_storage, stanza, archive_id, segment, dest, sub_key)
 }
 
 /// Whether `repo` holds `segment` for `stanza` in any stored form (plaintext or
@@ -1139,6 +1150,7 @@ fn fetch_from_repo(
     archive_id: &str,
     segment: &str,
     dest: &Path,
+    sub_key: Option<&str>,
 ) -> Result<(), CommandError> {
     let plaintext = repo_segment_path(stanza, archive_id, segment);
     let (source, suffix) = if repo_storage.exists(&plaintext)? {
@@ -1156,10 +1168,7 @@ fn fetch_from_repo(
     };
 
     let stored = read_segment(repo_storage, &source)?;
-    let bytes = match decompress_filter_for(suffix) {
-        Some(mut filter) => run_filter(filter.as_mut(), &stored)?,
-        None => stored,
-    };
+    let bytes = decode_stored_segment(&stored, suffix, sub_key)?;
 
     write_segment(&bytes, pg_storage, dest)
 }
@@ -1194,7 +1203,7 @@ fn serve_from_spool(
 /// plain function so tests (and a future protocol handler) can run it
 /// synchronously. Each requested segment is fetched from the repository
 /// (probing the plaintext and compressed forms under the stanza's archive-id
-/// directory exactly like [`fetch_from_repo`], via [`decompress_filter_for`])
+/// directory exactly like [`fetch_from_repo`], via [`decode_stored_segment`])
 /// and written, decompressed, to `archive/<stanza>/in/<segment>` so a later
 /// foreground [`get`] serves it without a repository round-trip. Segments
 /// absent from the repository are skipped (a future segment may not be archived
@@ -1234,6 +1243,9 @@ pub fn prefetch_get_spool(
     let (info, _) = InfoArchive::load_keyed(repo_storage, &info_path, user_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
     let archive_id = archive_id(&info);
+    // Repo sub-key so an encrypted WAL segment is decrypted before being staged
+    // (the spool holds plaintext WAL). `None` for an unencrypted repo.
+    let sub_key = crate::cipher::repo_sub_key(repo_storage, config, index, stanza)?;
 
     // Account for whatever is already staged so a partially-filled spool is not
     // overrun on the next prefetch round.
@@ -1265,10 +1277,7 @@ pub fn prefetch_get_spool(
         };
 
         let stored = read_segment(repo_storage, &source)?;
-        let bytes = match decompress_filter_for(suffix) {
-            Some(mut filter) => run_filter(filter.as_mut(), &stored)?,
-            None => stored,
-        };
+        let bytes = decode_stored_segment(&stored, suffix, sub_key.as_deref())?;
         staged_bytes += bytes.len() as u64;
         write_segment(&bytes, spool, &get_in_dir(stanza).join(segment))?;
         prefetched += 1;
@@ -1352,15 +1361,7 @@ pub(crate) fn read_archived_segment(
     };
 
     let stored = read_segment(repo, &source)?;
-    // Reverse the exact transform the WAL was written with: decrypt (under the
-    // repo sub-key) then decompress. `CompressType::from_str_id` takes the codec
-    // name without the leading dot (`".gz"` → `"gz"` → `Gz`; `""` → `None`). For
-    // an unencrypted repo `sub_key` is `None`, so this is decompress-only; for a
-    // plaintext segment (no suffix, no key) it returns the bytes unchanged.
-    let compress_type = CompressType::from_str_id(suffix.strip_prefix('.').unwrap_or(suffix));
-    let transform = RepoTransform::with_key(compress_type, 0, sub_key.map(str::to_owned));
-    let bytes = transform.apply_reverse_keyed(&stored).map_err(CommandError::from)?;
-    Ok(Some(bytes))
+    Ok(Some(decode_stored_segment(&stored, suffix, sub_key)?))
 }
 
 #[cfg(test)]
@@ -2667,6 +2668,7 @@ mod tests {
             ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
+            None,
             true,
             std::time::Duration::from_millis(0),
         )
@@ -2687,6 +2689,7 @@ mod tests {
             ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
+            None,
             true,
             std::time::Duration::from_millis(0),
         )
@@ -2709,6 +2712,7 @@ mod tests {
             ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
+            None,
             false,
             std::time::Duration::from_millis(0),
         )
