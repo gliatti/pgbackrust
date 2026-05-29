@@ -30,9 +30,36 @@
 //! unit tests, and a test-only `FakeBackupControl` lives in the test module of
 //! `backup.rs`.
 
-use pgbr_db::Connection;
+use pgbr_db::{Connection, QueryRows};
+use pgbr_io::{IoRead, IoWrite};
 
 use crate::CommandError;
+use crate::remote_db::RemoteDb;
+
+/// SQL the [`BackupControl`] info / status methods run, shared by
+/// [`LibpqBackupControl`] (libpq) and [`RemoteBackupControl`] (worker) so the
+/// two paths never drift. `backup_start` / `backup_stop` use the version-aware
+/// [`backup_start_sql`] / [`backup_stop_sql`] builders instead.
+mod sql {
+    /// `server_version_num` from `pg_settings` (an int4).
+    pub const SERVER_VERSION_NUM: &str =
+        "select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4";
+    /// `system_identifier` from `pg_control_system()` as text.
+    pub const SYSTEM_IDENTIFIER: &str = "select system_identifier::text from pg_catalog.pg_control_system()";
+    /// `pg_is_in_recovery()` as text (`t` / `f`).
+    pub const IS_IN_RECOVERY: &str = "select pg_catalog.pg_is_in_recovery()::text";
+    /// `pg_last_wal_replay_lsn()` as text (SQL `NULL` until WAL is replayed).
+    pub const REPLAY_LSN: &str = "select pg_catalog.pg_last_wal_replay_lsn()::text";
+    /// `wal_segment_size` in bytes, derived from `pg_settings` setting * unit.
+    pub const WAL_SEGMENT_SIZE: &str = "select (setting::int8 * \
+         case unit when '8kB' then 8192 when 'kB' then 1024 when 'MB' then 1048576 \
+         when 'GB' then 1073741824 else 1 end)::text \
+         from pg_catalog.pg_settings where name = 'wal_segment_size'";
+    /// `timeline_id` from `pg_control_checkpoint()` as text.
+    pub const TIMELINE: &str = "select timeline_id::text from pg_catalog.pg_control_checkpoint()";
+    /// `archive_mode` setting.
+    pub const ARCHIVE_MODE: &str = "select setting from pg_catalog.pg_settings where name = 'archive_mode'";
+}
 
 /// What [`BackupControl::server_info`] reports about the connected cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,21 +304,15 @@ impl LibpqBackupControl {
         }
         let version_result = self
             .conn
-            .query("select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4")
+            .query(sql::SERVER_VERSION_NUM)
             .map_err(|err| CommandError::Other(err.to_string()))?;
-        let server_version_num = version_result
-            .value(0, 0)
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .ok_or_else(|| CommandError::Other("could not read server_version_num from pg_settings".to_owned()))?;
+        let server_version_num = parse_server_version_num(version_result.value(0, 0).as_deref())?;
 
         let control_result = self
             .conn
-            .query("select system_identifier::text from pg_catalog.pg_control_system()")
+            .query(sql::SYSTEM_IDENTIFIER)
             .map_err(|err| CommandError::Other(err.to_string()))?;
-        let system_identifier = control_result
-            .value(0, 0)
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .ok_or_else(|| CommandError::Other("could not read system_identifier from pg_control_system()".to_owned()))?;
+        let system_identifier = parse_system_identifier(control_result.value(0, 0).as_deref())?;
 
         let info = BackupServerInfo {
             server_version_num,
@@ -336,16 +357,15 @@ impl BackupControl for LibpqBackupControl {
     fn is_in_recovery(&mut self) -> Result<bool, CommandError> {
         let result = self
             .conn
-            .query("select pg_catalog.pg_is_in_recovery()::text")
+            .query(sql::IS_IN_RECOVERY)
             .map_err(|err| CommandError::Other(err.to_string()))?;
-        // PostgreSQL renders boolean text as "t" / "f".
-        Ok(matches!(result.value(0, 0).as_deref(), Some("t" | "true")))
+        Ok(parse_in_recovery(result.value(0, 0).as_deref()))
     }
 
     fn replay_lsn(&mut self) -> Result<Option<String>, CommandError> {
         let result = self
             .conn
-            .query("select pg_catalog.pg_last_wal_replay_lsn()::text")
+            .query(sql::REPLAY_LSN)
             .map_err(|err| CommandError::Other(err.to_string()))?;
         // NULL (no WAL replayed yet) surfaces as `None` from `value`.
         Ok(result.value(0, 0))
@@ -358,36 +378,160 @@ impl BackupControl for LibpqBackupControl {
         // byte size the same way (setting times the documented byte multiplier).
         let result = self
             .conn
-            .query(
-                "select (setting::int8 * \
-                 case unit when '8kB' then 8192 when 'kB' then 1024 when 'MB' then 1048576 \
-                 when 'GB' then 1073741824 else 1 end)::text \
-                 from pg_catalog.pg_settings where name = 'wal_segment_size'",
-            )
+            .query(sql::WAL_SEGMENT_SIZE)
             .map_err(|err| CommandError::Other(err.to_string()))?;
-        result
-            .value(0, 0)
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .ok_or_else(|| CommandError::Other("could not read wal_segment_size from pg_settings".to_owned()))
+        parse_wal_segment_size(result.value(0, 0).as_deref())
     }
 
     fn timeline(&mut self) -> Result<u32, CommandError> {
         let result = self
             .conn
-            .query("select timeline_id::text from pg_catalog.pg_control_checkpoint()")
+            .query(sql::TIMELINE)
             .map_err(|err| CommandError::Other(err.to_string()))?;
-        result
-            .value(0, 0)
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .ok_or_else(|| CommandError::Other("could not read timeline_id from pg_control_checkpoint()".to_owned()))
+        parse_timeline(result.value(0, 0).as_deref())
     }
 
     fn archive_mode(&mut self) -> Result<String, CommandError> {
         let result = self
             .conn
-            .query("select setting from pg_catalog.pg_settings where name = 'archive_mode'")
+            .query(sql::ARCHIVE_MODE)
             .map_err(|err| CommandError::Other(err.to_string()))?;
         Ok(result.value(0, 0).unwrap_or_default().trim().to_owned())
+    }
+}
+
+/// Parse a `server_version_num` scalar text into a `u32`.
+fn parse_server_version_num(raw: Option<&str>) -> Result<u32, CommandError> {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read server_version_num from pg_settings".to_owned()))
+}
+
+/// Parse a `system_identifier` scalar text into a `u64`.
+fn parse_system_identifier(raw: Option<&str>) -> Result<u64, CommandError> {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| CommandError::Other("could not read system_identifier from pg_control_system()".to_owned()))
+}
+
+/// Interpret a `pg_is_in_recovery()` scalar text as a bool (`PostgreSQL` renders
+/// boolean text as `t` / `f`).
+fn parse_in_recovery(raw: Option<&str>) -> bool {
+    matches!(raw, Some("t" | "true"))
+}
+
+/// Parse a `wal_segment_size` byte-count scalar text into a `u64`.
+fn parse_wal_segment_size(raw: Option<&str>) -> Result<u64, CommandError> {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| CommandError::Other("could not read wal_segment_size from pg_settings".to_owned()))
+}
+
+/// Parse a `timeline_id` scalar text into a `u32`.
+fn parse_timeline(raw: Option<&str>) -> Result<u32, CommandError> {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read timeline_id from pg_control_checkpoint()".to_owned()))
+}
+
+/// Pull the single scalar text value at `(0, 0)` out of a [`QueryRows`], or
+/// `None` for an empty result / SQL `NULL`.
+fn scalar_from_rows(rows: &QueryRows) -> Option<String> {
+    rows.rows.first().and_then(|row| row.first()).and_then(Clone::clone)
+}
+
+/// The production *remote* [`BackupControl`].
+///
+/// Drives `pg_backup_start` / `pg_backup_stop` (and the info / status queries) on
+/// a worker that owns the real libpq connection, for the dedicated-repo-host
+/// (pull) topology (`pgN-host`). Runs the **same** SQL as [`LibpqBackupControl`],
+/// but via the worker `db-query` protocol — so start and stop still share the
+/// worker's one persistent session, as a non-exclusive backup requires.
+///
+/// The caller is responsible for `db-open`ing the worker connection (against the
+/// PG host's *local* cluster — no `host=<pghost>`) before driving this.
+pub struct RemoteBackupControl<R: IoRead, W: IoWrite> {
+    db: RemoteDb<R, W>,
+    /// Cached server info, resolved lazily on first [`BackupControl::server_info`].
+    info: Option<BackupServerInfo>,
+}
+
+impl<R: IoRead, W: IoWrite> RemoteBackupControl<R, W> {
+    /// Wrap a [`RemoteDb`] whose connection is already open.
+    #[must_use]
+    pub const fn new(db: RemoteDb<R, W>) -> Self {
+        Self { db, info: None }
+    }
+
+    /// Run `sql` on the worker and return the scalar text value at `(0, 0)`, or
+    /// `None` for an empty result / SQL `NULL`.
+    fn scalar(&mut self, sql: &str) -> Result<Option<String>, CommandError> {
+        let rows = self.db.query(sql)?;
+        Ok(scalar_from_rows(&rows))
+    }
+
+    /// Resolve (and cache) the server info, querying the worker only once.
+    fn resolve_info(&mut self) -> Result<BackupServerInfo, CommandError> {
+        if let Some(info) = &self.info {
+            return Ok(info.clone());
+        }
+        let server_version_num = parse_server_version_num(self.scalar(sql::SERVER_VERSION_NUM)?.as_deref())?;
+        let system_identifier = parse_system_identifier(self.scalar(sql::SYSTEM_IDENTIFIER)?.as_deref())?;
+        let info = BackupServerInfo {
+            server_version_num,
+            system_identifier,
+        };
+        self.info = Some(info.clone());
+        Ok(info)
+    }
+}
+
+impl<R: IoRead, W: IoWrite> BackupControl for RemoteBackupControl<R, W> {
+    fn server_info(&mut self) -> Result<BackupServerInfo, CommandError> {
+        self.resolve_info()
+    }
+
+    fn backup_start(&mut self, label: &str, fast: bool) -> Result<String, CommandError> {
+        let info = self.resolve_info()?;
+        let rows = self.db.query(&backup_start_sql(&info, label, fast))?;
+        scalar_from_rows(&rows).ok_or_else(|| CommandError::Other("backup start returned no LSN".to_owned()))
+    }
+
+    fn backup_stop(&mut self) -> Result<BackupStopResult, CommandError> {
+        let info = self.resolve_info()?;
+        let rows = self.db.query(&backup_stop_sql(&info))?;
+        let row = rows
+            .rows
+            .first()
+            .ok_or_else(|| CommandError::Other("backup stop returned no row".to_owned()))?;
+        let lsn = row
+            .first()
+            .and_then(Clone::clone)
+            .ok_or_else(|| CommandError::Other("backup stop returned no LSN".to_owned()))?;
+        // labelfile / spcmapfile may be SQL NULL; treat NULL as empty.
+        let label_file = row.get(1).and_then(Clone::clone).unwrap_or_default();
+        let spcmap_file = row.get(2).and_then(Clone::clone).unwrap_or_default();
+        Ok(BackupStopResult {
+            lsn,
+            label_file,
+            spcmap_file,
+        })
+    }
+
+    fn is_in_recovery(&mut self) -> Result<bool, CommandError> {
+        Ok(parse_in_recovery(self.scalar(sql::IS_IN_RECOVERY)?.as_deref()))
+    }
+
+    fn replay_lsn(&mut self) -> Result<Option<String>, CommandError> {
+        self.scalar(sql::REPLAY_LSN)
+    }
+
+    fn wal_segment_size(&mut self) -> Result<u64, CommandError> {
+        parse_wal_segment_size(self.scalar(sql::WAL_SEGMENT_SIZE)?.as_deref())
+    }
+
+    fn timeline(&mut self) -> Result<u32, CommandError> {
+        parse_timeline(self.scalar(sql::TIMELINE)?.as_deref())
+    }
+
+    fn archive_mode(&mut self) -> Result<String, CommandError> {
+        Ok(self.scalar(sql::ARCHIVE_MODE)?.unwrap_or_default().trim().to_owned())
     }
 }
 
@@ -494,5 +638,106 @@ mod tests {
         assert_eq!(sql_quote("plain"), "'plain'");
         assert_eq!(sql_quote("o'brien"), "'o''brien'");
         assert_eq!(sql_quote("a'b'c"), "'a''b''c'");
+    }
+
+    // -------- RemoteBackupControl over the worker protocol (no real PG) -------
+
+    #[test]
+    fn remote_backup_control_drives_start_stop_over_the_worker() {
+        use std::thread;
+
+        use pgbr_protocol::transport::{PipeRead, PipeWrite, serve};
+        use pgbr_protocol::{OkResponse, ProtocolClient, Request, Response};
+
+        // A fake worker answering each db-query with a canned result matched by
+        // SQL content (and db-open / db-close with success). This proves
+        // RemoteBackupControl encodes the same SQL LibpqBackupControl runs and
+        // decodes the replies — including the multi-column pg_backup_stop row.
+        fn one_col(value: &str) -> Response {
+            let rows = QueryRows {
+                columns: vec!["v".to_owned()],
+                rows: vec![vec![Some(value.to_owned())]],
+            };
+            Response::Ok(OkResponse {
+                out: Some(serde_json::to_value(&rows).unwrap()),
+            })
+        }
+        fn stop_row(lsn: &str, label: &str, spcmap: Option<&str>) -> Response {
+            let rows = QueryRows {
+                columns: vec!["lsn".to_owned(), "labelfile".to_owned(), "spcmapfile".to_owned()],
+                rows: vec![vec![Some(lsn.to_owned()), Some(label.to_owned()), spcmap.map(str::to_owned)]],
+            };
+            Response::Ok(OkResponse {
+                out: Some(serde_json::to_value(&rows).unwrap()),
+            })
+        }
+
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let mut handler = |req: &Request| -> Response {
+                match req.cmd.as_str() {
+                    "db-open" | "db-close" => Response::Ok(OkResponse { out: None }),
+                    "db-query" => {
+                        let sql = req.param.first().and_then(|v| v.as_str()).unwrap_or_default();
+                        if sql.contains("server_version_num") {
+                            one_col("160004")
+                        } else if sql.contains("pg_control_system") {
+                            one_col("6873049345984568091")
+                        } else if sql.contains("pg_backup_start") {
+                            one_col("0/2000028")
+                        } else if sql.contains("pg_backup_stop") {
+                            stop_row("0/3000000", "START WAL LOCATION: 0/2000028\n", None)
+                        } else if sql.contains("pg_is_in_recovery") {
+                            one_col("f")
+                        } else if sql.contains("wal_segment_size") {
+                            one_col("16777216")
+                        } else if sql.contains("pg_control_checkpoint") {
+                            one_col("1")
+                        } else if sql.contains("archive_mode") {
+                            one_col("on")
+                        } else {
+                            one_col("")
+                        }
+                    }
+                    other => panic!("unexpected worker command {other}"),
+                }
+            };
+            serve(&mut reader, &mut writer, &mut handler).unwrap();
+        });
+
+        let client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        let mut db = RemoteDb::new(client);
+        db.open("host=/var/run/postgresql").expect("db-open");
+        let mut control = RemoteBackupControl::new(db);
+
+        // server_info resolves + caches the version / system id.
+        let info = control.server_info().expect("server_info");
+        assert_eq!(info.server_version_num, 160_004);
+        assert_eq!(info.system_identifier, 6_873_049_345_984_568_091);
+        assert!(info.uses_pg_backup_start(), "PG16 uses pg_backup_start");
+
+        // The non-exclusive backup bracket: start returns the LSN, stop returns
+        // the LSN + the backup_label content (spcmap NULL -> empty).
+        let start = control.backup_start("20240101-120000F", false).expect("backup_start");
+        assert_eq!(start, "0/2000028");
+        let stop = control.backup_stop().expect("backup_stop");
+        assert_eq!(stop.lsn, "0/3000000");
+        assert!(stop.label_file.contains("START WAL LOCATION"));
+        assert!(stop.spcmap_file.is_empty(), "NULL spcmap -> empty");
+
+        // The status accessors round-trip through db-query too.
+        assert!(!control.is_in_recovery().expect("is_in_recovery"));
+        assert_eq!(control.wal_segment_size().expect("wal_segment_size"), 16_777_216);
+        assert_eq!(control.timeline().expect("timeline"), 1);
+        assert_eq!(control.archive_mode().expect("archive_mode"), "on");
+
+        // Drop the control (and its RemoteDb / write pipe) so the worker reads
+        // EOF and the serve loop returns.
+        drop(control);
+        server.join().unwrap();
     }
 }

@@ -71,7 +71,7 @@ use pgbr_storage::{Storage, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
-use crate::backup_control::{BackupControl, BackupServerInfo, BackupStopResult, LibpqBackupControl};
+use crate::backup_control::{BackupControl, BackupServerInfo, BackupStopResult, LibpqBackupControl, RemoteBackupControl};
 use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encrypted_key};
 
 /// Emit a human progress line at `INFO` through the process-global logger.
@@ -810,33 +810,43 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     // The diff label depends on the full it references, so it is computed inside
     // `run_backup` (which knows the full label); full labels are timestamp-derived
     // up front. Pass `None` to let the inner function pick.
-    let outcome = run_backup(
-        stanza,
-        repo_storage,
-        copy_storage,
-        backup_type,
-        None,
-        timestamp_start,
-        &transform,
-        process_max,
-        checksum_page,
-        &excludes,
-        primary.as_mut().map(|c| c as &mut dyn BackupControl),
-        standby.as_mut().map(|c| c as &mut dyn BackupControl),
-        start_fast,
-        features,
-        block_overrides,
-        job_retry,
-        archive_copy,
-        integrity,
-        policy,
-        repo_user_pass.as_deref(),
-        // The repo sub-key used to read (decrypt + decompress) archived WAL for
-        // archive-check / archive-copy. It is the same key the backup transform
-        // encrypts data/WAL with (resolved above via `active_sub_key`), so reuse
-        // it from the transform; `None` on an unencrypted repo.
-        transform.cipher_pass.as_deref(),
-    )?;
+    //
+    // The boxed controls (`primary` / `standby`) have non-trivial destructors (a
+    // `RemoteBackupControl` reaps its worker on drop). Take the `&mut dyn`
+    // borrows inside a block so they end — and the boxes can be dropped — before
+    // the rest of the function runs, satisfying dropck.
+    let outcome = {
+        let primary_ref: Option<&mut (dyn BackupControl + '_)> = primary.as_deref_mut();
+        let standby_ref: Option<&mut (dyn BackupControl + '_)> = standby.as_deref_mut();
+        run_backup(
+            stanza,
+            repo_storage,
+            copy_storage,
+            backup_type,
+            None,
+            timestamp_start,
+            &transform,
+            process_max,
+            checksum_page,
+            &excludes,
+            primary_ref,
+            standby_ref,
+            start_fast,
+            features,
+            block_overrides,
+            job_retry,
+            archive_copy,
+            integrity,
+            policy,
+            repo_user_pass.as_deref(),
+            // The repo sub-key used to read (decrypt + decompress) archived WAL
+            // for archive-check / archive-copy. It is the same key the backup
+            // transform encrypts data/WAL with (resolved above via
+            // `active_sub_key`), so reuse it from the transform; `None` on an
+            // unencrypted repo.
+            transform.cipher_pass.as_deref(),
+        )?
+    };
     log_info(&format!(
         "backup {} complete: {} file(s), {} byte(s)",
         outcome.label, outcome.file_count, outcome.total_size
@@ -859,12 +869,18 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
 }
 
 /// The backup-control connections resolved per the `backup-standby` policy.
+///
+/// Each control object is a `Box<dyn BackupControl>` so a *local* cluster
+/// (libpq [`LibpqBackupControl`]) and a *remote* one reached through a PG-host
+/// worker ([`RemoteBackupControl`], the dedicated-repo-host pull topology) are
+/// driven identically downstream — `pg_backup_start` / `pg_backup_stop` and the
+/// info / status queries are transport-agnostic.
 struct ControlConnections {
     /// Connection that drives `pg_backup_start` / `pg_backup_stop` — the primary
     /// (not in recovery). `None` when no DB source is configured (DB-free path).
-    primary: Option<LibpqBackupControl>,
+    primary: Option<Box<dyn BackupControl>>,
     /// Optional in-recovery standby whose replay is polled before the file copy.
-    standby: Option<LibpqBackupControl>,
+    standby: Option<Box<dyn BackupControl>>,
     /// The `pgN` index of the selected standby (`1`..=`8`), if any. Used to read
     /// backup files from the standby's data directory (I/O offload) when that
     /// `pgN` is locally reachable (no `pgN-host`).
@@ -930,11 +946,11 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
         });
     }
 
-    let mut primary: Option<LibpqBackupControl> = None;
-    let mut standby: Option<LibpqBackupControl> = None;
+    let mut primary: Option<Box<dyn BackupControl>> = None;
+    let mut standby: Option<Box<dyn BackupControl>> = None;
     let mut standby_index: Option<u32> = None;
     for (index, conninfo) in &conninfos {
-        let mut control = LibpqBackupControl::open(conninfo)?;
+        let mut control = open_control_for_index(config, *index, conninfo)?;
         let in_recovery = control.is_in_recovery()?;
         if in_recovery {
             if standby.is_none() && mode != StandbyMode::No {
@@ -962,6 +978,39 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
         standby,
         standby_index,
     })
+}
+
+/// Open the backup-control object for the cluster at `pg{index}`, choosing the
+/// transport by `pgN-host`.
+///
+/// When `pgN-host` is set (the dedicated-repo-host pull topology) the control
+/// connection must run on the PG host: a `pgbackrest` worker is spawned there
+/// over SSH and opened against the PG host's *local* cluster (no `host=<pghost>`
+/// — libpq uses the unix socket with peer / trust auth, no password), wrapped in
+/// a [`RemoteBackupControl`]. Otherwise a local libpq [`LibpqBackupControl`] is
+/// opened from `fallback_conninfo` (the `host=` / `DATABASE_URL` conninfo the
+/// candidate list already built). Either way the returned object is a
+/// `Box<dyn BackupControl>` the rest of the backup drives transport-agnostically.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the worker cannot be spawned or its `db-open`
+/// fails, or when the local libpq connection fails.
+fn open_control_for_index(
+    config: &LoadedConfig,
+    index: u32,
+    fallback_conninfo: &str,
+) -> Result<Box<dyn BackupControl>, CommandError> {
+    if let Some(host) = crate::remote_db::pg_host_for_index(config, index) {
+        // The conninfo the worker opens locally: socket / port / db / user
+        // (never the remote host) plus the global timeout / keepalive params.
+        let extra = conninfo_timeout_keepalive_params(config);
+        let conninfo = crate::remote_db::local_conninfo_for_index(config, index, &extra);
+        let mut remote = crate::remote_db::spawn_pg_worker(config, &host, index)?;
+        remote.open(&conninfo)?;
+        return Ok(Box::new(RemoteBackupControl::new(remote)));
+    }
+    Ok(Box::new(LibpqBackupControl::open(fallback_conninfo)?))
 }
 
 /// The local data-directory path of the standby at `pg{index}`, when that
@@ -3139,8 +3188,8 @@ fn run_backup(
     process_max: usize,
     checksum_page: bool,
     excludes: &[String],
-    mut control: Option<&mut dyn BackupControl>,
-    mut standby: Option<&mut dyn BackupControl>,
+    mut control: Option<&mut (dyn BackupControl + '_)>,
+    mut standby: Option<&mut (dyn BackupControl + '_)>,
     start_fast: bool,
     features: BackupFeatures,
     block_overrides: crate::block::BlockOverrides,

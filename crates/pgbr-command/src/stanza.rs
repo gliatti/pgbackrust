@@ -236,6 +236,45 @@ fn query_result_to_identity(row: DbIdentityRow) -> Result<ClusterIdentity, Comma
     })
 }
 
+/// `server_version_num` from `pg_settings` (an int4). Shared by the local
+/// (libpq) and remote (worker) identity readers so they never drift.
+const SQL_SERVER_VERSION_NUM: &str = "select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4";
+
+/// `system_identifier` / `catalog_version_no` / `pg_control_version` (all as
+/// text) from `pg_control_system()` (PG 9.6+).
+const SQL_PG_CONTROL_SYSTEM: &str = "select system_identifier::text, catalog_version_no::text, pg_control_version::text \
+     from pg_catalog.pg_control_system()";
+
+/// Assemble a [`DbIdentityRow`] from the four raw scalar texts and hand it to the
+/// pure [`query_result_to_identity`] mapper. Shared by the libpq and remote
+/// paths.
+fn identity_from_scalars(
+    server_version_num: Option<&str>,
+    system_identifier: Option<&str>,
+    catalog_version_no: Option<&str>,
+    pg_control_version: Option<&str>,
+) -> Result<ClusterIdentity, CommandError> {
+    let server_version_num = server_version_num
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read server_version_num from pg_settings".to_owned()))?;
+    let system_identifier = system_identifier
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| CommandError::Other("could not read system_identifier from pg_control_system()".to_owned()))?;
+    let catalog_version_no = catalog_version_no
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read catalog_version_no from pg_control_system()".to_owned()))?;
+    let pg_control_version = pg_control_version
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| CommandError::Other("could not read pg_control_version from pg_control_system()".to_owned()))?;
+
+    query_result_to_identity(DbIdentityRow {
+        server_version_num,
+        system_identifier,
+        catalog_version_no,
+        pg_control_version,
+    })
+}
+
 /// Query a live `PostgreSQL` for its cluster identity.
 ///
 /// Runs the same information queries the C `dbOpen` uses: `server_version_num`
@@ -249,38 +288,53 @@ fn query_result_to_identity(row: DbIdentityRow) -> Result<ClusterIdentity, Comma
 /// unparseable columns, or an unrecognised version.
 fn cluster_identity_from_db(conn: &mut Connection) -> Result<ClusterIdentity, CommandError> {
     let version_result = conn
-        .query("select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4")
+        .query(SQL_SERVER_VERSION_NUM)
         .map_err(|err| CommandError::Other(err.to_string()))?;
-    let server_version_num = version_result
-        .value(0, 0)
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or_else(|| CommandError::Other("could not read server_version_num from pg_settings".to_owned()))?;
-
     let control_result = conn
-        .query(
-            "select system_identifier::text, catalog_version_no::text, pg_control_version::text \
-             from pg_catalog.pg_control_system()",
-        )
+        .query(SQL_PG_CONTROL_SYSTEM)
         .map_err(|err| CommandError::Other(err.to_string()))?;
-    let system_identifier = control_result
-        .value(0, 0)
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .ok_or_else(|| CommandError::Other("could not read system_identifier from pg_control_system()".to_owned()))?;
-    let catalog_version_no = control_result
-        .value(0, 1)
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or_else(|| CommandError::Other("could not read catalog_version_no from pg_control_system()".to_owned()))?;
-    let pg_control_version = control_result
-        .value(0, 2)
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or_else(|| CommandError::Other("could not read pg_control_version from pg_control_system()".to_owned()))?;
 
-    query_result_to_identity(DbIdentityRow {
-        server_version_num,
-        system_identifier,
-        catalog_version_no,
-        pg_control_version,
-    })
+    identity_from_scalars(
+        version_result.value(0, 0).as_deref(),
+        control_result.value(0, 0).as_deref(),
+        control_result.value(0, 1).as_deref(),
+        control_result.value(0, 2).as_deref(),
+    )
+}
+
+/// Read the cluster identity from a worker on the PG host (the dedicated-repo-host
+/// pull topology, `pgN-host`).
+///
+/// Spawns the SSH worker, opens its connection against the PG host's *local*
+/// cluster (no `host=<pghost>`), runs the **same** two queries as
+/// [`cluster_identity_from_db`] via the worker `db-query` protocol, then closes
+/// the worker connection. `index` is the 1-based `pgN` group index.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the worker cannot be spawned, its `db-open`
+/// fails, a query fails, or the identity cannot be derived.
+fn cluster_identity_from_remote(config: &LoadedConfig, host: &str, index: u32) -> Result<ClusterIdentity, CommandError> {
+    let conninfo = crate::remote_db::local_conninfo_for_index(config, index, &[]);
+    let mut remote = crate::remote_db::spawn_pg_worker(config, host, index)?;
+    remote.open(&conninfo)?;
+
+    let version_rows = remote.query(SQL_SERVER_VERSION_NUM)?;
+    let control_rows = remote.query(SQL_PG_CONTROL_SYSTEM)?;
+    let _ = remote.close();
+
+    let version_value = version_rows.rows.first().and_then(|r| r.first()).and_then(Clone::clone);
+    let control_row = control_rows.rows.first();
+    let system_identifier = control_row.and_then(|r| r.first()).and_then(Clone::clone);
+    let catalog_version_no = control_row.and_then(|r| r.get(1)).and_then(Clone::clone);
+    let pg_control_version = control_row.and_then(|r| r.get(2)).and_then(Clone::clone);
+
+    identity_from_scalars(
+        version_value.as_deref(),
+        system_identifier.as_deref(),
+        catalog_version_no.as_deref(),
+        pg_control_version.as_deref(),
+    )
 }
 
 /// Build a libpq conninfo string for the primary cluster when the resolved
@@ -392,9 +446,22 @@ fn integer_opt(config: &LoadedConfig, name: &str) -> Option<i64> {
     }
 }
 
-/// Resolve the cluster identity, preferring a live libpq connection when one is
-/// configured and falling back to the on-disk `global/pg_control` otherwise.
+/// The `pgN` index stanza-create / -upgrade read the cluster identity at.
+const STANZA_PG_INDEX: u32 = 1;
+
+/// Resolve the cluster identity, preferring a live `PostgreSQL` connection when
+/// one is configured and falling back to the on-disk `global/pg_control`
+/// otherwise.
+///
+/// When `pg1-host` is set (the dedicated-repo-host pull topology), the identity
+/// is read through a worker on the PG host (a *local* connection there), not via
+/// a direct TCP connect from the repo host. Otherwise a derivable
+/// `pg1-*` / `DATABASE_URL` connection is opened locally with libpq, and a bare
+/// local `pg1-path` falls back to reading the on-disk control file.
 fn resolve_cluster_identity(config: &LoadedConfig, pg_storage: &dyn Storage) -> Result<ClusterIdentity, CommandError> {
+    if let Some(host) = crate::remote_db::pg_host_for_index(config, STANZA_PG_INDEX) {
+        return cluster_identity_from_remote(config, &host, STANZA_PG_INDEX);
+    }
     if let Some(conninfo) = derive_conninfo(config) {
         let mut conn = Connection::open(&conninfo).map_err(|err| CommandError::Other(err.to_string()))?;
         return cluster_identity_from_db(&mut conn);
@@ -1075,6 +1142,32 @@ mod tests {
         assert_eq!(identity.header.system_identifier, 0x0102_0304_0506_0708);
         assert_eq!(identity.header.catalog_version_no, v.catalog_version_no);
         assert_eq!(identity.header.pg_control_version, v.pg_control_version);
+    }
+
+    #[test]
+    fn identity_from_scalars_parses_text_columns() {
+        // The shared helper both the libpq and the remote (worker) readers use:
+        // it parses the four raw scalar texts and maps them. A PG 16 row maps
+        // cleanly to the "16" identity.
+        let v = version::by_label("16").expect("PG 16 in registry");
+        let identity = identity_from_scalars(
+            Some("160004"),
+            Some("6873049345984568091"),
+            Some(&v.catalog_version_no.to_string()),
+            Some(&v.pg_control_version.to_string()),
+        )
+        .expect("scalar texts map to PG 16 identity");
+        assert_eq!(identity.version, "16");
+        assert_eq!(identity.header.system_identifier, 6_873_049_345_984_568_091);
+        assert_eq!(identity.header.catalog_version_no, v.catalog_version_no);
+
+        // A missing server_version_num is a clear error (the worker returned no
+        // value / SQL NULL).
+        let err = identity_from_scalars(None, Some("1"), Some("1"), Some("1")).expect_err("missing version errors");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("server_version_num"), "{msg}"),
+            other => panic!("expected Other(server_version_num), got {other:?}"),
+        }
     }
 
     #[test]
