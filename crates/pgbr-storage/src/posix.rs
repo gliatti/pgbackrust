@@ -94,6 +94,10 @@ fn info_from_metadata(path: PathBuf, meta: &fs::Metadata) -> StorageInfo {
 }
 
 impl Storage for Posix {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     fn exists(&self, path: &Path) -> Result<bool, StorageError> {
         let resolved = self.resolve(path);
         match fs::symlink_metadata(&resolved) {

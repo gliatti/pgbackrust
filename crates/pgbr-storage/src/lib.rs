@@ -197,4 +197,16 @@ pub trait Storage: Send + Sync {
             message: "symlinks not supported by this backend".to_owned(),
         })
     }
+
+    /// Whether files on this backend live on the local filesystem and may be
+    /// written via `std::fs` directly (the parallel-copy fast path), as opposed
+    /// to backends whose writes must go through [`Storage::open_write`]
+    /// (remote/object backends: SSH-tunneled, S3, Azure, GCS, SFTP).
+    ///
+    /// Defaults to `false` so any backend is treated as remote/safe — writing
+    /// through `open_write` — unless it explicitly opts in. Only the local
+    /// filesystem backends ([`Posix`] and [`Cifs`]) override this to `true`.
+    fn is_local(&self) -> bool {
+        false
+    }
 }

@@ -1641,8 +1641,14 @@ struct CopyJob {
     rel: String,
     /// Absolute source path of the file on disk (from `StorageInfo::path`).
     abs_src: PathBuf,
-    /// Absolute destination path in the repo, suffix included.
+    /// Absolute destination path in the repo, suffix included. Used by the
+    /// local (`Posix`/`Cifs`) fast path, which writes via `std::fs`.
     abs_dest: PathBuf,
+    /// Repo-*relative* destination path, suffix included
+    /// (`backup/<stanza>/<label>/<rel><suffix>`) — the same relative path the
+    /// manifest / info writes use. Used by the non-local (remote/object) path,
+    /// which writes through [`Storage::open_write`].
+    rel_dest: String,
     /// Whether the worker should page-checksum-validate this file. Set only for
     /// an eligible relation file when `--checksum-page` is on; the worker still
     /// re-checks page alignment before validating.
@@ -1702,6 +1708,7 @@ fn plan_file(
     pg_storage: &dyn Storage,
     entry: &WalkEntry,
     abs_repo_backup_root: &Path,
+    backup_root: &str,
     transform: &RepoTransform,
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
@@ -1751,7 +1758,11 @@ fn plan_file(
 
     // Full backup, or a new / changed file in a diff / incr: copy it. The repo
     // filename carries the compression suffix; encryption does not change it.
-    let abs_dest = abs_repo_backup_root.join(format!("{}{}", entry.rel, transform.repo_suffix()));
+    let suffixed = format!("{}{}", entry.rel, transform.repo_suffix());
+    let abs_dest = abs_repo_backup_root.join(&suffixed);
+    // The repo-relative destination (the same path the manifest / info writes
+    // use); the non-local copy path writes through `open_write` at this path.
+    let rel_dest = format!("{backup_root}/{suffixed}");
     // Page-checksum validation applies only when the option is on AND the file
     // is an eligible relation file. The worker re-checks page alignment before
     // validating (a non-page-aligned relation file is left unvalidated).
@@ -1762,6 +1773,7 @@ fn plan_file(
             rel: entry.rel.clone(),
             abs_src: entry.info.path.clone(),
             abs_dest,
+            rel_dest,
             validate_pages,
             // The header check only matters when the page-validation pass runs.
             validate_page_header: validate_pages && page_header_check,
@@ -1781,6 +1793,40 @@ fn plaintext_sha1(bytes: &[u8]) -> Result<String, CommandError> {
     Ok(sha1.digest_hex())
 }
 
+/// Transform one file's plaintext into the repo bytes, computing the same
+/// checksum + page-validation outcome both copy paths record.
+///
+/// Shared by [`copy_file`] (the local `std::fs` fast path) and
+/// [`copy_file_storage`] (the non-local `open_write` path) so the
+/// checksum / page-checksum / page-header logic is written exactly once.
+/// Returns the transformed repo bytes alongside a partially-filled
+/// [`CopyResult`] (its `repo_bytes` reflects the transformed length, which the
+/// caller does not need to recompute).
+fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform) -> Result<(Vec<u8>, CopyResult), CommandError> {
+    let checksum = plaintext_sha1(bytes)?;
+
+    // Page-checksum validation runs on the same plaintext bytes the checksum is
+    // taken over, before the transform. A relation file is only validated when
+    // its size is an exact multiple of `PAGE_SIZE`; an unaligned file (or a
+    // non-relation file, which is never flagged) is left unvalidated
+    // (`checksum_page == None`).
+    let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len().is_multiple_of(PAGE_SIZE) {
+        let invalid = validate_relation_pages(bytes, job.validate_page_header);
+        (Some(invalid.is_empty()), invalid)
+    } else {
+        (None, Vec::new())
+    };
+
+    let repo_bytes = transform.apply_forward(bytes)?;
+    let result = CopyResult {
+        checksum,
+        repo_bytes: repo_bytes.len() as u64,
+        checksum_page,
+        invalid_blocks,
+    };
+    Ok((repo_bytes, result))
+}
+
 /// Copy one file into the repo: read `abs_src`, compress-then-encrypt the
 /// plaintext into the repo bytes (the identity transform passes them through),
 /// create the destination's parent directory, and write `abs_dest`. Returns the
@@ -1789,37 +1835,47 @@ fn plaintext_sha1(bytes: &[u8]) -> Result<String, CommandError> {
 /// This is the per-file unit of work run on a dispatcher worker thread. It does
 /// all of its I/O through `std::fs` against absolute paths, so it needs no
 /// `Storage` handle and no borrow from the caller — only the owned `transform`
-/// captured by the worker closure.
+/// captured by the worker closure. This fast path is used **only** for local
+/// (`Posix`/`Cifs`) repos; remote/object repos go through [`copy_file_storage`].
 fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, CommandError> {
     let bytes = std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
 
-    let checksum = plaintext_sha1(&bytes)?;
+    let (repo_bytes, result) = transform_and_validate(job, &bytes, transform)?;
 
-    // Page-checksum validation runs on the same plaintext bytes the checksum is
-    // taken over, before the transform. A relation file is only validated when
-    // its size is an exact multiple of `PAGE_SIZE`; an unaligned file (or a
-    // non-relation file, which is never flagged) is left unvalidated
-    // (`checksum_page == None`).
-    let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-        let invalid = validate_relation_pages(&bytes, job.validate_page_header);
-        (Some(invalid.is_empty()), invalid)
-    } else {
-        (None, Vec::new())
-    };
-
-    let repo_bytes = transform.apply_forward(&bytes)?;
     if let Some(parent) = job.abs_dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
     }
     std::fs::write(&job.abs_dest, &repo_bytes)
         .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dest.display())))?;
 
-    Ok(CopyResult {
-        checksum,
-        repo_bytes: repo_bytes.len() as u64,
-        checksum_page,
-        invalid_blocks,
-    })
+    Ok(result)
+}
+
+/// Copy one file into the repo through the [`Storage`] trait, for a non-local
+/// (remote/object) repo where `std::fs` would write to the wrong machine.
+///
+/// Reads `abs_src` from the local PG data dir (still a `std::fs` read — the
+/// source is always local), runs the **same** transform + page validation as
+/// [`copy_file`] via [`transform_and_validate`], then writes the repo bytes
+/// through `repo_storage.open_write(job.rel_dest)`. Runs serially on the main
+/// thread because the remote storage is single-connection / `!Send` and cannot
+/// be shared across the worker pool. Produces the identical [`CopyResult`] the
+/// parallel path would, so the manifest is filled exactly the same way.
+fn copy_file_storage(job: &CopyJob, transform: &RepoTransform, repo_storage: &dyn Storage) -> Result<CopyResult, CommandError> {
+    let bytes = std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+
+    let (repo_bytes, result) = transform_and_validate(job, &bytes, transform)?;
+
+    // The destination's parent subdirectory (`global/`, `base/<oid>/`, …) may
+    // not exist yet — `open_write` does not create parents — so create it first,
+    // mirroring the local path's `create_dir_all`.
+    let dest = Path::new(&job.rel_dest);
+    if let Some(parent) = dest.parent() {
+        repo_storage.create_path(parent, true)?;
+    }
+    write_repo_file(repo_storage, &job.rel_dest, &repo_bytes)?;
+
+    Ok(result)
 }
 
 /// Inputs to [`run_bundled_copy`]. Grouped into a struct so the signature stays
@@ -1973,14 +2029,23 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
                 }
             } else {
                 // Over the limit: its own object at `<rel><suffix>`, as in the
-                // unbundled path.
-                let abs_dest = job.abs_dest.clone();
-                if let Some(parent) = abs_dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+                // unbundled path. A local repo writes via `std::fs` (the fast
+                // path); a non-local repo must write through the `Storage` trait
+                // so the object lands on the remote/object repo, not locally.
+                if ctx.repo_storage.is_local() {
+                    let abs_dest = job.abs_dest.clone();
+                    if let Some(parent) = abs_dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+                    }
+                    std::fs::write(&abs_dest, &repo_bytes)
+                        .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
+                } else {
+                    if let Some(parent) = Path::new(&job.rel_dest).parent() {
+                        ctx.repo_storage.create_path(parent, true)?;
+                    }
+                    write_repo_file(ctx.repo_storage, &job.rel_dest, &repo_bytes)?;
                 }
-                std::fs::write(&abs_dest, &repo_bytes)
-                    .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
                 ManifestFile {
                     checksum: Some(checksum),
                     checksum_page,
@@ -2267,6 +2332,7 @@ fn copy_job_to_request(job: &CopyJob) -> Request {
             json!(job.abs_dest.to_string_lossy()),
             json!(job.validate_pages),
             json!(job.validate_page_header),
+            json!(job.rel_dest),
         ],
     }
 }
@@ -2289,10 +2355,21 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
     let validate_pages = request.param.get(2).and_then(serde_json::Value::as_bool).unwrap_or(false);
     // The page-header flag defaults to false for older-shaped requests too.
     let validate_page_header = request.param.get(3).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    // The repo-relative destination rides in `param[4]`; older-shaped requests
+    // without it default to empty (the local std::fs path uses `abs_dest`, not
+    // `rel_dest`, so this only matters for the non-local path which never goes
+    // through the dispatcher).
+    let rel_dest = request
+        .param
+        .get(4)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     Ok(CopyJob {
         rel: request.cmd.clone(),
         abs_src: PathBuf::from(abs_src),
         abs_dest: PathBuf::from(abs_dest),
+        rel_dest,
         validate_pages,
         validate_page_header,
     })
@@ -2315,14 +2392,34 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
 /// `job-retry` more times (with `job-retry-interval` between attempts) inside the
 /// worker before the job — and the whole backup — fails. [`JobRetry::none`]
 /// reproduces the single-attempt behaviour exactly.
+///
+/// When `repo_storage` is **not** local (a remote/object backend) the parallel
+/// `std::fs` path is unsafe — `std::fs` would write to the wrong machine — so
+/// the copies run serially on the main thread through
+/// [`copy_file_storage`] (the storage handle is single-connection / `!Send` and
+/// cannot cross the worker boundary). The result is the identical
+/// [`CopyResult`] list, so callers are unaffected by which path ran.
 fn run_copy_jobs(
     jobs: &[CopyJob],
     transform: &RepoTransform,
     worker_count: usize,
     job_retry: JobRetry,
+    repo_storage: &dyn Storage,
 ) -> Result<Vec<(String, CopyResult)>, CommandError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Non-local repo: write every file through the `Storage` trait, serially on
+    // this thread. `std::fs` (the parallel path below) would land the bytes on
+    // the local machine instead of the remote/object repo.
+    if !repo_storage.is_local() {
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let copied = job_retry.run(|| copy_file_storage(job, transform, repo_storage))?;
+            out.push((job.rel.clone(), copied));
+        }
+        return Ok(out);
     }
 
     let dispatcher_jobs: Vec<Job> = jobs
@@ -2552,7 +2649,7 @@ struct UnbundledCopyCtx<'a> {
 ///
 /// Returns the assembled file list and the total repo bytes written.
 fn run_unbundled_copy(mut ctx: UnbundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
-    let copy_results = run_copy_jobs(ctx.jobs, ctx.transform, ctx.process_max, ctx.job_retry)?;
+    let copy_results = run_copy_jobs(ctx.jobs, ctx.transform, ctx.process_max, ctx.job_retry, ctx.repo_storage)?;
     let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
 
     // Move the skeletons + already-decided referenced files out of `ctx` so the
@@ -2675,6 +2772,7 @@ struct BackupPlan {
 fn plan_backup(
     pg_storage: &dyn Storage,
     abs_repo_backup_root: &Path,
+    backup_root: &str,
     transform: &RepoTransform,
     prior_manifest: Option<&Manifest>,
     prior_label: Option<&str>,
@@ -2700,6 +2798,7 @@ fn plan_backup(
                 pg_storage,
                 &entry,
                 abs_repo_backup_root,
+                backup_root,
                 transform,
                 prior_manifest,
                 prior_label,
@@ -3040,6 +3139,7 @@ fn run_backup(
     let mut plan = plan_backup(
         pg_storage,
         &abs_repo_backup_root,
+        &backup_root,
         transform,
         prior_manifest.as_ref(),
         prior_label.as_deref(),
@@ -6762,5 +6862,120 @@ mod tests {
         });
         assert_eq!(result, Err("nope"));
         assert_eq!(calls.get(), 1, "no-retry policy attempts exactly once");
+    }
+
+    /// A `Storage` wrapper that reports itself as **non-local** and records every
+    /// `open_write` path, while delegating all real I/O to an inner [`Posix`].
+    ///
+    /// This simulates a remote/object backend (SSH / S3 / Azure / GCS / SFTP):
+    /// `is_local()` is `false`, so the backup copy path must route data-file
+    /// writes through [`Storage::open_write`] rather than `std::fs`. The
+    /// delegation to `Posix` lets the bytes actually land so the manifest is
+    /// loadable, while the recorded paths prove which writes went through the
+    /// trait — a `std::fs` write would never appear here.
+    struct RecordingStorage {
+        inner: Posix,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingStorage {
+        fn new(inner: Posix) -> Self {
+            Self {
+                inner,
+                writes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn writes(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+            std::sync::Arc::clone(&self.writes)
+        }
+    }
+
+    impl Storage for RecordingStorage {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.writes.lock().unwrap().push(path.to_string_lossy().into_owned());
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    #[test]
+    fn backup_into_non_local_repo_writes_data_files_through_open_write() {
+        // A non-local repo must route every data-file write through the Storage
+        // trait (`open_write`), not `std::fs` — otherwise a remote backup writes
+        // its data files to the local machine and a remote restore fails.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_s = Posix::new(pg.path());
+
+        init_stanza(&repo_inner, "demo");
+        seed_cluster(&pg_s);
+
+        let repo_s = RecordingStorage::new(repo_inner);
+        let writes = repo_s.writes();
+
+        let outcome = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+        assert_eq!(outcome.file_count, 4, "4 non-excluded files expected");
+
+        let recorded = writes.lock().unwrap().clone();
+        let prefix = format!("backup/demo/{LABEL}/");
+
+        // Every data file must have been written through open_write at its
+        // repo-relative path. If the buggy std::fs path were taken, these would
+        // be absent from the recorded set.
+        for rel in ["global/pg_control", "PG_VERSION", "base/1/1259", "base/1/1260"] {
+            let want = format!("{prefix}{rel}");
+            assert!(
+                recorded.contains(&want),
+                "data file {rel} must be written via open_write; recorded writes: {recorded:?}"
+            );
+        }
+
+        // The manifest write also goes through the trait (sanity check).
+        assert!(
+            recorded.iter().any(|p| p == &format!("{prefix}backup.manifest")),
+            "manifest must be written via open_write; recorded writes: {recorded:?}"
+        );
+
+        // The bytes actually landed in the repo and the manifest is consistent.
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let pg_control = manifest.file("global/pg_control").expect("pg_control in manifest");
+        assert_eq!(pg_control.checksum.as_deref(), Some(sha1_hex(b"\x01\x02\x03\x04").as_str()));
     }
 }

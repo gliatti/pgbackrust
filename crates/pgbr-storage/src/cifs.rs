@@ -41,6 +41,12 @@ impl Cifs {
 }
 
 impl Storage for Cifs {
+    fn is_local(&self) -> bool {
+        // CIFS shares mount as local POSIX paths, so the parallel std::fs copy
+        // fast path applies just as it does for Posix.
+        self.inner.is_local()
+    }
+
     fn exists(&self, path: &Path) -> Result<bool, StorageError> {
         self.inner.exists(path)
     }
