@@ -16,11 +16,15 @@ pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 hd()   { printf '\n=== %s ===\n' "$*"; }
 
-# Run a command as root on a node.
-on() { local n="$1"; shift; vagrant ssh "$n" -c "sudo bash -lc '$*'" 2>&1; }
-# Run a command as the postgres user on a node. `-H` sets HOME to postgres's
-# home so ssh (~/.ssh/config) and pgbackrest find their per-user state.
-pg() { local n="$1"; shift; vagrant ssh "$n" -c "sudo -u postgres -H bash -lc '$*'" 2>&1; }
+# Run a command on a node. The command is base64-encoded on the host and decoded
+# on the VM, then piped to a login shell — so SQL/config containing single quotes,
+# double quotes, $, or newlines passes through intact (a bash -lc '...' wrapper
+# would otherwise mangle embedded single quotes, e.g. pg_create_restore_point('x')).
+# The remote command's exit status propagates as the pipeline's status.
+on() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo bash -l" 2>&1; }
+# As `on` but as the postgres user; `-H` sets HOME so ssh (~/.ssh/config) and
+# pgbackrest find their per-user state.
+pg() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo -u postgres -H bash -l" 2>&1; }
 # psql on a node/port as postgres.
 psql_on() { local n="$1" port="$2"; shift 2; pg "$n" "/usr/lib/postgresql/$PGV/bin/psql -p $port -X -A -t -c \"$*\""; }
 
@@ -43,29 +47,18 @@ ok() {
 PRI=/var/lib/postgresql/$PGV/principal
 BIN=/usr/lib/postgresql/$PGV/bin
 
-############################################################################
-hd "Sanity: binary runs on each node"
-for node in depot principal secondaire; do
-  out=$(pg "$node" "pgbackrest version")
-  assert_contains "$out" "pgBackRest" "$node: pgbackrest version"
-done
+# Reset the principal cluster + repository to a clean baseline and create a fresh
+# stanza, so each scenario is self-contained and re-runnable regardless of the
+# state a prior scenario left behind. Asserts the reset and stanza-create.
+prepare_principal() {
+  vagrant upload provision/reset-cluster.sh /tmp/reset-cluster.sh principal >/dev/null 2>&1
+  local reset_out reset_rc
+  reset_out=$(on principal "PGBR_PG_VERSION=$PGV bash /tmp/reset-cluster.sh"); reset_rc=$?
+  if [ "$reset_rc" -eq 0 ]; then pass "reset principal cluster (clean initdb + start)"
+  else printf '%s\n' "$reset_out" | tail -6 >&2; fail "reset principal cluster (exit $reset_rc)"; fi
 
-############################################################################
-hd "Scenario 1 — local minimal backup on principal (KB Exemple 1)"
-# Reset the principal cluster to a clean, running baseline first. A previous run
-# (or a mid-restore failure) can leave the data dir half-restored and unbootable,
-# which would break every step below; this makes the whole scenario re-runnable.
-vagrant upload provision/reset-cluster.sh /tmp/reset-cluster.sh principal >/dev/null 2>&1
-reset_out=$(on principal "PGBR_PG_VERSION=$PGV bash /tmp/reset-cluster.sh"); reset_rc=$?
-if [ "$reset_rc" -eq 0 ]; then pass "reset principal cluster (clean initdb + start)"
-else printf '%s\n' "$reset_out" | tail -6 >&2; fail "reset principal cluster (exit $reset_rc)"; fi
-
-# Reset the repository so the run is deterministic (stanza-create is fresh).
-on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
-
-# principal is its own repo host (local repo). Write the minimal config to the
-# binary's default path (/etc/pgbackrest/pgbackrest.conf).
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+  on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
+  on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrest
 repo1-retention-full=2
@@ -79,9 +72,20 @@ EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf
 install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
 
-# archive_command on principal already points at pgbackrest (provisioning); the
-# cluster is up on 5433. Create + check the stanza.
-ok "stanza-create" principal "pgbackrest --stanza=demo stanza-create"
+  ok "stanza-create" principal "pgbackrest --stanza=demo stanza-create"
+}
+
+############################################################################
+hd "Sanity: binary runs on each node"
+for node in depot principal secondaire; do
+  out=$(pg "$node" "pgbackrest version")
+  assert_contains "$out" "pgBackRest" "$node: pgbackrest version"
+done
+
+############################################################################
+hd "Scenario 1 — local minimal backup on principal (KB Exemple 1)"
+# Clean baseline (cluster + repo + fresh stanza), then the live WAL round-trip.
+prepare_principal
 ok "check (live WAL archive round-trip)" principal "pgbackrest --stanza=demo check"
 
 # Seed data BEFORE the full backup so the restore can prove it survived.
@@ -117,6 +121,54 @@ else
   # Surface the recovery log so a failure is diagnosable from the run output.
   pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2
   fail "restored data (1500 rows) (got: $(printf '%s' "$rows" | tr -d '\n'))"
+fi
+
+############################################################################
+hd "Scenario 2 — PITR to a named restore point (pgstef PITR walkthrough)"
+# Self-contained: fresh promoted primary (archiving active), full backup, then a
+# named restore point as the PITR target with "future" rows after it that must
+# NOT survive a point-in-time restore to that target.
+# The base full backup MUST be taken BEFORE the recovery target so recovery can
+# replay forward to it. (Taking another backup AFTER the restore point would make
+# it the "latest" backup that --type=name restores, and recovery would start
+# after the target and never reach it — a classic PITR ordering mistake.)
+prepare_principal
+ok "PITR full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+
+# Data AFTER the base backup: 1000 rows committed before the restore point (the
+# PITR target), then 500 "future" rows that must NOT survive the restore.
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+psql_on principal 5433 "SELECT pg_create_restore_point('pitr_target')" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
+before=$(psql_on principal 5433 "SELECT count(*) FROM t")  # 1500
+
+# Complete + archive the segment holding the restore point WITHOUT a new backup,
+# so recovery can fetch it: capture the current segment, force a switch, then poll
+# the repo until that segment lands (deterministic; no async-archiver race).
+target_seg=$(psql_on principal 5433 "SELECT pg_walfile_name(pg_current_wal_lsn())" | grep -oE '[0-9A-F]{24}' | head -1)
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+# Poll directly via pg (not ok: ok prepends `timeout 600`, which cannot wrap a
+# `for` loop). The loop is self-bounded to ~60s.
+poll_rc=0
+pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrest/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
+if [ "$poll_rc" -eq 0 ]; then pass "restore-point WAL ($target_seg) archived to repo"
+else fail "restore-point WAL ($target_seg) not archived within 60s"; fi
+
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "PITR restore (--type=name --target=pitr_target --target-action=promote)" principal \
+  "pgbackrest --stanza=demo --delta --type=name --target=pitr_target --target-action=promote restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 120 start" >/dev/null 2>&1
+sleep 5
+after=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+future=$(psql_on principal 5433 "SELECT count(*) FROM t WHERE i>1000" | grep -oE '^[0-9]+$' | head -1)
+# Recovery stops at the restore point: the 1000 base rows survive, the 500
+# "future" rows do not — expect 1000 rows total and 0 future rows.
+if [ "$after" = "1000" ] && [ "$future" = "0" ]; then
+  pass "PITR recovered to named target (1000 base rows kept, future rows dropped)"
+else
+  pg principal "tail -30 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2
+  fail "PITR to named target (before=$before after=$after future=$future, want after=1000 future=0)"
 fi
 
 ############################################################################
