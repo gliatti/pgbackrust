@@ -372,6 +372,72 @@ if [ "$srows2" = "1600" ]; then pass "streaming replication primary -> standby (
 else pg secondaire "tail -15 $SEC/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "streaming replication (standby rows=$srows2, want 1600)"; fi
 
 ############################################################################
+hd "Scenario 8 — PITR to a timestamp (--type=time)"
+prepare_principal
+ok "PITR(time) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+# Capture a recovery target time AFTER the 1000 base rows committed; the 500
+# "future" rows are committed >2s later so they fall strictly after the target.
+target_time=$(psql_on principal 5433 "SELECT now()" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:.+-]+' | head -1)
+sleep 3
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
+target_seg=$(psql_on principal 5433 "SELECT pg_walfile_name(pg_current_wal_lsn())" | grep -oE '[0-9A-F]{24}' | head -1)
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+poll_rc=0
+pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrest/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
+[ "$poll_rc" -eq 0 ] && pass "target WAL ($target_seg) archived" || fail "target WAL not archived in 60s"
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "PITR restore (--type=time --target='$target_time' --target-action=promote)" principal \
+  "pgbackrest --stanza=demo --delta --type=time --target='$target_time' --target-action=promote restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 120 start" >/dev/null 2>&1
+sleep 5
+after=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+future=$(psql_on principal 5433 "SELECT count(*) FROM t WHERE i>1000" | grep -oE '^[0-9]+$' | head -1)
+if [ "$after" = "1000" ] && [ "$future" = "0" ]; then pass "PITR(time) recovered to target (1000 rows, future dropped)"
+else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(time) (after=$after future=$future, want 1000/0)"; fi
+
+############################################################################
+hd "Scenario 9 — multiple repositories (repo1 + repo2, both local on principal)"
+reset_principal_cluster
+on principal "rm -rf /var/lib/pgbackrest/* /var/lib/pgbackrest2/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/lib/pgbackrest2 /var/log/pgbackrest"
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+repo2-path=/var/lib/pgbackrest2
+repo2-retention-full=2
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "stanza-create (2 repos)" principal "pgbackrest --stanza=demo stanza-create"
+ok "check (2 repos)" principal "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup to repo1 (default)" principal "pgbackrest --stanza=demo --repo=1 --type=full backup"
+ok "full backup to repo2" principal "pgbackrest --stanza=demo --repo=2 --type=full backup"
+r1=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+r2=$(on principal "ls /var/lib/pgbackrest2/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+if printf '%s' "$r1" | grep -qE '[1-9]' && printf '%s' "$r2" | grep -qE '[1-9]'; then pass "both repos hold a full backup (repo1=$r1 repo2=$r2)"
+else fail "multi-repo backup placement (repo1=$r1 repo2=$r2, want both >=1)"; fi
+out=$(pg principal "pgbackrest --stanza=demo --repo=2 info")
+assert_contains "$out" "full backup" "repo2 info shows full"
+# Restore explicitly from repo2.
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore from repo2" principal "pgbackrest --stanza=demo --repo=2 --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "restore from repo2 (1500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "restore from repo2 (got: $rows)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
