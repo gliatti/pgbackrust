@@ -199,6 +199,34 @@ use pgbr_storage::{Storage, StorageError, StorageKind};
 use crate::CommandError;
 use crate::pipeline::RepoTransform;
 
+/// Emit a human progress line at `INFO` through the process-global logger.
+///
+/// The restore counterpart of `backup::log_info`: restore progress (command
+/// begin / end, planned dry-run actions) goes through [`pgbr_core::log`] instead
+/// of `println!` so it honours the configured level and `[DRY-RUN]` prefix. The
+/// write result is ignored — a logging failure must never fail the restore.
+fn log_info(message: &str) {
+    let _ = pgbr_core::log::format::log_internal(
+        pgbr_core::log::LOG_LEVEL_INFO,
+        pgbr_core::log::LOG_LEVEL_MIN,
+        pgbr_core::log::LOG_LEVEL_MAX,
+        u32::MAX,
+        file!(),
+        "restore",
+        0,
+        message,
+    );
+}
+
+/// Whether `--dry-run` was supplied. A `Boolean` defaulting to `false`; only an
+/// explicit `true` enables the no-mutation planning mode. C ref: `cfgOptDryRun`.
+fn dry_run_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("dry-run".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
 /// Result of a [`restore_inner`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreOutcome {
@@ -225,8 +253,13 @@ pub struct RestoreOutcome {
     pub links_as_dir: usize,
     /// Relative paths of the recovery files written after the copy pass
     /// (e.g. `recovery.conf`, or `postgresql.auto.conf` + `recovery.signal`).
-    /// Empty when `--type=none`.
+    /// Empty when `--type=none`. Under `--dry-run` these are the files that
+    /// *would* be written; none is actually created.
     pub recovery_files_written: Vec<String>,
+    /// Whether this was a `--dry-run`: every count reflects what a real restore
+    /// *would* do, but **no** files were created, removed, or modified in the PG
+    /// target. C ref: `cfgOptDryRun`.
+    pub dry_run: bool,
 }
 
 fn require_stanza(config: &LoadedConfig) -> Result<&str, CommandError> {
@@ -1618,9 +1651,14 @@ fn destination_absolute_path(storage: &dyn Storage, rel: &Path) -> Result<PathBu
 ///   malformed, if there are no backups to restore, if `--set` names an
 ///   unknown backup, or if a restored file's SHA-1 does not match the
 ///   manifest.
+#[allow(clippy::too_many_lines)]
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
     let delta = delta_enabled(config);
+    let dry_run = dry_run_enabled(config);
+    if dry_run {
+        log_info("dry-run: no files will be restored and PGDATA will not be modified");
+    }
 
     // Selective-restore filters. `--db-include` and `--db-exclude` are mutually
     // exclusive: a database cannot be both kept-only and dropped.
@@ -1663,10 +1701,13 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         other => CommandError::Other(other.to_string()),
     })?;
 
-    // 1. Re-create every directory recorded in the manifest.
+    // 1. Re-create every directory recorded in the manifest. A dry-run counts the
+    //    directories it would create but makes none.
     let mut paths_created = 0;
     for path in &manifest.paths {
-        pg.create_path(Path::new(&path.path), true)?;
+        if !dry_run {
+            pg.create_path(Path::new(&path.path), true)?;
+        }
         paths_created += 1;
     }
 
@@ -1679,6 +1720,10 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     //    never becomes a job.
     let mut files_skipped = 0;
     let mut jobs: Vec<RestoreCopyJob> = Vec::new();
+    // Under --dry-run the copy jobs are never built (building one creates the
+    // destination's parent dir, a mutation); instead the files that *would* be
+    // restored are counted directly.
+    let mut dry_run_restore_count = 0;
     // Resolver that follows whole-file references to the holding backup and
     // builds the physical source (standalone / bundled / block map). It caches
     // referenced manifests + bundle layouts so a multi-file backup loads each
@@ -1695,6 +1740,15 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
 
         if delta && target_matches(pg, &dst, file) {
             files_skipped += 1;
+            continue;
+        }
+
+        if dry_run {
+            // Report the file that would be restored without resolving its source
+            // (which is read-only but unnecessary) or anchoring a destination
+            // (which would create the parent directory). No bytes are touched.
+            log_info(&format!("dry-run: would restore {} ({} byte(s))", file.path, file.size));
+            dry_run_restore_count += 1;
             continue;
         }
 
@@ -1718,14 +1772,24 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // Fan the copy jobs out across `process-max` workers. The hard-fail SHA-1
     // check runs per file inside each worker, so a corrupt file still fails the
     // whole restore; `process-max=1` runs a single worker (the prior serial
-    // path). The number of files planned for copy is the restore count.
-    let files_restored = jobs.len();
+    // path). The number of files planned for copy is the restore count. A dry-run
+    // dispatches nothing — `dry_run_restore_count` is the would-be count.
+    let files_restored = if dry_run { dry_run_restore_count } else { jobs.len() };
     run_restore_jobs(jobs, process_max(config))?;
 
     // 3. Delta restore removes target files absent from the manifest so the
     //    target matches the backup exactly. Walk every restored directory root
-    //    and delete any regular file not listed in `[target:file]`.
-    let files_removed = if delta { remove_stray_files(pg, &manifest)? } else { 0 };
+    //    and delete any regular file not listed in `[target:file]`. A dry-run
+    //    only *counts* the stray files (read-only walk) and removes none.
+    let files_removed = if delta {
+        if dry_run {
+            count_stray_files(pg, &manifest)?
+        } else {
+            remove_stray_files(pg, &manifest)?
+        }
+    } else {
+        0
+    };
 
     // 4. Materialise every `[target:link]` entry in the PG target. Under the
     //    default `repo-symlink=y` this re-creates a real symlink at the link's
@@ -1740,8 +1804,9 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     for link in &manifest.links {
         let link_path = PathBuf::from(&link.path);
         // Defensively create the link's parent directory (paths are created up
-        // front, but a link could sit in an unlisted path).
-        if let Some(parent) = link_path.parent()
+        // front, but a link could sit in an unlisted path). Skipped on a dry run.
+        if !dry_run
+            && let Some(parent) = link_path.parent()
             && !parent.as_os_str().is_empty()
         {
             pg.create_path(parent, true)?;
@@ -1751,8 +1816,13 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         match link_plan(want_repo_symlink) {
             LinkPlan::PlainDir => {
                 // `--no-repo-symlink`: create the link's path as a real directory
-                // inside PGDATA so its restored contents land in-place.
-                pg.create_path(&link_path, true)?;
+                // inside PGDATA so its restored contents land in-place. A dry run
+                // only counts it.
+                if dry_run {
+                    log_info(&format!("dry-run: would create directory {} (link as dir)", link.path));
+                } else {
+                    pg.create_path(&link_path, true)?;
+                }
                 links_as_dir += 1;
             }
             LinkPlan::Symlink => {
@@ -1771,9 +1841,20 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
                         &links_map,
                     ))
                 };
-                match pg.create_symlink(&link_path, &target) {
-                    Ok(()) => links_created += 1,
-                    Err(_) => skipped_links += 1,
+                if dry_run {
+                    // No symlink is created; report the intended link and count it
+                    // as a would-be creation.
+                    log_info(&format!(
+                        "dry-run: would create symlink {} -> {}",
+                        link.path,
+                        target.display()
+                    ));
+                    links_created += 1;
+                } else {
+                    match pg.create_symlink(&link_path, &target) {
+                        Ok(()) => links_created += 1,
+                        Err(_) => skipped_links += 1,
+                    }
                 }
             }
         }
@@ -1782,8 +1863,20 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // 5. Write the version-appropriate recovery configuration. The pure
     //    `recovery_files` generator decides which files and contents apply; the
     //    only impure step is appending the block to any existing
-    //    `postgresql.auto.conf`.
-    let recovery_files_written = write_recovery_files(pg, &manifest.db_version, stanza, config)?;
+    //    `postgresql.auto.conf`. A dry run reports the files it would write
+    //    (computed purely) but creates none.
+    let recovery_files_written = if dry_run {
+        let planned: Vec<String> = recovery_files(&manifest.db_version, stanza, config)
+            .into_iter()
+            .map(|(rel, _)| rel.to_string_lossy().into_owned())
+            .collect();
+        for rel in &planned {
+            log_info(&format!("dry-run: would write recovery file {rel}"));
+        }
+        planned
+    } else {
+        write_recovery_files(pg, &manifest.db_version, stanza, config)?
+    };
 
     Ok(RestoreOutcome {
         label,
@@ -1795,6 +1888,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         skipped_links,
         links_as_dir,
         recovery_files_written,
+        dry_run,
     })
 }
 
@@ -1847,13 +1941,15 @@ fn append_to_existing(pg: &dyn Storage, rel: &Path, block: &str) -> Result<Vec<u
     Ok(existing)
 }
 
-/// Delete every regular file under the manifest's directory roots that is not
-/// listed in the manifest's `[target:file]` set, returning the number removed.
+/// Collect every regular file under the manifest's directory roots that is not
+/// listed in the manifest's `[target:file]` set (the stray files a delta restore
+/// would remove). Read-only.
 ///
 /// Roots are the top-level components of the manifest's recorded paths and
 /// files, so the walk covers exactly the tree the backup describes without
-/// descending into unrelated parts of the filesystem.
-fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
+/// descending into unrelated parts of the filesystem. Shared by
+/// [`remove_stray_files`] and the dry-run [`count_stray_files`].
+fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<Vec<PathBuf>, CommandError> {
     use std::collections::BTreeSet;
 
     // The set of paths the manifest captured — anything else under the roots is stray.
@@ -1878,17 +1974,32 @@ fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, Co
         collect_target_files(pg, root, &mut present)?;
     }
 
-    let mut files_removed = 0;
+    let mut stray = Vec::new();
     for rel in present {
         // Compare against the manifest's `/`-joined string keys.
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if !kept.contains(rel_str.as_str()) {
-            pg.remove(&rel, false)?;
-            files_removed += 1;
+            stray.push(rel);
         }
     }
+    Ok(stray)
+}
 
+/// Delete every stray target file (see [`stray_files`]), returning the count.
+fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
+    let stray = stray_files(pg, manifest)?;
+    let mut files_removed = 0;
+    for rel in stray {
+        pg.remove(&rel, false)?;
+        files_removed += 1;
+    }
     Ok(files_removed)
+}
+
+/// Count the stray target files (see [`stray_files`]) a delta restore *would*
+/// remove, without deleting any. The dry-run counterpart of [`remove_stray_files`].
+fn count_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
+    Ok(stray_files(pg, manifest)?.len())
 }
 
 /// `restore` — restore a backup into a PG data directory.
@@ -1898,13 +2009,19 @@ fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, Co
 /// # Errors
 ///
 /// Forwards every error from [`restore_inner`].
-#[allow(clippy::print_stdout)]
 pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+    log_info("restore command begin");
     let outcome = restore_inner(config, repo_storage, pg_storage)?;
 
-    println!(
-        "restore: backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) created, \
+    let prefix = if outcome.dry_run {
+        "dry-run: would restore"
+    } else {
+        "restore:"
+    };
+    log_info(&format!(
+        "{} backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) created, \
          {} link(s) skipped, {} link(s) as dir, {} recovery file(s) written",
+        prefix,
         outcome.label,
         outcome.files_restored,
         outcome.files_skipped,
@@ -1914,7 +2031,7 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
         outcome.skipped_links,
         outcome.links_as_dir,
         outcome.recovery_files_written.len(),
-    );
+    ));
 
     Ok(())
 }
@@ -1931,7 +2048,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{RestoreOutcome, restore_inner};
+    use super::{RestoreOutcome, dry_run_enabled, restore_inner};
     use crate::CommandError;
 
     /// SHA-1 of `bytes`, computed the way `restore` recomputes it, so fixtures
@@ -4681,5 +4798,94 @@ mod tests {
             contents.contains("archive_mode = off"),
             "archive_mode = off must appear in the generated config: {contents}"
         );
+    }
+
+    // ---- dry-run restore ---------------------------------------------------
+
+    /// A restore config with `--dry-run` enabled (plus an optional `--set`).
+    fn cfg_dry_run(stanza: Option<&str>, set: Option<&str>) -> LoadedConfig {
+        let mut config = cfg(stanza, set);
+        config
+            .options
+            .insert(("dry-run".to_owned(), None), OptionValue::Boolean(true));
+        config
+    }
+
+    #[test]
+    fn dry_run_restore_writes_nothing_but_reports_counts() {
+        // A dry-run restore reports the files / directories it *would* create but
+        // leaves the PG target empty.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let a = b"PG_VERSION contents".as_slice();
+        let b = b"base table page bytes".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[
+                ("pg_data/PG_VERSION", a, Some(sha1_hex(a))),
+                ("pg_data/base/1/1259", b, Some(sha1_hex(b))),
+            ],
+            &["pg_data", "pg_data/base", "pg_data/base/1"],
+            &[],
+        );
+
+        let outcome = restore_inner(&cfg_dry_run(Some(stanza), None), &repo_s, &pg_s).expect("dry-run restore");
+
+        // Counts report what a real restore would do.
+        assert!(outcome.dry_run, "outcome flagged as dry-run");
+        assert_eq!(outcome.files_restored, 2, "dry-run reports the would-be restore count");
+        assert_eq!(outcome.paths_created, 3, "dry-run reports the would-be path count");
+
+        // Nothing was written into the PG target: neither files nor directories.
+        assert!(
+            !pg_s.exists(Path::new("pg_data/PG_VERSION")).unwrap(),
+            "dry-run must not write files"
+        );
+        assert!(
+            !pg_s.exists(Path::new("pg_data")).unwrap(),
+            "dry-run must not create directories"
+        );
+    }
+
+    #[test]
+    fn dry_run_restore_skips_recovery_files() {
+        // A dry-run reports the recovery files it would write (computed purely)
+        // but creates none.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        // PG 14 -> postgresql.auto.conf + recovery.signal would be written.
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+
+        let outcome = restore_inner(&cfg_dry_run(Some(stanza), None), &repo_s, &pg_s).expect("dry-run restore");
+
+        // The recovery files are *reported* (would-be) ...
+        assert!(
+            outcome.recovery_files_written.iter().any(|f| f == "postgresql.auto.conf"),
+            "dry-run reports the would-be recovery files: {:?}",
+            outcome.recovery_files_written
+        );
+        // ... but none was actually created.
+        assert!(
+            !pg_s.exists(Path::new("postgresql.auto.conf")).unwrap(),
+            "dry-run must not write recovery files"
+        );
+        assert!(
+            !pg_s.exists(Path::new("recovery.signal")).unwrap(),
+            "dry-run must not write recovery.signal"
+        );
+    }
+
+    #[test]
+    fn dry_run_option_reader_defaults_false() {
+        assert!(!dry_run_enabled(&cfg(Some("demo"), None)));
+        assert!(dry_run_enabled(&cfg_dry_run(Some("demo"), None)));
     }
 }
