@@ -16,6 +16,11 @@ fs2 = "0.4"
 pgbr-build = { path = "../pgbr-build" }
 pgbr-compress = { path = "../pgbr-compress" }
 pgbr-config = { path = "../pgbr-config" }
+# Logger: human-facing progress / warning output is rerouted through
+# `pgbr_core::log` (the migrated `src/common/log.c` formatter) so machine-readable
+# command results stay on stdout while status lines honour the configured log
+# level / file sink. The `capture` submodule backs the unit-test assertions.
+pgbr-core = { path = "../pgbr-core" }
 # libpq wrapper: lets stanza-create/upgrade learn the cluster identity from a
 # live PostgreSQL connection (server_version_num + pg_control_system()) instead
 # of only reading global/pg_control off disk.
@@ -35,6 +40,13 @@ pgbr-storage = { path = "../pgbr-storage" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 serde_json = "1"
+# TCP keepalive on accepted `server` sockets: std's `TcpStream` exposes only
+# `set_nodelay`, not the keepalive idle / interval / count knobs the
+# `tcp-keep-alive-*` options map to. `socket2` borrows the socket fd via
+# `SockRef::from` (no ownership transfer, no `unsafe` in this crate) and sets
+# `SO_KEEPALIVE` plus the per-socket timers. Pure Rust, links no C library. The
+# `all` feature unlocks `TcpKeepalive::with_retries` (the probe-count knob).
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 # `rcgen` generates the self-signed cert used by the TLS round-trip tests.

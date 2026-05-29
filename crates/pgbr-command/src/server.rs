@@ -55,6 +55,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::{IoError, IoRead, IoWrite};
@@ -65,12 +66,107 @@ use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, RootCertStore, ServerConfig, ServerConnection, SideData, StreamOwned,
     SupportedCipherSuite,
 };
+use socket2::{SockRef, TcpKeepalive};
 
 use crate::CommandError;
 
 /// Default bind / connect address used when the configured
 /// `tls-server-address` / `tls-server-port` options are absent.
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8432";
+
+/// Resolved TCP keepalive settings for accepted `server` connections.
+///
+/// `sck-keep-alive` (default `true`) is the master switch: when off, no
+/// keepalive is configured on the accepted socket at all. When on, `SO_KEEPALIVE`
+/// is enabled and the `tcp-keep-alive-idle` / `-interval` / `-count` options —
+/// when set — tune the per-socket idle time, probe interval, and probe count.
+/// C ref: `sckOptionSet` / `sckKeepAlive` applied to accepted sockets in
+/// `src/common/io/socket/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeepAlive {
+    /// Master switch (`sck-keep-alive`). When false nothing is applied.
+    enabled: bool,
+    /// `tcp-keep-alive-idle`, seconds of idle before the first probe.
+    idle: Option<u32>,
+    /// `tcp-keep-alive-interval`, seconds between probes.
+    interval: Option<u32>,
+    /// `tcp-keep-alive-count`, number of unacknowledged probes before drop.
+    count: Option<u32>,
+}
+
+impl Default for KeepAlive {
+    fn default() -> Self {
+        // Matches the `sck-keep-alive` default (`true`) with no explicit timers,
+        // so the public `serve_*` helpers (and their tests) enable plain
+        // `SO_KEEPALIVE` without tuning the timers.
+        Self {
+            enabled: true,
+            idle: None,
+            interval: None,
+            count: None,
+        }
+    }
+}
+
+impl KeepAlive {
+    /// Resolve the keepalive settings from the resolved configuration.
+    fn from_config(config: &LoadedConfig) -> Self {
+        // `sck-keep-alive` is a boolean defaulting to true; absence means on.
+        let enabled = match config.options.get(&("sck-keep-alive".to_owned(), None)) {
+            Some(OptionValue::Boolean(b)) => *b,
+            _ => true,
+        };
+        Self {
+            enabled,
+            idle: keepalive_secs(config, "tcp-keep-alive-idle"),
+            interval: keepalive_secs(config, "tcp-keep-alive-interval"),
+            count: keepalive_secs(config, "tcp-keep-alive-count"),
+        }
+    }
+
+    /// Apply these settings to an accepted [`TcpStream`], best-effort.
+    ///
+    /// A failure to set a socket option is logged and ignored: keepalive tuning
+    /// is an optimisation, never a reason to drop an otherwise-good connection
+    /// (the C side likewise treats `setsockopt` failures as warnings).
+    fn apply(self, stream: &TcpStream) {
+        if !self.enabled {
+            return;
+        }
+        let mut ka = TcpKeepalive::new();
+        if let Some(secs) = self.idle {
+            ka = ka.with_time(Duration::from_secs(u64::from(secs)));
+        }
+        if let Some(secs) = self.interval {
+            ka = ka.with_interval(Duration::from_secs(u64::from(secs)));
+        }
+        // `with_retries` (probe count, `TCP_KEEPCNT`) is gated by socket2 per
+        // target; the dev / CI build targets Linux (Debian 13, see CLAUDE.md)
+        // where it is available. Guard so a non-Linux build still compiles —
+        // there the probe count is simply not applied (best-effort).
+        #[cfg(target_os = "linux")]
+        if let Some(c) = self.count {
+            ka = ka.with_retries(c);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = self.count;
+        if let Err(err) = SockRef::from(stream).set_tcp_keepalive(&ka) {
+            crate::control::log_warn(&format!("unable to set tcp keepalive on accepted socket: {err}"));
+        }
+    }
+}
+
+/// Read a positive `tcp-keep-alive-*` integer option as `u32` seconds / count,
+/// dropping absent or non-positive values.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn keepalive_secs(config: &LoadedConfig, name: &str) -> Option<u32> {
+    match config.options.get(&(name.to_owned(), None)) {
+        // The allow-ranges in config.yaml cap these well within u32, so the cast
+        // of a validated positive i64 cannot truncate.
+        Some(OptionValue::Integer(v)) if *v > 0 => Some(*v as u32),
+        _ => None,
+    }
+}
 
 /// Protocol error code returned for malformed or unexpected requests.
 ///
@@ -247,9 +343,17 @@ fn split(stream: TcpStream) -> Result<(TcpIo, TcpIo), CommandError> {
 /// [`CommandError::Other`] on an accept / clone failure, or whatever [`serve`]
 /// returns for a protocol or write error.
 pub fn serve_listener(listener: &TcpListener) -> Result<(), CommandError> {
+    serve_listener_with(listener, KeepAlive::default())
+}
+
+/// [`serve_listener`] with explicit keepalive settings applied to the accepted
+/// socket. The config-driven `server` path threads the resolved [`KeepAlive`]
+/// here; the public [`serve_listener`] uses the default.
+fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive) -> Result<(), CommandError> {
     let (stream, _peer) = listener
         .accept()
         .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+    keepalive.apply(&stream);
     let (mut reader, mut writer) = split(stream)?;
     serve(&mut reader, &mut writer)?;
     // Signal a clean EOF to the peer; ignore an already-closed socket.
@@ -265,8 +369,14 @@ pub fn serve_listener(listener: &TcpListener) -> Result<(), CommandError> {
 /// [`CommandError::Other`] if the address cannot be bound, plus anything
 /// [`serve_listener`] returns.
 pub fn serve_tcp(addr: &str) -> Result<(), CommandError> {
+    serve_tcp_with(addr, KeepAlive::default())
+}
+
+/// [`serve_tcp`] with explicit keepalive settings.
+fn serve_tcp_with(addr: &str, keepalive: KeepAlive) -> Result<(), CommandError> {
     let listener = TcpListener::bind(addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
-    serve_listener(&listener)
+    crate::control::log_info(&format!("server listening (tcp) on {addr}"));
+    serve_listener_with(&listener, keepalive)
 }
 
 /// Connect a [`TcpStream`] to `addr` and run [`ping_exchange`] over its
@@ -923,6 +1033,7 @@ pub fn serve_tls(
     let (stream, _peer) = listener
         .accept()
         .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+    KeepAlive::default().apply(&stream);
 
     let conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
     let io = SharedTlsIo::new(TlsServerIo::new(StreamOwned::new(conn, stream)));
@@ -963,9 +1074,24 @@ pub fn serve_tls_storage(
     stanza: Option<&str>,
     root: &std::path::Path,
 ) -> Result<(), CommandError> {
+    serve_tls_storage_with(listener, server_config, auth, stanza, root, KeepAlive::default())
+}
+
+/// [`serve_tls_storage`] with explicit keepalive settings applied to the
+/// accepted socket before the TLS handshake. The config-driven `server` path
+/// threads the resolved [`KeepAlive`] here.
+fn serve_tls_storage_with(
+    listener: &TcpListener,
+    server_config: Arc<ServerConfig>,
+    auth: &BTreeMap<String, Vec<String>>,
+    stanza: Option<&str>,
+    root: &std::path::Path,
+    keepalive: KeepAlive,
+) -> Result<(), CommandError> {
     let (stream, _peer) = listener
         .accept()
         .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
+    keepalive.apply(&stream);
 
     let mut conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
 
@@ -1135,6 +1261,7 @@ fn server_root(config: &LoadedConfig) -> std::path::PathBuf {
 /// protocol / write error from the serve loop).
 pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let addr = server_address(config);
+    let keepalive = KeepAlive::from_config(config);
 
     match (
         option_path(config, "tls-server-cert-file"),
@@ -1154,9 +1281,12 @@ pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), 
             let auth = tls_server_auth(config);
             let root = server_root(config);
             let listener = TcpListener::bind(&addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
-            serve_tls_storage(&listener, server_config, &auth, config.stanza.as_deref(), &root)
+            // Human-facing progress line goes to the logger; the served protocol
+            // is the command's machine-readable output on the socket.
+            crate::control::log_info(&format!("server listening (tls) on {addr}"));
+            serve_tls_storage_with(&listener, server_config, &auth, config.stanza.as_deref(), &root, keepalive)
         }
-        _ => serve_tcp(&addr),
+        _ => serve_tcp_with(&addr, keepalive),
     }
 }
 
@@ -1364,6 +1494,81 @@ mod tests {
             (("tls-server-port", None), OptionValue::Integer(0)),
         ]);
         assert_eq!(server_address(&bad_port), DEFAULT_ADDRESS);
+    }
+
+    // --- TCP keepalive (sck-keep-alive + tcp-keep-alive-*) -------------------
+
+    #[test]
+    fn keepalive_from_config_reads_options() {
+        // All knobs set, master switch on (default).
+        let cfg = config_with(vec![
+            (("tcp-keep-alive-idle", None), OptionValue::Integer(60)),
+            (("tcp-keep-alive-interval", None), OptionValue::Integer(10)),
+            (("tcp-keep-alive-count", None), OptionValue::Integer(5)),
+        ]);
+        let ka = KeepAlive::from_config(&cfg);
+        assert!(ka.enabled);
+        assert_eq!(ka.idle, Some(60));
+        assert_eq!(ka.interval, Some(10));
+        assert_eq!(ka.count, Some(5));
+    }
+
+    #[test]
+    fn keepalive_from_config_master_switch_off() {
+        let cfg = config_with(vec![(("sck-keep-alive", None), OptionValue::Boolean(false))]);
+        let ka = KeepAlive::from_config(&cfg);
+        assert!(!ka.enabled, "sck-keep-alive=false must disable keepalive");
+    }
+
+    #[test]
+    fn keepalive_defaults_enabled_without_timers() {
+        // No options: keepalive on (sck-keep-alive defaults true), no timers.
+        let ka = KeepAlive::from_config(&config_with(vec![]));
+        assert!(ka.enabled);
+        assert_eq!(ka.idle, None);
+        assert_eq!(ka.interval, None);
+        assert_eq!(ka.count, None);
+    }
+
+    #[test]
+    fn keepalive_apply_enables_so_keepalive_on_accepted_socket() {
+        // Bind, connect, accept, apply keepalive, then read SO_KEEPALIVE back
+        // via socket2 to confirm it was enabled on the accepted socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        let ka = KeepAlive {
+            enabled: true,
+            idle: Some(42),
+            interval: Some(7),
+            count: None,
+        };
+        ka.apply(&server_stream);
+
+        let sock = SockRef::from(&server_stream);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be enabled after apply");
+    }
+
+    #[test]
+    fn keepalive_apply_disabled_is_noop() {
+        // With the master switch off, apply must not enable SO_KEEPALIVE.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        KeepAlive {
+            enabled: false,
+            idle: Some(60),
+            interval: None,
+            count: None,
+        }
+        .apply(&server_stream);
+
+        let sock = SockRef::from(&server_stream);
+        assert!(!sock.keepalive().unwrap(), "disabled keepalive must leave SO_KEEPALIVE off");
     }
 
     #[test]

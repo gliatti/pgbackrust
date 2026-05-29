@@ -328,7 +328,57 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
     if let Some(user) = opt("pg1-user") {
         parts.push(format!("user={user}"));
     }
+
+    // Connection timeout (`db-timeout`, a `time` option in milliseconds) maps to
+    // libpq `connect_timeout`, which is expressed in *seconds*. Round up so a
+    // sub-second timeout still yields at least one second (libpq treats 0 as
+    // "no timeout", which would silently disable the bound). C ref: the
+    // `connect_timeout` set from `cfgOptionUInt64(cfgOptDbTimeout)` in
+    // `src/db/db.c` / `src/postgres/client.c`.
+    if let Some(ms) = time_opt(config, "db-timeout") {
+        let secs = ms.div_ceil(1000).max(1);
+        parts.push(format!("connect_timeout={secs}"));
+    }
+
+    // TCP keepalive (`tcp-keep-alive-idle` / `-interval` / `-count`, integer
+    // seconds / probe counts) maps to the libpq `keepalives_*` parameters. Any
+    // configured value turns keepalives on (`keepalives=1`); each present knob is
+    // forwarded. C ref: `pgClientOpen` setting `keepalives_idle` /
+    // `keepalives_interval` / `keepalives_count` in `src/postgres/client.c`.
+    let idle = integer_opt(config, "tcp-keep-alive-idle");
+    let interval = integer_opt(config, "tcp-keep-alive-interval");
+    let count = integer_opt(config, "tcp-keep-alive-count");
+    if idle.is_some() || interval.is_some() || count.is_some() {
+        parts.push("keepalives=1".to_owned());
+        if let Some(v) = idle {
+            parts.push(format!("keepalives_idle={v}"));
+        }
+        if let Some(v) = interval {
+            parts.push(format!("keepalives_interval={v}"));
+        }
+        if let Some(v) = count {
+            parts.push(format!("keepalives_count={v}"));
+        }
+    }
+
     Some(parts.join(" "))
+}
+
+/// Read a `time` option (milliseconds) with no group index.
+fn time_opt(config: &LoadedConfig, name: &str) -> Option<u64> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Time(ms)) => Some(*ms),
+        _ => None,
+    }
+}
+
+/// Read an `integer` option with no group index, dropping non-positive values
+/// (libpq keepalive knobs are positive seconds / probe counts).
+fn integer_opt(config: &LoadedConfig, name: &str) -> Option<i64> {
+    match config.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Integer(v)) if *v > 0 => Some(*v),
+        _ => None,
+    }
 }
 
 /// Resolve the cluster identity, preferring a live libpq connection when one is
@@ -1121,6 +1171,82 @@ mod tests {
         assert!(conninfo.contains("host=db.example"), "conninfo was {conninfo:?}");
         assert!(conninfo.contains("port=5433"), "conninfo was {conninfo:?}");
         assert!(conninfo.contains("dbname=postgres"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn derive_conninfo_appends_connect_timeout_from_db_timeout() {
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        // db-timeout is a `time` option in milliseconds: 30_000 ms -> 30 s.
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(30_000));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo");
+        assert!(conninfo.contains("connect_timeout=30"), "conninfo was {conninfo:?}");
+
+        // A sub-second timeout still rounds up to at least one second so libpq
+        // does not treat it as "no timeout".
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(250));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo");
+        assert!(conninfo.contains("connect_timeout=1"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn derive_conninfo_appends_keepalive_params() {
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        cfg.options
+            .insert(("tcp-keep-alive-idle".to_owned(), None), OptionValue::Integer(60));
+        cfg.options
+            .insert(("tcp-keep-alive-interval".to_owned(), None), OptionValue::Integer(10));
+        cfg.options
+            .insert(("tcp-keep-alive-count".to_owned(), None), OptionValue::Integer(5));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo");
+        assert!(conninfo.contains("keepalives=1"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("keepalives_idle=60"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("keepalives_interval=10"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("keepalives_count=5"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn derive_conninfo_keepalive_partial_still_enables() {
+        // Only one keepalive knob set: keepalives is still turned on and just
+        // that knob forwarded.
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        cfg.options
+            .insert(("tcp-keep-alive-idle".to_owned(), None), OptionValue::Integer(120));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo");
+        assert!(conninfo.contains("keepalives=1"), "conninfo was {conninfo:?}");
+        assert!(conninfo.contains("keepalives_idle=120"), "conninfo was {conninfo:?}");
+        assert!(!conninfo.contains("keepalives_interval"), "conninfo was {conninfo:?}");
+        assert!(!conninfo.contains("keepalives_count"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn derive_conninfo_no_keepalive_or_timeout_when_unset() {
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options
+            .insert(("pg1-host".to_owned(), None), OptionValue::String("db.example".to_owned()));
+        let conninfo = derive_conninfo_with_url(&cfg, None).expect("conninfo");
+        assert!(!conninfo.contains("keepalives"), "conninfo was {conninfo:?}");
+        assert!(!conninfo.contains("connect_timeout"), "conninfo was {conninfo:?}");
+    }
+
+    #[test]
+    fn derive_conninfo_database_url_unchanged_by_timeout_and_keepalive() {
+        // A DATABASE_URL is a complete URI and must be returned verbatim — the
+        // connect_timeout / keepalive params are only appended to the
+        // config-derived conninfo, never to a user-supplied URL.
+        let mut cfg = config_with_stanza(Some("demo"));
+        cfg.options.insert(("db-timeout".to_owned(), None), OptionValue::Time(30_000));
+        cfg.options
+            .insert(("tcp-keep-alive-idle".to_owned(), None), OptionValue::Integer(60));
+        assert_eq!(
+            derive_conninfo_with_url(&cfg, Some("host=/tmp dbname=postgres")).as_deref(),
+            Some("host=/tmp dbname=postgres"),
+        );
     }
 
     // Live-PostgreSQL stanza-create through the libpq identity path. Skipped by

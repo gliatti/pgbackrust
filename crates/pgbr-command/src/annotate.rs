@@ -180,19 +180,23 @@ pub fn annotate_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<Annot
 
 /// `annotate` — attach key/value annotations to an existing backup.
 ///
+/// The confirmation line is a *human-facing* status message, so it is routed
+/// through the logger ([`crate::control::log_info`]) at `INFO` rather than
+/// written to stdout — `annotate` produces no machine-readable result, and the
+/// C command likewise reports success with `LOG_INFO`, not a `printf`.
+///
 /// # Errors
 ///
 /// Surfaces whatever [`annotate_inner`] returns; see its docs.
-#[allow(clippy::print_stdout)]
 pub fn annotate(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let result = annotate_inner(config, repo_storage)?;
 
-    println!(
+    crate::control::log_info(&format!(
         "backup set '{}' annotated ({} set, {} removed)",
         result.backup_label,
         result.set_keys.len(),
         result.removed_keys.len()
-    );
+    ));
 
     Ok(())
 }
@@ -209,7 +213,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{CommandError, annotate_inner, merge_annotations};
+    use super::{CommandError, annotate, annotate_inner, merge_annotations};
 
     /// Build a `BTreeMap` of update pairs for the pure merge tests.
     fn updates(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -401,5 +405,44 @@ mod tests {
             CommandError::MissingOption { option } => assert_eq!(option, "set"),
             other => panic!("expected MissingOption, got {other:?}"),
         }
+    }
+
+    /// Serializes the process-global `pgbr_core::log` state across the capture
+    /// tests in this crate so concurrent `cargo test` threads do not race on it.
+    static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn annotate_confirmation_goes_to_logger_not_stdout() {
+        // The success line is routed through `pgbr_core::log`, not `println!`.
+        // Install the in-memory capture sink, raise the file-sink level to INFO,
+        // run the public `annotate`, and assert the rendered INFO line landed in
+        // the capture buffer (proving it took the logger path).
+        let _guard = LOG_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+        let label = "20240101-120000F";
+        let _seed = seed_backup_info(&repo, "demo", label, json!({ "backup-label": label }));
+
+        pgbr_core::log::capture::install();
+        // Route INFO to the (captured) file sink; the banner is emitted once per
+        // session, so reset it so the capture starts clean.
+        pgbr_core::log::set_level_file(pgbr_core::log::LOG_LEVEL_INFO);
+        pgbr_core::log::set_file_banner(false);
+
+        let cfg = fake_config("demo", Some(label), &[("key1", "value1")]);
+        annotate(&cfg, &repo).expect("annotate should succeed");
+
+        let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes are utf-8");
+        pgbr_core::log::capture::uninstall();
+
+        assert!(
+            captured.contains("backup set '20240101-120000F' annotated (1 set, 0 removed)"),
+            "logger should carry the annotate confirmation, got: {captured:?}"
+        );
+        assert!(
+            captured.contains("INFO:"),
+            "confirmation must be logged at INFO, got: {captured:?}"
+        );
     }
 }

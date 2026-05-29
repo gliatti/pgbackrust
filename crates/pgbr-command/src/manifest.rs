@@ -35,6 +35,36 @@ fn require_set(config: &LoadedConfig) -> Result<&str, CommandError> {
     }
 }
 
+/// The `--filter` option: a regular expression matched against each manifest
+/// entry's name (the same `string` option `repo-ls` uses, shared in
+/// `config.yaml`). `None` when unset.
+fn filter_opt(config: &LoadedConfig) -> Option<String> {
+    match config.options.get(&("filter".to_owned(), None)) {
+        Some(OptionValue::String(value) | OptionValue::StringId(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Apply the `--filter` regular expression (when set) to a loaded [`Manifest`],
+/// retaining only the file / path / link entries whose name matches. Mirrors
+/// `repo-ls --filter`: the pattern is matched against the entry name with
+/// [`pgbr_regex::Regex::is_match`].
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if the pattern is not a valid regular expression.
+fn apply_filter(config: &LoadedConfig, manifest: &mut Manifest) -> Result<(), CommandError> {
+    let Some(pattern) = filter_opt(config) else {
+        return Ok(());
+    };
+    let regex = pgbr_regex::Regex::new(pattern.as_bytes())
+        .map_err(|err| CommandError::Other(format!("invalid --filter regex `{pattern}`: {err}")))?;
+    manifest.files.retain(|f| regex.is_match(f.path.as_bytes()));
+    manifest.paths.retain(|p| regex.is_match(p.path.as_bytes()));
+    manifest.links.retain(|l| regex.is_match(l.path.as_bytes()));
+    Ok(())
+}
+
 /// Repository-relative path to a backup's manifest.
 fn manifest_path(stanza: &str, label: &str) -> PathBuf {
     PathBuf::from(format!("backup/{stanza}/{label}/backup.manifest"))
@@ -47,7 +77,7 @@ fn manifest_path(stanza: &str, label: &str) -> PathBuf {
 ///
 /// - [`CommandError::MissingOption`] if `--stanza` or `--set` was not supplied.
 /// - [`CommandError::Other`] if the manifest for the named backup does not
-///   exist in the repository.
+///   exist in the repository, or `--filter` is not a valid regular expression.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] for other backend
 ///   failures, and [`CommandError::Other`] for a malformed manifest.
 pub fn manifest_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<Manifest, CommandError> {
@@ -55,13 +85,20 @@ pub fn manifest_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<Manif
     let label = require_set(config)?.to_owned();
 
     let path = manifest_path(stanza, &label);
-    Manifest::load(repo, &path).map_err(|err| match err {
+    let mut manifest = Manifest::load(repo, &path).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => {
             CommandError::Other(format!("manifest for backup '{label}' not found"))
         }
         InfoError::Storage(storage_err) => CommandError::Storage(storage_err),
         other => CommandError::Other(other.to_string()),
-    })
+    })?;
+
+    // `--filter`: keep only entries whose name matches the regular expression
+    // (mirrors `repo-ls --filter`). Applied before rendering so the dump and
+    // the returned structure agree.
+    apply_filter(config, &mut manifest)?;
+
+    Ok(manifest)
 }
 
 /// `manifest` — print a backup's metadata and its file / path / link inventory.
@@ -242,5 +279,68 @@ mod tests {
             "expected pg_data/PG_VERSION among {:?}",
             loaded.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    /// `fake_config` plus a `--filter` regular expression.
+    fn fake_config_filtered(stanza: Option<&str>, set: Option<&str>, filter: &str) -> LoadedConfig {
+        let mut cfg = fake_config(stanza, set);
+        cfg.options
+            .insert(("filter".to_owned(), None), OptionValue::String(filter.to_owned()));
+        cfg
+    }
+
+    #[test]
+    fn manifest_filter_keeps_matching_entries() {
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+
+        let label = "20240101-120000F";
+        seed_manifest(&repo, "demo", &sample_manifest(label));
+
+        // Only the PG_VERSION file matches; the base/1/1259 file, the pg_data
+        // path, and the pg_wal link are all dropped.
+        let cfg = fake_config_filtered(Some("demo"), Some(label), "PG_VERSION$");
+        let loaded = manifest_inner(&cfg, &repo).expect("manifest_inner with filter should succeed");
+
+        assert_eq!(loaded.files.len(), 1, "only PG_VERSION should remain");
+        assert_eq!(loaded.files[0].path, "pg_data/PG_VERSION");
+        assert!(loaded.paths.is_empty(), "no path matches PG_VERSION$");
+        assert!(loaded.links.is_empty(), "no link matches PG_VERSION$");
+    }
+
+    #[test]
+    fn manifest_filter_matches_paths_and_links() {
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+
+        let label = "20240101-120000F";
+        seed_manifest(&repo, "demo", &sample_manifest(label));
+
+        // `pg_wal` appears only in the link destination path name; `pg_data`
+        // prefixes every entry. Filter on the link's leaf to prove links are
+        // matched too.
+        let cfg = fake_config_filtered(Some("demo"), Some(label), "pg_wal$");
+        let loaded = manifest_inner(&cfg, &repo).expect("manifest_inner with filter should succeed");
+
+        assert!(loaded.files.is_empty(), "no file ends in pg_wal");
+        assert!(loaded.paths.is_empty(), "no path ends in pg_wal");
+        assert_eq!(loaded.links.len(), 1, "the pg_wal link should remain");
+        assert_eq!(loaded.links[0].path, "pg_data/pg_wal");
+    }
+
+    #[test]
+    fn manifest_filter_invalid_regex_errors() {
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+
+        let label = "20240101-120000F";
+        seed_manifest(&repo, "demo", &sample_manifest(label));
+
+        let cfg = fake_config_filtered(Some("demo"), Some(label), "[unterminated");
+        let err = manifest_inner(&cfg, &repo).expect_err("invalid filter regex must error");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("invalid --filter regex"), "got: {msg}"),
+            other => panic!("expected Other(invalid --filter regex), got {other:?}"),
+        }
     }
 }

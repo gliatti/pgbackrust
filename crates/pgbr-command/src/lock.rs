@@ -29,6 +29,16 @@ use crate::CommandError;
 /// default in `src/build/config/config.yaml`.
 const DEFAULT_LOCK_PATH: &str = "/tmp/pgbackrest";
 
+/// Resolve the lock directory from the configured `lock-path`, falling back to
+/// [`DEFAULT_LOCK_PATH`].
+///
+/// `lock-path` is the user-facing knob that controls *where* every advisory
+/// lock and stop file lives; it is honoured by all of [`stop`] / [`start`] /
+/// [`is_stopped`] (via [`stop_file`]) and by [`acquire_command_lock`] (via
+/// [`resolved_lock_path`]), so a custom `--lock-path` redirects the whole lock
+/// surface consistently. (The separate `lock` *list* option in `config.yaml` is
+/// an `internal` remote-protocol detail — the names of locks a remote worker is
+/// asked to hold — and is consumed by the protocol layer, not here.)
 fn lock_path(config: &LoadedConfig) -> PathBuf {
     match config.options.get(&("lock-path".to_owned(), None)) {
         Some(OptionValue::Path(p) | OptionValue::String(p)) => PathBuf::from(p),
@@ -374,5 +384,48 @@ mod tests {
         };
         // Handle dropped at end of the block above; file is cleaned up.
         assert!(!path.exists(), "drop must remove the stale lock file");
+    }
+
+    use std::collections::BTreeMap;
+
+    use pgbr_config::ConfigCommandRole;
+
+    fn config_with(stanza: Option<&str>, opts: Vec<(&str, OptionValue)>) -> LoadedConfig {
+        let mut options = BTreeMap::new();
+        for (name, value) in opts {
+            options.insert((name.to_owned(), None), value);
+        }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: stanza.map(str::to_owned),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lock_path_option_is_honored() {
+        // A configured `--lock-path` redirects both the resolved lock directory
+        // and the stop file; an absent option falls back to the default.
+        let cfg = config_with(
+            Some("demo"),
+            vec![("lock-path", OptionValue::Path("/custom/locks".to_owned()))],
+        );
+        assert_eq!(resolved_lock_path(&cfg), PathBuf::from("/custom/locks"));
+        assert_eq!(stop_file_path(&cfg), PathBuf::from("/custom/locks/demo.stop"));
+
+        let default_cfg = config_with(Some("demo"), Vec::new());
+        assert_eq!(resolved_lock_path(&default_cfg), PathBuf::from(DEFAULT_LOCK_PATH));
+        assert_eq!(
+            stop_file_path(&default_cfg),
+            PathBuf::from(DEFAULT_LOCK_PATH).join("demo.stop")
+        );
+    }
+
+    #[test]
+    fn stop_file_uses_all_when_no_stanza() {
+        let cfg = config_with(None, vec![("lock-path", OptionValue::Path("/l".to_owned()))]);
+        assert_eq!(stop_file_path(&cfg), PathBuf::from("/l/all.stop"));
     }
 }
