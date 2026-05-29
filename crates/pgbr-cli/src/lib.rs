@@ -236,6 +236,13 @@ where
     // sidesteps the full-config default validation the parent already passed.
     let worker_cfg = worker_loaded_config(&resolved);
     if pgbr_command::worker::is_worker(&worker_cfg) {
+        // log-subprocess: the parent passes `--log-subprocess --log-level-file=<level>`
+        // down to the worker (see `worker_log_args`). When set, honour it by
+        // opening the worker's own file log at the inherited level before it
+        // starts serving the protocol, so subprocess activity is captured. With
+        // log-subprocess unset the worker stays console-only (the default), so
+        // this is a no-op for the common single-host case.
+        init_worker_logging(&worker_cfg, &cfg);
         return finish_dispatch(pgbr_command::worker::run_worker_stdio(&worker_cfg));
     }
 
@@ -610,6 +617,47 @@ fn resolve_log_level(loaded: &LoadedConfig, name: &str, fallback: &str) -> i32 {
         .unwrap_or_else(|| log_level_from_id(fallback).unwrap_or(pgbr_core::log::LOG_LEVEL_WARN))
 }
 
+/// Whether an explicit `detail-level=full` asks for the *full* (detailed)
+/// output and should therefore raise the effective console level to at least
+/// `DETAIL`.
+///
+/// `detail-level` (the `info` command option, `full` | `progress`, with a
+/// schema default of `full`) controls how much per-item detail the output
+/// carries. An explicit `full` wants the complete listing, so the console
+/// verbosity floor is lifted to `DETAIL` to let the detail lines through;
+/// `progress` keeps the terser level. The bump only ever *raises* the floor,
+/// never lowers it.
+///
+/// Only an explicitly-resolved value is honoured here: when the option is absent
+/// from the resolved map (every command other than `info`, and an `info`
+/// invocation whose default has not been materialised) this returns `false` so
+/// non-`info` commands keep their configured console level untouched. Returns
+/// `true` only when the resolved value is `full`.
+fn detail_level_raises_console(loaded: &LoadedConfig) -> bool {
+    matches!(string_id_option(loaded, "detail-level").as_deref(), Some("full"))
+}
+
+/// Build the extra argv tokens that propagate logging into a spawned
+/// remote / local worker when `log-subprocess` is enabled.
+///
+/// pgBackRest's `log-subprocess` (a `global`, `boolean`, default `false` option)
+/// asks the parent to enable file logging in any subprocess it creates, using
+/// the parent's `log-level-file`. The worker is otherwise launched with console
+/// logging only; with `log-subprocess=true` the parent passes the flag plus the
+/// resolved file level down so the child opens its own `<stanza>-<command>.log`.
+/// Returns an empty vector when `log-subprocess` is unset / false (no
+/// propagation). When set, it returns `["--log-subprocess",
+/// "--log-level-file=<level>"]` so the child's own config resolution turns file
+/// logging on at the inherited level. C ref: `cfgOptionBool(cfgOptLogSubprocess)`
+/// handling in `src/protocol/helper.c`.
+fn worker_log_args(loaded: &LoadedConfig) -> Vec<String> {
+    if !bool_option(loaded, "log-subprocess").unwrap_or(false) {
+        return Vec::new();
+    }
+    let file_level = string_id_option(loaded, "log-level-file").unwrap_or_else(|| DEFAULT_LOG_LEVEL_FILE.to_owned());
+    vec!["--log-subprocess".to_owned(), format!("--log-level-file={file_level}")]
+}
+
 /// Read an ungrouped `string`/`string-id`/`path` option as a [`String`].
 fn string_id_option(loaded: &LoadedConfig, name: &str) -> Option<String> {
     loaded.options.get(&(name.to_owned(), None)).and_then(|v| match v {
@@ -709,7 +757,52 @@ fn apply_process_options(loaded: &LoadedConfig, cfg: &Cfg) {
         pgbr_protocol::set_network_compress_level(level);
     }
 
+    // log-subprocess: publish the worker-logging propagation tokens so the
+    // worker-spawning storage helpers append them to the child argv (see
+    // `worker_log_propagation_args`). Empty when log-subprocess is unset/false.
+    set_worker_log_propagation_args(worker_log_args(loaded));
+
     init_logging(loaded, cfg);
+}
+
+/// Process-global propagation tokens for `log-subprocess`: the extra argv the
+/// parent appends to every spawned worker so the child enables file logging at
+/// the inherited `log-level-file`. Set once by [`apply_process_options`] from
+/// [`worker_log_args`] and read by the worker-spawning storage helpers via
+/// [`worker_log_propagation_args`]. Empty (the default) means no propagation.
+static WORKER_LOG_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record the `log-subprocess` worker-argv propagation tokens for the rest of
+/// the process. Idempotent (first writer wins, matching the once-per-invocation
+/// `apply_process_options` call).
+fn set_worker_log_propagation_args(args: Vec<String>) {
+    let _ = WORKER_LOG_ARGS.set(args);
+}
+
+/// The extra argv tokens a spawned worker should be launched with to honour
+/// `log-subprocess` (`["--log-subprocess", "--log-level-file=<level>"]`), or an
+/// empty slice when the option is unset/false.
+///
+/// Set from the resolved config by [`apply_process_options`]; consumed by the
+/// remote/local worker-spawn path so the propagation reaches the child. Returns
+/// an empty slice before [`apply_process_options`] has run.
+#[must_use]
+pub fn worker_log_propagation_args() -> &'static [String] {
+    WORKER_LOG_ARGS.get().map_or(&[], Vec::as_slice)
+}
+
+/// Initialise logging for a *worker* invocation, honouring `log-subprocess`.
+///
+/// A worker is normally console-only (it serves the protocol on stdin/stdout and
+/// is short-lived). When the parent propagated `log-subprocess` (and, with it,
+/// `--log-level-file`) onto the worker's argv, the worker opens its own file log
+/// so subprocess activity is captured — exactly the behaviour `log-subprocess`
+/// promises. When the flag is absent this is a no-op, leaving the worker's
+/// logging untouched.
+fn init_worker_logging(worker_cfg: &LoadedConfig, cfg: &Cfg) {
+    if bool_option(worker_cfg, "log-subprocess").unwrap_or(false) {
+        init_logging(worker_cfg, cfg);
+    }
 }
 
 /// Initialise `pgbr_core::log` from the resolved logging options.
@@ -741,6 +834,15 @@ fn init_logging(loaded: &LoadedConfig, cfg: &Cfg) {
 
     // --verbose bumps the console to at least DETAIL.
     if bool_option(loaded, "verbose").unwrap_or(false) {
+        level_console = level_console.max(pgbr_core::log::LOG_LEVEL_DETAIL);
+    }
+
+    // detail-level (info command, `full` | `progress`, default `full`): `full`
+    // asks for the complete, detailed listing, so raise the console floor to at
+    // least DETAIL so the extra per-backup detail lines are actually emitted;
+    // `progress` keeps the terser console level. This is the detail threshold
+    // the renderer's verbosity is gated on. See `detail_level_raises_console`.
+    if detail_level_raises_console(loaded) {
         level_console = level_console.max(pgbr_core::log::LOG_LEVEL_DETAIL);
     }
 
@@ -1338,8 +1440,8 @@ option:
     use pgbr_config::{ConfigCommandRole, LoadedConfig};
 
     use super::{
-        apply_legacy_compress, apply_process_options, init_logging, load_static_cfg as load_cfg, log_level_from_id,
-        resolve_log_level, resolve_process_id,
+        apply_legacy_compress, apply_process_options, detail_level_raises_console, init_logging, load_static_cfg as load_cfg,
+        log_level_from_id, resolve_log_level, resolve_process_id, worker_log_args,
     };
 
     /// Serialises the tests that touch process-global logger / io / protocol
@@ -1524,6 +1626,95 @@ option:
         assert!(
             log_dir.path().join("demo-backup.log").exists(),
             "init_logging should open <log-path>/<stanza>-<command>.log"
+        );
+    }
+
+    #[test]
+    fn detail_level_full_raises_console_progress_does_not() {
+        // detail-level=full asks for the detailed listing → raise.
+        let full = loaded(
+            "info",
+            Some("demo"),
+            &[("detail-level", None, OptionValue::StringId("full".to_owned()))],
+        );
+        assert!(detail_level_raises_console(&full));
+
+        // detail-level=progress keeps the terser level → no raise.
+        let progress = loaded(
+            "info",
+            Some("demo"),
+            &[("detail-level", None, OptionValue::StringId("progress".to_owned()))],
+        );
+        assert!(!detail_level_raises_console(&progress));
+
+        // Absent (non-info commands, or an unmaterialised default) → no raise,
+        // so the configured console level is left untouched.
+        let absent = loaded("backup", Some("demo"), &[]);
+        assert!(!detail_level_raises_console(&absent));
+    }
+
+    #[test]
+    fn detail_level_full_bumps_console_to_detail() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cfg = load_cfg().expect("config compiles");
+        // Console resolves to WARN by default, but detail-level=full lifts it to
+        // at least DETAIL. Keep the file sink off so no log file is opened.
+        let loaded_cfg = loaded(
+            "info",
+            Some("demo"),
+            &[
+                ("log-level-console", None, OptionValue::StringId("warn".to_owned())),
+                ("log-level-file", None, OptionValue::StringId("off".to_owned())),
+                ("detail-level", None, OptionValue::StringId("full".to_owned())),
+            ],
+        );
+        init_logging(&loaded_cfg, &cfg);
+        assert!(
+            pgbr_core::log::level_std_out() >= pgbr_core::log::LOG_LEVEL_DETAIL,
+            "detail-level=full should raise the console floor to at least DETAIL"
+        );
+    }
+
+    #[test]
+    fn worker_log_args_propagates_only_when_log_subprocess_set() {
+        // Unset → no propagation.
+        let none = loaded("backup", Some("demo"), &[]);
+        assert!(worker_log_args(&none).is_empty());
+
+        // Explicit false → no propagation.
+        let off = loaded(
+            "backup",
+            Some("demo"),
+            &[("log-subprocess", None, OptionValue::Boolean(false))],
+        );
+        assert!(worker_log_args(&off).is_empty());
+
+        // Set → `--log-subprocess` plus the inherited file level.
+        let on = loaded(
+            "backup",
+            Some("demo"),
+            &[
+                ("log-subprocess", None, OptionValue::Boolean(true)),
+                ("log-level-file", None, OptionValue::StringId("detail".to_owned())),
+            ],
+        );
+        assert_eq!(
+            worker_log_args(&on),
+            vec!["--log-subprocess".to_owned(), "--log-level-file=detail".to_owned()],
+        );
+
+        // Set without an explicit file level → falls back to the file default.
+        let on_default = loaded(
+            "backup",
+            Some("demo"),
+            &[("log-subprocess", None, OptionValue::Boolean(true))],
+        );
+        assert_eq!(
+            worker_log_args(&on_default),
+            vec![
+                "--log-subprocess".to_owned(),
+                format!("--log-level-file={}", super::DEFAULT_LOG_LEVEL_FILE),
+            ],
         );
     }
 }
