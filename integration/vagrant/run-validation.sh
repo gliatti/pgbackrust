@@ -59,13 +59,16 @@ reset_principal_cluster() {
   else printf '%s\n' "$reset_out" | tail -6 >&2; fail "reset principal cluster (exit $reset_rc)"; fi
 }
 
-prepare_principal() {
+# Reset cluster + local repo, write a [global] whose extra lines are $1 (e.g.
+# cipher / compress / retention knobs), then stanza-create. $1 may be multi-line.
+prepare_principal_cfg() {
+  local extra="$1"
   reset_principal_cluster
   on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
   on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrest
-repo1-retention-full=2
+$extra
 log-level-console=info
 log-path=/var/log/pgbackrest
 start-fast=y
@@ -78,6 +81,9 @@ install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackre
 
   ok "stanza-create" principal "pgbackrest --stanza=demo stanza-create"
 }
+
+# The KB Exemple 1 minimal config (local repo, retention-full=2).
+prepare_principal() { prepare_principal_cfg "repo1-retention-full=2"; }
 
 ############################################################################
 hd "Sanity: binary runs on each node"
@@ -229,6 +235,70 @@ sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
 if [ "$rows" = "1500" ]; then pass "remote-repo restored data (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "remote-repo restored data (got: $rows)"; fi
+
+############################################################################
+hd "Scenario 4 — encrypted repository (repo1-cipher-type=aes-256-cbc)"
+prepare_principal_cfg "repo1-retention-full=2
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=demo-cipher-passphrase"
+ok "check (encrypted repo)" principal "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup (encrypted)" principal "pgbackrest --stanza=demo --type=full backup"
+# Stored repo files must be OpenSSL-encrypted (the "Salted__" magic), not plaintext.
+hdr=$(on principal "f=\$(find /var/lib/pgbackrest/backup/demo -name 'pg_control*' | head -1); head -c6 \"\$f\" 2>/dev/null")
+assert_contains "$hdr" "Salted" "backup files encrypted (OpenSSL Salted__ header)"
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore (encrypted repo)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "encrypted restore data (1500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "encrypted restore data (got: $rows)"; fi
+
+############################################################################
+hd "Scenario 5 — zstd compression + differential backup + retention/expire"
+prepare_principal_cfg "repo1-retention-full=2
+compress-type=zst
+compress-level=3"
+ok "check (zstd repo)" principal "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup #1 (zstd)" principal "pgbackrest --stanza=demo --type=full backup"
+zst=$(on principal "ls /var/lib/pgbackrest/backup/demo/*F/global/pg_control* 2>/dev/null")
+assert_contains "$zst" ".zst" "backup files zstd-compressed (.zst suffix)"
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "differential backup (zstd)" principal "pgbackrest --stanza=demo --type=diff backup"
+ok "full backup #2 (zstd)" principal "pgbackrest --stanza=demo --type=full backup"
+fulls_before=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+ok "expire (--repo1-retention-full=1)" principal "pgbackrest --stanza=demo expire --repo1-retention-full=1"
+fulls_after=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+if [ "${fulls_before:-0}" = "2" ] && [ "${fulls_after:-0}" = "1" ]; then pass "expire kept newest full only ($fulls_before -> $fulls_after)"
+else fail "expire retention (full dirs before=$fulls_before after=$fulls_after, want 2 -> 1)"; fi
+
+############################################################################
+hd "Scenario 6 — block-incremental + file bundling (repo-block, repo-bundle)"
+prepare_principal_cfg "repo1-retention-full=2
+repo1-block=y
+repo1-bundle=y"
+ok "check (block+bundle repo)" principal "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,2000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup (block+bundle)" principal "pgbackrest --stanza=demo --type=full backup"
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(2001,2500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "incr backup (block+bundle)" principal "pgbackrest --stanza=demo --type=incr backup"
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore (block+bundle)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "2500" ]; then pass "block+bundle restored data (2500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "block+bundle restored data (got: $rows)"; fi
 
 ############################################################################
 printf '\n==================================================\n'
