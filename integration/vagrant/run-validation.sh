@@ -751,6 +751,42 @@ if [ "$in_rec" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "PIT
 else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(lsn) outcome (in_recovery=$in_rec rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+hd "Scenario 17 — info --output=json (machine-parsable) + expire --set=<label> (targeted)"
+# Two distinct documented features that combine naturally: the JSON output is
+# the canonical way for tooling to drive expire --set. Asserts (a) the JSON
+# output starts with `[` and ends with `]` (smoke-tests well-formed structure
+# without needing python on the MSYS host), (b) two backups appear as two
+# `"label" : "..."` entries in the JSON, (c) expire --set=<label1> removes
+# ONLY that backup. Labels are extracted with grep/sed (pgbackrest formats
+# labels as <YYYYMMDD>-<HHMMSS>{F,D,I}), so the harness stays bash-only.
+extract_labels_from_json() {
+  # echo each label in the JSON on its own line, in order. Empty if none.
+  printf '%s' "$1" | grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/'
+}
+prepare_principal
+out=$(pg principal "pgbackrest --stanza=demo info --output=json")
+first_nonblank=$(printf '%s' "$out" | sed -n '/[^[:space:]]/{p;q}')
+last_nonblank=$(printf '%s' "$out" | awk 'NF{l=$0}END{print l}')
+if [ "$first_nonblank" = "[" ] && [ "$last_nonblank" = "]" ]; then pass "info --output=json (empty repo) is a well-formed JSON array"
+else printf '%s\n' "$out" | tail -4 >&2; fail "info --output=json (empty) not bracketed (first=$first_nonblank last=$last_nonblank)"; fi
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+ok "full backup #1 (for expire --set)" principal "pgbackrest --stanza=demo --type=full backup"
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
+ok "full backup #2 (for expire --set)" principal "pgbackrest --stanza=demo --type=full backup"
+json=$(pg principal "pgbackrest --stanza=demo info --output=json")
+mapfile -t LABELS < <(extract_labels_from_json "$json")
+if [ "${#LABELS[@]}" = "2" ]; then pass "info --output=json shows both backups (${LABELS[0]}, ${LABELS[1]})"
+else fail "info --output=json missed backups (got ${#LABELS[@]}: ${LABELS[*]})"; fi
+LABEL1="${LABELS[0]:-}"
+LABEL2="${LABELS[1]:-}"
+ok "expire --set=$LABEL1 (targeted deletion)" principal "pgbackrest --stanza=demo expire --set=$LABEL1"
+post=$(pg principal "pgbackrest --stanza=demo info --output=json")
+mapfile -t REMAINING < <(extract_labels_from_json "$post")
+if [ "${#REMAINING[@]}" = "1" ] && [ "${REMAINING[0]}" = "$LABEL2" ]; then pass "expire --set removed only the targeted backup ($LABEL1 gone, $LABEL2 kept)"
+else fail "expire --set wrong outcome (remaining ${#REMAINING[@]}: ${REMAINING[*]}, want only $LABEL2)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
