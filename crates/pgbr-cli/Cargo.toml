@@ -16,6 +16,9 @@ path = "src/main.rs"
 pgbr-build = { path = "../pgbr-build" }
 pgbr-command = { path = "../pgbr-command" }
 pgbr-config = { path = "../pgbr-config" }
+# Process logger (`pgbr_core::log`): the CLI initialises it from the resolved
+# log-level / log-path / log-timestamp / exec-id options at startup.
+pgbr-core = { path = "../pgbr-core" }
 # The RemoteProcessStorage wrapper delegates the IoRead / IoWrite of the
 # RemoteStorage proxy, so pgbr-io's traits are part of the lib's public surface.
 pgbr-io = { path = "../pgbr-io" }
@@ -31,6 +34,12 @@ pgbr-storage = { path = "../pgbr-storage" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 # Re-exported as the error type for `pgbr_build::parse_config` failures.
 serde_yml = "0.0.12"
+
+# Process-control syscalls for the startup options: `umask(0)` (neutral-umask)
+# and `setpriority` (priority). Unix-only — Windows has no POSIX equivalent, so
+# those options degrade to a logged no-op there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Used by the cargo-native e2e test (tests/e2e.rs) to seed a synthetic PG data

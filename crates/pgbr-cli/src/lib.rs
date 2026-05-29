@@ -8,7 +8,11 @@
 //! [`storage_helper`]), and dispatches to the real command implementations.
 //! `version` / `help` short-circuit before any storage is built.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// `unsafe` is denied (not forbidden) so the two libc FFI shims for the
+// process-control options (`neutral-umask` → `umask(0)`, `priority` →
+// `setpriority`) can opt in locally with `#[allow(unsafe_code)]`. Every other
+// item in the crate stays unsafe-free.
+#![cfg_attr(not(test), deny(unsafe_code))]
 
 use std::path::PathBuf;
 
@@ -235,7 +239,16 @@ where
         return finish_dispatch(pgbr_command::worker::run_worker_stdio(&worker_cfg));
     }
 
-    let loaded = load_resolved(resolved, &cfg, ctx)?;
+    let mut loaded = load_resolved(resolved, &cfg, ctx)?;
+
+    // Apply the process-level options before any work: set the umask, feed the
+    // exec-id / priority / buffer-size / timeout / network-compression globals,
+    // and initialise the logger from the resolved log-* options + the command's
+    // log-level-default. Then fold the deprecated `compress` boolean into
+    // `compress-type` / `compress-level` so the command stack sees only the
+    // modern options.
+    apply_legacy_compress(&mut loaded);
+    apply_process_options(&loaded, &cfg);
 
     dispatch_loaded(&loaded)
 }
@@ -538,6 +551,317 @@ fn config_file_path(resolved: &ResolvedCli) -> PathBuf {
         _ => PathBuf::from(DEFAULT_CONFIG_PATH),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process / logging / network option wiring (Tasks 15, 16, 24)
+//
+// After the config is resolved the binary applies the cross-cutting options
+// that have no command-specific home: the logger setup, the process-control
+// options (umask, exec-id, priority), the I/O / protocol / network globals the
+// low-level crates read, and the legacy `compress` boolean fold-down. These all
+// live here because they are owned by the top-level invocation, not by any one
+// command.
+// ---------------------------------------------------------------------------
+
+/// Default `log-path` when the option is absent (matches `config.yaml`).
+const DEFAULT_LOG_PATH: &str = "/var/log/pgbackrest";
+
+/// Fallback console log level when `log-level-console` is absent from the
+/// resolved map (matches `config.yaml`'s default).
+const DEFAULT_LOG_LEVEL_CONSOLE: &str = "warn";
+
+/// Fallback stderr log level when `log-level-stderr` is absent. The task's
+/// requested fallback is `warn`; `config.yaml`'s own default (`off`) flows
+/// through the resolved map on the normal path, so this only applies when the
+/// option is missing entirely.
+const DEFAULT_LOG_LEVEL_STDERR: &str = "warn";
+
+/// Fallback file log level when `log-level-file` is absent (matches
+/// `config.yaml`'s default).
+const DEFAULT_LOG_LEVEL_FILE: &str = "info";
+
+/// Map a `log-level-*` string-id (`off|error|warn|info|detail|debug|trace`) to
+/// its `pgbr_core::log` numeric level.
+///
+/// `assert` has no string-id (it is synthesised internally), so it is absent
+/// from the table — mirroring `config.yaml`'s `log-level-console` allow-list.
+/// Returns `None` for an unrecognised id.
+#[must_use]
+fn log_level_from_id(id: &str) -> Option<i32> {
+    Some(match id {
+        "off" => pgbr_core::log::LOG_LEVEL_OFF,
+        "error" => pgbr_core::log::LOG_LEVEL_ERROR,
+        "warn" => pgbr_core::log::LOG_LEVEL_WARN,
+        "info" => pgbr_core::log::LOG_LEVEL_INFO,
+        "detail" => pgbr_core::log::LOG_LEVEL_DETAIL,
+        "debug" => pgbr_core::log::LOG_LEVEL_DEBUG,
+        "trace" => pgbr_core::log::LOG_LEVEL_TRACE,
+        _ => return None,
+    })
+}
+
+/// Resolve a `log-level-*` option to a numeric level, falling back to `fallback`
+/// (one of the `DEFAULT_LOG_LEVEL_*` ids) when the option is absent or carries
+/// an unrecognised value.
+fn resolve_log_level(loaded: &LoadedConfig, name: &str, fallback: &str) -> i32 {
+    string_id_option(loaded, name)
+        .as_deref()
+        .and_then(log_level_from_id)
+        .unwrap_or_else(|| log_level_from_id(fallback).unwrap_or(pgbr_core::log::LOG_LEVEL_WARN))
+}
+
+/// Read an ungrouped `string`/`string-id`/`path` option as a [`String`].
+fn string_id_option(loaded: &LoadedConfig, name: &str) -> Option<String> {
+    loaded.options.get(&(name.to_owned(), None)).and_then(|v| match v {
+        OptionValue::String(s) | OptionValue::StringId(s) | OptionValue::Path(s) => Some(s.clone()),
+        _ => None,
+    })
+}
+
+/// Read an ungrouped `boolean` option.
+fn bool_option(loaded: &LoadedConfig, name: &str) -> Option<bool> {
+    match loaded.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Boolean(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Read an ungrouped `integer` option.
+fn int_option(loaded: &LoadedConfig, name: &str) -> Option<i64> {
+    match loaded.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Integer(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Read an ungrouped `size` option (bytes).
+fn size_option(loaded: &LoadedConfig, name: &str) -> Option<u64> {
+    match loaded.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Size(s)) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Read an ungrouped `time` option (milliseconds).
+fn time_ms_option(loaded: &LoadedConfig, name: &str) -> Option<u64> {
+    match loaded.options.get(&(name.to_owned(), None)) {
+        Some(OptionValue::Time(ms)) => Some(*ms),
+        _ => None,
+    }
+}
+
+/// Fold the deprecated `compress` boolean into the modern `compress-type` (and,
+/// implicitly, `compress-level`) options on the resolved config.
+///
+/// pgBackRest keeps `compress` only for backward compatibility (`cfgLoadUpdateOption`
+/// in `src/config/load.c`): `compress=y` selects `compress-type=gz` and
+/// `compress=n` selects `compress-type=none`, but only when `compress-type` was
+/// not set explicitly (the modern option wins). The command stack reads
+/// `compress-type` / `compress-level`, so the fold-down must happen before
+/// dispatch. The level is left to `compress-level`'s own per-type default.
+fn apply_legacy_compress(loaded: &mut LoadedConfig) {
+    let Some(compress) = bool_option(loaded, "compress") else {
+        return;
+    };
+    // The modern option, when present, always wins over the deprecated boolean.
+    if loaded.options.contains_key(&("compress-type".to_owned(), None)) {
+        return;
+    }
+    let compress_type = if compress { "gz" } else { "none" };
+    loaded.options.insert(
+        ("compress-type".to_owned(), None),
+        OptionValue::StringId(compress_type.to_owned()),
+    );
+}
+
+/// Apply the cross-cutting process options once the config is resolved: set the
+/// umask, derive the process id, set the scheduling priority, feed the
+/// buffer-size / io-timeout / protocol-timeout / compress-level-network globals
+/// the low-level crates read, then initialise the logger.
+fn apply_process_options(loaded: &LoadedConfig, cfg: &Cfg) {
+    // neutral-umask (default y): clear the umask so files/dirs are created with
+    // their full mode, matching pgBackRest. Best-effort and Unix-only.
+    if bool_option(loaded, "neutral-umask").unwrap_or(true) {
+        set_neutral_umask();
+    }
+
+    // priority: best-effort scheduling nice level (Unix-only).
+    if let Some(priority) = int_option(loaded, "priority") {
+        set_process_priority(priority);
+    }
+
+    // buffer-size → pgbr_io copy buffer; io-timeout → pgbr_io timeout;
+    // protocol-timeout / compress-level-network → pgbr_protocol globals.
+    if let Some(size) = size_option(loaded, "buffer-size")
+        && let Ok(size) = usize::try_from(size)
+    {
+        pgbr_io::set_copy_buffer_size(size);
+    }
+    if let Some(ms) = time_ms_option(loaded, "io-timeout") {
+        pgbr_io::set_io_timeout_ms(ms);
+    }
+    if let Some(ms) = time_ms_option(loaded, "protocol-timeout") {
+        pgbr_protocol::set_protocol_timeout_ms(ms);
+    }
+    if let Some(level) = int_option(loaded, "compress-level-network")
+        && let Ok(level) = i32::try_from(level)
+    {
+        pgbr_protocol::set_network_compress_level(level);
+    }
+
+    init_logging(loaded, cfg);
+}
+
+/// Initialise `pgbr_core::log` from the resolved logging options.
+///
+/// Maps `log-level-console` → stdout level, `log-level-stderr` → stderr level,
+/// `log-level-file` → file level; honours the per-command `log-level-default`
+/// as a verbosity floor and `--verbose` as a console floor; sets the timestamp
+/// flag from `log-timestamp` and the process id from `exec-id` (or the OS pid);
+/// and, when the file level is not OFF, opens
+/// `<log-path>/<stanza>-<command>.log` (or `all-server.log` for `server`) and
+/// installs it as the file sink.
+fn init_logging(loaded: &LoadedConfig, cfg: &Cfg) {
+    let mut level_console = resolve_log_level(loaded, "log-level-console", DEFAULT_LOG_LEVEL_CONSOLE);
+    let level_stderr = resolve_log_level(loaded, "log-level-stderr", DEFAULT_LOG_LEVEL_STDERR);
+    let mut level_file = resolve_log_level(loaded, "log-level-file", DEFAULT_LOG_LEVEL_FILE);
+
+    // The per-command log-level-default raises the verbosity floor for the
+    // command's standard messages (louder wins). Applies to the console and
+    // file sinks, not stderr (which stays an error channel).
+    if let Some(default) = cfg
+        .commands
+        .get(&loaded.command)
+        .and_then(|c| c.log_level_default.as_deref())
+        .and_then(|d| log_level_from_id(&d.to_ascii_lowercase()))
+    {
+        level_console = level_console.max(default);
+        level_file = level_file.max(default);
+    }
+
+    // --verbose bumps the console to at least DETAIL.
+    if bool_option(loaded, "verbose").unwrap_or(false) {
+        level_console = level_console.max(pgbr_core::log::LOG_LEVEL_DETAIL);
+    }
+
+    let timestamp = bool_option(loaded, "log-timestamp").unwrap_or(true);
+    let process_id = resolve_process_id(loaded);
+
+    pgbr_core::log::init(level_console, level_stderr, level_file, timestamp, process_id, 1, false);
+
+    // Open the log file only when the file sink is active.
+    if level_file != pgbr_core::log::LOG_LEVEL_OFF {
+        open_log_file(loaded);
+    }
+}
+
+/// Resolve the process id used as the logger's `Pxx` prefix: the `exec-id`
+/// option's numeric prefix when present (`exec-id` is `<pid>-<random>`),
+/// otherwise the OS process id. Clamped to the logger's 0..=999 range.
+fn resolve_process_id(loaded: &LoadedConfig) -> u32 {
+    if let Some(exec_id) = string_id_option(loaded, "exec-id") {
+        // exec-id is `<pid>-<hex>`; take the leading numeric component.
+        let head = exec_id.split('-').next().unwrap_or(&exec_id);
+        if let Ok(pid) = head.parse::<u32>() {
+            return pid % 1000;
+        }
+    }
+    std::process::id() % 1000
+}
+
+/// Open `<log-path>/<stanza>-<command>.log` (or `all-server.log` for the
+/// `server` command) in append mode, creating the directory tree, and install
+/// it as the logger's file sink.
+///
+/// Best-effort: if the path can't be created or opened the file sink stays
+/// disabled (the console / stderr sinks still work) — pgBackRest likewise does
+/// not abort the command on a log-file open failure here.
+#[allow(clippy::print_stderr)] // a log-open failure is surfaced to stderr by design.
+fn open_log_file(loaded: &LoadedConfig) {
+    let log_path = string_id_option(loaded, "log-path").unwrap_or_else(|| DEFAULT_LOG_PATH.to_owned());
+    let file_name = if loaded.command == "server" {
+        "all-server.log".to_owned()
+    } else {
+        let stanza = loaded.stanza.as_deref().unwrap_or("all");
+        format!("{stanza}-{}.log", loaded.command)
+    };
+    let full = PathBuf::from(&log_path).join(file_name);
+
+    if let Some(parent) = full.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("unable to create log path {}: {err}", parent.display());
+        return;
+    }
+
+    match std::fs::OpenOptions::new().create(true).append(true).open(&full) {
+        Ok(file) => install_log_file_fd(file),
+        Err(err) => eprintln!("unable to open log file {}: {err}", full.display()),
+    }
+}
+
+/// Process-global slot that owns the open log [`std::fs::File`] for the lifetime
+/// of the process, keeping the raw fd handed to the logger valid.
+static LOG_FILE: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Install `file`'s raw fd as the logger's file sink and keep `file` alive in
+/// [`LOG_FILE`] so the fd is not closed out from under the logger.
+#[cfg(unix)]
+fn install_log_file_fd(file: std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    let file = LOG_FILE.get_or_init(|| file);
+    pgbr_core::log::set_fd_file(file.as_raw_fd());
+    // Re-promote level_any now that the file fd is open (the file level only
+    // counts toward `any` once the fd is set).
+    pgbr_core::log::any_set();
+}
+
+/// Non-Unix fallback: the logger writes via POSIX `write(2)` on a raw fd, which
+/// has no portable Windows analogue, so the file sink stays disabled there.
+#[cfg(not(unix))]
+#[allow(clippy::needless_pass_by_value)]
+fn install_log_file_fd(_file: std::fs::File) {}
+
+/// Clear the process umask so files and directories are created with their full
+/// mode (`neutral-umask`). Unix-only; a no-op elsewhere.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_neutral_umask() {
+    // SAFETY: `umask` is always safe to call; it only reads/replaces the
+    // process-global umask, cannot fail, and has no memory-safety implications.
+    unsafe {
+        libc::umask(0);
+    }
+}
+
+/// Non-Unix fallback for [`set_neutral_umask`]: Windows has no umask.
+#[cfg(not(unix))]
+fn set_neutral_umask() {}
+
+/// Best-effort process scheduling priority (`priority`, a nice level in
+/// `-20..=19`). Unix-only via `setpriority`; a logged no-op elsewhere.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+#[allow(clippy::print_stderr)] // a setpriority failure is surfaced to stderr by design.
+fn set_process_priority(priority: i64) {
+    let Ok(nice) = i32::try_from(priority) else {
+        return;
+    };
+    // SAFETY: `setpriority(PRIO_PROCESS, 0, nice)` targets the calling process
+    // and only adjusts its nice value; it has no memory-safety implications.
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+    if rc != 0 {
+        eprintln!(
+            "unable to set process priority to {nice}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Non-Unix fallback for [`set_process_priority`]: TODO — Windows priority
+/// classes have no direct nice-level mapping, so the option is ignored there.
+#[cfg(not(unix))]
+fn set_process_priority(_priority: i64) {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -1003,5 +1327,203 @@ option:
         assert_eq!(EXIT_CODE_CONFIG_ERROR, 27);
         assert_eq!(EXIT_CODE_RUNTIME_ERROR, 1);
         assert_eq!(EXIT_CODE_INTERNAL_ERROR, 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Process / logging / network option wiring (Tasks 15, 16, 24)
+    // -------------------------------------------------------------------
+
+    use std::collections::BTreeMap;
+
+    use pgbr_config::{ConfigCommandRole, LoadedConfig};
+
+    use super::{
+        apply_legacy_compress, apply_process_options, init_logging, load_static_cfg as load_cfg, log_level_from_id,
+        resolve_log_level, resolve_process_id,
+    };
+
+    /// Serialises the tests that touch process-global logger / io / protocol
+    /// state so they cannot observe each other's writes.
+    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn loaded(command: &str, stanza: Option<&str>, opts: &[(&str, Option<u32>, OptionValue)]) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        for (name, idx, value) in opts {
+            options.insert(((*name).to_owned(), *idx), value.clone());
+        }
+        LoadedConfig {
+            command: command.to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: stanza.map(str::to_owned),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn log_level_from_id_maps_every_string_id() {
+        use pgbr_core::log::{
+            LOG_LEVEL_DEBUG, LOG_LEVEL_DETAIL, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_OFF, LOG_LEVEL_TRACE, LOG_LEVEL_WARN,
+        };
+        assert_eq!(log_level_from_id("off"), Some(LOG_LEVEL_OFF));
+        assert_eq!(log_level_from_id("error"), Some(LOG_LEVEL_ERROR));
+        assert_eq!(log_level_from_id("warn"), Some(LOG_LEVEL_WARN));
+        assert_eq!(log_level_from_id("info"), Some(LOG_LEVEL_INFO));
+        assert_eq!(log_level_from_id("detail"), Some(LOG_LEVEL_DETAIL));
+        assert_eq!(log_level_from_id("debug"), Some(LOG_LEVEL_DEBUG));
+        assert_eq!(log_level_from_id("trace"), Some(LOG_LEVEL_TRACE));
+        // `assert` has no string-id, and garbage is rejected.
+        assert_eq!(log_level_from_id("assert"), None);
+        assert_eq!(log_level_from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn resolve_log_level_uses_value_then_fallback() {
+        use pgbr_core::log::{LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARN};
+        // Present + valid → that value.
+        let cfg = loaded(
+            "info",
+            None,
+            &[("log-level-console", None, OptionValue::StringId("debug".to_owned()))],
+        );
+        assert_eq!(resolve_log_level(&cfg, "log-level-console", "warn"), LOG_LEVEL_DEBUG);
+        // Absent → the fallback id.
+        let empty = loaded("info", None, &[]);
+        assert_eq!(resolve_log_level(&empty, "log-level-console", "warn"), LOG_LEVEL_WARN);
+        assert_eq!(resolve_log_level(&empty, "log-level-file", "info"), LOG_LEVEL_INFO);
+        // Present but garbage → the fallback id.
+        let bad = loaded(
+            "info",
+            None,
+            &[("log-level-console", None, OptionValue::StringId("loud".to_owned()))],
+        );
+        assert_eq!(resolve_log_level(&bad, "log-level-console", "warn"), LOG_LEVEL_WARN);
+    }
+
+    #[test]
+    fn legacy_compress_yes_maps_to_gz() {
+        // compress=y with no explicit compress-type → compress-type=gz.
+        let mut cfg = loaded("backup", Some("demo"), &[("compress", None, OptionValue::Boolean(true))]);
+        apply_legacy_compress(&mut cfg);
+        assert_eq!(
+            cfg.options.get(&("compress-type".to_owned(), None)),
+            Some(&OptionValue::StringId("gz".to_owned())),
+        );
+    }
+
+    #[test]
+    fn legacy_compress_no_maps_to_none() {
+        let mut cfg = loaded("backup", Some("demo"), &[("compress", None, OptionValue::Boolean(false))]);
+        apply_legacy_compress(&mut cfg);
+        assert_eq!(
+            cfg.options.get(&("compress-type".to_owned(), None)),
+            Some(&OptionValue::StringId("none".to_owned())),
+        );
+    }
+
+    #[test]
+    fn legacy_compress_does_not_override_explicit_compress_type() {
+        // An explicit compress-type wins; the deprecated boolean is ignored.
+        let mut cfg = loaded(
+            "backup",
+            Some("demo"),
+            &[
+                ("compress", None, OptionValue::Boolean(true)),
+                ("compress-type", None, OptionValue::StringId("zst".to_owned())),
+            ],
+        );
+        apply_legacy_compress(&mut cfg);
+        assert_eq!(
+            cfg.options.get(&("compress-type".to_owned(), None)),
+            Some(&OptionValue::StringId("zst".to_owned())),
+            "an explicit compress-type must win over the deprecated compress boolean",
+        );
+    }
+
+    #[test]
+    fn legacy_compress_absent_is_a_no_op() {
+        // No `compress` option → compress-type is left untouched.
+        let mut cfg = loaded("backup", Some("demo"), &[]);
+        apply_legacy_compress(&mut cfg);
+        assert!(!cfg.options.contains_key(&("compress-type".to_owned(), None)));
+    }
+
+    #[test]
+    fn resolve_process_id_reads_exec_id_then_pid() {
+        // exec-id `<pid>-<hex>` → leading numeric component (mod 1000).
+        let cfg = loaded(
+            "info",
+            None,
+            &[("exec-id", None, OptionValue::String("12345-abcdef".to_owned()))],
+        );
+        assert_eq!(resolve_process_id(&cfg), 12345 % 1000);
+        // No exec-id → the OS pid (mod 1000), always within range.
+        let empty = loaded("info", None, &[]);
+        assert!(resolve_process_id(&empty) < 1000);
+    }
+
+    #[test]
+    fn apply_process_options_feeds_io_and_protocol_globals() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cfg = load_cfg().expect("config compiles");
+        // buffer-size (size, bytes), io-timeout / protocol-timeout (time, ms),
+        // compress-level-network (integer). Use a stanza-less info command so no
+        // log file is opened (log-level-file defaults to info, but absent here
+        // resolves through the fallback; we keep file OFF by setting it).
+        let loaded_cfg = loaded(
+            "info",
+            Some("demo"),
+            &[
+                ("buffer-size", None, OptionValue::Size(2 * 1024 * 1024)),
+                ("io-timeout", None, OptionValue::Time(45_000)),
+                ("protocol-timeout", None, OptionValue::Time(150_000)),
+                ("compress-level-network", None, OptionValue::Integer(7)),
+                ("log-level-file", None, OptionValue::StringId("off".to_owned())),
+                ("neutral-umask", None, OptionValue::Boolean(false)),
+            ],
+        );
+        apply_process_options(&loaded_cfg, &cfg);
+
+        assert_eq!(pgbr_io::copy_buffer_size(), 2 * 1024 * 1024);
+        assert_eq!(pgbr_io::io_timeout(), Some(std::time::Duration::from_secs(45)));
+        assert_eq!(pgbr_protocol::protocol_timeout(), Some(std::time::Duration::from_secs(150)));
+        assert_eq!(pgbr_protocol::network_compress_level(), 7);
+
+        // Restore neutral defaults so other tests using `copy` are unaffected.
+        pgbr_io::set_copy_buffer_size(pgbr_io::DEFAULT_COPY_BUFFER_SIZE);
+        pgbr_io::set_io_timeout_ms(0);
+        pgbr_protocol::set_protocol_timeout_ms(0);
+    }
+
+    #[test]
+    fn init_logging_opens_file_and_sets_levels() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cfg = load_cfg().expect("config compiles");
+        let log_dir = tempfile::tempdir().expect("log tempdir");
+        let loaded_cfg = loaded(
+            "backup",
+            Some("demo"),
+            &[
+                ("log-level-console", None, OptionValue::StringId("info".to_owned())),
+                ("log-level-file", None, OptionValue::StringId("detail".to_owned())),
+                ("log-path", None, OptionValue::Path(log_dir.path().display().to_string())),
+                ("log-timestamp", None, OptionValue::Boolean(false)),
+                ("exec-id", None, OptionValue::String("42-deadbeef".to_owned())),
+            ],
+        );
+        init_logging(&loaded_cfg, &cfg);
+
+        assert_eq!(pgbr_core::log::level_std_out(), pgbr_core::log::LOG_LEVEL_INFO);
+        assert_eq!(pgbr_core::log::level_file(), pgbr_core::log::LOG_LEVEL_DETAIL);
+        assert!(!pgbr_core::log::timestamp());
+        assert_eq!(pgbr_core::log::process_id(), 42);
+
+        // The log file was created at <log-path>/<stanza>-<command>.log on unix
+        // (the file sink is fd-based, so this only applies there).
+        #[cfg(unix)]
+        assert!(
+            log_dir.path().join("demo-backup.log").exists(),
+            "init_logging should open <log-path>/<stanza>-<command>.log"
+        );
     }
 }
