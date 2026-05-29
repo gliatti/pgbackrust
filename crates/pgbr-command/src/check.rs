@@ -405,13 +405,19 @@ pub fn check_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<
         option: "stanza".to_owned(),
     })?;
 
-    // 2. The stanza must be initialized — both info files must load.
+    // 2. The stanza must be initialized — both info files must load. On an
+    //    encrypted repository the info files are encrypted under the user
+    //    passphrase (`repo-cipher-pass`); resolve it and decrypt on load. An
+    //    unencrypted repo resolves to `None` (the byte-for-byte plaintext path).
     let archive_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
     let backup_path = PathBuf::from(format!("backup/{stanza}/backup.info"));
+    let user_pass = crate::cipher::active_user_pass(config)?;
 
-    let archive = InfoArchive::load(repo_storage, &archive_path)
+    let archive = InfoArchive::load_keyed(repo_storage, &archive_path, user_pass.as_deref())
+        .map(|(archive, _)| archive)
         .map_err(|err| CommandError::Other(format!("stanza '{stanza}' is not initialized: archive.info: {err}")))?;
-    let backup = InfoBackup::load(repo_storage, &backup_path)
+    let backup = InfoBackup::load_keyed(repo_storage, &backup_path, user_pass.as_deref())
+        .map(|(backup, _)| backup)
         .map_err(|err| CommandError::Other(format!("stanza '{stanza}' is not initialized: backup.info: {err}")))?;
 
     // 3. The two info files must agree on the database identity.
@@ -721,8 +727,14 @@ pub fn run_check(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Ch
     let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
         option: "stanza".to_owned(),
     })?;
-    let archive = InfoArchive::load(repo_storage, &PathBuf::from(format!("archive/{stanza}/archive.info")))
-        .map_err(|err| CommandError::Other(format!("stanza '{stanza}' archive.info: {err}")))?;
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    let archive = InfoArchive::load_keyed(
+        repo_storage,
+        &PathBuf::from(format!("archive/{stanza}/archive.info")),
+        user_pass.as_deref(),
+    )
+    .map(|(archive, _)| archive)
+    .map_err(|err| CommandError::Other(format!("stanza '{stanza}' archive.info: {err}")))?;
 
     let mut conn = Connection::open(&conninfo).map_err(|err| CommandError::Other(err.to_string()))?;
     let mut db = ConnCheckDb::new(&mut conn);

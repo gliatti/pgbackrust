@@ -254,12 +254,16 @@ fn decode_backup(label: &str, value: &Value) -> BackupSummary {
 /// Build a `StanzaSummary` for `name` by attempting to load both info files.
 /// Each is tried independently — a missing file degrades to `NotInitialized`
 /// or `Error(...)` rather than propagating.
-fn summarize_stanza(repo_storage: &dyn Storage, name: &str) -> StanzaSummary {
+///
+/// `user_pass` is the active repository's user passphrase (`repo-cipher-pass`),
+/// or `None` for an unencrypted repository; the info files are encrypted under
+/// it on an encrypted repo, so they are loaded keyed.
+fn summarize_stanza(repo_storage: &dyn Storage, name: &str, user_pass: Option<&str>) -> StanzaSummary {
     let archive_path = PathBuf::from(format!("archive/{name}/archive.info"));
     let backup_path = PathBuf::from(format!("backup/{name}/backup.info"));
 
-    let archive = InfoArchive::load(repo_storage, &archive_path);
-    let backup = InfoBackup::load(repo_storage, &backup_path);
+    let archive = InfoArchive::load_keyed(repo_storage, &archive_path, user_pass).map(|(archive, _)| archive);
+    let backup = InfoBackup::load_keyed(repo_storage, &backup_path, user_pass).map(|(backup, _)| backup);
 
     let archive_missing = matches!(archive, Err(pgbr_info::InfoError::Storage(StorageError::NotFound { .. })));
     let backup_missing = matches!(backup, Err(pgbr_info::InfoError::Storage(StorageError::NotFound { .. })));
@@ -327,7 +331,13 @@ pub fn info_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<V
         discover_stanzas(repo_storage)?
     };
 
-    let summaries = stanzas.iter().map(|name| summarize_stanza(repo_storage, name)).collect();
+    // On an encrypted repository the info files are encrypted under the active
+    // repo's user passphrase; resolve it once for every stanza.
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    let summaries = stanzas
+        .iter()
+        .map(|name| summarize_stanza(repo_storage, name, user_pass.as_deref()))
+        .collect();
     Ok(summaries)
 }
 
@@ -627,9 +637,9 @@ enum SetManifest {
 /// be read, so the detail view can still render the summary plus a note. The
 /// "unknown label" case is detected separately against `backup.info` before
 /// this is called.
-fn load_set_manifest(repo: &dyn Storage, stanza: &str, label: &str) -> SetManifest {
+fn load_set_manifest(repo: &dyn Storage, stanza: &str, label: &str, sub_key: Option<&str>) -> SetManifest {
     let path = manifest_path(stanza, label);
-    match Manifest::load(repo, &path) {
+    match Manifest::load_keyed(repo, &path, sub_key) {
         Ok(manifest) => SetManifest::Loaded(Box::new(manifest)),
         Err(InfoError::Storage(StorageError::NotFound { .. })) => {
             SetManifest::Unavailable(format!("manifest for backup '{label}' not found"))
@@ -764,11 +774,19 @@ fn render_set(config: &LoadedConfig, repo_storage: &dyn Storage, label: &str) ->
         option: "stanza".to_owned(),
     })?;
 
-    let summary = summarize_stanza(repo_storage, stanza);
+    // On an encrypted repository the info files are encrypted under the user
+    // passphrase; resolve it for the info-file load.
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    let summary = summarize_stanza(repo_storage, stanza, user_pass.as_deref());
     let backup = find_backup(&summary, label)
         .ok_or_else(|| CommandError::Other(format!("backup '{label}' does not exist in stanza '{stanza}'")))?;
 
-    let manifest = load_set_manifest(repo_storage, stanza, label);
+    // The backup.manifest is currently written in plaintext even on an encrypted
+    // repository (the backup WRITE path does not yet encrypt the manifest with
+    // the repository sub-key — see the crate-level note in `cipher.rs`), so it is
+    // read in plaintext to match. `Manifest::load_keyed(None)` == the plaintext
+    // load; the sub-key path becomes live once the write side encrypts manifests.
+    let manifest = load_set_manifest(repo_storage, stanza, label, None);
 
     if want_json(config) {
         let format = summary.backrest_format.unwrap_or(0);
@@ -995,6 +1013,92 @@ mod tests {
         assert_eq!(full.backup_type, "full");
         assert_eq!(full.stop_timestamp, Some(1_700_000_000));
         assert_eq!(full.repo_size, Some(67890));
+    }
+
+    #[test]
+    fn info_reads_encrypted_archive_and_backup_info() {
+        // Regression for the encrypted-repo info bug: stanza-create writes an
+        // ENCRYPTED archive.info / backup.info (under the user passphrase), and
+        // `info` must decrypt them via the keyed loader rather than failing with
+        // the plaintext "invalid line 0: non-utf8 input" error.
+        let (_dir, storage) = posix_repo();
+
+        let user_pass = "user-passphrase";
+        let arc_sub = pgbr_info::cipher_pass_gen();
+        let bak_sub = pgbr_info::cipher_pass_gen();
+
+        storage
+            .create_path(std::path::Path::new("archive/enc"), true)
+            .expect("create archive/enc");
+        storage
+            .create_path(std::path::Path::new("backup/enc"), true)
+            .expect("create backup/enc");
+
+        sample_archive()
+            .save_keyed(
+                &storage,
+                std::path::Path::new("archive/enc/archive.info"),
+                Some(user_pass),
+                Some(&arc_sub),
+            )
+            .expect("save encrypted archive.info");
+
+        let mut current = BTreeMap::new();
+        current.insert(
+            "20260101-100000F".to_owned(),
+            json!({
+                "backup-info-size": 100,
+                "backup-info-repo-size": 50,
+                "backup-label": "20260101-100000F",
+                "backup-timestamp-stop": 1_700_000_000,
+                "backup-type": "full"
+            }),
+        );
+        sample_backup_with(current)
+            .save_keyed(
+                &storage,
+                std::path::Path::new("backup/enc/backup.info"),
+                Some(user_pass),
+                Some(&bak_sub),
+            )
+            .expect("save encrypted backup.info");
+
+        // The plaintext info files must be unreadable (they are encrypted).
+        assert!(
+            InfoArchive::load(&storage, std::path::Path::new("archive/enc/archive.info")).is_err(),
+            "encrypted archive.info must not parse as plaintext"
+        );
+
+        // With the repo cipher configured, `info` decrypts and lists the backup.
+        let mut cfg = fake_config(Some("enc"));
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-cipher-pass".to_owned(), Some(1)),
+            OptionValue::String(user_pass.to_owned()),
+        );
+
+        let summaries = info_inner(&cfg, &storage).expect("info_inner on encrypted repo");
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.status, StanzaStatus::Ok, "encrypted info files must load: {:?}", s.status);
+        assert_eq!(s.pg_version.as_deref(), Some("14"));
+        assert_eq!(s.backups.len(), 1);
+        assert_eq!(s.backups[0].label, "20260101-100000F");
+
+        // Without the passphrase, the encrypted repo surfaces the missing option.
+        let mut no_pass = fake_config(Some("enc"));
+        no_pass.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        let err = info_inner(&no_pass, &storage).expect_err("encrypted repo without passphrase must error");
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
+            other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
+        }
     }
 
     #[test]

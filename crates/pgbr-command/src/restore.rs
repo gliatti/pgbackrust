@@ -1055,12 +1055,18 @@ fn select_backup(
     repo: &dyn Storage,
     stanza: &str,
 ) -> Result<(String, serde_json::Value, InfoBackup), CommandError> {
-    let info = InfoBackup::load(repo, &backup_info_path(stanza)).map_err(|err| match err {
-        InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
-            path: backup_info_path(stanza),
-        }),
-        other => CommandError::Other(other.to_string()),
-    })?;
+    // On an encrypted repository backup.info is encrypted under the user
+    // passphrase (`repo-cipher-pass`); resolve it (`None` for an unencrypted
+    // repo, the plaintext path) and decrypt on load.
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    let info = InfoBackup::load_keyed(repo, &backup_info_path(stanza), user_pass.as_deref())
+        .map(|(info, _)| info)
+        .map_err(|err| match err {
+            InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
+                path: backup_info_path(stanza),
+            }),
+            other => CommandError::Other(other.to_string()),
+        })?;
 
     // `--set` defaults to the sentinel `latest` (config.yaml), which means "the
     // most recent backup" — NOT a literal label. Only an explicit, non-`latest`

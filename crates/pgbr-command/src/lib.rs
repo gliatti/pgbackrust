@@ -25,6 +25,7 @@ pub mod backup_control;
 pub mod block;
 pub mod bundle;
 pub mod check;
+pub mod cipher;
 pub mod control;
 pub mod expire;
 pub mod help;
@@ -254,7 +255,8 @@ fn archive_get_with_prefetch(
     // when serving a single segment). Best-effort: a miss leaves recovery to the
     // synchronous path on the next call, so a pre-fetch error is not propagated.
     if let Some(repo) = repo_storages.first() {
-        let _ = archive::prefetch_get_spool(&spool, *repo, stanza, &segments, queue_max);
+        let index = cipher::active_repo_index(config);
+        let _ = archive::prefetch_get_spool(config, &spool, *repo, index, stanza, &segments, queue_max);
     }
     Ok(())
 }

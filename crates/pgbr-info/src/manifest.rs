@@ -49,9 +49,11 @@ use pgbr_io::{IoRead, IoWrite};
 use pgbr_storage::Storage;
 use serde::{Deserialize, Serialize};
 
-use crate::archive::{json_string, parse_required_string, parse_required_u64};
+use crate::InfoError;
+use crate::archive::{
+    bytes_to_text, decode_maybe_encrypted, encode_maybe_encrypted, json_string, parse_required_string, parse_required_u64,
+};
 use crate::format::{self, BACKREST_SECTION, InfoFile};
-use crate::{InfoError, InfoFormatError};
 
 /// Section that holds the top-level backup metadata.
 const BACKUP_SECTION: &str = "backup";
@@ -282,7 +284,8 @@ pub struct Manifest {
 
 impl Manifest {
     /// Read `backup.manifest` from `path` via `storage`. Streams through
-    /// [`IoRead::read_all`] so any backend can plug in.
+    /// [`IoRead::read_all`] so any backend can plug in. Plaintext convenience
+    /// wrapper over [`Manifest::load_keyed`] with no passphrase.
     ///
     /// # Errors
     ///
@@ -290,26 +293,77 @@ impl Manifest {
     /// or checksum failures as [`InfoError::Format`]; absent required keys as
     /// [`InfoError::MissingField`]; malformed entry JSON as [`InfoError::Json`].
     pub fn load(storage: &dyn Storage, path: &Path) -> Result<Self, InfoError> {
-        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
-        let bytes = reader.read_all()?;
-        let raw = String::from_utf8(bytes).map_err(|err| {
-            InfoError::Format(InfoFormatError::InvalidLine {
-                line_number: 0,
-                line: format!("non-utf8 input: {err}"),
-            })
-        })?;
-        Self::from_text(&raw)
+        Self::load_keyed(storage, path, None)
     }
 
-    /// Write `backup.manifest` to `path` via `storage`.
+    /// Read `backup.manifest` from `path` via `storage`, decrypting under
+    /// `passphrase` when the repository is encrypted.
+    ///
+    /// Unlike `archive.info` / `backup.info`, a manifest carries no `[cipher]`
+    /// sub-key of its own — it is simply decrypted with the passed passphrase
+    /// (the repository sub-key, recovered by loading the stanza's `archive.info`
+    /// keyed). When `passphrase` is `None`, the bytes are parsed directly, so an
+    /// unencrypted repository behaves byte-for-byte like the plaintext load.
+    ///
+    /// # Errors
+    ///
+    /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`]; a
+    /// wrong passphrase (garbage plaintext) and other format / checksum failures
+    /// surface as [`InfoError::Format`].
+    pub fn load_keyed(storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<Self, InfoError> {
+        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
+        let bytes = reader.read_all()?;
+        Self::from_bytes_keyed(&bytes, passphrase)
+    }
+
+    /// Decode a `backup.manifest` document that may be encrypted under
+    /// `passphrase` (the repository sub-key). When `passphrase` is `Some`, the
+    /// bytes are first decrypted (pgBackRest `"Salted__"` framing) and then
+    /// parsed; when `None`, the bytes are parsed directly.
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Format`] for parse / checksum / non-UTF-8 errors (a wrong
+    /// passphrase typically surfaces here), plus the usual missing-field / JSON
+    /// errors.
+    pub fn from_bytes_keyed(raw: &[u8], passphrase: Option<&str>) -> Result<Self, InfoError> {
+        let plaintext = decode_maybe_encrypted(raw, passphrase)?;
+        let text = bytes_to_text(plaintext)?;
+        Self::from_text(&text)
+    }
+
+    /// Render this `Manifest` to bytes, encrypting under `passphrase` when one is
+    /// supplied.
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Io`] if the cipher filter fails.
+    pub fn to_bytes_keyed(&self, passphrase: Option<&str>) -> Result<Vec<u8>, InfoError> {
+        encode_maybe_encrypted(self.to_text().as_bytes(), passphrase)
+    }
+
+    /// Write `backup.manifest` to `path` via `storage`. Plaintext convenience
+    /// wrapper over [`Manifest::save_keyed`] with no passphrase.
     ///
     /// # Errors
     ///
     /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`].
     pub fn save(&self, storage: &dyn Storage, path: &Path) -> Result<(), InfoError> {
-        let text = self.to_text();
+        self.save_keyed(storage, path, None)
+    }
+
+    /// Write `backup.manifest` to `path` via `storage`, encrypting under
+    /// `passphrase` (the repository sub-key) when the repository is encrypted.
+    /// When `passphrase` is `None` the bytes are written verbatim, identical to
+    /// the plaintext save.
+    ///
+    /// # Errors
+    ///
+    /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`].
+    pub fn save_keyed(&self, storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<(), InfoError> {
+        let bytes = self.to_bytes_keyed(passphrase)?;
         let mut writer: Box<dyn IoWrite> = storage.open_write(path)?;
-        writer.write(text.as_bytes())?;
+        writer.write(&bytes)?;
         writer.flush()?;
         writer.close()?;
         Ok(())
@@ -511,6 +565,7 @@ mod tests {
     use pgbr_storage::Posix;
 
     use super::*;
+    use crate::InfoFormatError;
 
     fn sample() -> Manifest {
         Manifest {
@@ -910,6 +965,52 @@ mod tests {
         let path = Path::new("backup.manifest");
         manifest.save(&storage, path).unwrap();
         let loaded = Manifest::load(&storage, path).unwrap();
+        assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn encrypted_keyed_round_trip() {
+        let manifest = sample();
+        let sub_key = crate::cipher::cipher_pass_gen();
+
+        // Encrypt the whole manifest under the repository sub-key.
+        let bytes = manifest.to_bytes_keyed(Some(&sub_key)).unwrap();
+        assert_eq!(&bytes[..8], b"Salted__", "encrypted manifest uses pgBackRest framing");
+
+        // Decrypt + parse recovers the original.
+        let parsed = Manifest::from_bytes_keyed(&bytes, Some(&sub_key)).unwrap();
+        assert_eq!(parsed, manifest);
+
+        // A wrong passphrase fails.
+        assert!(Manifest::from_bytes_keyed(&bytes, Some("wrong-sub-key")).is_err());
+    }
+
+    #[test]
+    fn keyed_none_is_plaintext() {
+        // load_keyed(None) / save_keyed(None) must be byte-for-byte identical to
+        // the plaintext path, so unencrypted repositories are unaffected.
+        let manifest = sample();
+        let plaintext = manifest.to_bytes_keyed(None).unwrap();
+        assert_eq!(plaintext, manifest.to_text().into_bytes());
+        let parsed = Manifest::from_bytes_keyed(&plaintext, None).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn save_keyed_load_keyed_round_trip_via_posix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Posix::new(dir.path());
+        let manifest = sample();
+        let sub_key = crate::cipher::cipher_pass_gen();
+
+        let path = Path::new("backup.manifest");
+        manifest.save_keyed(&storage, path, Some(&sub_key)).unwrap();
+        // The file on disk is encrypted (not plain UTF-8 text).
+        assert!(
+            Manifest::load(&storage, path).is_err(),
+            "plaintext load of an encrypted manifest must fail"
+        );
+        let loaded = Manifest::load_keyed(&storage, path, Some(&sub_key)).unwrap();
         assert_eq!(loaded, manifest);
     }
 

@@ -773,6 +773,10 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let standby_storage = standby_dir.map(pgbr_storage::Posix::new);
     let copy_storage: &dyn Storage = standby_storage.as_ref().map_or(pg_storage, |s| s as &dyn Storage);
 
+    // On an encrypted repository backup.info is read / re-saved under the user
+    // passphrase; resolve it for the active repository (`None` when unencrypted).
+    let repo_user_pass = crate::cipher::active_user_pass(config)?;
+
     // The diff label depends on the full it references, so it is computed inside
     // `run_backup` (which knows the full label); full labels are timestamp-derived
     // up front. Pass `None` to let the inner function pick.
@@ -796,6 +800,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         archive_copy,
         integrity,
         policy,
+        repo_user_pass.as_deref(),
     )?;
     log_info(&format!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -2983,6 +2988,7 @@ pub fn backup_inner_with_workers(
         false,
         IntegrityChecks::disabled(),
         BackupPolicy::test_default(),
+        None,
     )
 }
 
@@ -3036,6 +3042,7 @@ fn run_backup(
     archive_copy: bool,
     integrity: IntegrityChecks,
     policy: BackupPolicy,
+    repo_user_pass: Option<&str>,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -3044,7 +3051,12 @@ fn run_backup(
         ));
     }
 
-    let mut info = InfoBackup::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+    // On an encrypted repository backup.info is encrypted under the user
+    // passphrase (`repo-cipher-pass`); decrypt on load and keep the recorded
+    // `[cipher]` sub-key so it can be re-saved encrypted unchanged. `None` (the
+    // unencrypted repo) is the byte-for-byte plaintext path.
+    let (mut info, recorded_sub) =
+        InfoBackup::load_keyed(repo_storage, &info_path, repo_user_pass).map_err(|err| CommandError::Other(err.to_string()))?;
 
     // Validate the live cluster against the stanza before touching any files:
     // a system-id / version mismatch means the configured PG is not the cluster
@@ -3245,7 +3257,14 @@ fn run_backup(
     if integrity.archive_check
         && let Some(bracket) = bracket.as_ref()
     {
-        wait_for_required_wal(repo_storage, stanza, bracket, integrity.archive_timeout, WAL_POLL_INTERVAL)?;
+        wait_for_required_wal(
+            repo_storage,
+            stanza,
+            bracket,
+            integrity.archive_timeout,
+            WAL_POLL_INTERVAL,
+            repo_user_pass,
+        )?;
     }
 
     // archive-copy: when enabled, copy every WAL segment from the start segment
@@ -3254,7 +3273,7 @@ fn run_backup(
     // places them. Done after the bracket (which yields the segment range) and
     // before totals are computed so the copied WAL counts toward the manifest.
     if archive_copy && let Some(bracket) = bracket.as_ref() {
-        let copied = copy_archive_wal(repo_storage, stanza, &backup_root, transform, bracket)?;
+        let copied = copy_archive_wal(repo_storage, stanza, &backup_root, transform, bracket, repo_user_pass)?;
         for (file, repo_bytes) in copied {
             repo_size += repo_bytes;
             files.push(file);
@@ -3337,8 +3356,17 @@ fn run_backup(
         entry["backup-reference"] = json!([prior_label]);
     }
     info.current.insert(label.clone(), entry);
-    info.save(repo_storage, &info_path)
-        .map_err(|err| CommandError::Other(err.to_string()))?;
+    // Re-save backup.info, re-encrypting under the user passphrase and
+    // re-injecting the recorded `[cipher]` sub-key on an encrypted repository so
+    // the file (and its `.copy` mirror) is not clobbered with plaintext. An
+    // unencrypted repo keeps the byte-for-byte plaintext save (no `.copy`).
+    if let Some(pass) = repo_user_pass {
+        info.save_keyed(repo_storage, &info_path, Some(pass), recorded_sub.as_deref())
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+    } else {
+        info.save(repo_storage, &info_path)
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+    }
 
     Ok(BackupOutcome {
         label,
@@ -3554,6 +3582,7 @@ fn copy_archive_wal(
     backup_root: &str,
     transform: &RepoTransform,
     bracket: &BackupBracket,
+    user_pass: Option<&str>,
 ) -> Result<Vec<(ManifestFile, u64)>, CommandError> {
     let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
         CommandError::Other(format!(
@@ -3569,7 +3598,7 @@ fn copy_archive_wal(
     repo_storage.create_path(Path::new(&format!("{backup_root}/pg_wal")), true)?;
     let mut out = Vec::with_capacity(segments.len());
     for segment in &segments {
-        let bytes = crate::archive::read_archived_segment(repo_storage, stanza, segment)?.ok_or_else(|| {
+        let bytes = crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass)?.ok_or_else(|| {
             CommandError::Other(format!(
                 "archive-copy: required WAL segment {segment} is missing from the archive"
             ))
@@ -3657,6 +3686,7 @@ fn wait_for_required_wal(
     bracket: &BackupBracket,
     timeout: std::time::Duration,
     poll_interval: std::time::Duration,
+    user_pass: Option<&str>,
 ) -> Result<(), CommandError> {
     let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
         CommandError::Other(format!(
@@ -3668,7 +3698,7 @@ fn wait_for_required_wal(
     for segment in &segments {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if crate::archive::read_archived_segment(repo_storage, stanza, segment)?.is_some() {
+            if crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass)?.is_some() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -5243,6 +5273,7 @@ mod tests {
             archive_copy,
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
+            None,
         )
     }
 
@@ -5274,6 +5305,7 @@ mod tests {
             false,
             integrity,
             BackupPolicy::test_default(),
+            None,
         )
     }
 
@@ -5918,6 +5950,7 @@ mod tests {
             false,
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
+            None,
         )
         .expect("live control-driven backup");
 
@@ -6318,6 +6351,7 @@ mod tests {
             false,
             IntegrityChecks::disabled(),
             policy,
+            None,
         )
     }
 
@@ -6553,6 +6587,7 @@ mod tests {
             false,
             IntegrityChecks::disabled(),
             policy,
+            None,
         )
         .expect("stop-auto backup");
 

@@ -102,10 +102,26 @@ fn backup_info_path(stanza: &str) -> PathBuf {
     PathBuf::from(format!("backup/{stanza}/backup.info"))
 }
 
-/// Load `backup.info`. Returns `Ok(None)` if the file does not exist
-/// (yields a no-op in [`expire_inner`]). Other failures map to typed
+/// The loaded `backup.info` plus the keys needed to re-save it unchanged on an
+/// encrypted repository.
+struct LoadedBackupInfo {
+    /// The parsed `backup.info`.
+    info: InfoBackup,
+    /// The active repository's user passphrase (`repo-cipher-pass`), or `None`
+    /// for an unencrypted repository. Re-supplied on save so the file is written
+    /// back encrypted.
+    user_pass: Option<String>,
+    /// The repository sub-key recorded in the `[cipher]` section, or `None` for
+    /// an unencrypted repository. Re-injected on save so the recorded sub-key is
+    /// preserved.
+    recorded_sub: Option<String>,
+}
+
+/// Load `backup.info`, decrypting under the active repository's user passphrase
+/// when the repository is encrypted. Returns `Ok(None)` if the file does not
+/// exist (yields a no-op in [`expire_inner`]). Other failures map to typed
 /// [`CommandError`]s.
-fn load_backup_info(repo: &dyn Storage, stanza: &str) -> Result<Option<InfoBackup>, CommandError> {
+fn load_backup_info(config: &LoadedConfig, repo: &dyn Storage, stanza: &str) -> Result<Option<LoadedBackupInfo>, CommandError> {
     let path = backup_info_path(stanza);
     match repo.exists(&path) {
         Ok(false) => return Ok(None),
@@ -113,11 +129,39 @@ fn load_backup_info(repo: &dyn Storage, stanza: &str) -> Result<Option<InfoBacku
         Err(err) => return Err(err.into()),
     }
 
-    match InfoBackup::load(repo, &path) {
-        Ok(info) => Ok(Some(info)),
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    match InfoBackup::load_keyed(repo, &path, user_pass.as_deref()) {
+        Ok((info, recorded_sub)) => Ok(Some(LoadedBackupInfo {
+            info,
+            user_pass,
+            recorded_sub,
+        })),
         Err(InfoError::Storage(StorageError::NotFound { .. })) => Ok(None),
         Err(err) => Err(CommandError::Other(err.to_string())),
     }
+}
+
+/// Save `backup.info`, re-encrypting under `user_pass` and re-injecting
+/// `recorded_sub` (the `[cipher]` sub-key) when the repository is encrypted. For
+/// an unencrypted repository (`user_pass == None`) this is byte-for-byte the
+/// plaintext save.
+fn save_backup_info(
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &InfoBackup,
+    user_pass: Option<&str>,
+    recorded_sub: Option<&str>,
+) -> Result<(), CommandError> {
+    let path = backup_info_path(stanza);
+    // Unencrypted repo: keep the byte-for-byte plaintext save (no `.copy`
+    // mirror, no `[cipher]` section), matching prior behaviour exactly.
+    if user_pass.is_none() {
+        return info.save(repo, &path).map_err(|err| CommandError::Other(err.to_string()));
+    }
+    // Encrypted repo: re-encrypt under the user passphrase and re-inject the
+    // recorded `[cipher]` sub-key so the file (and its `.copy` mirror) round-trips.
+    info.save_keyed(repo, &path, user_pass, recorded_sub)
+        .map_err(|err| CommandError::Other(err.to_string()))
 }
 
 /// Pull `backup-timestamp-stop` out of a `[backup:current]` entry. Missing
@@ -247,6 +291,8 @@ fn remove_backups(
     info: &mut InfoBackup,
     labels: &[String],
     dry_run: bool,
+    user_pass: Option<&str>,
+    recorded_sub: Option<&str>,
 ) -> Result<(), CommandError> {
     for label in labels {
         if dry_run {
@@ -261,8 +307,7 @@ fn remove_backups(
         info.current.remove(label);
     }
     if !labels.is_empty() && !dry_run {
-        info.save(repo, &backup_info_path(stanza))
-            .map_err(|err| CommandError::Other(err.to_string()))?;
+        save_backup_info(repo, stanza, info, user_pass, recorded_sub)?;
     }
     Ok(())
 }
@@ -276,6 +321,7 @@ fn archive_expire_tail(
     stanza: &str,
     info: &InfoBackup,
     dry_run: bool,
+    user_pass: Option<&str>,
 ) -> Result<Vec<String>, CommandError> {
     let archive_type = retention_archive_type(config);
     let kept_labels: Vec<String> = info.current.keys().cloned().collect();
@@ -291,6 +337,7 @@ fn archive_expire_tail(
                 &kept_anchor_oldest_first,
                 info,
                 dry_run,
+                user_pass,
             )
         },
     )
@@ -302,6 +349,7 @@ fn archive_expire_tail(
 /// The target must be a `full` or `diff` backup (the KB documents `--set` for
 /// these only); an unknown label or an `incr` target errors. Expiry is refused
 /// if it would leave the repository with no full backup.
+#[allow(clippy::too_many_arguments)]
 fn expire_adhoc_set(
     config: &LoadedConfig,
     repo: &dyn Storage,
@@ -309,6 +357,8 @@ fn expire_adhoc_set(
     info: &mut InfoBackup,
     set: &str,
     dry_run: bool,
+    user_pass: Option<&str>,
+    recorded_sub: Option<&str>,
 ) -> Result<ExpireSummary, CommandError> {
     let Some(target) = info.current.get(set) else {
         return Err(CommandError::Other(format!(
@@ -330,8 +380,8 @@ fn expire_adhoc_set(
     }
 
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire, dry_run)?;
-    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run)?;
+    remove_backups(repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run, user_pass)?;
     Ok(ExpireSummary {
         expired_labels: expire,
         kept_labels,
@@ -348,6 +398,8 @@ fn expire_adhoc_oldest(
     stanza: &str,
     info: &mut InfoBackup,
     dry_run: bool,
+    user_pass: Option<&str>,
+    recorded_sub: Option<&str>,
 ) -> Result<ExpireSummary, CommandError> {
     // Oldest full by (timestamp-stop, label).
     let oldest_full = info
@@ -374,8 +426,8 @@ fn expire_adhoc_oldest(
 
     let expire = dependent_closure(&info.current, std::slice::from_ref(&oldest_full));
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire, dry_run)?;
-    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run)?;
+    remove_backups(repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run, user_pass)?;
     Ok(ExpireSummary {
         expired_labels: expire,
         kept_labels,
@@ -894,11 +946,15 @@ fn load_archive_ids(
     repo: &dyn Storage,
     stanza: &str,
     backup_info: &InfoBackup,
+    user_pass: Option<&str>,
 ) -> Result<(Vec<ArchiveIdMarked>, VersionById), CommandError> {
     let archive_info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
     let loaded = match repo.exists(&archive_info_path) {
-        Ok(true) => match InfoArchive::load(repo, &archive_info_path) {
-            Ok(info) => Some((info.history, info.db_id)),
+        // On an encrypted repository archive.info is encrypted under the user
+        // passphrase; decrypt on load. An unencrypted repo passes `None` (the
+        // plaintext path).
+        Ok(true) => match InfoArchive::load_keyed(repo, &archive_info_path, user_pass) {
+            Ok((info, _)) => Some((info.history, info.db_id)),
             // A malformed/cipher archive.info should not abort backup expiry;
             // fall back to the backup history.
             Err(_) => None,
@@ -937,6 +993,7 @@ fn expire_archive(
     kept_anchor_oldest_first: &[serde_json::Value],
     info: &InfoBackup,
     dry_run: bool,
+    user_pass: Option<&str>,
 ) -> Result<Vec<String>, CommandError> {
     let archive_root = PathBuf::from(format!("archive/{stanza}"));
 
@@ -973,7 +1030,7 @@ fn expire_archive(
         // one is the current cluster (never dropped). Fall back to the
         // backup.info history (same db-id keys/versions) when archive.info
         // is absent or unreadable.
-        let (history_ids, version_by_id) = load_archive_ids(repo, stanza, info)?;
+        let (history_ids, version_by_id) = load_archive_ids(repo, stanza, info, user_pass)?;
         let backups = backups_for_archive(info, &version_by_id);
 
         // Restrict to archive-ids that actually exist on disk, but preserve
@@ -1170,14 +1227,22 @@ fn looks_like_wal_segment(name: &str) -> bool {
 pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireSummary, CommandError> {
     let stanza = require_stanza(config)?;
 
-    // No backup.info -> nothing to do.
-    let Some(mut info) = load_backup_info(repo, stanza)? else {
+    // No backup.info -> nothing to do. On an encrypted repository the file is
+    // decrypted under the user passphrase; the user passphrase + recorded
+    // `[cipher]` sub-key are kept so it can be re-saved encrypted unchanged.
+    let Some(loaded) = load_backup_info(config, repo, stanza)? else {
         return Ok(ExpireSummary {
             expired_labels: Vec::new(),
             kept_labels: Vec::new(),
             expired_archive_segments: Vec::new(),
         });
     };
+    let LoadedBackupInfo {
+        mut info,
+        user_pass,
+        recorded_sub,
+    } = loaded;
+    let (user_pass, recorded_sub) = (user_pass.as_deref(), recorded_sub.as_deref());
 
     // --dry-run: compute and report the plan, but perform no storage deletions
     // and do not rewrite backup.info. C reference: the cfgOptDryRun guards in
@@ -1187,10 +1252,10 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // Adhoc expiry (--set / --oldest) removes a specific backup set and bypasses
     // the retention policy entirely. C reference: the adhoc path in cmdExpire.
     if let Some(set) = set_option(config) {
-        return expire_adhoc_set(config, repo, stanza, &mut info, &set, dry_run);
+        return expire_adhoc_set(config, repo, stanza, &mut info, &set, dry_run, user_pass, recorded_sub);
     }
     if oldest_option(config) {
-        return expire_adhoc_oldest(config, repo, stanza, &mut info, dry_run);
+        return expire_adhoc_oldest(config, repo, stanza, &mut info, dry_run, user_pass, recorded_sub);
     }
 
     let archive_type = retention_archive_type(config);
@@ -1198,25 +1263,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // No backup retention configured. Backups are all kept, but archive
     // retention may still apply against the surviving anchor backups.
     let Some(keep_full) = retention_full(config)? else {
-        let kept_labels: Vec<String> = info.current.keys().cloned().collect();
-        let kept_anchor_oldest_first = anchor_backups_oldest_first(&info, &kept_labels, archive_type);
-        let expired_archive_segments = match retention_archive(config)? {
-            Some(keep_archive) => expire_archive(
-                repo,
-                stanza,
-                keep_archive,
-                archive_type,
-                &kept_anchor_oldest_first,
-                &info,
-                dry_run,
-            )?,
-            None => Vec::new(),
-        };
-        return Ok(ExpireSummary {
-            expired_labels: Vec::new(),
-            kept_labels,
-            expired_archive_segments,
-        });
+        return expire_keep_all_backups(config, repo, stanza, &info, archive_type, dry_run, user_pass);
     };
 
     // Sort current entries oldest-first by backup-timestamp-stop. Ties
@@ -1270,7 +1317,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // the rewritten backup.info (both skipped in --dry-run, which only logs the
     // plan and drops the labels from the in-memory `info` so archive retention is
     // computed against the would-be-surviving set).
-    remove_backups(repo, stanza, &mut info, &expired_labels, dry_run)?;
+    remove_backups(repo, stanza, &mut info, &expired_labels, dry_run, user_pass, recorded_sub)?;
 
     // Archive retention runs after backups are expired, counted against
     // the anchor backups that survived (in `kept_labels`, oldest first).
@@ -1284,6 +1331,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
             &kept_anchor_oldest_first,
             &info,
             dry_run,
+            user_pass,
         )?,
         None => Vec::new(),
     };
@@ -1366,6 +1414,41 @@ fn anchor_backups_oldest_first(
         .filter(|value| archive_type.includes(backup_type(value)))
         .cloned()
         .collect()
+}
+
+/// The `repo-retention-full`-unset path of [`expire_inner`]: every backup is
+/// kept (so `expired_labels` is empty), but WAL retention may still run against
+/// the surviving anchor backups. `user_pass` decrypts `archive.info` on an
+/// encrypted repository (`None` for an unencrypted one).
+fn expire_keep_all_backups(
+    config: &LoadedConfig,
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &InfoBackup,
+    archive_type: ArchiveRetentionType,
+    dry_run: bool,
+    user_pass: Option<&str>,
+) -> Result<ExpireSummary, CommandError> {
+    let kept_labels: Vec<String> = info.current.keys().cloned().collect();
+    let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
+    let expired_archive_segments = match retention_archive(config)? {
+        Some(keep_archive) => expire_archive(
+            repo,
+            stanza,
+            keep_archive,
+            archive_type,
+            &kept_anchor_oldest_first,
+            info,
+            dry_run,
+            user_pass,
+        )?,
+        None => Vec::new(),
+    };
+    Ok(ExpireSummary {
+        expired_labels: Vec::new(),
+        kept_labels,
+        expired_archive_segments,
+    })
 }
 
 /// `expire` — apply retention policy to existing backups.

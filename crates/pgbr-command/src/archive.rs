@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 
 use pgbr_compress::{Bz2Decompress, GzDecompress, Lz4Decompress, ZstDecompress};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
-use pgbr_info::{CipherType, InfoArchive, RepoKeys};
+use pgbr_info::InfoArchive;
 use pgbr_io::Filter;
 use pgbr_postgres::lsn::parse_wal_segment;
 use pgbr_storage::{Posix, Storage};
@@ -152,22 +152,6 @@ fn active_repo_index(config: &LoadedConfig) -> u32 {
     }
 }
 
-/// Fetch a `repo`-group `StringId` option at group index `index`.
-fn repo_string_id<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
-    match config.options.get(&(name.to_owned(), Some(index))) {
-        Some(OptionValue::StringId(value)) => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-/// Fetch a `repo`-group `String` option at group index `index`.
-fn repo_string<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
-    match config.options.get(&(name.to_owned(), Some(index))) {
-        Some(OptionValue::String(value)) => Some(value.as_str()),
-        _ => None,
-    }
-}
-
 /// Resolve the repository sub-key used to encrypt WAL for repository `index`, or
 /// `None` when that repository is unencrypted.
 ///
@@ -185,27 +169,9 @@ fn repo_string<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&
 /// `repo-cipher-pass`; [`CommandError::Other`] when the recorded sub-key cannot
 /// be decrypted (wrong passphrase / corrupt `[cipher]` section).
 fn repo_sub_key(repo: &dyn Storage, config: &LoadedConfig, index: u32, stanza: &str) -> Result<Option<String>, CommandError> {
-    let cipher_type = repo_string_id(config, "repo-cipher-type", index).map_or(CipherType::None, CipherType::from_str_id);
-    if !cipher_type.is_encrypted() {
-        return Ok(None);
-    }
-    let user_pass = repo_string(config, "repo-cipher-pass", index).filter(|s| !s.is_empty());
-    let user_pass = user_pass.ok_or_else(|| CommandError::MissingOption {
-        option: "repo-cipher-pass".to_owned(),
-    })?;
-
-    // Load the recorded repo sub-key from archive.info's [cipher] section,
-    // decrypting it under the user passphrase. An uninitialised repo (no
-    // archive.info) has no sub-key yet.
-    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
-    if !repo.exists(&info_path)? {
-        return Ok(None);
-    }
-    let (_, recorded) =
-        InfoArchive::load_keyed(repo, &info_path, Some(user_pass)).map_err(|err| CommandError::Other(err.to_string()))?;
-    let keys =
-        RepoKeys::resolve(cipher_type, Some(user_pass), recorded.as_deref()).map_err(|err| CommandError::Other(err.to_string()))?;
-    Ok(keys.repo_sub_pass().map(str::to_owned))
+    // Delegate to the shared command-layer cipher resolver so every command
+    // agrees on the same per-repo sub-key derivation.
+    crate::cipher::repo_sub_key(repo, config, index, stanza)
 }
 
 /// Build the per-repository [`RepoTransform`] (compress + that repo's cipher) for
@@ -603,19 +569,9 @@ fn load_archive_info(
             continue;
         }
         let index = indexes.get(pos).copied().unwrap_or(1);
-        let cipher_type = repo_string_id(config, "repo-cipher-type", index).map_or(CipherType::None, CipherType::from_str_id);
-        let pass = if cipher_type.is_encrypted() {
-            let p = repo_string(config, "repo-cipher-pass", index).filter(|s| !s.is_empty());
-            if p.is_none() {
-                return Err(CommandError::MissingOption {
-                    option: "repo-cipher-pass".to_owned(),
-                });
-            }
-            p
-        } else {
-            None
-        };
-        let (info, _) = InfoArchive::load_keyed(*repo, &info_path, pass).map_err(|err| CommandError::Other(err.to_string()))?;
+        let pass = crate::cipher::repo_user_pass(config, index)?;
+        let (info, _) =
+            InfoArchive::load_keyed(*repo, &info_path, pass.as_deref()).map_err(|err| CommandError::Other(err.to_string()))?;
         return Ok(Some(info));
     }
     Ok(None)
@@ -631,14 +587,24 @@ fn load_archive_info(
 ///
 /// [`CommandError::Other`] when the repository has no `archive.info`, or it
 /// fails to load. [`CommandError::Storage`] on an underlying storage failure.
-fn load_drain_archive_id(repo_storage: &dyn Storage, stanza: &str) -> Result<String, CommandError> {
+fn load_drain_archive_id(
+    config: &LoadedConfig,
+    repo_storage: &dyn Storage,
+    index: u32,
+    stanza: &str,
+) -> Result<String, CommandError> {
     let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
     if !repo_storage.exists(&info_path)? {
         return Err(CommandError::Other(
             "archive-push: unable to load archive.info — is the stanza created?".to_owned(),
         ));
     }
-    let info = InfoArchive::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+    // On an encrypted repository archive.info is encrypted under the user
+    // passphrase; resolve it (an unencrypted repo resolves to `None`, the
+    // plaintext path) and decrypt on load.
+    let user_pass = crate::cipher::repo_user_pass(config, index)?;
+    let (info, _) = InfoArchive::load_keyed(repo_storage, &info_path, user_pass.as_deref())
+        .map_err(|err| CommandError::Other(err.to_string()))?;
     Ok(archive_id(&info))
 }
 
@@ -852,6 +818,7 @@ fn consume_push_status(spool: &dyn Storage, stanza: &str, segment: &str) -> Resu
 ///   writing a status file itself fails (per-segment transfer failures are
 ///   recorded as `.error` status, not returned).
 pub fn drain_push_spool(
+    config: &LoadedConfig,
     spool: &dyn Storage,
     repo_storage: &dyn Storage,
     stanza: &str,
@@ -863,7 +830,7 @@ pub fn drain_push_spool(
         return Ok(0);
     }
 
-    let archive_id = load_drain_archive_id(repo_storage, stanza)?;
+    let archive_id = load_drain_archive_id(config, repo_storage, active_repo_index(config), stanza)?;
 
     let mut drained = 0;
     for entry in spool.list(&out_dir)? {
@@ -944,8 +911,10 @@ fn drain_one(
 ///   writing a status file itself fails (per-segment transfer failures are
 ///   recorded as `.error` status, not returned).
 pub fn drain_push_spool_keyed(
+    config: &LoadedConfig,
     spool: &dyn Storage,
     repo_storage: &dyn Storage,
+    index: u32,
     stanza: &str,
     transform: &RepoTransform,
 ) -> Result<usize, CommandError> {
@@ -954,7 +923,7 @@ pub fn drain_push_spool_keyed(
         return Ok(0);
     }
 
-    let archive_id = load_drain_archive_id(repo_storage, stanza)?;
+    let archive_id = load_drain_archive_id(config, repo_storage, index, stanza)?;
     let suffix = transform.repo_suffix();
     let mut drained = 0;
     for entry in spool.list(&out_dir)? {
@@ -1245,8 +1214,10 @@ fn serve_from_spool(
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if a repository read or
 ///   the write into the spool fails.
 pub fn prefetch_get_spool(
+    config: &LoadedConfig,
     spool: &dyn Storage,
     repo_storage: &dyn Storage,
+    index: u32,
     stanza: &str,
     segments: &[String],
     queue_max: Option<u64>,
@@ -1257,7 +1228,12 @@ pub fn prefetch_get_spool(
     if !repo_storage.exists(&info_path)? {
         return Ok(0);
     }
-    let archive_id = archive_id(&InfoArchive::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?);
+    // On an encrypted repository archive.info is encrypted under the user
+    // passphrase; resolve it (`None` for an unencrypted repo) and decrypt on load.
+    let user_pass = crate::cipher::repo_user_pass(config, index)?;
+    let (info, _) = InfoArchive::load_keyed(repo_storage, &info_path, user_pass.as_deref())
+        .map_err(|err| CommandError::Other(err.to_string()))?;
+    let archive_id = archive_id(&info);
 
     // Account for whatever is already staged so a partially-filled spool is not
     // overrun on the next prefetch round.
@@ -1329,13 +1305,20 @@ pub fn prefetch_get_spool(
 /// - [`CommandError::Io`] if a matched compressed form fails to decompress.
 /// - [`CommandError::Other`] if the repository's `archive.info` fails to load.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if a repository read fails.
-pub(crate) fn read_archived_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<Option<Vec<u8>>, CommandError> {
+pub(crate) fn read_archived_segment(
+    repo: &dyn Storage,
+    stanza: &str,
+    segment: &str,
+    user_pass: Option<&str>,
+) -> Result<Option<Vec<u8>>, CommandError> {
     // Resolve the archive-id directory from the repository's archive.info when
     // present; otherwise fall back to the flat `archive/<stanza>/` layout so a
     // caller that staged WAL before archive.info exists still finds it.
     let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
     let prefix = if repo.exists(&info_path)? {
-        let info = InfoArchive::load(repo, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+        // On an encrypted repository archive.info is encrypted under the user
+        // passphrase; `user_pass` is `None` for an unencrypted repo (plaintext).
+        let (info, _) = InfoArchive::load_keyed(repo, &info_path, user_pass).map_err(|err| CommandError::Other(err.to_string()))?;
         format!("archive/{stanza}/{}", archive_id(&info))
     } else {
         format!("archive/{stanza}")
@@ -1823,7 +1806,8 @@ mod tests {
 
         // Drain the spool synchronously: the segment lands in the repo, the
         // staged copy is gone, and a .ok status is recorded.
-        let drained = drain_push_spool(&spool_s, &repo_s, "demo", "", &no_transform).expect("drain should succeed");
+        let drained = drain_push_spool(&fake_config(None, vec![]), &spool_s, &repo_s, "demo", "", &no_transform)
+            .expect("drain should succeed");
         assert_eq!(drained, 1, "exactly one segment should drain");
 
         let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
@@ -1907,8 +1891,16 @@ mod tests {
 
         // Pre-fetch the segment from the repo into the spool in/ dir.
         put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
-        let prefetched =
-            prefetch_get_spool(&spool_s, &repo_s, "demo", &[SEGMENT.to_owned()], None).expect("prefetch should succeed");
+        let prefetched = prefetch_get_spool(
+            &fake_config(None, vec![]),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &[SEGMENT.to_owned()],
+            None,
+        )
+        .expect("prefetch should succeed");
         assert_eq!(prefetched, 1, "one segment should be pre-fetched");
         assert!(
             spool_s
@@ -1972,7 +1964,8 @@ mod tests {
         let blocker = repo.path().join("archive").join("demo").join(ARCHIVE_ID);
         std::fs::write(&blocker, b"not a directory").expect("write blocker file");
 
-        let drained = drain_push_spool(&spool_s, &repo_s, "demo", "", &no_transform).expect("drain returns Ok overall");
+        let drained = drain_push_spool(&fake_config(None, vec![]), &spool_s, &repo_s, "demo", "", &no_transform)
+            .expect("drain returns Ok overall");
         assert_eq!(drained, 0, "no segment should drain successfully");
         assert!(
             spool_s
@@ -1998,7 +1991,8 @@ mod tests {
         // suffix — the repo copy must be the gz frame of the plaintext.
         put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
         let transform = || -> Option<Box<dyn Filter>> { Some(Box::new(GzCompress::new(super::default_level("gz"), false))) };
-        let drained = drain_push_spool(&spool_s, &repo_s, "demo", ".gz", &transform).expect("drain should succeed");
+        let drained = drain_push_spool(&fake_config(None, vec![]), &spool_s, &repo_s, "demo", ".gz", &transform)
+            .expect("drain should succeed");
         assert_eq!(drained, 1, "one segment should drain");
 
         let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.gz");
@@ -2229,7 +2223,15 @@ mod tests {
         put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
 
         let transform = RepoTransform::with_key(CompressType::None, 0, Some("ZHJhaW4ta2V5ZWQtc3ViLWtleQ==".to_owned()));
-        let drained = drain_push_spool_keyed(&spool_s, &repo_s, "demo", &transform).expect("keyed drain should succeed");
+        let drained = drain_push_spool_keyed(
+            &fake_config(Some("demo"), Vec::new()),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &transform,
+        )
+        .expect("keyed drain should succeed");
         assert_eq!(drained, 1, "one segment should drain");
 
         let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
@@ -2390,7 +2392,7 @@ mod tests {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
 
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
         assert_eq!(bytes.as_deref(), Some(WAL_BODY), "plaintext segment returned as-is");
     }
 
@@ -2401,14 +2403,14 @@ mod tests {
         let compressed = run(GzCompress::new(super::default_level("gz"), false), WAL_BODY);
         put(&repo_s, &format!("archive/demo/{SEGMENT}.gz"), &compressed);
 
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
         assert_eq!(bytes.as_deref(), Some(WAL_BODY), "gz segment decompressed to plaintext");
     }
 
     #[test]
     fn read_archived_segment_absent_is_none() {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
         assert_eq!(bytes, None, "a segment not in the archive yields None");
     }
 
@@ -2698,7 +2700,16 @@ mod tests {
         // A 150-byte cap should stop after the first segment (100 staged >= 150?
         // no — after staging the first, staged=100 < 150, stage the second ->
         // staged=200 >= 150 stops). So exactly two are pre-fetched.
-        let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, Some(150)).expect("prefetch");
+        let prefetched = prefetch_get_spool(
+            &fake_config(Some("demo"), Vec::new()),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &requested,
+            Some(150),
+        )
+        .expect("prefetch");
         assert_eq!(prefetched, 2, "prefetch stops once the in/ spool reaches the cap");
         assert!(
             spool_s
@@ -2729,7 +2740,16 @@ mod tests {
             put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{seg}"), &[7u8; 100]);
         }
         let requested = vec!["000000010000000000000001".to_owned(), "000000010000000000000002".to_owned()];
-        let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, None).expect("prefetch");
+        let prefetched = prefetch_get_spool(
+            &fake_config(Some("demo"), Vec::new()),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &requested,
+            None,
+        )
+        .expect("prefetch");
         assert_eq!(prefetched, 2, "no cap fetches every requested segment");
     }
 }
