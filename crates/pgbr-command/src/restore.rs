@@ -197,6 +197,7 @@ use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 
 use crate::CommandError;
+use crate::backup::JobRetry;
 use crate::pipeline::RepoTransform;
 
 /// Emit a human progress line at `INFO` through the process-global logger.
@@ -1566,7 +1567,13 @@ fn copy_request(job: &RestoreCopyJob) -> Request {
 /// verifies the SHA-1. The dispatcher isolates a worker panic into an `Err`
 /// result too. `worker_count == 1` runs a single worker — byte-for-byte the
 /// prior serial behaviour.
-fn run_restore_jobs(jobs: Vec<RestoreCopyJob>, worker_count: usize) -> Result<(), CommandError> {
+///
+/// `job_retry` wraps each per-file restore: a failed restore (read / transform /
+/// write / checksum-mismatch) is retried up to `job-retry` more times — with
+/// `job-retry-interval` between attempts — inside the worker before the job, and
+/// the whole restore, fails. [`JobRetry::none`] reproduces the single-attempt
+/// behaviour exactly.
+fn run_restore_jobs(jobs: Vec<RestoreCopyJob>, worker_count: usize, job_retry: JobRetry) -> Result<(), CommandError> {
     if jobs.is_empty() {
         return Ok(());
     }
@@ -1590,7 +1597,9 @@ fn run_restore_jobs(jobs: Vec<RestoreCopyJob>, worker_count: usize) -> Result<()
         let job = table
             .get(&request.cmd)
             .ok_or_else(|| format!("no restore job for {}", request.cmd))?;
-        restore_file(job).map_err(|err| err.to_string())?;
+        // Retry the restore per `job-retry`: re-read + re-transform + re-write +
+        // re-verify on each attempt so a transient failure can recover.
+        job_retry.run(|| restore_file(job)).map_err(|err| err.to_string())?;
         Ok(Response::Ok(OkResponse { out: None }))
     });
 
@@ -1775,7 +1784,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // path). The number of files planned for copy is the restore count. A dry-run
     // dispatches nothing — `dry_run_restore_count` is the would-be count.
     let files_restored = if dry_run { dry_run_restore_count } else { jobs.len() };
-    run_restore_jobs(jobs, process_max(config))?;
+    run_restore_jobs(jobs, process_max(config), JobRetry::from_options(config))?;
 
     // 3. Delta restore removes target files absent from the manifest so the
     //    target matches the backup exactly. Walk every restored directory root
@@ -2040,7 +2049,7 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
     use pgbr_info::{DbHistoryEntry, InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
@@ -2048,7 +2057,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{RestoreOutcome, dry_run_enabled, restore_inner};
+    use super::{JobRetry, RestoreOutcome, dry_run_enabled, restore_inner};
     use crate::CommandError;
 
     /// SHA-1 of `bytes`, computed the way `restore` recomputes it, so fixtures
@@ -4220,6 +4229,64 @@ mod tests {
             let restored = std::fs::read(pg.path().join(rel)).unwrap_or_else(|_| panic!("read restored {rel}"));
             assert_eq!(&restored, bytes, "round trip mismatch for {rel}");
         }
+    }
+
+    // ---- job-retry around per-file restore ----------------------------------
+
+    /// Build a `RestoreCopyJob` that reads `abs_src` (identity transform) and
+    /// writes `abs_dst`, with no checksum check.
+    fn standalone_job(rel: &str, abs_src: PathBuf, abs_dst: PathBuf) -> super::RestoreCopyJob {
+        super::RestoreCopyJob {
+            rel: rel.to_owned(),
+            source: super::RestoreSource::Standalone {
+                abs_src,
+                transform: crate::pipeline::RepoTransform::identity(),
+            },
+            abs_dst,
+            expected_checksum: None,
+            mode: None,
+        }
+    }
+
+    /// A restore whose source is missing at first but appears before the retries
+    /// are exhausted is retried and succeeds.
+    #[test]
+    fn restore_retries_a_failing_copy_until_it_succeeds() {
+        let (_repo, pg, _repo_s, _pg_s) = posix_pair();
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let abs_src = src_dir.path().join("late_source");
+        let abs_dst = pg.path().join("restored_late");
+
+        // The source does not exist yet, so the first attempt(s) fail. A helper
+        // thread creates it shortly after, so a later retry succeeds. Generous
+        // retries + short interval keep the test reliable without being slow.
+        let create_path = abs_src.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::fs::write(&create_path, b"recovered late").expect("write late source");
+        });
+
+        let job = standalone_job("late", abs_src, abs_dst.clone());
+        let policy = JobRetry::new(40, std::time::Duration::from_millis(25));
+        super::run_restore_jobs(vec![job], 1, policy).expect("retry must recover once the source appears");
+        writer.join().expect("writer thread");
+
+        assert_eq!(std::fs::read(&abs_dst).expect("restored file"), b"recovered late");
+    }
+
+    /// A restore whose source never appears fails after exhausting its retries.
+    #[test]
+    fn restore_errors_after_exhausting_retries() {
+        let (_repo, pg, _repo_s, _pg_s) = posix_pair();
+        let abs_src = pg.path().join("never_exists_source");
+        let abs_dst = pg.path().join("restored_never");
+
+        let job = standalone_job("never", abs_src, abs_dst.clone());
+        // 2 retries (3 attempts), zero interval so the test is instant.
+        let policy = JobRetry::new(2, std::time::Duration::ZERO);
+        let err = super::run_restore_jobs(vec![job], 1, policy).expect_err("missing source must fail");
+        assert!(err.to_string().contains("never"), "error must name the failing file: {err}");
+        assert!(!abs_dst.exists(), "no destination is written when the copy never succeeds");
     }
 
     // ---- file bundling + block-incremental round trips ----------------------
