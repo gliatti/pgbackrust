@@ -50,13 +50,17 @@ BIN=/usr/lib/postgresql/$PGV/bin
 # Reset the principal cluster + repository to a clean baseline and create a fresh
 # stanza, so each scenario is self-contained and re-runnable regardless of the
 # state a prior scenario left behind. Asserts the reset and stanza-create.
-prepare_principal() {
+# Re-initdb the principal cluster to a clean, running PG18 primary (archiving on).
+reset_principal_cluster() {
   vagrant upload provision/reset-cluster.sh /tmp/reset-cluster.sh principal >/dev/null 2>&1
   local reset_out reset_rc
   reset_out=$(on principal "PGBR_PG_VERSION=$PGV bash /tmp/reset-cluster.sh"); reset_rc=$?
   if [ "$reset_rc" -eq 0 ]; then pass "reset principal cluster (clean initdb + start)"
   else printf '%s\n' "$reset_out" | tail -6 >&2; fail "reset principal cluster (exit $reset_rc)"; fi
+}
 
+prepare_principal() {
+  reset_principal_cluster
   on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
   on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
@@ -170,6 +174,61 @@ else
   pg principal "tail -30 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2
   fail "PITR to named target (before=$before after=$after future=$future, want after=1000 future=0)"
 fi
+
+############################################################################
+hd "Scenario 3 — backup to a dedicated remote repository over SSH (depot)"
+# pgBackRest topology: the backup runs ON the PG host (principal) and writes the
+# repository to a dedicated host (depot) over SSH (repo1-host=depot). The DB
+# connection is local; only repository I/O + archive-push go over the SSH worker.
+reset_principal_cluster
+on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+# Also clear principal's LOCAL repo so the placement check reflects only this
+# scenario (the remote backup must put NOTHING in principal's local repo).
+on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+
+ok "stanza-create (remote repo on depot)" principal "pgbackrest --stanza=demo stanza-create"
+ok "check (remote repo write + WAL archive over SSH)" principal "pgbackrest --stanza=demo check"
+
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup (files pushed to depot over SSH)" principal "pgbackrest --stanza=demo --type=full backup"
+
+# The repository must live on depot, not principal.
+dep_has=$(on depot "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -c 'F\$'")
+pri_has=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -c 'F\$' || true")
+if printf '%s' "$dep_has" | grep -qE '[1-9]' && printf '%s' "${pri_has:-0}" | grep -qxE '0'; then
+  pass "backup stored on depot (not principal)"
+else
+  fail "backup placement (depot=$dep_has principal=$pri_has, want depot>=1 principal=0)"
+fi
+
+out=$(pg principal "pgbackrest --stanza=demo info")
+assert_contains "$out" "status: ok" "remote-repo info status ok"
+assert_contains "$out" "full backup" "remote-repo info shows full"
+
+# Restore reads the backup back FROM depot over SSH into principal's PGDATA.
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore (reads remote repo on depot over SSH)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "remote-repo restored data (1500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "remote-repo restored data (got: $rows)"; fi
 
 ############################################################################
 printf '\n==================================================\n'
