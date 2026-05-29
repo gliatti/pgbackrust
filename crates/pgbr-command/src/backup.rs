@@ -1015,10 +1015,13 @@ fn open_control_for_index(
 
 /// The local data-directory path of the standby at `pg{index}`, when that
 /// cluster is locally reachable (no `pgN-host` configured). Returns `None` for a
-/// remote standby (`pgN-host` set) — its filesystem is only reachable through an
-/// inter-host worker, which the backup file copy does not yet drive, so a remote
-/// standby's files are read from the primary instead (the backup stays consistent
-/// because start/stop run on the primary and the standby's replay is awaited).
+/// remote standby (`pgN-host` set) — its filesystem is only reachable through its
+/// own inter-host worker, which the copy phase has no per-standby `pg_storage`
+/// handle for, so a remote standby's files are read from the primary instead (the
+/// backup stays consistent because start/stop run on the primary and the
+/// standby's replay is awaited). The primary's own files, by contrast, ARE read
+/// through `pg_storage` — including the remote/pull case where it is a worker
+/// proxy (see [`read_source`]).
 fn standby_local_path(config: &LoadedConfig, index: u32) -> Option<PathBuf> {
     let opt = |field: &str| -> Option<String> {
         let base = format!("pg-{field}");
@@ -1920,6 +1923,31 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
     Ok((repo_bytes, result))
 }
 
+/// Read a copy job's source bytes from the PG data dir.
+///
+/// A local PG data dir (`Posix`/`Cifs` `pg_storage`) is read straight off disk
+/// via `std::fs` against `job.abs_src` — the absolute path the walk recorded —
+/// which is the original fast path and needs no `Storage` handle.
+///
+/// A non-local `pg_storage` is the dedicated-repo-host **pull** topology: the
+/// orchestrator runs on the repo host, the PG data dir lives on a remote host
+/// reached through an SSH-spawned worker, and `pg_storage` is a
+/// [`pgbr_storage::remote::RemoteStorage`] proxy over that worker. There,
+/// `job.abs_src` is the **remote** host's absolute path and does **not** exist on
+/// this (repo) host — a `std::fs::read` would fail every time (and, under the
+/// `job-retry` policy, spin forever in the retry backoff, hanging the backup).
+/// So the source is read through the `Storage` trait at the PG-data-relative path
+/// `job.rel` instead, exactly as the reference-detection pass in [`plan_file`]
+/// already does, sending the read to the worker that can actually reach the file.
+fn read_source(pg_storage: &dyn Storage, job: &CopyJob) -> Result<Vec<u8>, CommandError> {
+    if pg_storage.is_local() {
+        std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))
+    } else {
+        let mut reader = pg_storage.open_read(Path::new(&job.rel))?;
+        Ok(reader.read_all()?)
+    }
+}
+
 /// Copy one file into the repo: read `abs_src`, compress-then-encrypt the
 /// plaintext into the repo bytes (the identity transform passes them through),
 /// create the destination's parent directory, and write `abs_dest`. Returns the
@@ -1928,8 +1956,11 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
 /// This is the per-file unit of work run on a dispatcher worker thread. It does
 /// all of its I/O through `std::fs` against absolute paths, so it needs no
 /// `Storage` handle and no borrow from the caller — only the owned `transform`
-/// captured by the worker closure. This fast path is used **only** for local
-/// (`Posix`/`Cifs`) repos; remote/object repos go through [`copy_file_storage`].
+/// captured by the worker closure. This fast path is used **only** when **both**
+/// the repo and the PG data dir are local (`Posix`/`Cifs`); a non-local repo
+/// goes through [`copy_file_storage`], and a non-local (remote/pull) PG data dir
+/// likewise forces [`copy_file_storage`], which reads the source via
+/// [`read_source`].
 fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, CommandError> {
     let bytes = std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
 
@@ -1945,17 +1976,25 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
 }
 
 /// Copy one file into the repo through the [`Storage`] trait, for a non-local
-/// (remote/object) repo where `std::fs` would write to the wrong machine.
+/// (remote/object) repo where `std::fs` would write to the wrong machine — or a
+/// non-local (remote/pull) PG data dir where `std::fs` would read from the wrong
+/// machine.
 ///
-/// Reads `abs_src` from the local PG data dir (still a `std::fs` read — the
-/// source is always local), runs the **same** transform + page validation as
-/// [`copy_file`] via [`transform_and_validate`], then writes the repo bytes
-/// through `repo_storage.open_write(job.rel_dest)`. Runs serially on the main
-/// thread because the remote storage is single-connection / `!Send` and cannot
-/// be shared across the worker pool. Produces the identical [`CopyResult`] the
+/// Reads the source via [`read_source`] (`std::fs` for a local PG data dir, the
+/// `Storage` trait at the PG-data-relative path for a remote/pull one), runs the
+/// **same** transform + page validation as [`copy_file`] via
+/// [`transform_and_validate`], then writes the repo bytes through
+/// `repo_storage.open_write(job.rel_dest)`. Runs serially on the main thread
+/// because the remote storage is single-connection / `!Send` and cannot be
+/// shared across the worker pool. Produces the identical [`CopyResult`] the
 /// parallel path would, so the manifest is filled exactly the same way.
-fn copy_file_storage(job: &CopyJob, transform: &RepoTransform, repo_storage: &dyn Storage) -> Result<CopyResult, CommandError> {
-    let bytes = std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+fn copy_file_storage(
+    job: &CopyJob,
+    transform: &RepoTransform,
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+) -> Result<CopyResult, CommandError> {
+    let bytes = read_source(pg_storage, job)?;
 
     let (repo_bytes, result) = transform_and_validate(job, &bytes, transform)?;
 
@@ -1976,6 +2015,11 @@ fn copy_file_storage(job: &CopyJob, transform: &RepoTransform, repo_storage: &dy
 struct BundledCopyCtx<'a> {
     /// Repository storage backend.
     repo_storage: &'a dyn Storage,
+    /// PG data dir storage. For the dedicated-repo-host pull topology this is a
+    /// non-local [`pgbr_storage::remote::RemoteStorage`] proxy over a worker;
+    /// [`read_source`] then reads each source file through it rather than via
+    /// `std::fs` (whose absolute `job.abs_src` only exists on the remote PG host).
+    pg_storage: &'a dyn Storage,
     /// `backup/<stanza>/<label>` repo-relative root of this backup.
     backup_root: &'a str,
     /// The compress + encrypt transform applied to every file (and block).
@@ -2049,11 +2093,11 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
             .remove(&skeleton.path)
             .ok_or_else(|| CommandError::Other(format!("no copy job for {}", skeleton.path)))?;
         // Read the source under the job-retry policy: a transient read failure is
-        // retried up to `job-retry` times before failing the backup.
-        let bytes = ctx
-            .job_retry
-            .run(|| std::fs::read(&job.abs_src))
-            .map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+        // retried up to `job-retry` times before failing the backup. The read goes
+        // through `read_source`, so a non-local (remote/pull) PG data dir is read
+        // via the worker rather than `std::fs` (whose absolute `job.abs_src` only
+        // exists on the remote PG host).
+        let bytes = ctx.job_retry.run(|| read_source(ctx.pg_storage, &job))?;
         let checksum = plaintext_sha1(&bytes)?;
 
         // Page-checksum + page-header validation, identical to the per-file path.
@@ -2530,30 +2574,40 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
 /// worker before the job — and the whole backup — fails. [`JobRetry::none`]
 /// reproduces the single-attempt behaviour exactly.
 ///
-/// When `repo_storage` is **not** local (a remote/object backend) the parallel
-/// `std::fs` path is unsafe — `std::fs` would write to the wrong machine — so
-/// the copies run serially on the main thread through
-/// [`copy_file_storage`] (the storage handle is single-connection / `!Send` and
-/// cannot cross the worker boundary). The result is the identical
-/// [`CopyResult`] list, so callers are unaffected by which path ran.
+/// When `repo_storage` is **not** local (a remote/object repo backend) the
+/// parallel `std::fs` path is unsafe — `std::fs` would *write* to the wrong
+/// machine — and when `pg_storage` is **not** local (the dedicated-repo-host
+/// pull topology, where the PG data dir is reached over a worker) the parallel
+/// path is equally unsafe — `std::fs` would *read* from the wrong machine (the
+/// absolute `job.abs_src` only exists on the remote PG host). In either case the
+/// copies run serially on the main thread through [`copy_file_storage`], which
+/// reads via [`read_source`] and writes via [`Storage::open_write`] (a local
+/// `Posix` repo is still written correctly through the trait). The storage
+/// handles are single-connection / `!Send` and cannot cross the worker boundary.
+/// The result is the identical [`CopyResult`] list, so callers are unaffected by
+/// which path ran. The parallel `std::fs` fast path runs **only** when both the
+/// repo and the PG data dir are local.
 fn run_copy_jobs(
     jobs: &[CopyJob],
     transform: &RepoTransform,
     worker_count: usize,
     job_retry: JobRetry,
     repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
 ) -> Result<Vec<(String, CopyResult)>, CommandError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Non-local repo: write every file through the `Storage` trait, serially on
-    // this thread. `std::fs` (the parallel path below) would land the bytes on
-    // the local machine instead of the remote/object repo.
-    if !repo_storage.is_local() {
+    // Non-local repo OR non-local PG data dir: copy every file through the
+    // `Storage` trait, serially on this thread. The parallel `std::fs` path below
+    // would land the bytes on the local machine instead of the remote/object repo
+    // (non-local repo), or read `job.abs_src` — the *remote* PG host's absolute
+    // path — off the local disk where it does not exist (non-local pull PG dir).
+    if !repo_storage.is_local() || !pg_storage.is_local() {
         let mut out = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let copied = job_retry.run(|| copy_file_storage(job, transform, repo_storage))?;
+            let copied = job_retry.run(|| copy_file_storage(job, transform, repo_storage, pg_storage))?;
             out.push((job.rel.clone(), copied));
         }
         return Ok(out);
@@ -2567,11 +2621,15 @@ fn run_copy_jobs(
         })
         .collect();
 
-    // The dispatcher demands a `Send + Sync + 'static` worker, so the closure
-    // can only borrow owned data: an owned clone of the transform (cheap) and
-    // whatever rides in each `Request`. No `Storage` handle crosses the boundary
-    // — workers do their I/O through `std::fs` against the absolute paths in the
-    // request, so nothing borrowed from this stack frame escapes.
+    // Both the repo and the PG data dir are local here (the serial branch above
+    // caught every non-local combination), so the parallel `std::fs` fast path is
+    // safe. The dispatcher demands a `Send + Sync + 'static` worker, so the
+    // closure can only borrow owned data: an owned clone of the transform (cheap)
+    // and whatever rides in each `Request`. No `Storage` handle crosses the
+    // boundary — in particular `pg_storage` is NOT captured (a `RemoteStorage` is
+    // single-connection / `!Send`); it does not need to be, because this path
+    // runs only when the PG data dir is local and the source is read off disk via
+    // `std::fs` in `copy_file`. Nothing borrowed from this stack frame escapes.
     let worker_transform = transform.clone();
     let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
         let job = request_to_copy_job(request)?;
@@ -2758,6 +2816,11 @@ impl ResumeContext {
 /// write a periodic in-progress `backup.manifest` for `manifest-save-threshold`.
 struct UnbundledCopyCtx<'a> {
     repo_storage: &'a dyn Storage,
+    /// PG data dir storage. For the dedicated-repo-host pull topology this is a
+    /// non-local [`pgbr_storage::remote::RemoteStorage`] proxy over a worker, so
+    /// the copy reads the source through it instead of `std::fs` (whose absolute
+    /// `job.abs_src` only exists on the remote PG host).
+    pg_storage: &'a dyn Storage,
     backup_root: &'a str,
     backup_type: BackupType,
     label: &'a str,
@@ -2789,7 +2852,14 @@ struct UnbundledCopyCtx<'a> {
 ///
 /// Returns the assembled file list and the total repo bytes written.
 fn run_unbundled_copy(mut ctx: UnbundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
-    let copy_results = run_copy_jobs(ctx.jobs, ctx.transform, ctx.process_max, ctx.job_retry, ctx.repo_storage)?;
+    let copy_results = run_copy_jobs(
+        ctx.jobs,
+        ctx.transform,
+        ctx.process_max,
+        ctx.job_retry,
+        ctx.repo_storage,
+        ctx.pg_storage,
+    )?;
     let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
 
     // Move the skeletons + already-decided referenced files out of `ctx` so the
@@ -3347,6 +3417,7 @@ fn run_backup(
     } else if features.bundle {
         run_bundled_copy(BundledCopyCtx {
             repo_storage,
+            pg_storage,
             backup_root: &backup_root,
             transform,
             label: &label,
@@ -3363,6 +3434,7 @@ fn run_backup(
     } else {
         run_unbundled_copy(UnbundledCopyCtx {
             repo_storage,
+            pg_storage,
             backup_root: &backup_root,
             backup_type,
             label: &label,
@@ -6734,7 +6806,7 @@ mod tests {
     fn save_partial_manifest_writes_a_loadable_manifest() {
         // Directly exercise the periodic-save helper: it must write a manifest the
         // resume path can load back.
-        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let backup_root = "backup/demo/partial";
         repo_s.create_path(Path::new(backup_root), true).unwrap();
         let files = vec![ManifestFile {
@@ -6755,6 +6827,7 @@ mod tests {
         let links: Vec<ManifestLink> = Vec::new();
         let ctx = UnbundledCopyCtx {
             repo_storage: &repo_s,
+            pg_storage: &pg_s,
             backup_root,
             backup_type: BackupType::Full,
             label: "partial",
@@ -7249,5 +7322,168 @@ mod tests {
         let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
         let pg_control = manifest.file("global/pg_control").expect("pg_control in manifest");
         assert_eq!(pg_control.checksum.as_deref(), Some(sha1_hex(b"\x01\x02\x03\x04").as_str()));
+    }
+
+    /// A `Storage` wrapper that counts every `open_read` while delegating all
+    /// real I/O to an inner [`Posix`]. Used as the **worker-side** backing store
+    /// behind a [`pgbr_storage::remote::StorageRequestHandler`] so the test can
+    /// prove the backup copy path read each source file *through the worker*
+    /// (`open_read`), not via `std::fs`.
+    struct CountingPosix {
+        inner: Posix,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingPosix {
+        fn new(inner: Posix) -> Self {
+            Self {
+                inner,
+                reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn reads(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+            std::sync::Arc::clone(&self.reads)
+        }
+    }
+
+    impl Storage for CountingPosix {
+        // Inherit the default `is_local()` (false) so this is irrelevant here; the
+        // worker only ever serves storage requests over the protocol.
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    #[test]
+    fn backup_with_non_local_pg_reads_source_through_the_worker() {
+        // The dedicated-repo-host "pull" topology: the orchestrator runs on the
+        // repo host, the repo is LOCAL there, but the PG data dir lives on a
+        // remote host reached through an SSH-spawned worker. Here `pg_storage` is a
+        // `RemoteStorage` proxy over a `StorageRequestHandler<Posix>` served on a
+        // thread, exactly as the real worker transport wires it.
+        //
+        // The bug: the copy path read each source via `std::fs::read(job.abs_src)`,
+        // where `abs_src` is the REMOTE host's absolute PGDATA path — absent on the
+        // repo host — so every read failed and the `job-retry` backoff hung the
+        // backup. The fix reads the PG-data-relative path through `pg_storage`
+        // (the worker). This test proves the source bytes really travelled through
+        // the worker (its `open_read` is invoked once per data file) and that the
+        // repo ends up with the copied files, byte-for-byte.
+        use pgbr_protocol::ProtocolClient;
+        use pgbr_protocol::transport::{PipeRead, PipeWrite, serve};
+        use pgbr_storage::remote::{RemoteStorage, StorageRequestHandler};
+        use std::sync::atomic::Ordering;
+        use std::thread;
+
+        // Backing store for the worker (the remote PG host's filesystem), wrapped
+        // so we can count the `open_read`s the worker serves.
+        let pg_dir = tempfile::tempdir().expect("pg tempdir");
+        let counting = CountingPosix::new(Posix::new(pg_dir.path()));
+        let reads = counting.reads();
+
+        // Seed a representative PG data dir into the worker's backing store. These
+        // are the files the copy path must read through the worker.
+        let server_pg = Posix::new(pg_dir.path());
+        seed_file(&server_pg, "PG_VERSION", b"14\n");
+        seed_file(&server_pg, "base/1/1259", b"relation-data-1259");
+        seed_file(&server_pg, "global/pg_control", b"\x01\x02\x03\x04");
+
+        // Wire a RemoteStorage client to the StorageRequestHandler over two
+        // os_pipe channels (server on its own thread), mirroring the real
+        // worker transport (and `pgbr_storage::remote` / `worker.rs` tests).
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let mut handler = StorageRequestHandler::new(counting);
+            serve(&mut reader, &mut writer, &mut handler).unwrap();
+        });
+        let client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        let pg_remote = RemoteStorage::new(client);
+        // The proxy must report itself as non-local so the copy path reads the
+        // source through it (the whole point of the fix).
+        assert!(!pg_remote.is_local(), "RemoteStorage must be non-local");
+
+        // The repository is LOCAL to the repo host (the pull topology), so it is a
+        // plain Posix store on this machine.
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo_s = Posix::new(repo_dir.path());
+        init_stanza(&repo_s, "demo");
+
+        // Run a full backup with the remote PG storage and the local repo. With the
+        // bug this would never read the source through the worker (and, in a real
+        // multi-host setup, would hang on the missing local `abs_src`).
+        let outcome =
+            backup_inner("demo", &repo_s, &pg_remote, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("pull backup");
+        assert_eq!(outcome.file_count, 3, "3 non-excluded files expected");
+
+        // The source for every data file was read THROUGH the worker. A full
+        // backup performs no reference-detection reads, so the only `open_read`s on
+        // `pg_storage` are the copy-path source reads added by the fix: one per
+        // data file. If the buggy `std::fs` path had run, this would be zero.
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "each source file must be read through the worker (open_read), not std::fs"
+        );
+
+        // The copied bytes really landed in the local repo, byte-for-byte — the
+        // pull copy path round-tripped the source through the worker into the repo.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert_eq!(std::fs::read(backup_root.join("PG_VERSION")).unwrap(), b"14\n");
+        assert_eq!(std::fs::read(backup_root.join("base/1/1259")).unwrap(), b"relation-data-1259");
+        assert_eq!(
+            std::fs::read(backup_root.join("global/pg_control")).unwrap(),
+            b"\x01\x02\x03\x04"
+        );
+
+        // The manifest lists the copied files with their plaintext checksums.
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let listed: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(listed.contains(&"PG_VERSION"), "manifest must list PG_VERSION: {listed:?}");
+        assert!(listed.contains(&"base/1/1259"));
+        assert!(listed.contains(&"global/pg_control"));
+        let pg_control = manifest.file("global/pg_control").expect("pg_control in manifest");
+        assert_eq!(pg_control.checksum.as_deref(), Some(sha1_hex(b"\x01\x02\x03\x04").as_str()));
+
+        // Drop the client (sends the exit handshake) so the worker sees EOF and the
+        // server thread joins cleanly — keeping the test deterministic.
+        pg_remote.close().expect("close remote pg storage");
+        server.join().expect("worker thread joins");
     }
 }
