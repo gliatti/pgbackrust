@@ -675,6 +675,12 @@ fn value_to_match_str(v: &serde_yml::Value) -> Option<String> {
         serde_yml::Value::String(s) => Some(s.clone()),
         serde_yml::Value::Bool(b) => Some(b.to_string()),
         serde_yml::Value::Number(n) => Some(n.to_string()),
+        // A compile-time-feature-gated allow-list entry is a single-key mapping
+        // `{value: FEATURE_FLAG}` — e.g. `{zst: HAVE_LIBZST}` in config.yaml,
+        // mirroring pgBackRest's `#ifdef HAVE_LIBZST`. This build links every
+        // optional codec (zstd, lz4, bz2, …) unconditionally, so the gate is
+        // always satisfied: take the key as the permitted value.
+        serde_yml::Value::Mapping(m) if m.len() == 1 => m.iter().next().and_then(|(k, _)| k.as_str().map(ToOwned::to_owned)),
         _ => None,
     }
 }
