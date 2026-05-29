@@ -201,13 +201,18 @@ pub trait BackupControl {
 pub fn backup_start_sql(info: &BackupServerInfo, label: &str, fast: bool) -> String {
     let label_lit = sql_quote(label);
     let fast_lit = sql_bool(fast);
+    // `pg_backup_start` / `pg_start_backup` return a *scalar* `pg_lsn`, so the
+    // function item in the FROM clause must be aliased (`… as lsn`) to give its
+    // single output column the name `lsn` — otherwise the column is named after
+    // the function and `select lsn` fails with `column "lsn" does not exist`.
+    // pgBackRest's `db/db.c` uses the same `as lsn` alias.
     if info.uses_pg_backup_start() {
         // PG >= 15: keyword arguments, always non-exclusive.
-        format!("select lsn::text as lsn from pg_catalog.pg_backup_start(label => {label_lit}, fast => {fast_lit})")
+        format!("select lsn::text as lsn from pg_catalog.pg_backup_start(label => {label_lit}, fast => {fast_lit}) as lsn")
     } else {
         // PG < 15: positional args; the trailing `false` selects a
         // non-exclusive backup (so start/stop must share this session).
-        format!("select lsn::text as lsn from pg_catalog.pg_start_backup({label_lit}, {fast_lit}, false)")
+        format!("select lsn::text as lsn from pg_catalog.pg_start_backup({label_lit}, {fast_lit}, false) as lsn")
     }
 }
 

@@ -50,6 +50,14 @@ done
 
 ############################################################################
 hd "Scenario 1 — local minimal backup on principal (KB Exemple 1)"
+# Reset the principal cluster to a clean, running baseline first. A previous run
+# (or a mid-restore failure) can leave the data dir half-restored and unbootable,
+# which would break every step below; this makes the whole scenario re-runnable.
+vagrant upload provision/reset-cluster.sh /tmp/reset-cluster.sh principal >/dev/null 2>&1
+reset_out=$(on principal "PGBR_PG_VERSION=$PGV bash /tmp/reset-cluster.sh"); reset_rc=$?
+if [ "$reset_rc" -eq 0 ]; then pass "reset principal cluster (clean initdb + start)"
+else printf '%s\n' "$reset_out" | tail -6 >&2; fail "reset principal cluster (exit $reset_rc)"; fi
+
 # Reset the repository so the run is deterministic (stanza-create is fresh).
 on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
 
@@ -96,10 +104,18 @@ assert_contains "$out" "incr backup" "info shows incr"
 # verify the rows survived (1000 + 500 = 1500).
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
 ok "delta restore (--delta restore, options before command)" principal "pgbackrest --stanza=demo --delta restore"
-pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w start" >/dev/null 2>&1
+# `-w` waits for the cluster to finish recovery and accept connections; a
+# recovery failure makes pg_ctl return non-zero after its timeout.
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 60 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t")
-assert_contains "$rows" "1500" "restored data (1500 rows)"
+if printf '%s' "$rows" | grep -qF -- "1500"; then
+  pass "restored data (1500 rows)"
+else
+  # Surface the recovery log so a failure is diagnosable from the run output.
+  pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2
+  fail "restored data (1500 rows) (got: $(printf '%s' "$rows" | tr -d '\n'))"
+fi
 
 ############################################################################
 printf '\n==================================================\n'
