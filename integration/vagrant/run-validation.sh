@@ -515,6 +515,33 @@ for CT in bz2 lz4; do
 done
 
 ############################################################################
+hd "Scenario 12 — asynchronous WAL archiving (archive-async=y + spool-path)"
+# Async mode stages each WAL into <spool>/archive/<stanza>/out/ and the foreground
+# call drains the spool into the repo before returning. A 'check' archive
+# round-trip + a full backup (whose pg_backup_stop waits for the stop WAL via
+# archive-check) are the deterministic proof that staged segments actually reach
+# the repo within archive-timeout, not pile up in the spool unread.
+prepare_principal_cfg "archive-async=y
+spool-path=/var/spool/pgbackrest
+repo1-retention-full=2"
+on principal "install -d -o postgres -g postgres -m 0750 /var/spool/pgbackrest; rm -rf /var/spool/pgbackrest/* 2>/dev/null; true"
+ok "check (async archive round-trip)" principal "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+for _ in 1 2 3; do psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null; done
+ok "full backup (async; archive-check waits for stop WAL)" principal "pgbackrest --stanza=demo --type=full backup"
+arch=$(on principal "ls /var/lib/pgbackrest/archive/demo/*/0000* 2>/dev/null | wc -l" | tr -d ' ')
+if [ "${arch:-0}" -ge 1 ]; then pass "WAL segments reached the repo archive ($arch present)"
+else fail "no WAL in repo archive (got: $arch) — async drain regression"; fi
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore (async repo)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "async repo restored data (1500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "async repo restored data (got: $rows)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
