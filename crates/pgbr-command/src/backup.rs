@@ -747,7 +747,31 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let ControlConnections {
         mut primary,
         mut standby,
+        standby_index,
     } = resolve_control_connections(config, standby_mode(config))?;
+
+    // backup-standby I/O offload: when a standby was selected and its data
+    // directory is locally reachable (no `pgN-host`), read the backup files from
+    // the standby to offload the primary's I/O (C ref: backup.c reads from the
+    // standby `storagePg()` when `backup-standby` is active). A remote standby's
+    // files fall back to `pg_storage` (the primary) — the backup is still
+    // consistent (start/stop on the primary, standby replay awaited); only the
+    // read location differs. A standby at pg1 with a local path resolves to the
+    // same directory as `pg_storage`, so the override is a harmless no-op there.
+    let standby_dir = standby_index.and_then(|idx| standby_local_path(config, idx));
+    if standby.is_some() {
+        match &standby_dir {
+            Some(dir) => log_info(&format!(
+                "backup-standby: reading files from the standby data directory {}",
+                dir.display()
+            )),
+            None => log_info(
+                "backup-standby: standby is remote; reading files from the primary data directory (consistent; remote-standby read offload not yet plumbed)",
+            ),
+        }
+    }
+    let standby_storage = standby_dir.map(pgbr_storage::Posix::new);
+    let copy_storage: &dyn Storage = standby_storage.as_ref().map_or(pg_storage, |s| s as &dyn Storage);
 
     // The diff label depends on the full it references, so it is computed inside
     // `run_backup` (which knows the full label); full labels are timestamp-derived
@@ -755,7 +779,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let outcome = run_backup(
         stanza,
         repo_storage,
-        pg_storage,
+        copy_storage,
         backup_type,
         None,
         timestamp_start,
@@ -801,6 +825,10 @@ struct ControlConnections {
     primary: Option<LibpqBackupControl>,
     /// Optional in-recovery standby whose replay is polled before the file copy.
     standby: Option<LibpqBackupControl>,
+    /// The `pgN` index of the selected standby (`1`..=`8`), if any. Used to read
+    /// backup files from the standby's data directory (I/O offload) when that
+    /// `pgN` is locally reachable (no `pgN-host`).
+    standby_index: Option<u32>,
 }
 
 /// Open the backup-control connection(s) the `backup-standby` policy calls for.
@@ -832,17 +860,19 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
     /// Highest `pgN` index pgBackRest supports.
     const MAX_PG_INDEX: u32 = 8;
 
-    // Gather candidate conninfos, deduplicated, primary (pg1 / DATABASE_URL)
-    // first so it is preferred as the primary when reachable + not in recovery.
-    let mut conninfos: Vec<String> = Vec::new();
+    // Gather candidate `(pgN-index, conninfo)` pairs, deduplicated, primary
+    // (pg1 / DATABASE_URL) first so it is preferred as the primary when reachable
+    // + not in recovery. The index is retained so a selected standby's data
+    // directory can be located for the file-copy I/O offload.
+    let mut conninfos: Vec<(u32, String)> = Vec::new();
     if let Some(pg1) = derive_conninfo_with_url(config, std::env::var("DATABASE_URL").ok().as_deref()) {
-        conninfos.push(pg1);
+        conninfos.push((1, pg1));
     }
     for index in 2..=MAX_PG_INDEX {
         if let Some(conninfo) = derive_conninfo_for_index(config, index)
-            && !conninfos.contains(&conninfo)
+            && !conninfos.iter().any(|(_, c)| c == &conninfo)
         {
-            conninfos.push(conninfo);
+            conninfos.push((index, conninfo));
         }
     }
 
@@ -856,17 +886,20 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
         return Ok(ControlConnections {
             primary: None,
             standby: None,
+            standby_index: None,
         });
     }
 
     let mut primary: Option<LibpqBackupControl> = None;
     let mut standby: Option<LibpqBackupControl> = None;
-    for conninfo in &conninfos {
+    let mut standby_index: Option<u32> = None;
+    for (index, conninfo) in &conninfos {
         let mut control = LibpqBackupControl::open(conninfo)?;
         let in_recovery = control.is_in_recovery()?;
         if in_recovery {
             if standby.is_none() && mode != StandbyMode::No {
                 standby = Some(control);
+                standby_index = Some(*index);
             }
         } else if primary.is_none() {
             primary = Some(control);
@@ -884,7 +917,31 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
         ));
     }
 
-    Ok(ControlConnections { primary, standby })
+    Ok(ControlConnections {
+        primary,
+        standby,
+        standby_index,
+    })
+}
+
+/// The local data-directory path of the standby at `pg{index}`, when that
+/// cluster is locally reachable (no `pgN-host` configured). Returns `None` for a
+/// remote standby (`pgN-host` set) — its filesystem is only reachable through an
+/// inter-host worker, which the backup file copy does not yet drive, so a remote
+/// standby's files are read from the primary instead (the backup stays consistent
+/// because start/stop run on the primary and the standby's replay is awaited).
+fn standby_local_path(config: &LoadedConfig, index: u32) -> Option<PathBuf> {
+    let opt = |name: &str| -> Option<String> {
+        match config.options.get(&(name.to_owned(), None)) {
+            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    };
+    // A configured host means the standby is remote — not locally readable.
+    if opt(&format!("pg{index}-host")).is_some() {
+        return None;
+    }
+    opt(&format!("pg{index}-path")).map(PathBuf::from)
 }
 
 /// Whether the resolved `archive-copy` option is set.
@@ -5609,6 +5666,40 @@ mod tests {
         assert!(conninfo.contains("host=standby.example"), "{conninfo}");
         assert!(conninfo.contains("port=5433"), "{conninfo}");
         assert!(conninfo.contains("dbname=postgres"), "{conninfo}");
+    }
+
+    #[test]
+    fn standby_local_path_only_for_local_pg() {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        // pg1: local standby (path, no host) -> its data dir is returned.
+        options.insert(
+            ("pg1-path".to_owned(), None),
+            OptionValue::Path("/var/lib/postgresql/16/standby".to_owned()),
+        );
+        // pg2: remote standby (host set) -> None (read from primary instead).
+        options.insert(("pg2-host".to_owned(), None), OptionValue::String("secondaire".to_owned()));
+        options.insert(
+            ("pg2-path".to_owned(), None),
+            OptionValue::Path("/var/lib/postgresql/16/main".to_owned()),
+        );
+        let cfg = LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options,
+            params: Vec::new(),
+        };
+        assert_eq!(
+            standby_local_path(&cfg, 1),
+            Some(PathBuf::from("/var/lib/postgresql/16/standby")),
+            "a local standby (no host) yields its data dir for the file-copy offload"
+        );
+        assert_eq!(
+            standby_local_path(&cfg, 2),
+            None,
+            "a remote standby (host set) is not locally readable"
+        );
+        assert_eq!(standby_local_path(&cfg, 3), None, "an unconfigured index yields None");
     }
 
     #[test]
