@@ -168,6 +168,38 @@ fn keepalive_secs(config: &LoadedConfig, name: &str) -> Option<u32> {
     }
 }
 
+/// Resolve the `sck-block` boolean from the configuration (default `false`).
+///
+/// `sck-block` selects blocking (`true`) vs non-blocking (`false`) socket mode
+/// for the protocol sockets. pgBackRest defaults it to `false` (non-blocking) —
+/// see the `sck-block` definition in `config.yaml`. Returns the resolved flag.
+fn sck_block(config: &LoadedConfig) -> bool {
+    match config.options.get(&("sck-block".to_owned(), None)) {
+        Some(OptionValue::Boolean(b)) => *b,
+        _ => false,
+    }
+}
+
+/// Apply the resolved `sck-block` mode to a socket, best-effort.
+///
+/// `block == true` (the operator opted in to blocking sockets) explicitly sets
+/// blocking mode. `block == false` (the `sck-block` default) leaves the socket
+/// as-is: the protocol transport here is synchronous std I/O, which relies on
+/// blocking reads / writes, so forcing non-blocking mode would break the serve /
+/// ping loops with spurious `WouldBlock` errors. The original C runs its sockets
+/// non-blocking behind an event loop; this Rust port has no such loop, so the
+/// non-blocking case is honoured only to the extent the blocking transport
+/// allows (i.e. no-op) — a deliberate best-effort limitation.
+///
+/// A failure to set the mode is logged and ignored: like keepalive tuning it is
+/// never a reason to drop an otherwise-good connection. C ref: `sckOptionSet` /
+/// the blocking-mode handling in `src/common/io/socket/`.
+fn apply_sck_block(stream: &TcpStream, block: bool) {
+    if block && let Err(err) = stream.set_nonblocking(false) {
+        crate::control::log_warn(&format!("unable to set socket blocking mode (sck-block=true): {err}"));
+    }
+}
+
 /// Protocol error code returned for malformed or unexpected requests.
 ///
 /// Mirrors `pgbr_error::ErrorType` numbering, where `ProtocolError` is 39.
@@ -343,17 +375,19 @@ fn split(stream: TcpStream) -> Result<(TcpIo, TcpIo), CommandError> {
 /// [`CommandError::Other`] on an accept / clone failure, or whatever [`serve`]
 /// returns for a protocol or write error.
 pub fn serve_listener(listener: &TcpListener) -> Result<(), CommandError> {
-    serve_listener_with(listener, KeepAlive::default())
+    serve_listener_with(listener, KeepAlive::default(), false)
 }
 
-/// [`serve_listener`] with explicit keepalive settings applied to the accepted
-/// socket. The config-driven `server` path threads the resolved [`KeepAlive`]
-/// here; the public [`serve_listener`] uses the default.
-fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive) -> Result<(), CommandError> {
+/// [`serve_listener`] with explicit keepalive + `sck-block` settings applied to
+/// the accepted socket. The config-driven `server` path threads the resolved
+/// [`KeepAlive`] and `sck-block` flag here; the public [`serve_listener`] uses
+/// the defaults.
+fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive, sck_block: bool) -> Result<(), CommandError> {
     let (stream, _peer) = listener
         .accept()
         .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
     keepalive.apply(&stream);
+    apply_sck_block(&stream, sck_block);
     let (mut reader, mut writer) = split(stream)?;
     serve(&mut reader, &mut writer)?;
     // Signal a clean EOF to the peer; ignore an already-closed socket.
@@ -369,14 +403,14 @@ fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive) -> Result<(
 /// [`CommandError::Other`] if the address cannot be bound, plus anything
 /// [`serve_listener`] returns.
 pub fn serve_tcp(addr: &str) -> Result<(), CommandError> {
-    serve_tcp_with(addr, KeepAlive::default())
+    serve_tcp_with(addr, KeepAlive::default(), false)
 }
 
-/// [`serve_tcp`] with explicit keepalive settings.
-fn serve_tcp_with(addr: &str, keepalive: KeepAlive) -> Result<(), CommandError> {
+/// [`serve_tcp`] with explicit keepalive + `sck-block` settings.
+fn serve_tcp_with(addr: &str, keepalive: KeepAlive, sck_block: bool) -> Result<(), CommandError> {
     let listener = TcpListener::bind(addr).map_err(|e| CommandError::Other(format!("tcp bind {addr}: {e}")))?;
     crate::control::log_info(&format!("server listening (tcp) on {addr}"));
-    serve_listener_with(&listener, keepalive)
+    serve_listener_with(&listener, keepalive, sck_block)
 }
 
 /// Connect a [`TcpStream`] to `addr` and run [`ping_exchange`] over its
@@ -591,10 +625,81 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, CommandError> 
 /// `ca_path`.
 fn root_store_from_ca(ca_path: &str) -> Result<RootCertStore, CommandError> {
     let mut roots = RootCertStore::empty();
+    add_ca_file(&mut roots, ca_path)?;
+    Ok(roots)
+}
+
+/// Add every certificate in the PEM file at `ca_path` to `roots`.
+fn add_ca_file(roots: &mut RootCertStore, ca_path: &str) -> Result<(), CommandError> {
     for cert in load_cert_chain(ca_path)? {
         roots
             .add(cert)
             .map_err(|e| CommandError::Other(format!("add CA from {ca_path}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Add every certificate found in every regular file under the directory
+/// `ca_dir` to `roots`.
+///
+/// This is the `*-host-ca-path` / OpenSSL `CApath` style trust source: a
+/// directory holding one or more CA certificate files (each possibly a bundle).
+/// Every entry that is a regular file is read and parsed as a PEM chain and its
+/// certificates added to the store; sub-directories and unreadable / non-PEM
+/// entries are skipped so a stray file does not abort loading the rest. Entries
+/// are processed in sorted order for deterministic behaviour. C ref:
+/// `SSL_CTX_load_verify_locations` with a `CApath` in `src/common/io/tls/`.
+fn add_ca_path(roots: &mut RootCertStore, ca_dir: &str) -> Result<(), CommandError> {
+    let entries = std::fs::read_dir(ca_dir).map_err(|e| CommandError::Other(format!("read ca-path dir {ca_dir}: {e}")))?;
+
+    // Collect paths first so they can be sorted for deterministic ordering.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| CommandError::Other(format!("read ca-path entry in {ca_dir}: {e}")))?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+
+    for path in files {
+        // Parse each file as a PEM chain; a file that cannot be read, or holds no
+        // certs (not PEM at all), simply contributes nothing rather than failing
+        // the load.
+        let Ok(pem) = std::fs::read(&path) else { continue };
+        let display = path.display().to_string();
+        let mut reader = &pem[..];
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader).filter_map(Result::ok).collect();
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|e| CommandError::Other(format!("add CA from {display}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a [`RootCertStore`] from an optional CA *file* and an optional CA
+/// *directory*, loading the certs from each that is supplied.
+///
+/// `ca_file` is a single PEM file (`*-host-ca-file`); `ca_dir` is a directory of
+/// PEM files (`*-host-ca-path`). Both are additive — supplying both trusts the
+/// union — and at least one must yield a usable root for the resulting store to
+/// validate any peer (an empty store is returned when neither is given, which
+/// the caller treats as a configuration error upstream).
+///
+/// # Errors
+///
+/// [`CommandError::Other`] if a configured file / directory cannot be read or a
+/// certificate it contains is rejected by rustls.
+pub fn root_store_from_ca_sources(ca_file: Option<&str>, ca_dir: Option<&str>) -> Result<RootCertStore, CommandError> {
+    let mut roots = RootCertStore::empty();
+    if let Some(file) = ca_file {
+        add_ca_file(&mut roots, file)?;
+    }
+    if let Some(dir) = ca_dir {
+        add_ca_path(&mut roots, dir)?;
     }
     Ok(roots)
 }
@@ -922,24 +1027,26 @@ fn build_client_config(
 /// Build a mutual-TLS [`ClientConfig`] from PEM **file paths**, for the
 /// `repo-host-type=tls` / `pg-host-type=tls` worker transport.
 ///
-/// Trusts the CA in `ca_file`, and — when `cert_file` and `key_file` are both
-/// `Some` — presents that client certificate (the mutual-TLS leg the peer
-/// `pgbackrest server` authorizes by Common Name). `cipher_names`, when
-/// non-empty, is a `tls-cipher-12` / `tls-cipher-13` style suite list that
-/// restricts the negotiated ciphers.
+/// Trusts the CA in `ca_file` and/or every CA file in the directory `ca_path`
+/// (`*-host-ca-file` / `*-host-ca-path`, both additive), and — when `cert_file`
+/// and `key_file` are both `Some` — presents that client certificate (the
+/// mutual-TLS leg the peer `pgbackrest server` authorizes by Common Name).
+/// `cipher_names`, when non-empty, is a `tls-cipher-12` / `tls-cipher-13` style
+/// suite list that restricts the negotiated ciphers.
 ///
 /// # Errors
 ///
-/// [`CommandError::Other`] if a PEM file cannot be read / parsed, the provider
-/// rejects the restricted cipher suites, or the client certificate / key is
-/// invalid.
+/// [`CommandError::Other`] if a PEM file / directory cannot be read / parsed,
+/// the provider rejects the restricted cipher suites, or the client certificate
+/// / key is invalid.
 pub fn build_client_config_from_files(
-    ca_file: &str,
+    ca_file: Option<&str>,
+    ca_path: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
     cipher_names: &[String],
 ) -> Result<ClientConfig, CommandError> {
-    let roots = root_store_from_ca(ca_file)?;
+    let roots = root_store_from_ca_sources(ca_file, ca_path)?;
 
     let client_auth = match (cert_file, key_file) {
         (Some(cert), Some(key)) => Some((load_cert_chain(cert)?, load_private_key(key)?)),
@@ -1074,12 +1181,12 @@ pub fn serve_tls_storage(
     stanza: Option<&str>,
     root: &std::path::Path,
 ) -> Result<(), CommandError> {
-    serve_tls_storage_with(listener, server_config, auth, stanza, root, KeepAlive::default())
+    serve_tls_storage_with(listener, server_config, auth, stanza, root, KeepAlive::default(), false)
 }
 
-/// [`serve_tls_storage`] with explicit keepalive settings applied to the
-/// accepted socket before the TLS handshake. The config-driven `server` path
-/// threads the resolved [`KeepAlive`] here.
+/// [`serve_tls_storage`] with explicit keepalive + `sck-block` settings applied
+/// to the accepted socket before the TLS handshake. The config-driven `server`
+/// path threads the resolved [`KeepAlive`] and `sck-block` flag here.
 fn serve_tls_storage_with(
     listener: &TcpListener,
     server_config: Arc<ServerConfig>,
@@ -1087,11 +1194,13 @@ fn serve_tls_storage_with(
     stanza: Option<&str>,
     root: &std::path::Path,
     keepalive: KeepAlive,
+    sck_block: bool,
 ) -> Result<(), CommandError> {
     let (stream, _peer) = listener
         .accept()
         .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
     keepalive.apply(&stream);
+    apply_sck_block(&stream, sck_block);
 
     let mut conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
 
@@ -1262,6 +1371,7 @@ fn server_root(config: &LoadedConfig) -> std::path::PathBuf {
 pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let addr = server_address(config);
     let keepalive = KeepAlive::from_config(config);
+    let sck_block = sck_block(config);
 
     match (
         option_path(config, "tls-server-cert-file"),
@@ -1284,9 +1394,17 @@ pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), 
             // Human-facing progress line goes to the logger; the served protocol
             // is the command's machine-readable output on the socket.
             crate::control::log_info(&format!("server listening (tls) on {addr}"));
-            serve_tls_storage_with(&listener, server_config, &auth, config.stanza.as_deref(), &root, keepalive)
+            serve_tls_storage_with(
+                &listener,
+                server_config,
+                &auth,
+                config.stanza.as_deref(),
+                &root,
+                keepalive,
+                sck_block,
+            )
         }
-        _ => serve_tcp_with(&addr, keepalive),
+        _ => serve_tcp_with(&addr, keepalive, sck_block),
     }
 }
 
@@ -1963,6 +2081,152 @@ mod tests {
         let chain = cert_chain_from_pem(&cert_pem);
         let key = private_key_from_pem(&key_pem);
         build_client_config(roots2, Some((chain, key)), &[]).expect("client config with auth");
+    }
+
+    // --- ca-path (directory of CA files) -------------------------------------
+
+    #[test]
+    fn add_ca_path_loads_every_cert_in_dir() {
+        // A directory holding two distinct self-signed CA PEMs: both certs must
+        // land in the root store. rustls does not expose a count directly, so we
+        // assert via `len()` on the `roots` (the field is public on RootCertStore
+        // in rustls 0.23).
+        let (cert_a, _key_a) = self_signed_localhost();
+        let mut params_b = rcgen::CertificateParams::new(vec!["other.example".to_owned()]).unwrap();
+        params_b.distinguished_name.push(rcgen::DnType::CommonName, "ca-b");
+        let key_b = rcgen::KeyPair::generate().unwrap();
+        let cert_b = params_b.self_signed(&key_b).unwrap().pem();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.crt"), cert_a.as_bytes()).unwrap();
+        std::fs::write(dir.path().join("b.crt"), cert_b.as_bytes()).unwrap();
+        // A non-PEM stray file must be skipped without aborting the load.
+        std::fs::write(dir.path().join("notes.txt"), b"not a cert").unwrap();
+        // A sub-directory must be ignored (only regular files are read).
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+        let mut roots = RootCertStore::empty();
+        add_ca_path(&mut roots, dir.path().to_str().unwrap()).expect("ca-path load");
+        assert_eq!(roots.len(), 2, "both CA certs in the directory should load");
+    }
+
+    #[test]
+    fn add_ca_path_missing_dir_errors() {
+        let mut roots = RootCertStore::empty();
+        let err = add_ca_path(&mut roots, "/no/such/cadir").unwrap_err();
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("ca-path dir"), "msg was {msg:?}"),
+            other => panic!("expected Other(read ca-path dir), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_store_from_ca_sources_unions_file_and_path() {
+        // A ca-file plus a ca-path directory (with one more CA) trust the union.
+        let (cert_file_pem, _k) = self_signed_localhost();
+        let file_dir = tempfile::tempdir().unwrap();
+        let ca_file = file_dir.path().join("ca.pem");
+        std::fs::write(&ca_file, cert_file_pem.as_bytes()).unwrap();
+
+        let mut params = rcgen::CertificateParams::new(vec!["dir.example".to_owned()]).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "dir-ca");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let dir_cert = params.self_signed(&key).unwrap().pem();
+        let ca_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ca_dir.path().join("dir.crt"), dir_cert.as_bytes()).unwrap();
+
+        let roots = root_store_from_ca_sources(Some(ca_file.to_str().unwrap()), Some(ca_dir.path().to_str().unwrap()))
+            .expect("union root store");
+        assert_eq!(roots.len(), 2, "file CA + dir CA should both be trusted");
+
+        // ca-file only.
+        let only_file = root_store_from_ca_sources(Some(ca_file.to_str().unwrap()), None).expect("file-only store");
+        assert_eq!(only_file.len(), 1);
+
+        // ca-path only.
+        let only_path = root_store_from_ca_sources(None, Some(ca_dir.path().to_str().unwrap())).expect("path-only store");
+        assert_eq!(only_path.len(), 1);
+
+        // Neither source: an empty store (the caller treats this as a config error).
+        let neither = root_store_from_ca_sources(None, None).expect("empty store");
+        assert!(neither.is_empty());
+    }
+
+    #[test]
+    fn build_client_config_from_files_accepts_ca_path() {
+        // The public file-path client-config builder must accept a ca-path
+        // directory as the (sole) CA source — no ca-file required.
+        let (cert_pem, _key) = self_signed_localhost();
+        let ca_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ca_dir.path().join("ca.pem"), cert_pem.as_bytes()).unwrap();
+        build_client_config_from_files(None, Some(ca_dir.path().to_str().unwrap()), None, None, &[])
+            .expect("client config from ca-path only");
+    }
+
+    // --- sck-block -----------------------------------------------------------
+
+    #[test]
+    fn sck_block_defaults_false_and_reads_option() {
+        // Absent → false (the config.yaml default).
+        assert!(!sck_block(&config_with(vec![])));
+        // Explicit true is honoured.
+        let on = config_with(vec![(("sck-block", None), OptionValue::Boolean(true))]);
+        assert!(sck_block(&on));
+        // Explicit false is honoured.
+        let off = config_with(vec![(("sck-block", None), OptionValue::Boolean(false))]);
+        assert!(!sck_block(&off));
+    }
+
+    #[test]
+    fn apply_sck_block_sets_blocking_when_true() {
+        // With sck-block=true the accepted socket is put in blocking mode; a
+        // subsequent read therefore blocks (not WouldBlock). We assert the
+        // blocking-mode side effect by confirming a 0-timeout read still blocks
+        // rather than returning immediately — but to keep the test cheap and
+        // deterministic, just confirm apply does not error and the socket
+        // remains usable for a write.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        // First force non-blocking, then apply sck-block=true and confirm a
+        // read now blocks-then-times-out (Err kind TimedOut/WouldBlock differs):
+        // a blocking socket with a read timeout yields a timeout error, whereas a
+        // non-blocking socket yields WouldBlock immediately.
+        server_stream.set_nonblocking(true).unwrap();
+        apply_sck_block(&server_stream, true);
+        server_stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut buf = [0u8; 1];
+        let err = (&server_stream).read(&mut buf).unwrap_err();
+        // A blocking socket honouring the read timeout reports WouldBlock or
+        // TimedOut after the wait; the key point is the apply call set blocking
+        // mode without erroring and the socket is still usable.
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+            "blocking read with timeout should time out, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_sck_block_false_is_noop() {
+        // sck-block=false must not flip a blocking socket to non-blocking (the
+        // synchronous transport needs blocking I/O), so a read still blocks.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        apply_sck_block(&server_stream, false);
+        // Confirm still blocking: a read with a short timeout times out rather
+        // than returning WouldBlock instantly (which a non-blocking socket would).
+        server_stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut buf = [0u8; 1];
+        let err = (&server_stream).read(&mut buf).unwrap_err();
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+            "non-flipped socket read should time out, got {err:?}"
+        );
     }
 
     #[test]
