@@ -15,6 +15,24 @@ BIN="/usr/lib/postgresql/$PGV/bin"
 PRI="/var/lib/postgresql/$PGV/principal"
 PORT=5433
 
+# Stop systemd-logind from reaping the postgres user's POSIX IPC. The cluster is
+# started via `sudo -u postgres pg_ctl`, so its DSM control segment under
+# /dev/shm/PostgreSQL.* is owned by the postgres uid. With the systemd default
+# RemoveIPC=yes (and no lingering user manager), logind removes all postgres-owned
+# shared-memory segments the moment the last postgres login session closes — which
+# happens constantly as the harness opens/closes `sudo -u postgres` sessions. The
+# running postmaster then survives but every NEW backend dies with
+#   FATAL: could not open shared memory segment "/PostgreSQL.<id>": No such file
+# (seen as a pgbackrest "db-open" failure / hang on the pull-backup path). Enabling
+# linger + RemoveIPC=no makes the segments persistent for the cluster's lifetime.
+sudo loginctl enable-linger postgres >/dev/null 2>&1 || true
+if grep -q '^RemoveIPC' /etc/systemd/logind.conf 2>/dev/null; then
+  sed -i 's/^RemoveIPC.*/RemoveIPC=no/' /etc/systemd/logind.conf
+else
+  printf 'RemoveIPC=no\n' >> /etc/systemd/logind.conf
+fi
+systemctl restart systemd-logind >/dev/null 2>&1 || true
+
 # Free port 5433 from ANY running postmaster, not just $PRI: after a PG-major
 # switch a leftover cluster from the previous version (e.g. /var/lib/postgresql/
 # 16/principal) is still bound to 5433, so the freshly-initdb'd cluster cannot

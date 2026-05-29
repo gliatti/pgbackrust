@@ -438,6 +438,83 @@ if [ "$rows" = "1500" ]; then pass "restore from repo2 (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "restore from repo2 (got: $rows)"; fi
 
 ############################################################################
+hd "Scenario 10 — pull backup from a dedicated repo host (KB Exemple 2: depot runs backup, pg1-host=principal)"
+# The backup/stanza/check commands run ON depot with the PG host remote
+# (pg1-host=principal): the control connection (pg_backup_start/stop, version,
+# WAL switch) runs on an SSH worker on principal (local libpq, peer/trust). The
+# repository is local to depot; principal archives WAL to depot.
+reset_principal_cluster
+on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-host=principal
+pg1-host-user=postgres
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "pull stanza-create (on depot, pg1-host=principal via SSH worker)" depot "pgbackrest --stanza=demo stanza-create"
+ok "pull check (on depot, control connection on principal worker)" depot "pgbackrest --stanza=demo check"
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "pull full backup (on depot, pg_backup_start/stop on worker; files pulled over SSH)" depot "pgbackrest --stanza=demo --type=full backup"
+out=$(pg depot "pgbackrest --stanza=demo info")
+assert_contains "$out" "full backup" "pull backup: info shows full"
+# Cross-validate the pull backup is restorable: principal (repo on depot) restores it.
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "restore the pull backup (on principal, repo on depot)" principal "pgbackrest --stanza=demo --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "pull backup restored (1500 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "pull backup restore (got: $rows)"; fi
+
+############################################################################
+hd "Scenario 11 — compression variants bz2 + lz4 (configuration.html compress-type)"
+# Scenario 5 proved zstd; this proves the remaining real codecs are usable
+# end-to-end: each does a full backup whose repo files carry the codec's suffix
+# (.bz2 / .lz4), then a delta restore that brings back all 1500 rows. The suffix
+# is asserted via `ls ... pg_control*` (the same idiom Scenario 5 uses) rather
+# than `find | grep -q`, which trips set -o pipefail (grep -q closes the pipe,
+# find dies on SIGPIPE, pipefail reports the pipeline as failed despite a match).
+for CT in bz2 lz4; do
+  prepare_principal_cfg "compress-type=$CT"
+  ok "check ($CT repo)" principal "pgbackrest --stanza=demo check"
+  psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+  psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+  psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+  ok "full backup ($CT)" principal "pgbackrest --stanza=demo --type=full backup"
+  sfx=$(on principal "ls /var/lib/pgbackrest/backup/demo/*F/global/pg_control* 2>/dev/null")
+  assert_contains "$sfx" ".$CT" "backup files $CT-compressed (.$CT suffix)"
+  pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+  ok "delta restore ($CT)" principal "pgbackrest --stanza=demo --delta restore"
+  pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+  sleep 4
+  rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+  if [ "$rows" = "1500" ]; then pass "$CT restored data (1500 rows)"
+  else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "$CT restored data (got: $rows)"; fi
+done
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
