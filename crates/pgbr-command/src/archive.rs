@@ -235,6 +235,46 @@ fn write_segment(bytes: &[u8], dst: &dyn Storage, dst_path: &Path) -> Result<(),
     Ok(())
 }
 
+/// Write `bytes` to `dest_arg` exactly the way `PostgreSQL`'s `restore_command`
+/// contract expects: as a plain CLI path — absolute as-is, relative against
+/// the invoker's current working directory — NOT joined onto `pg1-path` or
+/// any configured storage root. `archive-get` is invoked by PG with
+/// cwd=PGDATA and a relative `%p` (e.g. `pg_wal/RECOVERYXLOG`); writing
+/// through `pg_storage` (rooted at `pg1-path`) misdirects the file when
+/// PGDATA != `pg1-path`. Mirrors the C `archive-get`, which writes the
+/// destination directly via the OS, not via `storagePg()`.
+fn write_segment_to_dest_arg(bytes: &[u8], dest_arg: &Path) -> Result<(), CommandError> {
+    let resolved: PathBuf = if dest_arg.is_absolute() {
+        dest_arg.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                CommandError::Other(format!(
+                    "archive-get could not resolve destination '{}' against cwd: {err}",
+                    dest_arg.display()
+                ))
+            })?
+            .join(dest_arg)
+    };
+    if let Some(parent) = resolved.parent() {
+        // An empty parent (relative bare filename) is a no-op for create_dir_all,
+        // which is the correct behaviour: the caller's cwd already exists.
+        std::fs::create_dir_all(parent).map_err(|err| {
+            CommandError::Other(format!(
+                "archive-get could not create destination parent '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::write(&resolved, bytes).map_err(|err| {
+        CommandError::Other(format!(
+            "archive-get could not write destination '{}': {err}",
+            resolved.display()
+        ))
+    })?;
+    Ok(())
+}
+
 /// Build the repository-relative path for a WAL `name` under `stanza`'s
 /// `archive_id` directory: `archive/<stanza>/<archive_id>/<name>`.
 ///
@@ -1259,9 +1299,22 @@ fn fetch_segment_with_retry(
         }
     }
 
-    // Still missing: read the last repository's plaintext path so the caller
-    // gets the canonical NotFound error (the caller rejected an empty set, so
-    // there is always at least one repository).
+    // Still missing. A timeline-history file (`<tli>.history`) that no repository
+    // holds is not an error: PostgreSQL probes for `.history` files on every
+    // higher timeline to discover branches, and a missing one simply means "no
+    // newer timeline". Stock pgBackRest returns exit 0 (no destination file
+    // written) for the missing case so the noisy "not found:" stderr line and
+    // the non-zero exit go away. Match the segment name suffix exactly (plain
+    // string, case-sensitive) — `.history` files are always lowercase per the
+    // C `XLogFileName` family. C ref: the `.history` short-circuit in
+    // `src/command/archive/get/get.c`.
+    if segment.ends_with(".history") {
+        return Ok(());
+    }
+
+    // Read the last repository's plaintext path so the caller gets the
+    // canonical NotFound error (the caller rejected an empty set, so there is
+    // always at least one repository).
     let last = repo_storages
         .last()
         .ok_or_else(|| CommandError::Other("archive-get found no repository to read from".to_owned()))?;
@@ -1283,7 +1336,7 @@ fn repo_has_segment(repo: &dyn Storage, stanza: &str, archive_id: &str, segment:
     Ok(false)
 }
 
-/// Synchronous repository fetch of `segment` into `dest` on `pg_storage`.
+/// Synchronous repository fetch of `segment` into `dest`.
 ///
 /// The stored form is discovered by probing under the archive-id directory: the
 /// plaintext `archive/<stanza>/<archive-id>/<segment>` is preferred, then each
@@ -1291,9 +1344,18 @@ fn repo_has_segment(repo: &dyn Storage, stanza: &str, archive_id: &str, segment:
 /// form is decompressed before the plaintext WAL is written. When nothing is
 /// found the plaintext path is read so the caller gets the canonical `NotFound`
 /// error.
+///
+/// The destination is written via [`write_segment_to_dest_arg`] — the
+/// `restore_command` contract treats `dest` as a plain CLI path (absolute as-is,
+/// relative against cwd), NOT a path under `pg1-path`. `_pg_storage` is kept on
+/// the signature for symmetry with the caller chain but is intentionally unused
+/// for the destination write so a later refactor cannot accidentally route the
+/// fetched bytes through the `Posix(pg1-path)` root again. C ref: the C
+/// `archive-get` calls `storageNewWriteP(storageLocalWrite(), …)` against the
+/// raw destination path, not `storagePgWrite()`.
 fn fetch_from_repo(
     repo_storage: &dyn Storage,
-    pg_storage: &dyn Storage,
+    _pg_storage: &dyn Storage,
     stanza: &str,
     archive_id: &str,
     segment: &str,
@@ -1318,7 +1380,7 @@ fn fetch_from_repo(
     let stored = read_segment(repo_storage, &source)?;
     let bytes = decode_stored_segment(&stored, suffix, sub_key)?;
 
-    write_segment(&bytes, pg_storage, dest)
+    write_segment_to_dest_arg(&bytes, dest)
 }
 
 /// Serve `segment` from the spool *in* directory if it was pre-fetched.
@@ -1327,9 +1389,13 @@ fn fetch_from_repo(
 /// (already-plaintext) bytes are written to `dest` and the staged copy is
 /// removed. Returns `Ok(false)` when the segment was not pre-fetched, so the
 /// caller falls back to a synchronous repository fetch.
+///
+/// The destination is written via [`write_segment_to_dest_arg`] — see
+/// [`fetch_from_repo`] for the reasoning. `_pg_storage` is kept on the signature
+/// for symmetry.
 fn serve_from_spool(
     spool: &dyn Storage,
-    pg_storage: &dyn Storage,
+    _pg_storage: &dyn Storage,
     stanza: &str,
     segment: &str,
     dest: &Path,
@@ -1340,7 +1406,7 @@ fn serve_from_spool(
     }
 
     let bytes = read_segment(spool, &staged)?;
-    write_segment(&bytes, pg_storage, dest)?;
+    write_segment_to_dest_arg(&bytes, dest)?;
     spool.remove(&staged, false)?;
     Ok(true)
 }
@@ -1627,6 +1693,41 @@ mod tests {
         (repo, pg, repo_storage, pg_storage)
     }
 
+    /// Global lock guarding tests that mutate the process cwd. `archive-get`
+    /// writes its destination via the OS (PG's `restore_command` contract — a
+    /// relative `%p` resolves against cwd), so any test that exercises a
+    /// relative dest has to pin the cwd to a known root for the duration of the
+    /// call. cwd is per-process, so serialise across tests via a `Mutex`.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that switches the process cwd to `target` while held and
+    /// restores the previous cwd on drop. Holds the [`CWD_LOCK`] for its
+    /// lifetime so concurrent tests don't observe each other's cwd. A poisoned
+    /// lock (a panicking test left it poisoned) is consumed via `into_inner` —
+    /// the cwd contract is best-effort across tests and we'd rather run than
+    /// cascade panics.
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CwdGuard {
+        fn new(target: &Path) -> Self {
+            let lock = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::current_dir().expect("current_dir");
+            std::env::set_current_dir(target).expect("set_current_dir to target");
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            // Best-effort restore; if the original cwd was a tempdir already
+            // gone the test still passes.
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
     /// Write `bytes` to `path` inside `storage`, creating parents as needed.
     fn put(storage: &Posix, path: &str, bytes: &[u8]) {
         let p = Path::new(path);
@@ -1714,16 +1815,113 @@ mod tests {
 
     #[test]
     fn archive_get_copies_segment_back_to_pg() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        // archive-get writes the destination at the path PG hands it on the CLI
+        // (PG's restore_command contract): absolute as-is, relative against cwd
+        // — NOT joined under pg1-path. Use an absolute destination here so the
+        // assertion is independent of the test process cwd; the cwd-relative
+        // case is covered by `archive_get_writes_dest_relative_to_cwd_not_pg1_path`.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
         put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
-        let dest = format!("pg_wal/{SEGMENT}");
-        let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        let dest_dir = pg.path().join("pg_wal");
+        std::fs::create_dir_all(&dest_dir).expect("create pg_wal");
+        let dest_abs = dest_dir.join(SEGMENT);
+        let cfg = fake_config(
+            Some("demo"),
+            vec![SEGMENT.to_owned(), dest_abs.to_string_lossy().into_owned()],
+        );
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
 
-        assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
-        assert_eq!(read(&pg_s, &dest), WAL_BODY, "pg copy should match repo bytes");
+        assert!(dest_abs.exists(), "segment should land at the absolute dest");
+        assert_eq!(std::fs::read(&dest_abs).expect("read dest"), WAL_BODY);
+    }
+
+    /// Regression test for the PG-18 alt-restore bug: when PG's `restore_command`
+    /// invokes `pgbackrest archive-get <seg> <relative-dest>` with cwd=PGDATA
+    /// and PGDATA != pg1-path, the WAL must land at the cwd-relative destination
+    /// (where PG will `stat()` it), NOT under `<pg1-path>/<relative-dest>`. The
+    /// pre-fix code wrote through `pg_storage` (a `Posix` rooted at pg1-path)
+    /// which joined the relative dest onto pg1-path; `archive-get` exited 0 but
+    /// PG's recovery then failed with "could not stat file `pg_wal/RECOVERYXLOG`".
+    #[test]
+    fn archive_get_writes_dest_relative_to_cwd_not_pg1_path() {
+        // pg_storage is rooted at the "principal-style" pg1-path tempdir; cwd
+        // is a separate "alt-PGDATA" tempdir. The two are intentionally
+        // different so a regression that routes the write through pg_storage
+        // is caught.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg1_path = tempfile::tempdir().expect("pg1-path tempdir (principal-style)");
+        let alt_pgdata = tempfile::tempdir().expect("alt-PGDATA tempdir (cwd)");
+        let repo_s = Posix::new(repo.path());
+        let pg_s = Posix::new(pg1_path.path());
+
+        seed_archive_info_generic(&repo_s, "demo");
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
+
+        // Mimic PG's restore_command invocation: relative `%p`.
+        let dest_rel = "pg_wal/RECOVERYXLOG";
+        let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest_rel.to_owned()]);
+
+        // Pin cwd to the alt-PGDATA tempdir; this is where PG would have
+        // invoked archive-get from. CwdGuard takes CWD_LOCK so the global cwd
+        // mutation does not race with any other test.
+        let _cwd = CwdGuard::new(alt_pgdata.path());
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("archive-get should succeed");
+
+        // The fix: WAL lands at <alt-PGDATA>/pg_wal/RECOVERYXLOG (cwd-relative).
+        let cwd_dest = alt_pgdata.path().join("pg_wal").join("RECOVERYXLOG");
+        assert!(
+            cwd_dest.exists(),
+            "WAL must land at the cwd-relative destination, got nothing at {cwd_dest:?}",
+        );
+        assert_eq!(
+            std::fs::read(&cwd_dest).expect("read cwd dest"),
+            WAL_BODY,
+            "cwd-relative destination must hold the seeded WAL bytes",
+        );
+
+        // The bug: pre-fix, the WAL landed under pg1-path. Assert it did not.
+        let pg1_dest = pg1_path.path().join("pg_wal").join("RECOVERYXLOG");
+        assert!(
+            !pg1_dest.exists(),
+            "WAL must NOT land under pg1-path (the pre-fix bug landed it at {pg1_dest:?})",
+        );
+    }
+
+    /// Secondary fix: missing `.history` returns exit 0 (no file written).
+    /// PG probes for every higher timeline's `.history` file on recovery; an
+    /// archive that does not hold one means "no newer timeline", not an error.
+    /// Stock pgBackRest documents exit 0 for the missing case; the Rust port
+    /// must match so the noisy "not found:" stderr line and non-zero exit go
+    /// away.
+    #[test]
+    fn archive_get_missing_history_file_is_exit_zero() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        // archive.info exists (the stanza is created) but NO `.history` segment
+        // anywhere in the repo: this is the case we want to short-circuit.
+        seed_archive_info_generic(&repo_s, "demo");
+
+        let history_seg = "00000002.history";
+        let dest_rel = "pg_wal/RECOVERYHISTORY";
+        let cfg = fake_config(Some("demo"), vec![history_seg.to_owned(), dest_rel.to_owned()]);
+
+        let _cwd = CwdGuard::new(pg.path());
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("missing .history must be exit 0");
+
+        // No destination file: PG's restore_command treats exit 0 + missing
+        // file as "no newer timeline" (the documented stock-pgBackRest
+        // behaviour); writing an empty/spurious file would mislead PG.
+        let cwd_dest = pg.path().join("pg_wal").join("RECOVERYHISTORY");
+        assert!(
+            !cwd_dest.exists(),
+            "no destination file should be written for a missing .history (got {cwd_dest:?})",
+        );
+        // And no `.error` or other artefact either.
+        assert!(
+            !pg.path().join("pg_wal").join("RECOVERYHISTORY.error").exists(),
+            "no spurious .error sidecar should be written",
+        );
     }
 
     /// `fake_config` plus an explicit `lock-path` so the command takes a real
@@ -1768,13 +1966,18 @@ mod tests {
     #[test]
     fn archive_get_acquires_archive_lock() {
         // archive-get takes the same archive lock as push.
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
         put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
         let lock_dir = tempfile::tempdir().expect("lock tempdir");
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_locked(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], lock_dir.path());
+
+        // Pin cwd to the pg tempdir: archive-get resolves a relative dest
+        // against cwd (PG's restore_command contract), so this is where the
+        // assertion below expects the WAL to land.
+        let _cwd = CwdGuard::new(pg.path());
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
         let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get must fail while the archive lock is held");
@@ -1790,9 +1993,13 @@ mod tests {
 
     #[test]
     fn archive_get_unknown_segment_errors_with_storage() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), format!("pg_wal/{SEGMENT}")]);
+        // archive-get writes via cwd; pin cwd to the pg tempdir so the failed
+        // write path (the canonical NotFound) is sourced from the repo, not from
+        // an attempt to mkdir under the test runner's cwd.
+        let _cwd = CwdGuard::new(pg.path());
         let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get of an absent segment must fail");
         match err {
             CommandError::Storage(_) => {}
@@ -1858,7 +2065,7 @@ mod tests {
 
     #[test]
     fn archive_push_then_get_gz_round_trip() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
@@ -1870,7 +2077,9 @@ mod tests {
         push(&push_cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         // Recover into a fresh PG target; compress-type on get is irrelevant
-        // (the stored form is discovered by probing).
+        // (the stored form is discovered by probing). Pin cwd to the pg tempdir
+        // so the relative dest resolves there (PG's restore_command contract).
+        let _cwd = CwdGuard::new(pg.path());
         let dest = "pg_wal/recovered".to_owned();
         let get_cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
         get(&get_cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
@@ -1884,7 +2093,7 @@ mod tests {
 
     #[test]
     fn archive_get_finds_compressed_when_plaintext_absent() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
 
         // Pre-place only the `.zst` form in the repo.
@@ -1893,6 +2102,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should find and decompress the .zst form");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
@@ -1901,7 +2111,7 @@ mod tests {
 
     #[test]
     fn archive_get_prefers_plaintext_when_present() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         seed_archive_info_generic(&repo_s, "demo");
 
         // Both forms exist: the plaintext holds the real bytes; the `.gz`
@@ -1915,6 +2125,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
 
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "plaintext form should be used when both exist");
@@ -2037,7 +2248,7 @@ mod tests {
 
     #[test]
     fn async_get_serves_prefetched_segment_from_spool() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
         seed_archive_info_generic(&repo_s, "demo");
 
@@ -2069,6 +2280,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_async(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], spool.path());
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async get should serve the pre-fetched segment");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
@@ -2083,7 +2295,7 @@ mod tests {
 
     #[test]
     fn async_get_falls_back_to_repo_when_not_prefetched() {
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         let (spool, _spool_s) = spool_storage();
         seed_archive_info_generic(&repo_s, "demo");
 
@@ -2092,6 +2304,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_async(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], spool.path());
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async get should fall back to a synchronous repo fetch");
 
         assert!(pg_s.exists(Path::new(&dest)).expect("exists"), "segment should land in pg");
@@ -2534,6 +2747,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("get should serve from repo2");
 
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "segment should be served from repo2");
@@ -2557,6 +2771,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
+        let _cwd = CwdGuard::new(pg.path());
         get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("get should succeed");
 
         assert_eq!(read(&pg_s, &dest), WAL_BODY, "earliest repo (repo1) should win");
@@ -2575,6 +2790,7 @@ mod tests {
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest]);
+        let _cwd = CwdGuard::new(pg.path());
         let err = get(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
             .expect_err("get must fail when no repository has the segment");
         match err {
@@ -2844,9 +3060,10 @@ mod tests {
         // Simulate "lands between attempts" by placing it before the call but
         // asserting the retry path serves it (a found-on-first case also works;
         // the retry must not break the happy path).
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
         let dest = format!("pg_wal/{SEGMENT}");
+        let _cwd = CwdGuard::new(pg.path());
         fetch_segment_with_retry(
             &[&repo_s as &dyn Storage],
             &pg_s,
@@ -2866,8 +3083,9 @@ mod tests {
     fn fetch_retry_still_missing_errors() {
         // With retry on but the segment never present, the canonical NotFound
         // surfaces (after the bounded retry).
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         let dest = format!("pg_wal/{SEGMENT}");
+        let _cwd = CwdGuard::new(pg.path());
         let err = fetch_segment_with_retry(
             &[&repo_s as &dyn Storage],
             &pg_s,
@@ -2889,8 +3107,9 @@ mod tests {
     #[test]
     fn fetch_no_retry_errors_immediately() {
         // With retry off, a missing segment errors without a second probe.
-        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
         let dest = format!("pg_wal/{SEGMENT}");
+        let _cwd = CwdGuard::new(pg.path());
         fetch_segment_with_retry(
             &[&repo_s as &dyn Storage],
             &pg_s,
