@@ -45,16 +45,28 @@ pub enum ProtocolError {
     Io(IoError),
     /// The worker returned an error response. Carries the worker's message.
     Worker(String),
+    /// The worker returned a file-missing error response (error code
+    /// [`WORKER_CODE_FILE_MISSING`]). Surfaced distinctly from [`Self::Worker`]
+    /// so a storage backend can reconstruct the typed `StorageError::NotFound`
+    /// that local backends return for a missing path (callers rely on matching
+    /// that variant to treat an absent file as "not present" rather than a hard
+    /// error). Carries the worker's message.
+    WorkerNotFound(String),
     /// Failed to spawn or manage the child worker process.
     Spawn(String),
 }
+
+/// Protocol error code for a missing file (`file-missing` in `error.yaml`); the
+/// worker encodes `StorageError::NotFound` as this code, and the client maps it
+/// back to [`ProtocolError::WorkerNotFound`].
+pub const WORKER_CODE_FILE_MISSING: u32 = 55;
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Codec(e) => write!(f, "codec: {e}"),
             Self::Io(e) => write!(f, "i/o: {e}"),
-            Self::Worker(msg) => write!(f, "worker error: {msg}"),
+            Self::Worker(msg) | Self::WorkerNotFound(msg) => write!(f, "worker error: {msg}"),
             Self::Spawn(msg) => write!(f, "spawn: {msg}"),
         }
     }
@@ -65,7 +77,7 @@ impl std::error::Error for ProtocolError {
         match self {
             Self::Codec(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::Worker(_) | Self::Spawn(_) => None,
+            Self::Worker(_) | Self::WorkerNotFound(_) | Self::Spawn(_) => None,
         }
     }
 }
@@ -209,7 +221,11 @@ impl<R: IoRead, W: IoWrite> ProtocolClient<R, W> {
 
         match read_message(&mut self.reader)? {
             Some(Message::Response(Response::Ok(ok))) => Ok(ok),
-            Some(Message::Response(Response::Err(err))) => Err(ProtocolError::Worker(err.message)),
+            Some(Message::Response(Response::Err(err))) => Err(if err.err == WORKER_CODE_FILE_MISSING {
+                ProtocolError::WorkerNotFound(err.message)
+            } else {
+                ProtocolError::Worker(err.message)
+            }),
             Some(Message::Request(_)) => Err(ProtocolError::Worker(
                 "expected a response from worker but received a request".to_owned(),
             )),

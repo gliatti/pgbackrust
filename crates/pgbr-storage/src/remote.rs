@@ -719,8 +719,18 @@ fn backend(path: &Path, message: &str) -> StorageError {
 }
 
 /// Map a [`ProtocolError`] from the client side into a [`StorageError`].
+///
+/// A worker file-missing error ([`ProtocolError::WorkerNotFound`]) is mapped to
+/// the typed [`StorageError::NotFound`] so callers that match `NotFound` to treat
+/// an absent file as "not present" (e.g. an optional `tablespace_map`) behave the
+/// same against a remote repo as a local one. Everything else is a `Backend`.
 fn protocol_err(path: &Path, err: &ProtocolError) -> StorageError {
-    backend(path, &err.to_string())
+    match err {
+        ProtocolError::WorkerNotFound(_) => StorageError::NotFound {
+            path: path.to_path_buf(),
+        },
+        _ => backend(path, &err.to_string()),
+    }
 }
 
 fn json_err(err: &serde_json::Error) -> StorageError {
@@ -909,22 +919,24 @@ mod tests {
     }
 
     #[test]
-    fn not_found_maps_to_error() {
+    fn not_found_maps_to_not_found() {
         let (remote, server, _dir, _posix) = wire();
-        // open_read on a missing file: the worker's Posix returns NotFound,
-        // which serializes to an error response and surfaces as a StorageError.
-        // `Box<dyn IoRead>` is not Debug, so match the Result by hand rather
-        // than `unwrap_err`.
+        // open_read on a missing file: the worker's Posix returns NotFound, which
+        // serializes to a file-missing (code 55) error response; the client maps
+        // it back to the typed StorageError::NotFound (NOT a generic Backend), so
+        // callers can treat an absent file as "not present" uniformly across local
+        // and remote repos. `Box<dyn IoRead>` is not Debug, so match by hand.
         match remote.open_read(Path::new("missing.txt")) {
-            Err(StorageError::Backend { message, .. }) => {
-                assert!(message.contains("not found") || message.contains("worker error"));
-            }
-            Err(other) => panic!("expected Backend error carrying worker message, got {other:?}"),
+            Err(StorageError::NotFound { path }) => assert_eq!(path, Path::new("missing.txt")),
+            Err(other) => panic!("expected NotFound, got {other:?}"),
             Ok(_) => panic!("expected open_read on a missing file to error"),
         }
 
-        // info on a missing path likewise errors.
-        assert!(remote.info(Path::new("missing.txt")).is_err());
+        // info on a missing path likewise maps to the typed NotFound.
+        match remote.info(Path::new("missing.txt")) {
+            Err(StorageError::NotFound { .. }) => {}
+            other => panic!("expected NotFound from info on a missing path, got {other:?}"),
+        }
 
         remote.close().unwrap();
         server.join().unwrap();
