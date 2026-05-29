@@ -14,7 +14,10 @@ use std::ptr::NonNull;
 
 pub mod protocol;
 
-pub use crate::protocol::{DbExecutor, DbProtocolClient, DbProtocolError, QueryRows, handle_db_request};
+pub use crate::protocol::{
+    CMD_DB_CLOSE, CMD_DB_EXECUTE, CMD_DB_OPEN, CMD_DB_QUERY, DB_PROTOCOL_PREFIX, DbExecutor, DbProtocolClient, DbProtocolError,
+    DbRequestHandler, QueryRows, handle_db_request,
+};
 
 /// One `PostgreSQL` client connection.
 pub struct Connection {

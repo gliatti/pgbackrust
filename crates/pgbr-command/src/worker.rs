@@ -16,10 +16,14 @@
 //! - [`WorkerHandler`] — a [`pgbr_protocol::transport::RequestHandler`] that
 //!   delegates `storage-*` requests to a
 //!   [`pgbr_storage::remote::StorageRequestHandler`] wrapping a local
-//!   [`pgbr_storage::Posix`] rooted at the worker's repository / PG path.
-//!   Anything else (including `db-*`, which would require a live libpq
-//!   connection the worker does not own in this slice) is answered with an
-//!   error response.
+//!   [`pgbr_storage::Posix`] rooted at the worker's repository / PG path, and
+//!   `db-*` requests to a [`pgbr_db::DbRequestHandler`] that owns a libpq
+//!   [`pgbr_db::Connection`] the worker opens *locally* (on the PG host, via
+//!   the unix socket — peer/trust auth, no password). Anything else is
+//!   answered with an error response. This is what makes the "dedicated repo
+//!   host (pull)" topology work: a backup / check / stanza command running on
+//!   the repo host with `pg1-host=<pghost>` reaches the cluster's control
+//!   connection through this worker rather than via a direct TCP libpq connect.
 //! - [`serve_worker`] — build the handler and run the transport
 //!   [`serve`](pgbr_protocol::transport::serve) loop over a reader / writer
 //!   pair. Transport-agnostic, so it is exercised in tests over in-process
@@ -32,6 +36,7 @@ use std::io::{Stdin, Stdout};
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
+use pgbr_db::{DB_PROTOCOL_PREFIX, DbRequestHandler};
 use pgbr_io::{IoRead, IoWrite};
 use pgbr_protocol::transport::{PipeRead, PipeWrite, RequestHandler, serve};
 use pgbr_protocol::{ErrResponse, Request, Response};
@@ -53,20 +58,26 @@ const WORKER_ERR_CODE: u32 = 1;
 /// Worker-side [`RequestHandler`] for the `local` / `remote` roles.
 ///
 /// `storage-*` requests are forwarded to a [`StorageRequestHandler`] over a
-/// [`Posix`] rooted at the worker's repository or PG path. Every other command
-/// (unknown verbs, and `db-*` which needs a
-/// libpq connection the worker does not carry here) yields an
-/// [`ErrResponse`].
+/// [`Posix`] rooted at the worker's repository or PG path; `db-*` requests are
+/// forwarded to a [`DbRequestHandler`] that owns the worker's libpq connection
+/// (lazily opened on `db-open`). Every other command yields an [`ErrResponse`].
+///
+/// The [`DbRequestHandler`]'s [`pgbr_db::Connection`] is `!Send`, but a worker
+/// process is single-threaded and serves requests one at a time, so the
+/// connection never crosses a thread boundary.
 pub struct WorkerHandler {
     storage: StorageRequestHandler<Posix>,
+    db: DbRequestHandler,
 }
 
 impl WorkerHandler {
-    /// Build a worker handler serving a local [`Posix`] rooted at `root`.
+    /// Build a worker handler serving a local [`Posix`] rooted at `root`, with
+    /// no DB connection open yet (the first `db-open` request opens one).
     #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
             storage: StorageRequestHandler::new(Posix::new(root)),
+            db: DbRequestHandler::new(),
         }
     }
 }
@@ -75,6 +86,8 @@ impl RequestHandler for WorkerHandler {
     fn handle(&mut self, req: &Request) -> Response {
         if req.cmd.starts_with(STORAGE_PREFIX) {
             self.storage.handle(req)
+        } else if req.cmd.starts_with(DB_PROTOCOL_PREFIX) {
+            self.db.handle(req)
         } else {
             Response::Err(ErrResponse {
                 err: WORKER_ERR_CODE,
@@ -232,8 +245,8 @@ mod tests {
 
     #[test]
     fn worker_unknown_command_errs() {
-        // A non-storage command must come back as an error response, which the
-        // client surfaces as a `ProtocolError::Worker`.
+        // A command that is neither `storage-*` nor `db-*` must come back as an
+        // error response, which the client surfaces as a `ProtocolError::Worker`.
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_path_buf();
 
@@ -248,13 +261,52 @@ mod tests {
 
         let mut client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
         let req = Request {
-            cmd: "db-query".to_owned(),
+            cmd: "bogus-verb".to_owned(),
             param: Vec::new(),
         };
         let err = client.execute(&req).expect_err("unknown command must error");
         let msg = err.to_string();
         assert!(msg.contains("unsupported protocol command"), "message was {msg:?}");
-        assert!(msg.contains("db-query"), "message was {msg:?}");
+        assert!(msg.contains("bogus-verb"), "message was {msg:?}");
+
+        client.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_routes_db_commands_to_db_handler() {
+        // The worker now serves the DB protocol too. Without a real PostgreSQL
+        // we cannot drive `db-open`, but we can prove the routing reaches the
+        // `DbRequestHandler`: a `db-query` before any `db-open` is answered by
+        // the DB handler's "requires an open connection" error (NOT the
+        // "unsupported protocol command" the storage-only worker used to
+        // return), and `db-close` succeeds as an idempotent no-op.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            serve_worker(&root, &mut reader, &mut writer).unwrap();
+        });
+
+        let mut client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+
+        // db-query before db-open -> DB-handler error.
+        let query = pgbr_db::DbProtocolClient::query_request("SELECT 1");
+        let err = client.execute(&query).expect_err("query before open must error");
+        let msg = err.to_string();
+        assert!(msg.contains("requires an open connection"), "message was {msg:?}");
+
+        // db-close with nothing open -> idempotent success. (The null `out`
+        // round-trips to `None` over the wire — serde maps JSON `null` for an
+        // `Option<Value>` to `None` — so assert success, not the exact payload.)
+        let close = pgbr_db::DbProtocolClient::close_request();
+        let resp = pgbr_protocol::Response::Ok(client.execute(&close).expect("db-close is a no-op success"));
+        pgbr_db::DbProtocolClient::decode_unit_response(&resp).expect("db-close decodes as success");
 
         client.close().unwrap();
         server.join().unwrap();

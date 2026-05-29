@@ -3,15 +3,23 @@
 //! pgBackRest's main process drives a remote worker that owns a libpq
 //! [`Connection`] and answers a small set of protocol commands on its
 //! behalf (C reference: `src/db/protocol.c`, `dbOpenProtocol` /
-//! `dbQueryProtocol`). This module provides three pieces, all decoupled
+//! `dbQueryProtocol`). This module provides the pieces, all decoupled
 //! from the byte transport (which lives in `pgbr_protocol::codec` /
 //! `transport`):
 //!
 //! - [`DbExecutor`] — a trait abstracting query execution so the handler
 //!   can be unit-tested without a real libpq connection. It is implemented
 //!   for [`Connection`] (the real path).
-//! - [`handle_db_request`] — the server side: maps a
-//!   [`pgbr_protocol::Request`] to a [`pgbr_protocol::Response`].
+//! - [`handle_db_request`] — the stateless server side over an existing
+//!   executor: maps a [`pgbr_protocol::Request`] (`db-query` / `db-execute`)
+//!   to a [`pgbr_protocol::Response`].
+//! - [`DbRequestHandler`] — the stateful server side a worker uses: it owns
+//!   an `Option<Connection>` and additionally serves `db-open` (open a libpq
+//!   connection *locally*, on the PG host) and `db-close` (drop it). The
+//!   connection persists between requests so a non-exclusive backup's
+//!   `pg_backup_start` / `pg_backup_stop` share one session. [`Connection`]
+//!   is `!Send`, but a worker is single-threaded, so the handler keeps it
+//!   inside the worker process.
 //! - [`DbProtocolClient`] — the client side: builds the requests and
 //!   decodes the responses back into typed results.
 //!
@@ -25,15 +33,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Connection, DbError, QueryResult};
 
+/// Prefix every DB protocol command shares (`db-open`, `db-query`, …). A worker
+/// keys on this to route a request to the [`DbRequestHandler`] vs the storage
+/// handler.
+pub const DB_PROTOCOL_PREFIX: &str = "db-";
+
+/// Protocol command name: open a libpq connection (the worker opens it locally,
+/// from the PG host's perspective, with the conninfo in `param[0]`).
+pub const CMD_DB_OPEN: &str = "db-open";
 /// Protocol command name: run a `SELECT`-style query and return its rows.
-const CMD_DB_QUERY: &str = "db-query";
+pub const CMD_DB_QUERY: &str = "db-query";
 /// Protocol command name: run a statement that returns no rows.
-const CMD_DB_EXECUTE: &str = "db-execute";
+pub const CMD_DB_EXECUTE: &str = "db-execute";
+/// Protocol command name: close the worker's open connection.
+pub const CMD_DB_CLOSE: &str = "db-close";
 
 /// Error code carried by an [`ErrResponse`] produced by this layer. The C
 /// protocol surfaces a numeric `pgbr_error::ErrorType` code; we use a single
 /// generic code here since the message is the load-bearing part.
-const DB_PROTOCOL_ERR_CODE: u32 = 1;
+pub(crate) const DB_PROTOCOL_ERR_CODE: u32 = 1;
 
 /// A JSON-serializable query result carried over the protocol.
 ///
@@ -147,11 +165,12 @@ impl DbExecutor for Connection {
     }
 }
 
-/// Pull the single SQL-string parameter (`param[0]`) out of a request,
-/// or describe why it is missing/ill-typed.
+/// Pull the single string parameter (`param[0]`) out of a request — the SQL for
+/// `db-query` / `db-execute`, the conninfo for `db-open` — or describe why it is
+/// missing / ill-typed.
 fn sql_param(request: &Request) -> Result<&str, String> {
     request.param.first().map_or_else(
-        || Err(format!("{} requires a sql parameter", request.cmd)),
+        || Err(format!("{} requires a string parameter", request.cmd)),
         |value| {
             value
                 .as_str()
@@ -209,13 +228,109 @@ pub fn handle_db_request<E: DbExecutor>(exec: &mut E, request: &Request) -> Resp
     }
 }
 
-/// Client side of the DB protocol: builds the `db-query` / `db-execute`
-/// requests and decodes the responses into typed results.
+/// Stateful, worker-side DB protocol handler.
+///
+/// Owns the worker's single libpq [`Connection`] (lazily created on `db-open`)
+/// and serves the full DB command set on its behalf:
+///
+/// - `db-open` (`param[0]` = conninfo) → open the connection *locally* (the
+///   worker runs on the PG host, so a `host=`-less conninfo uses the unix
+///   socket with peer/trust auth → no password). `Ok { out: null }`. A second
+///   `db-open` while a connection is already open replaces it.
+/// - `db-query` (`param[0]` = sql) → run on the open connection → `Ok { out:
+///   QueryRows }`.
+/// - `db-execute` (`param[0]` = sql) → run on the open connection → `Ok { out:
+///   null }`.
+/// - `db-close` → drop the connection → `Ok { out: null }`. Idempotent.
+///
+/// A `db-query` / `db-execute` before `db-open` is an error (no connection).
+/// The connection persists across requests so a non-exclusive backup's
+/// start / stop share one session. [`Connection`] is `!Send`; the handler keeps
+/// it inside the (single-threaded) worker process and never sends it across a
+/// thread boundary.
+#[derive(Debug, Default)]
+pub struct DbRequestHandler {
+    conn: Option<Connection>,
+}
+
+impl DbRequestHandler {
+    /// A handler with no open connection.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { conn: None }
+    }
+
+    /// Handle one `db-*` request, mutating the held connection as needed.
+    ///
+    /// Unknown verbs (not `db-open` / `db-query` / `db-execute` / `db-close`)
+    /// and database / protocol failures yield a [`Response::Err`] so the worker
+    /// keeps serving rather than tearing down.
+    pub fn handle(&mut self, request: &Request) -> Response {
+        match request.cmd.as_str() {
+            CMD_DB_OPEN => self.handle_open(request),
+            CMD_DB_CLOSE => {
+                self.conn = None;
+                Response::Ok(OkResponse {
+                    out: Some(serde_json::Value::Null),
+                })
+            }
+            CMD_DB_QUERY | CMD_DB_EXECUTE => self.conn.as_mut().map_or_else(
+                || {
+                    err_response(&DbProtocolError::Protocol(format!(
+                        "{} requires an open connection (send db-open first)",
+                        request.cmd
+                    )))
+                },
+                |conn| handle_db_request(conn, request),
+            ),
+            other => err_response(&DbProtocolError::Protocol(format!("unknown db protocol command: {other}"))),
+        }
+    }
+
+    /// Open (or replace) the connection from the `db-open` conninfo parameter.
+    fn handle_open(&mut self, request: &Request) -> Response {
+        let conninfo = match sql_param(request) {
+            Ok(conninfo) => conninfo,
+            Err(msg) => return err_response(&DbProtocolError::Protocol(msg)),
+        };
+        match Connection::open(conninfo) {
+            Ok(conn) => {
+                self.conn = Some(conn);
+                Response::Ok(OkResponse {
+                    out: Some(serde_json::Value::Null),
+                })
+            }
+            Err(err) => err_response(&DbProtocolError::Db(err)),
+        }
+    }
+}
+
+/// Client side of the DB protocol: builds the `db-open` / `db-query` /
+/// `db-execute` / `db-close` requests and decodes the responses into typed
+/// results.
 ///
 /// This is a stateless helper; all methods are associated functions.
 pub struct DbProtocolClient;
 
 impl DbProtocolClient {
+    /// Build a `db-open` request for `conninfo` (a libpq conninfo string).
+    #[must_use]
+    pub fn open_request(conninfo: &str) -> Request {
+        Request {
+            cmd: CMD_DB_OPEN.to_owned(),
+            param: vec![serde_json::Value::String(conninfo.to_owned())],
+        }
+    }
+
+    /// Build a `db-close` request.
+    #[must_use]
+    pub fn close_request() -> Request {
+        Request {
+            cmd: CMD_DB_CLOSE.to_owned(),
+            param: Vec::new(),
+        }
+    }
+
     /// Build a `db-query` request for `sql`.
     #[must_use]
     pub fn query_request(sql: &str) -> Request {
@@ -231,6 +346,20 @@ impl DbProtocolClient {
         Request {
             cmd: CMD_DB_EXECUTE.to_owned(),
             param: vec![serde_json::Value::String(sql.to_owned())],
+        }
+    }
+
+    /// Decode a `db-open` / `db-close` / `db-execute` response (all return an
+    /// empty / null `out`): success is `Ok(())`, an error response maps to
+    /// [`DbProtocolError::Protocol`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbProtocolError::Protocol`] for an error response.
+    pub fn decode_unit_response(resp: &Response) -> Result<(), DbProtocolError> {
+        match resp {
+            Response::Ok(_) => Ok(()),
+            Response::Err(err) => Err(DbProtocolError::Protocol(err.message.clone())),
         }
     }
 
@@ -403,7 +532,73 @@ mod tests {
         let Response::Err(err) = &resp else {
             panic!("expected Err, got {resp:?}");
         };
-        assert!(err.message.contains("requires a sql parameter"));
+        assert!(err.message.contains("requires a string parameter"));
+    }
+
+    #[test]
+    fn db_request_handler_query_before_open_errs() {
+        // A db-query before db-open has no connection to run against, so it
+        // must come back as an error rather than panicking.
+        let mut handler = DbRequestHandler::new();
+        let resp = handler.handle(&DbProtocolClient::query_request("SELECT 1"));
+        let Response::Err(err) = &resp else {
+            panic!("expected Err (no open connection), got {resp:?}");
+        };
+        assert!(err.message.contains("requires an open connection"), "{}", err.message);
+    }
+
+    #[test]
+    fn db_request_handler_close_is_idempotent() {
+        // db-close with nothing open is a no-op success; a second close too.
+        let mut handler = DbRequestHandler::new();
+        DbProtocolClient::decode_unit_response(&handler.handle(&DbProtocolClient::close_request()))
+            .expect("close with nothing open is ok");
+        DbProtocolClient::decode_unit_response(&handler.handle(&DbProtocolClient::close_request())).expect("second close is ok");
+    }
+
+    #[test]
+    fn db_request_handler_open_rejects_bad_conninfo() {
+        // db-open against an unreachable socket surfaces the libpq connect
+        // failure as an error response (no connection is retained).
+        let mut handler = DbRequestHandler::new();
+        let req = DbProtocolClient::open_request("host=/nonexistent-socket-path-98765 connect_timeout=1");
+        let resp = handler.handle(&req);
+        assert!(matches!(resp, Response::Err(_)), "expected Err, got {resp:?}");
+        // With no connection retained, a follow-up query also errors with the
+        // "requires an open connection" message.
+        let q = handler.handle(&DbProtocolClient::query_request("SELECT 1"));
+        let Response::Err(err) = &q else {
+            panic!("expected Err, got {q:?}");
+        };
+        assert!(err.message.contains("requires an open connection"), "{}", err.message);
+    }
+
+    #[test]
+    fn db_request_handler_unknown_command_errs() {
+        let mut handler = DbRequestHandler::new();
+        let req = Request {
+            cmd: "db-bogus".to_owned(),
+            param: vec![],
+        };
+        let resp = handler.handle(&req);
+        let Response::Err(err) = &resp else {
+            panic!("expected Err, got {resp:?}");
+        };
+        assert!(err.message.contains("unknown db protocol command"), "{}", err.message);
+    }
+
+    #[test]
+    fn db_protocol_client_builds_open_and_close_requests() {
+        let open = DbProtocolClient::open_request("host=/tmp dbname=postgres");
+        assert_eq!(open.cmd, "db-open");
+        assert_eq!(
+            open.param,
+            vec![serde_json::Value::String("host=/tmp dbname=postgres".to_owned())]
+        );
+
+        let close = DbProtocolClient::close_request();
+        assert_eq!(close.cmd, "db-close");
+        assert!(close.param.is_empty());
     }
 
     #[test]
