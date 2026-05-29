@@ -301,6 +301,77 @@ if [ "$rows" = "2500" ]; then pass "block+bundle restored data (2500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "block+bundle restored data (got: $rows)"; fi
 
 ############################################################################
+hd "Scenario 7 — create a streaming standby on secondaire (restore --type=standby)"
+# Repo on depot (shared); principal is the primary backing up to depot. The
+# secondaire node restores that backup as a hot standby and streams from principal.
+# (KB Exemple 3 / Dalibo Ex.4: a backup-fed streaming replica.)
+SEC=/var/lib/postgresql/$PGV/secondaire
+reset_principal_cluster
+on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+log-level-console=info
+log-path=/var/log/pgbackrest
+start-fast=y
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+ok "stanza-create (standby scenario)" principal "pgbackrest --stanza=demo stanza-create"
+ok "check (standby scenario)" principal "pgbackrest --stanza=demo check"
+# Replication role the standby connects as (reset-cluster's pg_hba allows the
+# 192.168.56.0/24 subnet via scram-sha-256).
+psql_on principal 5433 "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator'" >/dev/null
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup (for standby)" principal "pgbackrest --stanza=demo --type=full backup"
+
+# Configure pgbackrest on secondaire (same remote repo on depot, its own data dir).
+on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-host=depot
+repo1-host-user=postgres
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-path=/var/log/pgbackrest
+[demo]
+pg1-path=$SEC
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrest/pgbackrest.conf
+install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest"
+# Stop any prior standby + wipe its data dir, then restore as a standby from depot.
+on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
+ok "restore --type=standby (on secondaire, from depot)" secondaire \
+  "pgbackrest --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
+sig=$(on secondaire "ls $SEC/standby.signal 2>&1")
+assert_contains "$sig" "standby.signal" "restore wrote standby.signal"
+
+pg secondaire "$BIN/pg_ctl -D $SEC -l $SEC/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 5
+in_rec=$(psql_on secondaire 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
+srows=$(psql_on secondaire 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$in_rec" = "t" ] && [ "$srows" = "1500" ]; then
+  pass "standby is a hot replica with the restored data (1500 rows)"
+else
+  pg secondaire "tail -25 $SEC/server.log" 2>&1 | grep -vE 'Connection to' >&2
+  fail "standby state (in_recovery=$in_rec rows=$srows, want t/1500)"
+fi
+# Streaming: an insert on the primary must replicate to the standby.
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1501,1600)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+sleep 6
+srows2=$(psql_on secondaire 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$srows2" = "1600" ]; then pass "streaming replication primary -> standby (1600 rows)"
+else pg secondaire "tail -15 $SEC/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "streaming replication (standby rows=$srows2, want 1600)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
