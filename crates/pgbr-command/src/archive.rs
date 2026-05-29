@@ -1300,9 +1300,17 @@ pub fn prefetch_get_spool(
 /// PG-data destination. It does not take the archive lock (the caller already
 /// holds the backup lock) and never writes anything.
 ///
+/// On an encrypted repository the stored WAL is compress-then-encrypt
+/// (`Salted__` + ciphertext), so it must be decrypted *before* it is
+/// decompressed. `user_pass` decrypts `archive.info` (to resolve the archive-id
+/// directory) while `sub_key` is the repository **sub-key** that decrypts the
+/// WAL/data bytes themselves; both are `None` for an unencrypted repository, in
+/// which case the reverse transform is decompress-only (or a verbatim copy for
+/// a plaintext segment), matching the previous behaviour exactly.
+///
 /// # Errors
 ///
-/// - [`CommandError::Io`] if a matched compressed form fails to decompress.
+/// - [`CommandError::Io`] if a matched stored form fails to decrypt/decompress.
 /// - [`CommandError::Other`] if the repository's `archive.info` fails to load.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if a repository read fails.
 pub(crate) fn read_archived_segment(
@@ -1310,6 +1318,7 @@ pub(crate) fn read_archived_segment(
     stanza: &str,
     segment: &str,
     user_pass: Option<&str>,
+    sub_key: Option<&str>,
 ) -> Result<Option<Vec<u8>>, CommandError> {
     // Resolve the archive-id directory from the repository's archive.info when
     // present; otherwise fall back to the flat `archive/<stanza>/` layout so a
@@ -1343,10 +1352,14 @@ pub(crate) fn read_archived_segment(
     };
 
     let stored = read_segment(repo, &source)?;
-    let bytes = match decompress_filter_for(suffix) {
-        Some(mut filter) => run_filter(filter.as_mut(), &stored)?,
-        None => stored,
-    };
+    // Reverse the exact transform the WAL was written with: decrypt (under the
+    // repo sub-key) then decompress. `CompressType::from_str_id` takes the codec
+    // name without the leading dot (`".gz"` → `"gz"` → `Gz`; `""` → `None`). For
+    // an unencrypted repo `sub_key` is `None`, so this is decompress-only; for a
+    // plaintext segment (no suffix, no key) it returns the bytes unchanged.
+    let compress_type = CompressType::from_str_id(suffix.strip_prefix('.').unwrap_or(suffix));
+    let transform = RepoTransform::with_key(compress_type, 0, sub_key.map(str::to_owned));
+    let bytes = transform.apply_reverse_keyed(&stored).map_err(CommandError::from)?;
     Ok(Some(bytes))
 }
 
@@ -2392,7 +2405,7 @@ mod tests {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
 
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None, None).expect("read");
         assert_eq!(bytes.as_deref(), Some(WAL_BODY), "plaintext segment returned as-is");
     }
 
@@ -2403,14 +2416,40 @@ mod tests {
         let compressed = run(GzCompress::new(super::default_level("gz"), false), WAL_BODY);
         put(&repo_s, &format!("archive/demo/{SEGMENT}.gz"), &compressed);
 
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None, None).expect("read");
         assert_eq!(bytes.as_deref(), Some(WAL_BODY), "gz segment decompressed to plaintext");
+    }
+
+    #[test]
+    fn read_archived_segment_decrypts_then_decompresses_encrypted_form() {
+        // On an encrypted repo WAL is stored compress-then-encrypt
+        // (`Salted__` + gz). Reading it back must decrypt under the repo sub-key
+        // *before* decompressing — inflating the ciphertext directly fails with
+        // "gz inflate failed: zlib code -3" (the original bug).
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let sub_key = "repo-sub-key-secret";
+
+        // Write the segment exactly as archive-push does: keyed forward transform
+        // (gz compress then AES-256-CBC encrypt under the sub-key).
+        let forward = RepoTransform::with_key(CompressType::Gz, super::default_level("gz"), Some(sub_key.to_owned()));
+        let stored = forward.apply_forward_keyed(WAL_BODY).expect("forward transform");
+        // Sanity: the stored bytes are encrypted (salted), not raw gzip.
+        assert!(stored.starts_with(b"Salted__"), "stored WAL is encrypted (salted)");
+        put(&repo_s, &format!("archive/demo/{SEGMENT}.gz"), &stored);
+
+        // Reading with the sub-key recovers the original plaintext.
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None, Some(sub_key)).expect("read encrypted");
+        assert_eq!(
+            bytes.as_deref(),
+            Some(WAL_BODY),
+            "encrypted gz segment decrypted + decompressed to plaintext"
+        );
     }
 
     #[test]
     fn read_archived_segment_absent_is_none() {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
-        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None).expect("read");
+        let bytes = read_archived_segment(&repo_s, "demo", SEGMENT, None, None).expect("read");
         assert_eq!(bytes, None, "a segment not in the archive yields None");
     }
 

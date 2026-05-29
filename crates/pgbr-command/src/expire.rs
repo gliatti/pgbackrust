@@ -323,10 +323,11 @@ fn archive_expire_tail(
     dry_run: bool,
     user_pass: Option<&str>,
 ) -> Result<Vec<String>, CommandError> {
-    let archive_type = retention_archive_type(config);
+    let repo_index = crate::cipher::active_repo_index(config);
+    let archive_type = retention_archive_type(config, repo_index);
     let kept_labels: Vec<String> = info.current.keys().cloned().collect();
     let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
-    retention_archive(config)?.map_or_else(
+    retention_archive(config, repo_index)?.map_or_else(
         || Ok(Vec::new()),
         |keep_archive| {
             expire_archive(
@@ -435,10 +436,23 @@ fn expire_adhoc_oldest(
     })
 }
 
+/// Look up a `repo`-group option, trying the grouped key
+/// `(name, Some(repo_index))` first and falling back to the ungrouped key
+/// `(name, None)`. A grouped repo option such as `--repo1-retention-full=1`
+/// is stored under `("repo-retention-full", Some(1))`, so a lookup at the
+/// ungrouped key alone never finds it; this accessor mirrors the grouped-key
+/// resolution used elsewhere in the command layer.
+fn retention_option<'a>(config: &'a LoadedConfig, name: &str, repo_index: u32) -> Option<&'a OptionValue> {
+    config
+        .options
+        .get(&(name.to_owned(), Some(repo_index)))
+        .or_else(|| config.options.get(&(name.to_owned(), None)))
+}
+
 /// `repo-retention-full` lookup. Missing option is reported as `None`
 /// (no-op). A non-integer value is reported as `Other`.
-fn retention_full(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
-    match config.options.get(&("repo-retention-full".to_owned(), None)) {
+fn retention_full(config: &LoadedConfig, repo_index: u32) -> Result<Option<u32>, CommandError> {
+    match retention_option(config, "repo-retention-full", repo_index) {
         None => Ok(None),
         Some(OptionValue::Integer(n)) => {
             if *n <= 0 {
@@ -467,8 +481,8 @@ enum RetentionFullType {
 }
 
 /// `repo-retention-full-type` lookup (`count` default, or `time`).
-fn retention_full_type(config: &LoadedConfig) -> RetentionFullType {
-    match config.options.get(&("repo-retention-full-type".to_owned(), None)) {
+fn retention_full_type(config: &LoadedConfig, repo_index: u32) -> RetentionFullType {
+    match retention_option(config, "repo-retention-full-type", repo_index) {
         Some(OptionValue::String(s) | OptionValue::StringId(s)) if s.eq_ignore_ascii_case("time") => RetentionFullType::Time,
         _ => RetentionFullType::Count,
     }
@@ -477,8 +491,8 @@ fn retention_full_type(config: &LoadedConfig) -> RetentionFullType {
 /// `repo-retention-diff` lookup — the number of differential backups to keep.
 /// Missing / non-positive is reported as `None` (no diff-specific expiry). A
 /// non-integer value is an error.
-fn retention_diff(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
-    match config.options.get(&("repo-retention-diff".to_owned(), None)) {
+fn retention_diff(config: &LoadedConfig, repo_index: u32) -> Result<Option<u32>, CommandError> {
+    match retention_option(config, "repo-retention-diff", repo_index) {
         None => Ok(None),
         Some(OptionValue::Integer(n)) => {
             if *n <= 0 {
@@ -497,8 +511,8 @@ fn retention_diff(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
 
 /// `repo-retention-history` lookup — days of `backup.history` metadata to keep.
 /// Missing / non-positive → `None` (history kept indefinitely).
-fn retention_history(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
-    match config.options.get(&("repo-retention-history".to_owned(), None)) {
+fn retention_history(config: &LoadedConfig, repo_index: u32) -> Result<Option<u32>, CommandError> {
+    match retention_option(config, "repo-retention-history", repo_index) {
         None => Ok(None),
         Some(OptionValue::Integer(n)) if *n <= 0 => Ok(None),
         Some(OptionValue::Integer(n)) => u32::try_from(*n)
@@ -609,8 +623,8 @@ fn apply_diff_retention(entries: &[(String, serde_json::Value)], keep_label: &mu
 /// value is reported as `None` / `Other` respectively — a zero/negative
 /// retention is treated as "unset" to match the C tree, which skips
 /// archive expiry when the option is not effectively set.
-fn retention_archive(config: &LoadedConfig) -> Result<Option<u32>, CommandError> {
-    match config.options.get(&("repo-retention-archive".to_owned(), None)) {
+fn retention_archive(config: &LoadedConfig, repo_index: u32) -> Result<Option<u32>, CommandError> {
+    match retention_option(config, "repo-retention-archive", repo_index) {
         None => Ok(None),
         Some(OptionValue::Integer(n)) => {
             if *n <= 0 {
@@ -653,8 +667,8 @@ fn backup_pg_id(value: &serde_json::Value) -> Option<u32> {
 
 /// `repo-retention-archive-type` lookup. Defaults to `full` when unset
 /// (matching the C default), and treats any unrecognised value as `full`.
-fn retention_archive_type(config: &LoadedConfig) -> ArchiveRetentionType {
-    match config.options.get(&("repo-retention-archive-type".to_owned(), None)) {
+fn retention_archive_type(config: &LoadedConfig, repo_index: u32) -> ArchiveRetentionType {
+    match retention_option(config, "repo-retention-archive-type", repo_index) {
         Some(OptionValue::String(s)) => ArchiveRetentionType::parse(s),
         _ => ArchiveRetentionType::Full,
     }
@@ -1258,11 +1272,15 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         return expire_adhoc_oldest(config, repo, stanza, &mut info, dry_run, user_pass, recorded_sub);
     }
 
-    let archive_type = retention_archive_type(config);
+    // Grouped repo options (e.g. `--repo1-retention-full`) are stored under
+    // `(name, Some(repo_index))`; resolve the active repo index once and thread
+    // it through every retention lookup so the grouped keys are actually found.
+    let repo_index = crate::cipher::active_repo_index(config);
+    let archive_type = retention_archive_type(config, repo_index);
 
     // No backup retention configured. Backups are all kept, but archive
     // retention may still apply against the surviving anchor backups.
-    let Some(keep_full) = retention_full(config)? else {
+    let Some(keep_full) = retention_full(config, repo_index)? else {
         return expire_keep_all_backups(config, repo, stanza, &info, archive_type, dry_run, user_pass);
     };
 
@@ -1283,7 +1301,8 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
             .map_or(0, |d| d.as_secs()),
     )
     .unwrap_or(i64::MAX);
-    let (mut keep_label, cutoff_full_ts) = full_retention_keep(&entries, keep_full, retention_full_type(config), now_secs);
+    let (mut keep_label, cutoff_full_ts) =
+        full_retention_keep(&entries, keep_full, retention_full_type(config, repo_index), now_secs);
 
     // Every diff/incr backup whose timestamp is at least the oldest
     // retained full's timestamp is kept; everything older expires (its
@@ -1299,7 +1318,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // Differential retention: among the diffs still kept, retain only the newest
     // `repo-retention-diff`; older diffs and their dependent incrs expire even
     // though their full survives.
-    if let Some(keep_diff) = retention_diff(config)? {
+    if let Some(keep_diff) = retention_diff(config, repo_index)? {
         apply_diff_retention(&entries, &mut keep_label, keep_diff);
     }
 
@@ -1322,7 +1341,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // Archive retention runs after backups are expired, counted against
     // the anchor backups that survived (in `kept_labels`, oldest first).
     let kept_anchor_oldest_first = anchor_backups_oldest_first(&info, &kept_labels, archive_type);
-    let expired_archive_segments = match retention_archive(config)? {
+    let expired_archive_segments = match retention_archive(config, repo_index)? {
         Some(keep_archive) => expire_archive(
             repo,
             stanza,
@@ -1338,7 +1357,7 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
 
     // History retention: prune backup.history manifest copies older than
     // `repo-retention-history` days. Skipped in --dry-run mode.
-    if let Some(keep_history_days) = retention_history(config)?
+    if let Some(keep_history_days) = retention_history(config, repo_index)?
         && !dry_run
     {
         expire_history(repo, stanza, keep_history_days, now_secs)?;
@@ -1429,9 +1448,10 @@ fn expire_keep_all_backups(
     dry_run: bool,
     user_pass: Option<&str>,
 ) -> Result<ExpireSummary, CommandError> {
+    let repo_index = crate::cipher::active_repo_index(config);
     let kept_labels: Vec<String> = info.current.keys().cloned().collect();
     let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
-    let expired_archive_segments = match retention_archive(config)? {
+    let expired_archive_segments = match retention_archive(config, repo_index)? {
         Some(keep_archive) => expire_archive(
             repo,
             stanza,
@@ -1506,7 +1526,8 @@ mod tests {
 
     use super::{
         ArchiveIdPlan, ArchiveRange, ArchiveRetentionType, BackupForArchive, ExpireSummary, RetentionFullType,
-        apply_diff_retention, compute_archive_plan, expire_inner, full_retention_keep, label_date_epoch, segment_in_ranges,
+        apply_diff_retention, compute_archive_plan, expire_inner, full_retention_keep, label_date_epoch, retention_full,
+        segment_in_ranges,
     };
 
     fn cfg(stanza: Option<&str>, retention_full: Option<i64>) -> LoadedConfig {
@@ -2184,6 +2205,59 @@ mod tests {
                 "20260101-120000F".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn retention_full_resolves_grouped_repo_key() {
+        // `--repo1-retention-full=1` is stored under the grouped key
+        // ("repo-retention-full", Some(1)); `retention_full(config, 1)` must
+        // find it (this was the no-op bug — only the ungrouped key was read).
+        let mut grouped = cfg(Some("demo"), None);
+        grouped
+            .options
+            .insert(("repo-retention-full".to_owned(), Some(1)), OptionValue::Integer(1));
+        assert_eq!(retention_full(&grouped, 1).expect("grouped lookup"), Some(1));
+
+        // The ungrouped-default fallback is preserved.
+        let mut ungrouped = cfg(Some("demo"), None);
+        ungrouped
+            .options
+            .insert(("repo-retention-full".to_owned(), None), OptionValue::Integer(2));
+        assert_eq!(retention_full(&ungrouped, 1).expect("ungrouped fallback"), Some(2));
+
+        // Missing in both is still `None`.
+        assert_eq!(retention_full(&cfg(Some("demo"), None), 1).expect("missing"), None);
+    }
+
+    #[test]
+    fn grouped_retention_full_expires_older_fulls() {
+        // Two fulls + `--repo1-retention-full=1` (grouped key) must expire the
+        // older full, leaving exactly one — the end-to-end form of the bug.
+        let (_dir, repo) = empty_repo();
+        seed_backup_info(
+            &repo,
+            "demo",
+            &[("20260101-100000F", 100, "full"), ("20260101-200000F", 200, "full")],
+        );
+        seed_backup_dir(&repo, "demo", "20260101-100000F");
+        seed_backup_dir(&repo, "demo", "20260101-200000F");
+
+        let mut cfg = cfg(Some("demo"), None);
+        cfg.options
+            .insert(("repo-retention-full".to_owned(), Some(1)), OptionValue::Integer(1));
+
+        let summary = expire_inner(&cfg, &repo).expect("expire_inner grouped retention");
+
+        assert_eq!(summary.kept_labels, vec!["20260101-200000F".to_owned()]);
+        assert_eq!(summary.expired_labels, vec!["20260101-100000F".to_owned()]);
+        // The expired backup directory is gone and backup.info is pruned.
+        assert!(!backup_dir_exists(&repo, "demo", "20260101-100000F"));
+        assert!(backup_dir_exists(&repo, "demo", "20260101-200000F"));
+        let info = super::load_backup_info(&cfg, &repo, "demo")
+            .expect("reload backup.info")
+            .expect("backup.info present");
+        assert!(!info.info.current.contains_key("20260101-100000F"));
+        assert!(info.info.current.contains_key("20260101-200000F"));
     }
 
     #[test]

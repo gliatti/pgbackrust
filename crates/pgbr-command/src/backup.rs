@@ -812,6 +812,11 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         integrity,
         policy,
         repo_user_pass.as_deref(),
+        // The repo sub-key used to read (decrypt + decompress) archived WAL for
+        // archive-check / archive-copy. It is the same key the backup transform
+        // encrypts data/WAL with (resolved above via `active_sub_key`), so reuse
+        // it from the transform; `None` on an unencrypted repo.
+        transform.cipher_pass.as_deref(),
     )?;
     log_info(&format!(
         "backup {} complete: {} file(s), {} byte(s)",
@@ -2376,6 +2381,7 @@ pub fn backup_inner_keyed(
         IntegrityChecks::disabled(),
         BackupPolicy::test_default(),
         repo_user_pass,
+        transform.cipher_pass.as_deref(),
     )
 }
 
@@ -3059,6 +3065,7 @@ pub fn backup_inner_with_workers(
         IntegrityChecks::disabled(),
         BackupPolicy::test_default(),
         None,
+        None,
     )
 }
 
@@ -3113,6 +3120,7 @@ fn run_backup(
     integrity: IntegrityChecks,
     policy: BackupPolicy,
     repo_user_pass: Option<&str>,
+    repo_sub_key: Option<&str>,
 ) -> Result<BackupOutcome, CommandError> {
     let info_path = backup_info_path(stanza);
     if !repo_storage.exists(&info_path)? {
@@ -3334,6 +3342,7 @@ fn run_backup(
             integrity.archive_timeout,
             WAL_POLL_INTERVAL,
             repo_user_pass,
+            repo_sub_key,
         )?;
     }
 
@@ -3343,7 +3352,15 @@ fn run_backup(
     // places them. Done after the bracket (which yields the segment range) and
     // before totals are computed so the copied WAL counts toward the manifest.
     if archive_copy && let Some(bracket) = bracket.as_ref() {
-        let copied = copy_archive_wal(repo_storage, stanza, &backup_root, transform, bracket, repo_user_pass)?;
+        let copied = copy_archive_wal(
+            repo_storage,
+            stanza,
+            &backup_root,
+            transform,
+            bracket,
+            repo_user_pass,
+            repo_sub_key,
+        )?;
         for (file, repo_bytes) in copied {
             repo_size += repo_bytes;
             files.push(file);
@@ -3659,6 +3676,7 @@ fn copy_archive_wal(
     transform: &RepoTransform,
     bracket: &BackupBracket,
     user_pass: Option<&str>,
+    sub_key: Option<&str>,
 ) -> Result<Vec<(ManifestFile, u64)>, CommandError> {
     let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
         CommandError::Other(format!(
@@ -3674,7 +3692,7 @@ fn copy_archive_wal(
     repo_storage.create_path(Path::new(&format!("{backup_root}/pg_wal")), true)?;
     let mut out = Vec::with_capacity(segments.len());
     for segment in &segments {
-        let bytes = crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass)?.ok_or_else(|| {
+        let bytes = crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass, sub_key)?.ok_or_else(|| {
             CommandError::Other(format!(
                 "archive-copy: required WAL segment {segment} is missing from the archive"
             ))
@@ -3765,6 +3783,7 @@ fn wait_for_required_wal(
     timeout: std::time::Duration,
     poll_interval: std::time::Duration,
     user_pass: Option<&str>,
+    sub_key: Option<&str>,
 ) -> Result<(), CommandError> {
     let segments = wal_segment_range(&bracket.archive_start, &bracket.archive_stop, bracket.wal_segment_size).ok_or_else(|| {
         CommandError::Other(format!(
@@ -3776,7 +3795,7 @@ fn wait_for_required_wal(
     for segment in &segments {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass)?.is_some() {
+            if crate::archive::read_archived_segment(repo_storage, stanza, segment, user_pass, sub_key)?.is_some() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -5352,6 +5371,7 @@ mod tests {
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
             None,
+            transform.cipher_pass.as_deref(),
         )
     }
 
@@ -5383,6 +5403,7 @@ mod tests {
             false,
             integrity,
             BackupPolicy::test_default(),
+            None,
             None,
         )
     }
@@ -6029,6 +6050,7 @@ mod tests {
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
             None,
+            None,
         )
         .expect("live control-driven backup");
 
@@ -6430,6 +6452,7 @@ mod tests {
             IntegrityChecks::disabled(),
             policy,
             None,
+            None,
         )
     }
 
@@ -6665,6 +6688,7 @@ mod tests {
             false,
             IntegrityChecks::disabled(),
             policy,
+            None,
             None,
         )
         .expect("stop-auto backup");
