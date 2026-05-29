@@ -4,20 +4,18 @@
 //! `src/command/archive/push/push.c`.
 //!
 //! A WAL segment is copied between the `PostgreSQL` data directory and the
-//! repository through the [`Storage`] trait. When `--compress-type` is set to
+//! repository through the [`Storage`] trait, stored under the stanza's
+//! archive-id directory `archive/<stanza>/<archive-id>/`, where the archive-id
+//! is `<db-version>-<db-id>` from the stanza's `archive.info` (the same scheme
+//! the C version and the `check` command use). When `--compress-type` is set to
 //! a codec (`gz`/`bz2`/`lz4`/`zst`), `archive-push` runs the segment through
 //! the matching compress filter and stores it with the codec's file
-//! extension (`archive/<stanza>/<segment>.gz`, …); `compress-type=none`
-//! keeps the raw, suffix-less copy. `archive-get` probes the repository for
-//! the plaintext segment first, then for each compression suffix, and runs
-//! the matching decompress filter so a WAL archived compressed is recovered
-//! regardless of the client's current `compress-type` — matching pgBackRest,
-//! which names archived WAL with the compression extension.
-//!
-//! Encryption (`--cipher-pass`) is **not** applied here — that filter wiring
-//! lands in a follow-up. The archive-id subdirectory scheme the C version
-//! derives from the PG version + system id is likewise simplified to a flat
-//! `archive/<stanza>/<segment>` layout for now.
+//! extension (`archive/<stanza>/<archive-id>/<segment>.gz`, …);
+//! `compress-type=none` keeps the raw, suffix-less copy. `archive-get` probes
+//! the repository for the plaintext segment first, then for each compression
+//! suffix, and runs the matching decompress filter so a WAL archived compressed
+//! is recovered regardless of the client's current `compress-type` — matching
+//! pgBackRest, which names archived WAL with the compression extension.
 //!
 //! ## Multiple repositories
 //!
@@ -282,12 +280,24 @@ fn write_segment(bytes: &[u8], dst: &dyn Storage, dst_path: &Path) -> Result<(),
     Ok(())
 }
 
-/// Build the repository-relative path for a WAL `segment` under `stanza`.
+/// Build the repository-relative path for a WAL `name` under `stanza`'s
+/// `archive_id` directory: `archive/<stanza>/<archive_id>/<name>`.
 ///
-/// Flat layout `archive/<stanza>/<segment>` — the version + system-id
-/// archive-id directory used by the C implementation is deferred.
-fn repo_segment_path(stanza: &str, segment: &str) -> PathBuf {
-    PathBuf::from(format!("archive/{stanza}/{segment}"))
+/// `name` is the segment basename plus any compression suffix (e.g.
+/// `000000010000000000000001` or `000000010000000000000001.gz`). The
+/// `archive_id` is `<db-version>-<db-id>` from the stanza's `archive.info`
+/// (see [`archive_id`]), matching pgBackRest's per-cluster archive directory
+/// and the layout the `check` command polls.
+fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
+    PathBuf::from(format!("archive/{stanza}/{archive_id}/{name}"))
+}
+
+/// The archive-id directory name for a stanza's `archive.info`:
+/// `<db-version>-<db-id>` (e.g. `"16-1"`). This is the per-cluster
+/// subdirectory archived WAL is stored under, matching the C implementation
+/// and the `check` command.
+fn archive_id(info: &InfoArchive) -> String {
+    format!("{}-{}", info.db_version, info.db_id)
 }
 
 /// Read every byte of `src_path` from `src` storage.
@@ -550,23 +560,80 @@ fn check_wal_header(bytes: &[u8], segment: &str, info: &InfoArchive) -> Result<(
     Ok(())
 }
 
-/// Load the stanza's `archive.info` from the first repository that has it, used
-/// by `archive-header-check` to source the cluster identity. Returns `Ok(None)`
-/// when no repository holds an `archive.info` (a not-yet-initialised stanza), so
-/// the caller can skip the header check rather than fail the push.
-fn load_archive_info(repo_storages: &[&dyn Storage], stanza: &str) -> Result<Option<InfoArchive>, CommandError> {
+/// Load the stanza's `archive.info` from the first repository that has it,
+/// decrypting it with that repository's cipher passphrase when the repo is
+/// encrypted. Used to resolve the archive-id directory (`<db-version>-<db-id>`)
+/// the WAL is stored under and the cluster identity for `archive-header-check`.
+///
+/// The `[db]` section that carries `db-version` / `db-id` / `db-system-id` lives
+/// *inside* the encrypted blob, so an encrypted repository's `archive.info` must
+/// be decrypted to read it — a plaintext load would fail with a non-UTF-8 parse
+/// error. Mirrors [`repo_sub_key`]'s per-repo cipher resolution. Returns
+/// `Ok(None)` when no repository holds an `archive.info` (a not-yet-initialised
+/// stanza), so the caller can decide whether that is fatal.
+///
+/// # Errors
+///
+/// [`CommandError::MissingOption`] when an encrypted repo has no
+/// `repo-cipher-pass`; [`CommandError::Other`] when the info file cannot be
+/// loaded / decrypted; [`CommandError::Storage`] on an underlying storage error.
+fn load_archive_info(
+    config: &LoadedConfig,
+    repo_storages: &[&dyn Storage],
+    stanza: &str,
+) -> Result<Option<InfoArchive>, CommandError> {
     let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
-    for repo in repo_storages {
-        if repo.exists(&info_path)? {
-            let info = InfoArchive::load(*repo, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
-            return Ok(Some(info));
+    let indexes = configured_repo_indexes(config);
+    for (pos, repo) in repo_storages.iter().enumerate() {
+        if !repo.exists(&info_path)? {
+            continue;
         }
+        let index = indexes.get(pos).copied().unwrap_or(1);
+        let cipher_type = repo_string_id(config, "repo-cipher-type", index).map_or(CipherType::None, CipherType::from_str_id);
+        let pass = if cipher_type.is_encrypted() {
+            let p = repo_string(config, "repo-cipher-pass", index).filter(|s| !s.is_empty());
+            if p.is_none() {
+                return Err(CommandError::MissingOption {
+                    option: "repo-cipher-pass".to_owned(),
+                });
+            }
+            p
+        } else {
+            None
+        };
+        let (info, _) = InfoArchive::load_keyed(*repo, &info_path, pass).map_err(|err| CommandError::Other(err.to_string()))?;
+        return Ok(Some(info));
     }
     Ok(None)
 }
 
+/// Resolve the archive-id directory (`<db-version>-<db-id>`) for a single
+/// repository's `archive.info`, used by the spool drains. The drains target one
+/// repository at a time, so they load `archive.info` directly from that repo's
+/// storage rather than from a slice. A repository with no `archive.info` cannot
+/// accept WAL (the stanza has not been created), so this is a hard error.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the repository has no `archive.info`, or it
+/// fails to load. [`CommandError::Storage`] on an underlying storage failure.
+fn load_drain_archive_id(repo_storage: &dyn Storage, stanza: &str) -> Result<String, CommandError> {
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    if !repo_storage.exists(&info_path)? {
+        return Err(CommandError::Other(
+            "archive-push: unable to load archive.info — is the stanza created?".to_owned(),
+        ));
+    }
+    let info = InfoArchive::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+    Ok(archive_id(&info))
+}
+
 /// `archive-push` — copy a completed WAL segment from the PG data directory
-/// into **every** configured repository at `archive/<stanza>/<segment><suffix>`.
+/// into **every** configured repository.
+///
+/// The segment is stored at `archive/<stanza>/<archive-id>/<segment><suffix>`,
+/// where the archive-id is `<db-version>-<db-id>` from the stanza's
+/// `archive.info`.
 ///
 /// `config.params[0]` is the WAL source path (relative to the PG data dir,
 /// resolved against `pg_storage`); the segment basename is taken from it.
@@ -633,15 +700,20 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
         return Ok(());
     }
 
+    // Load the stanza's archive.info: it provides the archive-id directory the
+    // WAL is stored under (`<db-version>-<db-id>`) and the cluster identity used
+    // by archive-header-check. A stanza with no archive.info cannot accept WAL
+    // (it has not been created), so this is a hard error regardless of the
+    // header-check setting.
+    let archive_info = load_archive_info(config, repo_storages, stanza)?
+        .ok_or_else(|| CommandError::Other("archive-push: unable to load archive.info — is the stanza created?".to_owned()))?;
+    let archive_id = archive_id(&archive_info);
+
     // archive-header-check: validate the WAL segment's long-page header against
     // the stanza's archive.info before storing, rejecting a segment that belongs
-    // to a different cluster / version / timeline. Skipped when no archive.info
-    // is present yet (uninitialised stanza) or when the option is disabled.
-    let archive_info = if archive_header_check(config) {
-        load_archive_info(repo_storages, stanza)?
-    } else {
-        None
-    };
+    // to a different cluster / version / timeline. Skipped when the option is
+    // disabled.
+    let header_info = archive_header_check(config).then_some(&archive_info);
 
     // Asynchronous mode: stage the segment in the spool out/ directory and let
     // the background drain move it to the repository. Before staging, consume
@@ -653,18 +725,11 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
             option: "spool-path".to_owned(),
         })?;
         let spool = Posix::new(spool_root);
-        return push_async(
-            pg_storage,
-            &spool,
-            stanza,
-            segment,
-            Path::new(wal_source),
-            archive_info.as_ref(),
-        );
+        return push_async(pg_storage, &spool, stanza, segment, Path::new(wal_source), header_info);
     }
 
     let bytes = read_segment(pg_storage, Path::new(wal_source))?;
-    if let Some(info) = archive_info.as_ref() {
+    if let Some(info) = header_info {
         check_wal_header(&bytes, segment, info)?;
     }
 
@@ -675,7 +740,7 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     // destination path is the same for every repo. The segment is only archived
     // once it has reached all of them.
     let transforms = per_repo_transforms(config, repo_storages, stanza)?;
-    let dest = repo_segment_path(stanza, &format!("{segment}{}", compress_suffix(config)));
+    let dest = repo_segment_path(stanza, &archive_id, &format!("{segment}{}", compress_suffix(config)));
     for (repo, transform) in repo_storages.iter().zip(transforms.iter()) {
         let stored = transform_segment(transform, &bytes)?;
         write_segment(&stored, *repo, &dest)?;
@@ -751,7 +816,8 @@ fn consume_push_status(spool: &dyn Storage, stanza: &str, segment: &str) -> Resu
 /// (status files — `.ok` / `.error` — are skipped) is run through the
 /// `transform` factory (a fresh compress [`Filter`] per segment, or `None` to
 /// store raw) and written to the repository at
-/// `archive/<stanza>/<segment><suffix>`. On success the staged copy is removed
+/// `archive/<stanza>/<archive-id>/<segment><suffix>` (the archive-id is loaded
+/// from the repository's `archive.info`). On success the staged copy is removed
 /// and a `<segment>.ok` status is written; on failure a `<segment>.error`
 /// status carrying the message is written and the staged copy is left in place
 /// for a retry. The returned count is the number of segments drained
@@ -759,6 +825,8 @@ fn consume_push_status(spool: &dyn Storage, stanza: &str, segment: &str) -> Resu
 ///
 /// # Errors
 ///
+/// - [`CommandError::Other`] if the repository has no `archive.info` (the
+///   archive-id cannot be resolved, so there is nowhere to drain to).
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
 ///   writing a status file itself fails (per-segment transfer failures are
 ///   recorded as `.error` status, not returned).
@@ -774,6 +842,8 @@ pub fn drain_push_spool(
         return Ok(0);
     }
 
+    let archive_id = load_drain_archive_id(repo_storage, stanza)?;
+
     let mut drained = 0;
     for entry in spool.list(&out_dir)? {
         let Some(segment) = entry.path.file_name().and_then(|name| name.to_str()) else {
@@ -786,7 +856,7 @@ pub fn drain_push_spool(
         let segment = segment.to_owned();
         let staged = out_dir.join(&segment);
 
-        match drain_one(spool, repo_storage, stanza, &segment, suffix, &staged, transform) {
+        match drain_one(spool, repo_storage, stanza, &archive_id, &segment, suffix, &staged, transform) {
             Ok(()) => {
                 spool.remove(&staged, false)?;
                 write_segment(b"", spool, &status_ok_path(stanza, &segment))?;
@@ -808,6 +878,7 @@ fn drain_one(
     spool: &dyn Storage,
     repo_storage: &dyn Storage,
     stanza: &str,
+    archive_id: &str,
     segment: &str,
     suffix: &str,
     staged: &Path,
@@ -818,7 +889,7 @@ fn drain_one(
         Some(mut filter) => run_filter(filter.as_mut(), &bytes)?,
         None => bytes,
     };
-    let dest = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+    let dest = repo_segment_path(stanza, archive_id, &format!("{segment}{suffix}"));
     write_segment(&stored, repo_storage, &dest)
 }
 
@@ -840,10 +911,14 @@ fn drain_one(
 /// On success the staged copy is removed and a `<segment>.ok` status is written;
 /// on failure a `<segment>.error` status carrying the message is left and the
 /// staged copy is kept for a retry. The count returned is the number of segments
-/// drained successfully into this repository.
+/// drained successfully into this repository. The repo-side path is
+/// `archive/<stanza>/<archive-id>/<segment><suffix>`, with the archive-id loaded
+/// from this repository's `archive.info`.
 ///
 /// # Errors
 ///
+/// - [`CommandError::Other`] if the repository has no `archive.info` (the
+///   archive-id cannot be resolved, so there is nowhere to drain to).
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
 ///   writing a status file itself fails (per-segment transfer failures are
 ///   recorded as `.error` status, not returned).
@@ -858,6 +933,7 @@ pub fn drain_push_spool_keyed(
         return Ok(0);
     }
 
+    let archive_id = load_drain_archive_id(repo_storage, stanza)?;
     let suffix = transform.repo_suffix();
     let mut drained = 0;
     for entry in spool.list(&out_dir)? {
@@ -871,7 +947,7 @@ pub fn drain_push_spool_keyed(
         let segment = segment.to_owned();
         let staged = out_dir.join(&segment);
 
-        match drain_one_keyed(spool, repo_storage, stanza, &segment, suffix, &staged, transform) {
+        match drain_one_keyed(spool, repo_storage, stanza, &archive_id, &segment, suffix, &staged, transform) {
             Ok(()) => {
                 spool.remove(&staged, false)?;
                 write_segment(b"", spool, &status_ok_path(stanza, &segment))?;
@@ -893,6 +969,7 @@ fn drain_one_keyed(
     spool: &dyn Storage,
     repo_storage: &dyn Storage,
     stanza: &str,
+    archive_id: &str,
     segment: &str,
     suffix: &str,
     staged: &Path,
@@ -900,7 +977,7 @@ fn drain_one_keyed(
 ) -> Result<(), CommandError> {
     let bytes = read_segment(spool, staged)?;
     let stored = transform_segment(transform, &bytes)?;
-    let dest = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+    let dest = repo_segment_path(stanza, archive_id, &format!("{segment}{suffix}"));
     write_segment(&stored, repo_storage, &dest)
 }
 
@@ -915,12 +992,15 @@ fn drain_one_keyed(
 /// repository. The repositories are tried in order and the segment is served
 /// from the first that has it (a segment archived to all repositories may only
 /// have reached some of them after a partial failure). Within each repository
-/// the stored form is discovered by probing: the plaintext
-/// `archive/<stanza>/<segment>` is preferred, then each compression suffix
-/// (`.gz`, `.zst`, `.bz2`, `.lz4`) is tried via [`Storage::exists`]. When a
-/// compressed form is found it is run through the matching decompress filter
-/// before the plaintext WAL is written to PG — so a WAL archived compressed
-/// is recovered regardless of the client's current `compress-type`.
+/// the stored form is discovered by probing under the stanza's archive-id
+/// directory (`<db-version>-<db-id>` from `archive.info`): the plaintext
+/// `archive/<stanza>/<archive-id>/<segment>` is preferred, then each
+/// compression suffix (`.gz`, `.zst`, `.bz2`, `.lz4`) is tried via
+/// [`Storage::exists`]. When a compressed form is found it is run through the
+/// matching decompress filter before the plaintext WAL is written to PG — so a
+/// WAL archived compressed is recovered regardless of the client's current
+/// `compress-type`. When no repository holds an `archive.info` the segment
+/// cannot exist and a [`pgbr_storage::StorageError::NotFound`] is surfaced.
 ///
 /// # Errors
 ///
@@ -961,6 +1041,17 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
         }
     }
 
+    // Resolve the stanza's archive-id (`<db-version>-<db-id>`) so the segment is
+    // looked up under `archive/<stanza>/<archive-id>/`. When no repository holds
+    // an archive.info the stanza has not been created and the segment cannot
+    // exist — surface the canonical NotFound for the segment.
+    let Some(archive_info) = load_archive_info(config, repo_storages, stanza)? else {
+        return Err(CommandError::Storage(pgbr_storage::StorageError::NotFound {
+            path: PathBuf::from(format!("archive/{stanza}/archive.info")),
+        }));
+    };
+    let archive_id = archive_id(&archive_info);
+
     // Try each repository in order; serve from the first that has the segment.
     // archive-missing-retry: a segment may land in the archive between two
     // lookups (PostgreSQL requests it just as archive-push writes it), so when
@@ -972,6 +1063,7 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
         repo_storages,
         pg_storage,
         stanza,
+        &archive_id,
         segment,
         Path::new(dest),
         retry,
@@ -995,6 +1087,7 @@ fn fetch_segment_with_retry(
     repo_storages: &[&dyn Storage],
     pg_storage: &dyn Storage,
     stanza: &str,
+    archive_id: &str,
     segment: &str,
     dest: &Path,
     retry: bool,
@@ -1002,8 +1095,8 @@ fn fetch_segment_with_retry(
 ) -> Result<(), CommandError> {
     // First pass: serve from any repository that already has the segment.
     for repo in repo_storages {
-        if repo_has_segment(*repo, stanza, segment)? {
-            return fetch_from_repo(*repo, pg_storage, stanza, segment, dest);
+        if repo_has_segment(*repo, stanza, archive_id, segment)? {
+            return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest);
         }
     }
 
@@ -1011,8 +1104,8 @@ fn fetch_segment_with_retry(
     if retry {
         std::thread::sleep(delay);
         for repo in repo_storages {
-            if repo_has_segment(*repo, stanza, segment)? {
-                return fetch_from_repo(*repo, pg_storage, stanza, segment, dest);
+            if repo_has_segment(*repo, stanza, archive_id, segment)? {
+                return fetch_from_repo(*repo, pg_storage, stanza, archive_id, segment, dest);
             }
         }
     }
@@ -1023,18 +1116,18 @@ fn fetch_segment_with_retry(
     let last = repo_storages
         .last()
         .ok_or_else(|| CommandError::Other("archive-get found no repository to read from".to_owned()))?;
-    fetch_from_repo(*last, pg_storage, stanza, segment, dest)
+    fetch_from_repo(*last, pg_storage, stanza, archive_id, segment, dest)
 }
 
 /// Whether `repo` holds `segment` for `stanza` in any stored form (plaintext or
 /// a compressed suffix). Used by [`get`] to pick the first repository that has
 /// the segment.
-fn repo_has_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<bool, CommandError> {
-    if repo.exists(&repo_segment_path(stanza, segment))? {
+fn repo_has_segment(repo: &dyn Storage, stanza: &str, archive_id: &str, segment: &str) -> Result<bool, CommandError> {
+    if repo.exists(&repo_segment_path(stanza, archive_id, segment))? {
         return Ok(true);
     }
     for suffix in COMPRESS_SUFFIXES {
-        if repo.exists(&repo_segment_path(stanza, &format!("{segment}{suffix}")))? {
+        if repo.exists(&repo_segment_path(stanza, archive_id, &format!("{segment}{suffix}")))? {
             return Ok(true);
         }
     }
@@ -1043,25 +1136,27 @@ fn repo_has_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<b
 
 /// Synchronous repository fetch of `segment` into `dest` on `pg_storage`.
 ///
-/// The stored form is discovered by probing: the plaintext
-/// `archive/<stanza>/<segment>` is preferred, then each compression suffix is
-/// tried via [`Storage::exists`]; a matched compressed form is decompressed
-/// before the plaintext WAL is written. When nothing is found the plaintext
-/// path is read so the caller gets the canonical `NotFound` error.
+/// The stored form is discovered by probing under the archive-id directory: the
+/// plaintext `archive/<stanza>/<archive-id>/<segment>` is preferred, then each
+/// compression suffix is tried via [`Storage::exists`]; a matched compressed
+/// form is decompressed before the plaintext WAL is written. When nothing is
+/// found the plaintext path is read so the caller gets the canonical `NotFound`
+/// error.
 fn fetch_from_repo(
     repo_storage: &dyn Storage,
     pg_storage: &dyn Storage,
     stanza: &str,
+    archive_id: &str,
     segment: &str,
     dest: &Path,
 ) -> Result<(), CommandError> {
-    let plaintext = repo_segment_path(stanza, segment);
+    let plaintext = repo_segment_path(stanza, archive_id, segment);
     let (source, suffix) = if repo_storage.exists(&plaintext)? {
         (plaintext, "")
     } else {
         let mut found = None;
         for suffix in COMPRESS_SUFFIXES {
-            let candidate = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+            let candidate = repo_segment_path(stanza, archive_id, &format!("{segment}{suffix}"));
             if repo_storage.exists(&candidate)? {
                 found = Some((candidate, *suffix));
                 break;
@@ -1108,12 +1203,14 @@ fn serve_from_spool(
 /// This is the background half of asynchronous `archive-get`, exposed as a
 /// plain function so tests (and a future protocol handler) can run it
 /// synchronously. Each requested segment is fetched from the repository
-/// (probing the plaintext and compressed forms exactly like [`fetch_from_repo`]
-/// via [`decompress_filter_for`]) and written, decompressed, to
-/// `archive/<stanza>/in/<segment>` so a later foreground [`get`] serves it
-/// without a repository round-trip. Segments absent from the repository are
-/// skipped (a future segment may not be archived yet). The returned count is
-/// the number of segments pre-fetched.
+/// (probing the plaintext and compressed forms under the stanza's archive-id
+/// directory exactly like [`fetch_from_repo`], via [`decompress_filter_for`])
+/// and written, decompressed, to `archive/<stanza>/in/<segment>` so a later
+/// foreground [`get`] serves it without a repository round-trip. Segments
+/// absent from the repository are skipped (a future segment may not be archived
+/// yet); when the repository holds no `archive.info` there is nothing to
+/// pre-fetch and `Ok(0)` is returned. The returned count is the number of
+/// segments pre-fetched.
 ///
 /// `queue_max` is the resolved `archive-get-queue-max` (bytes): pre-fetching
 /// stops as soon as the *in* spool already holds at least this many bytes, so
@@ -1133,6 +1230,14 @@ pub fn prefetch_get_spool(
     segments: &[String],
     queue_max: Option<u64>,
 ) -> Result<usize, CommandError> {
+    // Resolve the archive-id directory from the repository's archive.info; with
+    // no archive.info the stanza is not created and there is nothing to fetch.
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    if !repo_storage.exists(&info_path)? {
+        return Ok(0);
+    }
+    let archive_id = archive_id(&InfoArchive::load(repo_storage, &info_path).map_err(|err| CommandError::Other(err.to_string()))?);
+
     // Account for whatever is already staged so a partially-filled spool is not
     // overrun on the next prefetch round.
     let mut staged_bytes = spool_in_backlog_bytes(spool, stanza);
@@ -1144,13 +1249,13 @@ pub fn prefetch_get_spool(
         }
 
         // Probe the stored form; skip segments not yet in the repository.
-        let plaintext = repo_segment_path(stanza, segment);
+        let plaintext = repo_segment_path(stanza, &archive_id, segment);
         let (source, suffix) = if repo_storage.exists(&plaintext)? {
             (plaintext, "")
         } else {
             let mut found = None;
             for suffix in COMPRESS_SUFFIXES {
-                let candidate = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+                let candidate = repo_segment_path(stanza, &archive_id, &format!("{segment}{suffix}"));
                 if repo_storage.exists(&candidate)? {
                     found = Some((candidate, *suffix));
                     break;
@@ -1178,12 +1283,20 @@ pub fn prefetch_get_spool(
 /// Locate `segment` in the repository archive and return its **plaintext**
 /// bytes, transparently decompressing whatever stored form is present.
 ///
-/// The stored form is discovered exactly as [`fetch_from_repo`] does: the
-/// plaintext `archive/<stanza>/<segment>` is preferred, then each compression
-/// suffix (`.gz`, `.zst`, `.bz2`, `.lz4`) is probed; a matched compressed form
-/// is run through the matching decompress filter. Returns `Ok(None)` when no
-/// stored form exists, so a caller (e.g. `archive-copy`) can decide whether a
-/// missing segment is an error.
+/// The stored form is discovered exactly as [`fetch_from_repo`] does, under the
+/// stanza's archive-id directory (`<db-version>-<db-id>` from `archive.info`):
+/// the plaintext `archive/<stanza>/<archive-id>/<segment>` is preferred, then
+/// each compression suffix (`.gz`, `.zst`, `.bz2`, `.lz4`) is probed; a matched
+/// compressed form is run through the matching decompress filter. Returns
+/// `Ok(None)` when no stored form exists, so a caller (e.g. `archive-copy`) can
+/// decide whether a missing segment is an error.
+///
+/// When the repository holds an `archive.info` the archive-id directory is
+/// derived from it; for a repository with no `archive.info` yet (the
+/// backup command's archive-copy / archive-check tests stage WAL directly under
+/// `archive/<stanza>/` before the stanza's archive metadata exists) the lookup
+/// falls back to the flat `archive/<stanza>/<segment>` layout so those callers
+/// still find their staged segments.
 ///
 /// This is a read-only sibling of the WAL-fetch path, factored out so the
 /// backup command can pull a required WAL segment out of the archive without a
@@ -1193,15 +1306,27 @@ pub fn prefetch_get_spool(
 /// # Errors
 ///
 /// - [`CommandError::Io`] if a matched compressed form fails to decompress.
+/// - [`CommandError::Other`] if the repository's `archive.info` fails to load.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if a repository read fails.
 pub(crate) fn read_archived_segment(repo: &dyn Storage, stanza: &str, segment: &str) -> Result<Option<Vec<u8>>, CommandError> {
-    let plaintext = repo_segment_path(stanza, segment);
+    // Resolve the archive-id directory from the repository's archive.info when
+    // present; otherwise fall back to the flat `archive/<stanza>/` layout so a
+    // caller that staged WAL before archive.info exists still finds it.
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    let prefix = if repo.exists(&info_path)? {
+        let info = InfoArchive::load(repo, &info_path).map_err(|err| CommandError::Other(err.to_string()))?;
+        format!("archive/{stanza}/{}", archive_id(&info))
+    } else {
+        format!("archive/{stanza}")
+    };
+
+    let plaintext = PathBuf::from(format!("{prefix}/{segment}"));
     let (source, suffix) = if repo.exists(&plaintext)? {
         (plaintext, "")
     } else {
         let mut found = None;
         for suffix in COMPRESS_SUFFIXES {
-            let candidate = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+            let candidate = PathBuf::from(format!("{prefix}/{segment}{suffix}"));
             if repo.exists(&candidate)? {
                 found = Some((candidate, *suffix));
                 break;
@@ -1244,6 +1369,12 @@ mod tests {
     const SEGMENT: &str = "000000010000000000000001";
     const WAL_BODY: &[u8] = b"fake-wal-segment-contents";
 
+    /// Archive-id directory the generic tests store WAL under. The generic seed
+    /// ([`seed_archive_info_generic`]) writes `db_version` `"16"`, `db_id` `1`,
+    /// so the archive-id is `"16-1"` and WAL lands at
+    /// `archive/<stanza>/16-1/<segment>`.
+    const ARCHIVE_ID: &str = "16-1";
+
     /// The PG-14 system identifier / version used across these tests.
     const TEST_SYSTEM_ID: u64 = 6_873_049_345_984_568_091;
 
@@ -1267,6 +1398,14 @@ mod tests {
         test_archive_info(system_id, version)
             .save(repo, Path::new(&format!("archive/{stanza}/archive.info")))
             .expect("save archive.info");
+    }
+
+    /// Seed the generic `archive.info` (`db_version` `"16"`, `db_id` `1`) into
+    /// `repo` so push / get / drain resolve the archive-id [`ARCHIVE_ID`]
+    /// (`"16-1"`). The system-id is irrelevant to the non-header-check tests, so
+    /// [`TEST_SYSTEM_ID`] is reused.
+    fn seed_archive_info_generic(repo: &Posix, stanza: &str) {
+        seed_archive_info(repo, stanza, TEST_SYSTEM_ID, "16");
     }
 
     /// Build a WAL segment first-page buffer (long header) with the given magic,
@@ -1368,13 +1507,16 @@ mod tests {
     #[test]
     fn archive_push_copies_wal_into_repo() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}");
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         assert!(
             repo_s.exists(Path::new(&dest)).expect("exists"),
             "segment should land in repo"
@@ -1407,7 +1549,8 @@ mod tests {
     #[test]
     fn archive_get_copies_segment_back_to_pg() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        seed_archive_info_generic(&repo_s, "demo");
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
@@ -1433,11 +1576,14 @@ mod tests {
         // archive-push must take the `<stanza>-archive.lock`; a concurrent run
         // already holding it makes the push fail with "another archive".
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
         let lock_dir = tempfile::tempdir().expect("lock tempdir");
-        let cfg = fake_config_locked(Some("demo"), vec![wal_source], lock_dir.path());
+        let mut cfg = fake_config_locked(Some("demo"), vec![wal_source], lock_dir.path());
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         let expected_lock = lock_dir.path().join("demo-archive.lock");
 
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
@@ -1457,7 +1603,8 @@ mod tests {
     fn archive_get_acquires_archive_lock() {
         // archive-get takes the same archive lock as push.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        seed_archive_info_generic(&repo_s, "demo");
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
         let lock_dir = tempfile::tempdir().expect("lock tempdir");
         let dest = format!("pg_wal/{SEGMENT}");
@@ -1478,6 +1625,7 @@ mod tests {
     #[test]
     fn archive_get_unknown_segment_errors_with_storage() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), format!("pg_wal/{SEGMENT}")]);
         let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get of an absent segment must fail");
         match err {
@@ -1489,15 +1637,18 @@ mod tests {
     #[test]
     fn archive_push_none_is_raw() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
         // Explicit `compress-type=none` must store the segment unchanged with
         // no suffix, exactly like the implicit-default path.
-        let cfg = fake_config_compress(Some("demo"), vec![wal_source], "none");
+        let mut cfg = fake_config_compress(Some("demo"), vec![wal_source], "none");
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}");
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         assert!(
             repo_s.exists(Path::new(&dest)).expect("exists"),
             "raw segment should land in repo"
@@ -1512,19 +1663,24 @@ mod tests {
     #[test]
     fn archive_push_gz_stores_compressed_with_suffix() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        let cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
+        let mut cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}.gz");
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.gz");
         assert!(
             repo_s.exists(Path::new(&dest)).expect("exists"),
             "gz segment should land in repo with .gz suffix"
         );
         assert!(
-            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            !repo_s
+                .exists(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")))
+                .expect("exists"),
             "no plaintext copy should exist for compress-type=gz"
         );
         let stored = read(&repo_s, &dest);
@@ -1537,10 +1693,14 @@ mod tests {
     #[test]
     fn archive_push_then_get_gz_round_trip() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        let push_cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
+        let mut push_cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
+        push_cfg
+            .options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&push_cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push should succeed");
 
         // Recover into a fresh PG target; compress-type on get is irrelevant
@@ -1559,10 +1719,11 @@ mod tests {
     #[test]
     fn archive_get_finds_compressed_when_plaintext_absent() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
 
         // Pre-place only the `.zst` form in the repo.
         let compressed = run(ZstCompress::new(super::default_level("zst")), WAL_BODY);
-        put(&repo_s, &format!("archive/demo/{SEGMENT}.zst"), &compressed);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.zst"), &compressed);
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
@@ -1575,15 +1736,16 @@ mod tests {
     #[test]
     fn archive_get_prefers_plaintext_when_present() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
 
         // Both forms exist: the plaintext holds the real bytes; the `.gz`
         // form holds an unrelated payload so we can detect mis-selection.
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
         let decoy = run(
             GzCompress::new(super::default_level("gz"), false),
             b"this is the wrong payload",
         );
-        put(&repo_s, &format!("archive/demo/{SEGMENT}.gz"), &decoy);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.gz"), &decoy);
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
@@ -1614,12 +1776,15 @@ mod tests {
     fn async_push_writes_to_spool_then_drains_to_repo() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
         // Foreground async push only stages into the spool out/ dir; nothing
         // reaches the repo yet.
-        let cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
+        let mut cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async push should stage to spool");
 
         let staged = format!("archive/demo/out/{SEGMENT}");
@@ -1629,7 +1794,9 @@ mod tests {
         );
         assert_eq!(read(&spool_s, &staged), WAL_BODY, "staged copy should match source bytes");
         assert!(
-            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            !repo_s
+                .exists(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")))
+                .expect("exists"),
             "nothing should reach the repo before the drain runs"
         );
 
@@ -1638,7 +1805,7 @@ mod tests {
         let drained = drain_push_spool(&spool_s, &repo_s, "demo", "", &no_transform).expect("drain should succeed");
         assert_eq!(drained, 1, "exactly one segment should drain");
 
-        let repo_dest = format!("archive/demo/{SEGMENT}");
+        let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         assert!(
             repo_s.exists(Path::new(&repo_dest)).expect("exists"),
             "drained segment should land in the repo"
@@ -1660,6 +1827,7 @@ mod tests {
     fn async_push_consumes_prior_ok_status() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
@@ -1689,6 +1857,7 @@ mod tests {
     fn async_push_consumes_prior_error_status() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
@@ -1713,9 +1882,10 @@ mod tests {
     fn async_get_serves_prefetched_segment_from_spool() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
 
         // Pre-fetch the segment from the repo into the spool in/ dir.
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
         let prefetched =
             prefetch_get_spool(&spool_s, &repo_s, "demo", &[SEGMENT.to_owned()], None).expect("prefetch should succeed");
         assert_eq!(prefetched, 1, "one segment should be pre-fetched");
@@ -1729,7 +1899,7 @@ mod tests {
         // Remove the repo copy so the test fails if get falls back to the repo
         // instead of serving the pre-fetched copy.
         repo_s
-            .remove(Path::new(&format!("archive/demo/{SEGMENT}")), true)
+            .remove(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")), true)
             .expect("remove");
 
         let dest = format!("pg_wal/{SEGMENT}");
@@ -1750,9 +1920,10 @@ mod tests {
     fn async_get_falls_back_to_repo_when_not_prefetched() {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, _spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
 
         // Nothing pre-fetched into the spool in/ dir; only the repo has it.
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config_async(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()], spool.path());
@@ -1766,16 +1937,19 @@ mod tests {
     fn async_push_drain_records_error_status_on_failure() {
         let (_spool, spool_s) = spool_storage();
 
-        // Stage a segment, then drain into a read-only repo path so the write
-        // fails and the drain records an .error status (the staged copy stays).
+        // Stage a segment, then drain into a repo whose archive-id directory is
+        // blocked by a file so the per-segment write fails and the drain records
+        // an .error status (the staged copy stays). archive.info itself must be
+        // loadable so the archive-id resolves before the per-segment write.
         put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
 
-        // Point the repo at a path under a file (not a directory) so the
-        // create_path/write fails for every segment.
         let repo = tempfile::tempdir().expect("repo tempdir");
-        let blocker = repo.path().join("archive");
-        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
         let repo_s = Posix::new(repo.path());
+        seed_archive_info_generic(&repo_s, "demo");
+        // Place a file where the archive-id directory must go so create_path /
+        // write fails for every segment under it.
+        let blocker = repo.path().join("archive").join("demo").join(ARCHIVE_ID);
+        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
 
         let drained = drain_push_spool(&spool_s, &repo_s, "demo", "", &no_transform).expect("drain returns Ok overall");
         assert_eq!(drained, 0, "no segment should drain successfully");
@@ -1797,6 +1971,7 @@ mod tests {
     fn async_push_drain_compresses_with_transform() {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         let (_spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
 
         // Stage a raw segment, then drain through a gz transform with the .gz
         // suffix — the repo copy must be the gz frame of the plaintext.
@@ -1805,7 +1980,7 @@ mod tests {
         let drained = drain_push_spool(&spool_s, &repo_s, "demo", ".gz", &transform).expect("drain should succeed");
         assert_eq!(drained, 1, "one segment should drain");
 
-        let repo_dest = format!("archive/demo/{SEGMENT}.gz");
+        let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.gz");
         assert!(
             repo_s.exists(Path::new(&repo_dest)).expect("exists"),
             "compressed segment should land in the repo with the .gz suffix"
@@ -1831,14 +2006,17 @@ mod tests {
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
+        seed_archive_info_generic(&repo1_s, "demo");
 
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("multi-repo push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}");
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s)] {
             assert!(
                 repo.exists(Path::new(&dest)).expect("exists"),
@@ -1923,7 +2101,8 @@ mod tests {
 
         push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("per-repo push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}");
+        // archive.info was seeded with db_version "14", db_id 1 -> archive-id "14-1".
+        let dest = format!("archive/demo/14-1/{SEGMENT}");
         let r1 = read(&repo1_s, &dest);
         let r2 = read(&repo2_s, &dest);
 
@@ -1976,7 +2155,8 @@ mod tests {
 
         push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("dual-encrypted push should succeed");
 
-        let dest = format!("archive/demo/{SEGMENT}");
+        // archive.info was seeded with db_version "14", db_id 1 -> archive-id "14-1".
+        let dest = format!("archive/demo/14-1/{SEGMENT}");
         let r1 = read(&repo1_s, &dest);
         let r2 = read(&repo2_s, &dest);
         assert_ne!(r1, WAL_BODY, "repo1 encrypted");
@@ -2024,13 +2204,14 @@ mod tests {
         // staged plaintext.
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         let (_spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
         put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
 
         let transform = RepoTransform::with_key(CompressType::None, 0, Some("ZHJhaW4ta2V5ZWQtc3ViLWtleQ==".to_owned()));
         let drained = drain_push_spool_keyed(&spool_s, &repo_s, "demo", &transform).expect("keyed drain should succeed");
         assert_eq!(drained, 1, "one segment should drain");
 
-        let repo_dest = format!("archive/demo/{SEGMENT}");
+        let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         let stored = read(&repo_s, &repo_dest);
         assert_ne!(stored, WAL_BODY, "drained-and-encrypted copy must differ from plaintext");
         assert_eq!(
@@ -2085,6 +2266,7 @@ mod tests {
         let bad = tempfile::tempdir().expect("bad repo tempdir");
         let pg = tempfile::tempdir().expect("pg tempdir");
         let repo1_s = Posix::new(repo1.path());
+        seed_archive_info_generic(&repo1_s, "demo");
         // Block repo2 by placing a file where the `archive` directory must go.
         std::fs::write(bad.path().join("archive"), b"not a dir").expect("write blocker");
         let bad_s = Posix::new(bad.path());
@@ -2093,7 +2275,9 @@ mod tests {
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        let cfg = fake_config(Some("demo"), vec![wal_source]);
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo1_s as &dyn Storage, &bad_s as &dyn Storage], &pg_s)
             .expect_err("push must fail when any repository write fails");
     }
@@ -2120,9 +2304,10 @@ mod tests {
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
+        seed_archive_info_generic(&repo2_s, "demo");
 
         // Only repo2 has the segment.
-        put(&repo2_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo2_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
@@ -2141,9 +2326,11 @@ mod tests {
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
+        seed_archive_info_generic(&repo1_s, "demo");
+        seed_archive_info_generic(&repo2_s, "demo");
 
-        put(&repo1_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
-        put(&repo2_s, &format!("archive/demo/{SEGMENT}"), b"repo2 payload");
+        put(&repo1_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
+        put(&repo2_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), b"repo2 payload");
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest.clone()]);
@@ -2160,6 +2347,8 @@ mod tests {
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
+        seed_archive_info_generic(&repo1_s, "demo");
+        seed_archive_info_generic(&repo2_s, "demo");
 
         let dest = format!("pg_wal/{SEGMENT}");
         let cfg = fake_config(Some("demo"), vec![SEGMENT.to_owned(), dest]);
@@ -2253,7 +2442,9 @@ mod tests {
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("over-queue push returns success");
 
         assert!(
-            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            !repo_s
+                .exists(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")))
+                .expect("exists"),
             "segment must be dropped (not archived) when the queue is over the limit"
         );
     }
@@ -2262,15 +2453,20 @@ mod tests {
     fn push_under_queue_max_archives_normally() {
         // A backlog under the limit lets the push proceed normally.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
         // 1 GiB limit, a tiny backlog -> archived.
-        let cfg = fake_config_queue_max(Some("demo"), vec![wal_source], 1024 * 1024 * 1024);
+        let mut cfg = fake_config_queue_max(Some("demo"), vec![wal_source], 1024 * 1024 * 1024);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("under-queue push archives");
 
         assert!(
-            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            repo_s
+                .exists(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")))
+                .expect("exists"),
             "segment must be archived when the backlog is under the limit"
         );
     }
@@ -2336,8 +2532,11 @@ mod tests {
         let cfg = fake_config(Some("demo"), vec![wal_source]);
         let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("foreign segment must be rejected");
         assert!(err.to_string().contains("system-id"), "msg was {err}");
+        // archive.info seeded with db_version "14", db_id 1 -> archive-id "14-1".
         assert!(
-            !repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            !repo_s
+                .exists(Path::new(&format!("archive/demo/14-1/{SEGMENT}")))
+                .expect("exists"),
             "a rejected segment must not be stored"
         );
     }
@@ -2352,8 +2551,11 @@ mod tests {
 
         let cfg = fake_config(Some("demo"), vec![wal_source]);
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("a matching segment is archived");
+        // archive.info seeded with db_version "14", db_id 1 -> archive-id "14-1".
         assert!(
-            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            repo_s
+                .exists(Path::new(&format!("archive/demo/14-1/{SEGMENT}")))
+                .expect("exists"),
             "a matching segment must be stored"
         );
     }
@@ -2374,8 +2576,11 @@ mod tests {
         cfg.options
             .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("header check disabled -> stored regardless");
+        // archive.info seeded with db_version "14", db_id 1 -> archive-id "14-1".
         assert!(
-            repo_s.exists(Path::new(&format!("archive/demo/{SEGMENT}"))).expect("exists"),
+            repo_s
+                .exists(Path::new(&format!("archive/demo/14-1/{SEGMENT}")))
+                .expect("exists"),
             "with the check off the segment is stored even though it mismatches"
         );
     }
@@ -2391,12 +2596,13 @@ mod tests {
         // asserting the retry path serves it (a found-on-first case also works;
         // the retry must not break the happy path).
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
-        put(&repo_s, &format!("archive/demo/{SEGMENT}"), WAL_BODY);
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
         let dest = format!("pg_wal/{SEGMENT}");
         fetch_segment_with_retry(
             &[&repo_s as &dyn Storage],
             &pg_s,
             "demo",
+            ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
             true,
@@ -2416,6 +2622,7 @@ mod tests {
             &[&repo_s as &dyn Storage],
             &pg_s,
             "demo",
+            ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
             true,
@@ -2437,6 +2644,7 @@ mod tests {
             &[&repo_s as &dyn Storage],
             &pg_s,
             "demo",
+            ARCHIVE_ID,
             SEGMENT,
             Path::new(&dest),
             false,
@@ -2454,14 +2662,15 @@ mod tests {
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (_spool, spool_s) = spool_storage();
         let _ = &pg_s;
-        // Three 100-byte segments in the repo.
+        seed_archive_info_generic(&repo_s, "demo");
+        // Three 100-byte segments in the repo (under the archive-id directory).
         let segs = [
             "000000010000000000000001",
             "000000010000000000000002",
             "000000010000000000000003",
         ];
         for seg in &segs {
-            put(&repo_s, &format!("archive/demo/{seg}"), &[7u8; 100]);
+            put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{seg}"), &[7u8; 100]);
         }
         let requested: Vec<String> = segs.iter().map(|s| (*s).to_owned()).collect();
 
@@ -2494,8 +2703,9 @@ mod tests {
     fn prefetch_unbounded_fetches_all() {
         let (_repo, _pg, repo_s, _pg_s) = posix_pair();
         let (_spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
         for seg in ["000000010000000000000001", "000000010000000000000002"] {
-            put(&repo_s, &format!("archive/demo/{seg}"), &[7u8; 100]);
+            put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{seg}"), &[7u8; 100]);
         }
         let requested = vec!["000000010000000000000001".to_owned(), "000000010000000000000002".to_owned()];
         let prefetched = prefetch_get_spool(&spool_s, &repo_s, "demo", &requested, None).expect("prefetch");
