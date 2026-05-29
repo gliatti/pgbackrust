@@ -166,6 +166,28 @@ fn oldest_option(config: &LoadedConfig) -> bool {
     )
 }
 
+/// Whether `--dry-run` was supplied. In dry-run mode `expire` reports the backups
+/// and WAL it *would* remove (in the returned [`ExpireSummary`] and the logged
+/// plan) but performs no storage deletions and does not rewrite `backup.info`.
+/// Defaults to `false` (a real run).
+fn dry_run_option(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("dry-run".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Emit a human-facing progress / plan line to the log sink (stderr).
+///
+/// pgBackRest routes progress lines to its log (stderr by default), keeping
+/// stdout free for machine-readable command output. The dedicated `pgbr-core`
+/// logger is not reachable from this crate's dependency graph, so this is a thin,
+/// level-prefixed `stderr` writer matching the logger's `INFO: ` convention.
+#[allow(clippy::print_stderr)]
+fn log_info(message: &str) {
+    eprintln!("INFO: {message}");
+}
+
 /// Forward transitive closure of dependents: every backup in `current` that
 /// references (directly or transitively) any label in `seed`, plus the seed
 /// labels themselves. Expiring `seed` therefore requires expiring all of these,
@@ -201,16 +223,31 @@ fn remaining_full_count(current: &std::collections::BTreeMap<String, serde_json:
 
 /// Remove the on-disk directories for `labels`, drop them from `info.current`,
 /// and persist `backup.info` when anything changed. Shared by both adhoc paths.
-fn remove_backups(repo: &dyn Storage, stanza: &str, info: &mut InfoBackup, labels: &[String]) -> Result<(), CommandError> {
+///
+/// When `dry_run` is set, no storage directory is removed and `backup.info` is
+/// not rewritten — the labels are still dropped from the in-memory `info` so the
+/// downstream archive-retention plan is computed against the would-be-surviving
+/// set, but nothing is persisted. Each would-be removal is logged.
+fn remove_backups(
+    repo: &dyn Storage,
+    stanza: &str,
+    info: &mut InfoBackup,
+    labels: &[String],
+    dry_run: bool,
+) -> Result<(), CommandError> {
     for label in labels {
-        let path = PathBuf::from(format!("backup/{stanza}/{label}"));
-        match repo.remove_path(&path, true, false) {
-            Ok(()) | Err(StorageError::NotFound { .. }) => {}
-            Err(err) => return Err(err.into()),
+        if dry_run {
+            log_info(&format!("[DRY-RUN] would remove backup {label}"));
+        } else {
+            let path = PathBuf::from(format!("backup/{stanza}/{label}"));
+            match repo.remove_path(&path, true, false) {
+                Ok(()) | Err(StorageError::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         info.current.remove(label);
     }
-    if !labels.is_empty() {
+    if !labels.is_empty() && !dry_run {
         info.save(repo, &backup_info_path(stanza))
             .map_err(|err| CommandError::Other(err.to_string()))?;
     }
@@ -225,13 +262,24 @@ fn archive_expire_tail(
     repo: &dyn Storage,
     stanza: &str,
     info: &InfoBackup,
+    dry_run: bool,
 ) -> Result<Vec<String>, CommandError> {
     let archive_type = retention_archive_type(config);
     let kept_labels: Vec<String> = info.current.keys().cloned().collect();
     let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
     retention_archive(config)?.map_or_else(
         || Ok(Vec::new()),
-        |keep_archive| expire_archive(repo, stanza, keep_archive, archive_type, &kept_anchor_oldest_first, info),
+        |keep_archive| {
+            expire_archive(
+                repo,
+                stanza,
+                keep_archive,
+                archive_type,
+                &kept_anchor_oldest_first,
+                info,
+                dry_run,
+            )
+        },
     )
 }
 
@@ -247,6 +295,7 @@ fn expire_adhoc_set(
     stanza: &str,
     info: &mut InfoBackup,
     set: &str,
+    dry_run: bool,
 ) -> Result<ExpireSummary, CommandError> {
     let Some(target) = info.current.get(set) else {
         return Err(CommandError::Other(format!(
@@ -268,8 +317,8 @@ fn expire_adhoc_set(
     }
 
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire)?;
-    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
+    remove_backups(repo, stanza, info, &expire, dry_run)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run)?;
     Ok(ExpireSummary {
         expired_labels: expire,
         kept_labels,
@@ -285,6 +334,7 @@ fn expire_adhoc_oldest(
     repo: &dyn Storage,
     stanza: &str,
     info: &mut InfoBackup,
+    dry_run: bool,
 ) -> Result<ExpireSummary, CommandError> {
     // Oldest full by (timestamp-stop, label).
     let oldest_full = info
@@ -311,8 +361,8 @@ fn expire_adhoc_oldest(
 
     let expire = dependent_closure(&info.current, std::slice::from_ref(&oldest_full));
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire)?;
-    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info)?;
+    remove_backups(repo, stanza, info, &expire, dry_run)?;
+    let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run)?;
     Ok(ExpireSummary {
         expired_labels: expire,
         kept_labels,
@@ -865,6 +915,7 @@ fn load_archive_ids(
 /// layout, falling back to a flat-layout cutoff for loose WAL files that
 /// sit directly under `archive/<stanza>/` (the current [`crate::archive`]
 /// push layout). Returns the removed base segment names in ascending order.
+#[allow(clippy::too_many_arguments)]
 fn expire_archive(
     repo: &dyn Storage,
     stanza: &str,
@@ -872,6 +923,7 @@ fn expire_archive(
     retention_type: ArchiveRetentionType,
     kept_anchor_oldest_first: &[serde_json::Value],
     info: &InfoBackup,
+    dry_run: bool,
 ) -> Result<Vec<String>, CommandError> {
     let archive_root = PathBuf::from(format!("archive/{stanza}"));
 
@@ -932,16 +984,20 @@ fn expire_archive(
         for plan in &plans {
             let id_dir = archive_root.join(&plan.archive_id);
             if plan.drop_all {
-                match repo.remove_path(&id_dir, true, false) {
-                    Ok(()) | Err(StorageError::NotFound { .. }) => {}
-                    Err(err) => return Err(err.into()),
+                if dry_run {
+                    log_info(&format!("[DRY-RUN] would remove archive-id {}", plan.archive_id));
+                } else {
+                    match repo.remove_path(&id_dir, true, false) {
+                        Ok(()) | Err(StorageError::NotFound { .. }) => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
                 continue;
             }
             if plan.skip_expiry {
                 continue;
             }
-            remove_wal_under(repo, &id_dir, plan, &mut removed)?;
+            remove_wal_under(repo, &id_dir, plan, &mut removed, dry_run)?;
         }
     }
 
@@ -952,10 +1008,14 @@ fn expire_archive(
         for file_name in loose_files {
             let base = strip_compress_suffix(&file_name);
             if base < cutoff.as_str() {
-                let path = archive_root.join(&file_name);
-                match repo.remove(&path, false) {
-                    Ok(()) | Err(StorageError::NotFound { .. }) => {}
-                    Err(err) => return Err(err.into()),
+                if dry_run {
+                    log_info(&format!("[DRY-RUN] would remove WAL segment {base}"));
+                } else {
+                    let path = archive_root.join(&file_name);
+                    match repo.remove(&path, false) {
+                        Ok(()) | Err(StorageError::NotFound { .. }) => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
                 removed.push(base.to_owned());
             }
@@ -988,6 +1048,7 @@ fn remove_wal_under(
     id_dir: &std::path::Path,
     plan: &ArchiveIdPlan,
     removed: &mut Vec<String>,
+    dry_run: bool,
 ) -> Result<(), CommandError> {
     let mut leaves: Vec<PathBuf> = Vec::new();
     collect_files(repo, id_dir, &mut leaves)?;
@@ -1004,10 +1065,7 @@ fn remove_wal_under(
                 && timeline.len() >= 8
                 && &timeline[0..8] < keep_below
             {
-                match repo.remove(&leaf, false) {
-                    Ok(()) | Err(StorageError::NotFound { .. }) => {}
-                    Err(err) => return Err(err.into()),
-                }
+                remove_leaf(repo, &leaf, base, dry_run)?;
                 removed.push(base.to_owned());
             }
             continue;
@@ -1020,14 +1078,24 @@ fn remove_wal_under(
         }
 
         if !segment_in_ranges(base, &plan.ranges) {
-            match repo.remove(&leaf, false) {
-                Ok(()) | Err(StorageError::NotFound { .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
+            remove_leaf(repo, &leaf, base, dry_run)?;
             removed.push(base.to_owned());
         }
     }
     Ok(())
+}
+
+/// Remove a single WAL / history leaf `path` (idempotent on a missing file),
+/// or — in `dry_run` mode — log the would-be removal of `base` and leave it.
+fn remove_leaf(repo: &dyn Storage, path: &std::path::Path, base: &str, dry_run: bool) -> Result<(), CommandError> {
+    if dry_run {
+        log_info(&format!("[DRY-RUN] would remove WAL segment {base}"));
+        return Ok(());
+    }
+    match repo.remove(path, false) {
+        Ok(()) | Err(StorageError::NotFound { .. }) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Depth-first collect every file path beneath `dir` (inclusive of nested
@@ -1098,13 +1166,18 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         });
     };
 
+    // --dry-run: compute and report the plan, but perform no storage deletions
+    // and do not rewrite backup.info. C reference: the cfgOptDryRun guards in
+    // cmdExpire.
+    let dry_run = dry_run_option(config);
+
     // Adhoc expiry (--set / --oldest) removes a specific backup set and bypasses
     // the retention policy entirely. C reference: the adhoc path in cmdExpire.
     if let Some(set) = set_option(config) {
-        return expire_adhoc_set(config, repo, stanza, &mut info, &set);
+        return expire_adhoc_set(config, repo, stanza, &mut info, &set, dry_run);
     }
     if oldest_option(config) {
-        return expire_adhoc_oldest(config, repo, stanza, &mut info);
+        return expire_adhoc_oldest(config, repo, stanza, &mut info, dry_run);
     }
 
     let archive_type = retention_archive_type(config);
@@ -1115,7 +1188,15 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         let kept_labels: Vec<String> = info.current.keys().cloned().collect();
         let kept_anchor_oldest_first = anchor_backups_oldest_first(&info, &kept_labels, archive_type);
         let expired_archive_segments = match retention_archive(config)? {
-            Some(keep_archive) => expire_archive(repo, stanza, keep_archive, archive_type, &kept_anchor_oldest_first, &info)?,
+            Some(keep_archive) => expire_archive(
+                repo,
+                stanza,
+                keep_archive,
+                archive_type,
+                &kept_anchor_oldest_first,
+                &info,
+                dry_run,
+            )?,
             None => Vec::new(),
         };
         return Ok(ExpireSummary {
@@ -1172,36 +1253,33 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
         }
     }
 
-    // Remove the on-disk backup directory for every expired label; the
-    // call is recursive and idempotent so a partially-deleted backup is
-    // a no-op rather than a failure.
-    for label in &expired_labels {
-        let path = PathBuf::from(format!("backup/{stanza}/{label}"));
-        match repo.remove_path(&path, true, false) {
-            Ok(()) | Err(StorageError::NotFound { .. }) => {}
-            Err(err) => return Err(err.into()),
-        }
-        info.current.remove(label);
-    }
-
-    // Persist the rewritten backup.info only when something actually
-    // changed — keeps the file's mtime stable on no-op runs.
-    if !expired_labels.is_empty() {
-        let path = backup_info_path(stanza);
-        info.save(repo, &path).map_err(|err| CommandError::Other(err.to_string()))?;
-    }
+    // Remove the on-disk backup directories for every expired label and persist
+    // the rewritten backup.info (both skipped in --dry-run, which only logs the
+    // plan and drops the labels from the in-memory `info` so archive retention is
+    // computed against the would-be-surviving set).
+    remove_backups(repo, stanza, &mut info, &expired_labels, dry_run)?;
 
     // Archive retention runs after backups are expired, counted against
     // the anchor backups that survived (in `kept_labels`, oldest first).
     let kept_anchor_oldest_first = anchor_backups_oldest_first(&info, &kept_labels, archive_type);
     let expired_archive_segments = match retention_archive(config)? {
-        Some(keep_archive) => expire_archive(repo, stanza, keep_archive, archive_type, &kept_anchor_oldest_first, &info)?,
+        Some(keep_archive) => expire_archive(
+            repo,
+            stanza,
+            keep_archive,
+            archive_type,
+            &kept_anchor_oldest_first,
+            &info,
+            dry_run,
+        )?,
         None => Vec::new(),
     };
 
     // History retention: prune backup.history manifest copies older than
-    // `repo-retention-history` days.
-    if let Some(keep_history_days) = retention_history(config)? {
+    // `repo-retention-history` days. Skipped in --dry-run mode.
+    if let Some(keep_history_days) = retention_history(config)?
+        && !dry_run
+    {
         expire_history(repo, stanza, keep_history_days, now_secs)?;
     }
 
@@ -1289,24 +1367,30 @@ pub fn expire(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), C
     // Hold the backup lock for the whole command — expire mutates the same
     // repository state as backup. C ref: lockAcquire(lockTypeBackup).
     let _locks = acquire_command_lock(config, LockType::Backup)?;
+    let dry_run = dry_run_option(config);
     let summary = expire_inner(config, repo_storage)?;
+    // `expire` produces no machine-readable result on stdout; the summary is
+    // human-facing progress, so it is routed to the log sink (stderr) via
+    // `log_info`. In --dry-run mode the wording reflects that nothing was
+    // actually removed.
+    let verb = if dry_run { "would remove" } else { "removed" };
     if summary.expired_labels.is_empty() {
-        println!("expire: nothing to expire ({} kept)", summary.kept_labels.len());
+        log_info(&format!("expire: nothing to expire ({} kept)", summary.kept_labels.len()));
     } else {
-        println!(
-            "expire: removed {} backup(s), kept {}",
+        log_info(&format!(
+            "expire: {verb} {} backup(s), kept {}",
             summary.expired_labels.len(),
             summary.kept_labels.len()
-        );
+        ));
         for label in &summary.expired_labels {
-            println!("  expired: {label}");
+            log_info(&format!("  {verb}: {label}"));
         }
     }
     if !summary.expired_archive_segments.is_empty() {
-        println!(
-            "expire: removed {} archived WAL segment(s)",
+        log_info(&format!(
+            "expire: {verb} {} archived WAL segment(s)",
             summary.expired_archive_segments.len()
-        );
+        ));
     }
     Ok(())
 }
@@ -1319,6 +1403,7 @@ mod tests {
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig, LockType, OptionValue};
     use pgbr_info::{DbHistoryEntry, InfoBackup};
+    use pgbr_io::IoRead;
     use pgbr_storage::{Posix, Storage};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1539,6 +1624,13 @@ mod tests {
     fn cfg_oldest(stanza: Option<&str>) -> LoadedConfig {
         let mut cfg = cfg(stanza, None);
         cfg.options.insert(("oldest".to_owned(), None), OptionValue::Boolean(true));
+        cfg
+    }
+
+    /// `cfg_archive` plus `--dry-run`.
+    fn cfg_dry_run(stanza: Option<&str>, retention_full: Option<i64>, retention_archive: Option<i64>) -> LoadedConfig {
+        let mut cfg = cfg_archive(stanza, retention_full, retention_archive);
+        cfg.options.insert(("dry-run".to_owned(), None), OptionValue::Boolean(true));
         cfg
     }
 
@@ -2772,6 +2864,133 @@ mod tests {
             dir.path().join("archive/demo/14-1").exists(),
             "archive.info marks 14-1 current, so it is preserved despite having no backups"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // --dry-run
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dry_run_reports_plan_but_removes_no_backup_and_keeps_info() {
+        let (_dir, repo) = empty_repo();
+        // Four fulls; retention-full=2 would normally expire the two oldest.
+        seed_backup_info(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full"),
+                ("20260102F", 200, "full"),
+                ("20260103F", 300, "full"),
+                ("20260104F", 400, "full"),
+            ],
+        );
+        for label in ["20260101F", "20260102F", "20260103F", "20260104F"] {
+            seed_backup_dir(&repo, "demo", label);
+        }
+
+        // Snapshot backup.info bytes so we can prove it is byte-identical after
+        // a dry run (no rewrite).
+        let info_before = read(&repo, &super::backup_info_path("demo").to_string_lossy());
+
+        let summary = expire_inner(&cfg_dry_run(Some("demo"), Some(2), None), &repo).expect("dry-run expire");
+
+        // The plan still names the would-be-expired backups...
+        assert_eq!(
+            summary.expired_labels,
+            vec!["20260101F".to_owned(), "20260102F".to_owned()],
+            "dry-run still reports which backups WOULD be removed"
+        );
+        // ...but every on-disk backup directory must survive.
+        for label in ["20260101F", "20260102F", "20260103F", "20260104F"] {
+            assert!(
+                backup_dir_exists(&repo, "demo", label),
+                "dry-run must not remove backup {label}"
+            );
+        }
+        // backup.info must be byte-for-byte unchanged.
+        let info_after = read(&repo, &super::backup_info_path("demo").to_string_lossy());
+        assert_eq!(info_before, info_after, "dry-run must not rewrite backup.info");
+    }
+
+    /// Read every byte of `path` inside `repo` (test helper for the dry-run
+    /// info-file comparison).
+    fn read(repo: &Posix, path: &str) -> Vec<u8> {
+        let mut r: Box<dyn IoRead> = repo.open_read(Path::new(path)).expect("open_read");
+        r.read_all().expect("read_all")
+    }
+
+    #[test]
+    fn dry_run_removes_no_wal_segments() {
+        let (dir, repo) = empty_repo();
+        // Same setup as archive_retention_removes_segments_before_retained_backup,
+        // but with --dry-run: the plan must list the segments that WOULD be
+        // removed while leaving every file on disk.
+        seed_backup_info_wal(
+            &repo,
+            "demo",
+            &[
+                (
+                    "20260101-100000F",
+                    100,
+                    "full",
+                    "000000010000000000000001",
+                    "000000010000000000000002",
+                ),
+                (
+                    "20260101-120000F",
+                    300,
+                    "full",
+                    "000000010000000000000009",
+                    "00000001000000000000000A",
+                ),
+            ],
+        );
+        seed_archive_segment(&repo, "demo", "000000010000000000000001", "");
+        seed_archive_segment(&repo, "demo", "000000010000000000000009", "");
+
+        let summary = expire_inner(&cfg_dry_run(Some("demo"), Some(2), Some(1)), &repo).expect("dry-run archive expire");
+
+        assert_eq!(
+            summary.expired_archive_segments,
+            vec!["000000010000000000000001".to_owned()],
+            "dry-run still reports the WAL it WOULD remove"
+        );
+        // Both segments must remain on disk.
+        assert!(
+            dir.path().join("archive/demo/000000010000000000000001").exists(),
+            "dry-run must not remove the pre-cutoff WAL segment"
+        );
+        assert!(
+            dir.path().join("archive/demo/000000010000000000000009").exists(),
+            "the retained segment is kept (as always)"
+        );
+    }
+
+    #[test]
+    fn dry_run_set_removes_nothing() {
+        let (_dir, repo) = empty_repo();
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260110F", 400, "full", &[]),
+            ],
+        );
+        let mut cfg = cfg_set(Some("demo"), "20260101F");
+        cfg.options.insert(("dry-run".to_owned(), None), OptionValue::Boolean(true));
+
+        let summary = expire_inner(&cfg, &repo).expect("dry-run --set");
+        assert_eq!(
+            summary.expired_labels,
+            vec!["20260101F".to_owned(), "20260101F_20260102D".to_owned()],
+            "dry-run --set reports the set it WOULD remove"
+        );
+        // Nothing on disk is removed.
+        assert!(backup_dir_exists(&repo, "demo", "20260101F"));
+        assert!(backup_dir_exists(&repo, "demo", "20260101F_20260102D"));
+        assert!(backup_dir_exists(&repo, "demo", "20260110F"));
     }
 
     // Touch ArchiveIdPlan's public fields so the struct stays exercised even

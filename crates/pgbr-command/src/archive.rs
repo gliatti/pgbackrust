@@ -52,17 +52,19 @@
 //! `.ok` / `.error` status extensions in `src/command/archive/common.h`.
 //! Synchronous mode (no `--archive-async`) is unchanged.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use pgbr_compress::{Bz2Compress, Bz2Decompress, GzCompress, GzDecompress, Lz4Compress, Lz4Decompress, ZstCompress, ZstDecompress};
+use pgbr_compress::{Bz2Decompress, GzDecompress, Lz4Decompress, ZstDecompress};
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
-use pgbr_info::InfoArchive;
+use pgbr_info::{CipherType, InfoArchive, RepoKeys};
 use pgbr_io::Filter;
 use pgbr_postgres::lsn::parse_wal_segment;
 use pgbr_storage::{Posix, Storage};
 
 use crate::CommandError;
 use crate::backup::acquire_command_lock;
+use crate::pipeline::{CompressType, RepoTransform};
 
 /// File extensions for stored WAL, in the order `archive-get` probes them
 /// once the plaintext form is found absent. Each maps to the compress codec
@@ -112,18 +114,136 @@ const fn default_level(codec: &str) -> i32 {
     }
 }
 
-/// Build the compress [`Filter`] for the configured `compress-type`, or
-/// `None` when compression is disabled (`none`).
-fn compress_filter_for(config: &LoadedConfig) -> Option<Box<dyn Filter>> {
-    let codec = compress_type(config);
-    let level = compress_level(config, codec);
-    match codec {
-        "gz" => Some(Box::new(GzCompress::new(level, false))),
-        "bz2" => Some(Box::new(Bz2Compress::new(level))),
-        "lz4" => Some(Box::new(Lz4Compress::new(level, false))),
-        "zst" => Some(Box::new(ZstCompress::new(level))),
+/// The [`CompressType`] resolved from `compress-type` (or the legacy `compress`
+/// boolean), used to build the keyed per-repo [`RepoTransform`].
+fn compress_type_enum(config: &LoadedConfig) -> CompressType {
+    CompressType::from_str_id(compress_type(config))
+}
+
+/// Enumerate the configured repository group indexes in ascending order — the
+/// same order `pgbr_cli::storage_helper::build_all_repo_storages` constructs the
+/// `repo_storages` slice in, so the i-th storage handed to [`push`] / [`get`]
+/// belongs to the i-th index returned here.
+///
+/// A repository index `N` counts as configured when an explicit `repoN-path` or
+/// `repoN-type` is present at that group index. The active `--repo` index is
+/// always included, and the implicit single repository (index 1) is the
+/// fallback so the set is never empty. Mirrors `configured_repo_indexes` in the
+/// CLI's storage helper (kept in sync so the position↔index mapping holds).
+fn configured_repo_indexes(config: &LoadedConfig) -> Vec<u32> {
+    let mut indexes: BTreeSet<u32> = BTreeSet::new();
+    for (name, idx) in config.options.keys() {
+        if let Some(i) = idx
+            && matches!(name.as_str(), "repo-path" | "repo-type")
+        {
+            indexes.insert(*i);
+        }
+    }
+    indexes.insert(active_repo_index(config));
+    if indexes.is_empty() {
+        indexes.insert(1);
+    }
+    indexes.into_iter().collect()
+}
+
+/// The active repository index from the `--repo` option, defaulting to 1.
+fn active_repo_index(config: &LoadedConfig) -> u32 {
+    match config.options.get(&("repo".to_owned(), None)) {
+        Some(OptionValue::Integer(n)) if *n >= 1 => u32::try_from(*n).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// Fetch a `repo`-group `StringId` option at group index `index`.
+fn repo_string_id<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(index))) {
+        Some(OptionValue::StringId(value)) => Some(value.as_str()),
         _ => None,
     }
+}
+
+/// Fetch a `repo`-group `String` option at group index `index`.
+fn repo_string<'a>(config: &'a LoadedConfig, name: &str, index: u32) -> Option<&'a str> {
+    match config.options.get(&(name.to_owned(), Some(index))) {
+        Some(OptionValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Resolve the repository sub-key used to encrypt WAL for repository `index`, or
+/// `None` when that repository is unencrypted.
+///
+/// WAL is encrypted with the repository *sub-key* (the second level of
+/// pgBackRest's two-level scheme), not the user passphrase directly. The sub-key
+/// is stored, encrypted under the user passphrase, in the `[cipher]` section of
+/// that repository's `archive.info`; [`InfoArchive::load_keyed`] returns it. A
+/// repository with no `archive.info` yet (uninitialised) returns `Ok(None)` —
+/// there is nothing to push to an uninitialised, encrypted repo, but we degrade
+/// to a plaintext copy rather than fail here.
+///
+/// # Errors
+///
+/// [`CommandError::MissingOption`] when an encrypted repo has no
+/// `repo-cipher-pass`; [`CommandError::Other`] when the recorded sub-key cannot
+/// be decrypted (wrong passphrase / corrupt `[cipher]` section).
+fn repo_sub_key(repo: &dyn Storage, config: &LoadedConfig, index: u32, stanza: &str) -> Result<Option<String>, CommandError> {
+    let cipher_type = repo_string_id(config, "repo-cipher-type", index).map_or(CipherType::None, CipherType::from_str_id);
+    if !cipher_type.is_encrypted() {
+        return Ok(None);
+    }
+    let user_pass = repo_string(config, "repo-cipher-pass", index).filter(|s| !s.is_empty());
+    let user_pass = user_pass.ok_or_else(|| CommandError::MissingOption {
+        option: "repo-cipher-pass".to_owned(),
+    })?;
+
+    // Load the recorded repo sub-key from archive.info's [cipher] section,
+    // decrypting it under the user passphrase. An uninitialised repo (no
+    // archive.info) has no sub-key yet.
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    if !repo.exists(&info_path)? {
+        return Ok(None);
+    }
+    let (_, recorded) =
+        InfoArchive::load_keyed(repo, &info_path, Some(user_pass)).map_err(|err| CommandError::Other(err.to_string()))?;
+    let keys =
+        RepoKeys::resolve(cipher_type, Some(user_pass), recorded.as_deref()).map_err(|err| CommandError::Other(err.to_string()))?;
+    Ok(keys.repo_sub_pass().map(str::to_owned))
+}
+
+/// Build the per-repository [`RepoTransform`] (compress + that repo's cipher) for
+/// each storage in `repo_storages`, in the same order. The compression settings
+/// are shared (read from `config`); the cipher sub-key is resolved per repo from
+/// its own `repoN-cipher-*` options + recorded `[cipher]` sub-key, so an
+/// encrypted repo stores encrypted WAL while a plaintext repo in the same
+/// fan-out stores plaintext.
+///
+/// # Errors
+///
+/// Propagates [`repo_sub_key`] failures (missing passphrase, undecryptable
+/// recorded sub-key, storage errors).
+fn per_repo_transforms(
+    config: &LoadedConfig,
+    repo_storages: &[&dyn Storage],
+    stanza: &str,
+) -> Result<Vec<RepoTransform>, CommandError> {
+    let compress_type = compress_type_enum(config);
+    let compress_level = compress_level(config, compress_type.as_str_id());
+    let indexes = configured_repo_indexes(config);
+    let mut transforms = Vec::with_capacity(repo_storages.len());
+    for (pos, repo) in repo_storages.iter().enumerate() {
+        // Fall back to index 1 if there are more storages than enumerated
+        // indexes (defensive; the two are kept in lock-step by construction).
+        let index = indexes.get(pos).copied().unwrap_or(1);
+        let sub_key = repo_sub_key(*repo, config, index, stanza)?;
+        transforms.push(RepoTransform::with_key(compress_type, compress_level, sub_key));
+    }
+    Ok(transforms)
+}
+
+/// Apply `transform` (compress + optional per-repo encryption, SHA-1 KDF) to the
+/// plaintext WAL `bytes`, returning the repo-side bytes to store.
+fn transform_segment(transform: &RepoTransform, bytes: &[u8]) -> Result<Vec<u8>, CommandError> {
+    transform.apply_forward_keyed(bytes).map_err(CommandError::from)
 }
 
 /// Build the decompress [`Filter`] matching a stored WAL file `suffix`
@@ -341,13 +461,27 @@ fn push_queue_exceeded(queue_max: Option<u64>, backlog: u64) -> bool {
 /// Emit a `WARN` line that the push-queue limit dropped a WAL segment.
 ///
 /// pgBackRest returns success to `PostgreSQL` so PG recycles the WAL (rather than
-/// the partition filling), logging a warning that the segment was dropped.
-#[allow(clippy::print_stderr)]
+/// the partition filling), logging a warning that the segment was dropped. The
+/// message is human-facing diagnostic output, so it is routed to the log sink
+/// ([`log_warn`], stderr) rather than stdout, which is reserved for
+/// machine-readable command output.
 fn warn_queue_dropped(segment: &str, backlog: u64, limit: u64) {
-    eprintln!(
-        "WARN: dropped WAL segment {segment} because the unarchived WAL backlog ({backlog} bytes) \
+    log_warn(&format!(
+        "dropped WAL segment {segment} because the unarchived WAL backlog ({backlog} bytes) \
          reached archive-push-queue-max ({limit} bytes)"
-    );
+    ));
+}
+
+/// Emit a human-facing `WARN` diagnostic to the log sink (stderr).
+///
+/// pgBackRest sends progress / warning lines to its log (stderr by default),
+/// keeping stdout free for machine-readable command output. The dedicated
+/// `pgbr-core` logger is not reachable from this crate's dependency graph, so
+/// this is a thin, level-prefixed `stderr` writer matching the logger's `WARN: `
+/// prefix convention.
+#[allow(clippy::print_stderr)]
+fn log_warn(message: &str) {
+    eprintln!("WARN: {message}");
 }
 
 /// Validate a WAL segment's long-page header against the stanza's `archive.info`
@@ -521,15 +655,17 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     if let Some(info) = archive_info.as_ref() {
         check_wal_header(&bytes, segment, info)?;
     }
-    let stored = match compress_filter_for(config) {
-        Some(mut filter) => run_filter(filter.as_mut(), &bytes)?,
-        None => bytes,
-    };
 
-    // Fan the (single, already-compressed) copy out to every repository. The
-    // segment is only archived once it has reached all of them.
+    // Build one transform per repository (shared compression, but each repo's
+    // own cipher sub-key) so an encrypted repo stores encrypted WAL while a
+    // plaintext repo stores plaintext — even in the same fan-out. The compress
+    // suffix is shared (encryption does not change the file name), so the
+    // destination path is the same for every repo. The segment is only archived
+    // once it has reached all of them.
+    let transforms = per_repo_transforms(config, repo_storages, stanza)?;
     let dest = repo_segment_path(stanza, &format!("{segment}{}", compress_suffix(config)));
-    for repo in repo_storages {
+    for (repo, transform) in repo_storages.iter().zip(transforms.iter()) {
+        let stored = transform_segment(transform, &bytes)?;
         write_segment(&stored, *repo, &dest)?;
     }
     Ok(())
@@ -670,6 +806,88 @@ fn drain_one(
         Some(mut filter) => run_filter(filter.as_mut(), &bytes)?,
         None => bytes,
     };
+    let dest = repo_segment_path(stanza, &format!("{segment}{suffix}"));
+    write_segment(&stored, repo_storage, &dest)
+}
+
+/// Drain the spool *out* directory into a single repository with that repo's
+/// cipher.
+///
+/// Applies that repository's own [`RepoTransform`] (compress + per-repo cipher)
+/// to every staged segment — the per-repo-encryption counterpart of
+/// [`drain_push_spool`].
+///
+/// pgBackRest's async client stages a single plaintext copy of each WAL segment;
+/// the background drain is what actually compresses, encrypts, and writes it to
+/// each repository. Because each repository has its own cipher sub-key, the
+/// drain must run once per repository with that repository's `transform`
+/// (built by [`per_repo_transforms`] / [`RepoTransform::with_key`]). The
+/// repo-side file name carries the compression suffix (`transform.repo_suffix()`);
+/// encryption does not change it.
+///
+/// On success the staged copy is removed and a `<segment>.ok` status is written;
+/// on failure a `<segment>.error` status carrying the message is left and the
+/// staged copy is kept for a retry. The count returned is the number of segments
+/// drained successfully into this repository.
+///
+/// # Errors
+///
+/// - [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
+///   writing a status file itself fails (per-segment transfer failures are
+///   recorded as `.error` status, not returned).
+pub fn drain_push_spool_keyed(
+    spool: &dyn Storage,
+    repo_storage: &dyn Storage,
+    stanza: &str,
+    transform: &RepoTransform,
+) -> Result<usize, CommandError> {
+    let out_dir = push_out_dir(stanza);
+    if !spool.exists(&out_dir)? {
+        return Ok(0);
+    }
+
+    let suffix = transform.repo_suffix();
+    let mut drained = 0;
+    for entry in spool.list(&out_dir)? {
+        let Some(segment) = entry.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Skip status files left by earlier drains.
+        if segment.ends_with(STATUS_EXT_OK) || segment.ends_with(STATUS_EXT_ERROR) {
+            continue;
+        }
+        let segment = segment.to_owned();
+        let staged = out_dir.join(&segment);
+
+        match drain_one_keyed(spool, repo_storage, stanza, &segment, suffix, &staged, transform) {
+            Ok(()) => {
+                spool.remove(&staged, false)?;
+                write_segment(b"", spool, &status_ok_path(stanza, &segment))?;
+                drained += 1;
+            }
+            Err(err) => {
+                write_segment(err.to_string().as_bytes(), spool, &status_error_path(stanza, &segment))?;
+            }
+        }
+    }
+
+    Ok(drained)
+}
+
+/// Transfer a single staged segment to one repository, applying that repo's
+/// [`RepoTransform`] (compress + per-repo cipher). Used by
+/// [`drain_push_spool_keyed`]; a returned error becomes a `.error` status.
+fn drain_one_keyed(
+    spool: &dyn Storage,
+    repo_storage: &dyn Storage,
+    stanza: &str,
+    segment: &str,
+    suffix: &str,
+    staged: &Path,
+    transform: &RepoTransform,
+) -> Result<(), CommandError> {
+    let bytes = read_segment(spool, staged)?;
+    let stored = transform_segment(transform, &bytes)?;
     let dest = repo_segment_path(stanza, &format!("{segment}{suffix}"));
     write_segment(&stored, repo_storage, &dest)
 }
@@ -1004,9 +1222,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandError, check_wal_header, drain_push_spool, fetch_segment_with_retry, get, get_in_dir, prefetch_get_spool, push,
-        push_out_dir, push_queue_exceeded, read_archived_segment, status_error_path, status_ok_path, wal_backlog_bytes,
+        CommandError, check_wal_header, drain_push_spool, drain_push_spool_keyed, fetch_segment_with_retry, get, get_in_dir,
+        per_repo_transforms, prefetch_get_spool, push, push_out_dir, push_queue_exceeded, read_archived_segment, status_error_path,
+        status_ok_path, wal_backlog_bytes,
     };
+    use crate::pipeline::{CompressType, RepoTransform};
     use pgbr_info::InfoArchive;
 
     const SEGMENT: &str = "000000010000000000000001";
@@ -1613,6 +1833,235 @@ mod tests {
                 "segment should land in {label}"
             );
             assert_eq!(read(repo, &dest), WAL_BODY, "{label} copy should match source bytes");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-repo archive encryption (Task 25)
+    // -----------------------------------------------------------------------
+
+    /// pgBackRest's AES-256-CBC framing prefix; encrypted repo bytes start with
+    /// it (`"Salted__"`), so its presence proves a segment was encrypted.
+    const CIPHER_MAGIC: &[u8] = b"Salted__";
+
+    /// Seed an encrypted `archive.info` into `repo` carrying `repo_sub_key` in
+    /// its `[cipher]` section, encrypted under the user `passphrase`. This is
+    /// what [`super::repo_sub_key`] reads to recover the WAL encryption key.
+    fn seed_encrypted_archive_info(repo: &Posix, stanza: &str, system_id: u64, version: &str, passphrase: &str, repo_sub: &str) {
+        repo.create_path(Path::new(&format!("archive/{stanza}")), true)
+            .expect("create archive dir");
+        test_archive_info(system_id, version)
+            .save_keyed(
+                repo,
+                Path::new(&format!("archive/{stanza}/archive.info")),
+                Some(passphrase),
+                Some(repo_sub),
+            )
+            .expect("save encrypted archive.info");
+    }
+
+    /// Add `repoN-cipher-type=aes-256-cbc` + `repoN-cipher-pass` at group index
+    /// `index`, and mark that index as configured via `repoN-path` so
+    /// [`super::configured_repo_indexes`] enumerates it (keeping the
+    /// position↔index mapping in step with the storages slice).
+    fn set_repo_cipher(cfg: &mut LoadedConfig, index: u32, user_pass: &str) {
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(index)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-cipher-pass".to_owned(), Some(index)),
+            OptionValue::String(user_pass.to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-path".to_owned(), Some(index)),
+            OptionValue::Path(format!("/repo{index}")),
+        );
+    }
+
+    #[test]
+    fn push_encrypts_per_repo_when_only_one_repo_is_encrypted() {
+        // repo1 is encrypted, repo2 is plaintext. The SAME WAL must be stored
+        // encrypted in repo1 (cipher magic, bytes differ from plaintext) and
+        // plaintext in repo2 — proving each repo's own cipher is applied.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        // repo1 (index 1) is encrypted with a recorded sub-key.
+        seed_encrypted_archive_info(&repo1_s, "demo", TEST_SYSTEM_ID, "14", "userpass1", "cmVwbzEtc3ViLWtleQ==");
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        // Use a WAL-header-valid body so archive-header-check (on for repo1)
+        // passes; the header check loads archive.info from the FIRST repo, which
+        // is encrypted — load there uses the no-passphrase load that the header
+        // check path tolerates only for plaintext, so disable the header check.
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        // repo2 (index 2) configured but unencrypted.
+        cfg.options
+            .insert(("repo-path".to_owned(), Some(2)), OptionValue::Path("/repo2".to_owned()));
+
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("per-repo push should succeed");
+
+        let dest = format!("archive/demo/{SEGMENT}");
+        let r1 = read(&repo1_s, &dest);
+        let r2 = read(&repo2_s, &dest);
+
+        assert_eq!(r2, WAL_BODY, "plaintext repo2 must store the raw WAL");
+        assert_ne!(r1, WAL_BODY, "encrypted repo1 must NOT store the raw WAL");
+        assert_ne!(r1, r2, "the two repos must store different bytes (one encrypted, one not)");
+        assert_eq!(
+            &r1[..CIPHER_MAGIC.len()],
+            CIPHER_MAGIC,
+            "repo1 bytes must carry the cipher magic"
+        );
+    }
+
+    #[test]
+    fn push_encrypts_differently_when_repos_use_different_keys() {
+        // Both repos encrypted but with DIFFERENT sub-keys -> the stored bytes
+        // differ between the two repos.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "c3ViLWtleS1vbmUtMTExMQ==",
+        );
+        seed_encrypted_archive_info(
+            &repo2_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass2",
+            "c3ViLWtleS10d28tMjIyMg==",
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("dual-encrypted push should succeed");
+
+        let dest = format!("archive/demo/{SEGMENT}");
+        let r1 = read(&repo1_s, &dest);
+        let r2 = read(&repo2_s, &dest);
+        assert_ne!(r1, WAL_BODY, "repo1 encrypted");
+        assert_ne!(r2, WAL_BODY, "repo2 encrypted");
+        assert_eq!(&r1[..CIPHER_MAGIC.len()], CIPHER_MAGIC, "repo1 cipher magic");
+        assert_eq!(&r2[..CIPHER_MAGIC.len()], CIPHER_MAGIC, "repo2 cipher magic");
+        // Different keys (and random salts) -> different ciphertext.
+        assert_ne!(r1, r2, "different sub-keys must produce different ciphertext");
+    }
+
+    #[test]
+    fn per_repo_transforms_pairs_each_storage_with_its_cipher() {
+        // The transform list must be 1:1 with the storages slice and carry the
+        // encrypted/plaintext flag from each repo's own config.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "cGVyLXJlcG8tdHJhbnNmb3JtLWtleQ==",
+        );
+
+        let mut cfg = fake_config(Some("demo"), Vec::new());
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        cfg.options
+            .insert(("repo-path".to_owned(), Some(2)), OptionValue::Path("/repo2".to_owned()));
+
+        let transforms =
+            per_repo_transforms(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], "demo").expect("transforms resolve");
+        assert_eq!(transforms.len(), 2, "one transform per storage");
+        assert!(transforms[0].is_encrypted(), "repo1 transform must be encrypted");
+        assert!(!transforms[1].is_encrypted(), "repo2 transform must be plaintext");
+    }
+
+    #[test]
+    fn async_drain_keyed_encrypts_for_the_target_repo() {
+        // The async drain into a single repo applies that repo's RepoTransform,
+        // so the repo copy is encrypted (cipher magic) and differs from the
+        // staged plaintext.
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let (_spool, spool_s) = spool_storage();
+        put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
+
+        let transform = RepoTransform::with_key(CompressType::None, 0, Some("ZHJhaW4ta2V5ZWQtc3ViLWtleQ==".to_owned()));
+        let drained = drain_push_spool_keyed(&spool_s, &repo_s, "demo", &transform).expect("keyed drain should succeed");
+        assert_eq!(drained, 1, "one segment should drain");
+
+        let repo_dest = format!("archive/demo/{SEGMENT}");
+        let stored = read(&repo_s, &repo_dest);
+        assert_ne!(stored, WAL_BODY, "drained-and-encrypted copy must differ from plaintext");
+        assert_eq!(
+            &stored[..CIPHER_MAGIC.len()],
+            CIPHER_MAGIC,
+            "drained copy must carry the cipher magic"
+        );
+    }
+
+    #[test]
+    fn push_missing_cipher_pass_errors() {
+        // An encrypted repo with no repo-cipher-pass must fail the push.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "bWlzc2luZy1wYXNzLXN1Yi1rZXk=",
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        // cipher-type set, but NO cipher-pass.
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options
+            .insert(("repo-path".to_owned(), Some(1)), OptionValue::Path("/repo1".to_owned()));
+
+        let err = push(&cfg, &[&repo1_s as &dyn Storage], &pg_s).expect_err("missing repo-cipher-pass must error");
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
+            other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
         }
     }
 
