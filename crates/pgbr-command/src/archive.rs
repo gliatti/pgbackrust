@@ -31,24 +31,27 @@
 //!
 //! ## Asynchronous (spool) mode (`--archive-async`)
 //!
-//! With `--archive-async` the foreground `archive-push` does not push the WAL
-//! segment to the repository synchronously. Instead it stages the segment in
-//! the spool *out* directory (`<spool-path>/archive/<stanza>/out/`) and a
-//! background process drains the spool into the repository, recording a
-//! `<segment>.ok` (or `<segment>.error` carrying the failure message) status
-//! file that the *next* foreground invocation consumes. `archive-get` async
+//! With `--archive-async` the foreground `archive-push` stages the WAL segment
+//! in the spool *out* directory (`<spool-path>/archive/<stanza>/out/`) and then,
+//! in the same call, drains the whole `out/` backlog into every configured
+//! repository — `PostgreSQL` runs the foreground process and there is no separate
+//! long-lived daemon, so the drain is inlined ([`push`] → [`drain_push_spool_multi`]).
+//! Each staged segment is fanned out to ALL repositories before its staged copy
+//! is removed and a `<segment>.ok` (or `<segment>.error` carrying the failure
+//! message) status file is written; the foreground call consumes that status to
+//! decide whether the requested segment is archived. `archive-get` async
 //! pre-fetches upcoming segments into the spool *in* directory
 //! (`<spool-path>/archive/<stanza>/in/`) so a later foreground call can serve
 //! them without a repository round-trip.
 //!
-//! The drain ([`drain_push_spool`]) and pre-fetch ([`prefetch_get_spool`])
-//! steps are exposed as ordinary functions so tests (and a future protocol
-//! handler) can drive them synchronously without spawning a real background
-//! process. The spool path layout is factored into pure helpers
-//! ([`push_out_dir`], [`get_in_dir`], [`status_ok_path`], [`status_error_path`])
-//! that mirror the C `STORAGE_SPOOL_ARCHIVE_{OUT,IN}` expressions and the
-//! `.ok` / `.error` status extensions in `src/command/archive/common.h`.
-//! Synchronous mode (no `--archive-async`) is unchanged.
+//! The drains ([`drain_push_spool`], [`drain_push_spool_keyed`],
+//! [`drain_push_spool_multi`]) and pre-fetch ([`prefetch_get_spool`]) steps are
+//! also exposed as ordinary functions so tests can drive them in isolation. The
+//! spool path layout is factored into pure helpers ([`push_out_dir`],
+//! [`get_in_dir`], [`status_ok_path`], [`status_error_path`]) that mirror the C
+//! `STORAGE_SPOOL_ARCHIVE_{OUT,IN}` expressions and the `.ok` / `.error` status
+//! extensions in `src/command/archive/common.h`. Synchronous mode (no
+//! `--archive-async`) is unchanged.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -701,17 +704,50 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     // header check on `walIsSegment()`.
     let header_info = (archive_header_check(config) && is_checkable_wal_segment(segment)).then_some(&archive_info);
 
-    // Asynchronous mode: stage the segment in the spool out/ directory and let
-    // the background drain move it to the repository. Before staging, consume
-    // any status file the drain left for this segment from the previous call.
-    // The spool stages a single plaintext copy regardless of repo count; the
-    // background drain fans it out (a future protocol handler runs the drain).
+    // Asynchronous mode: stage the segment in the spool out/ directory, then
+    // drain the whole out/ backlog into every configured repository in this same
+    // foreground call (PostgreSQL runs the foreground process; there is no
+    // separate long-lived background daemon, so the drain is inlined here). The
+    // requested segment is only reported archived once it is durably present in
+    // ALL repositories — `check` / `backup` / PostgreSQL itself poll the repo and
+    // would time out otherwise.
     if async_enabled {
         let spool_root = spool_path(config).ok_or_else(|| CommandError::MissingOption {
             option: "spool-path".to_owned(),
         })?;
         let spool = Posix::new(spool_root);
-        return push_async(pg_storage, &spool, stanza, segment, Path::new(wal_source), header_info);
+
+        // A prior drain may already have finished this exact segment, leaving a
+        // `.ok` (or `.error`) status. Consume it first — preserving the
+        // foreground/drain handshake and surfacing any recorded failure — before
+        // staging again.
+        if let Some(outcome) = consume_push_status(&spool, stanza, segment)? {
+            return outcome;
+        }
+
+        // Stage the current segment into out/ exactly as the synchronous-staging
+        // step does (read from PG, header-check a real WAL segment, write the raw
+        // plaintext copy). The drain below compresses + encrypts per repository.
+        stage_push_segment(pg_storage, &spool, stanza, segment, Path::new(wal_source), header_info)?;
+
+        // Drain the whole out/ backlog into every repository, fanning each staged
+        // segment out to ALL repos before removing the staged copy — so no repo is
+        // skipped (the single-repo `drain_push_spool_keyed` would delete the
+        // staged file after the first repo and starve the rest).
+        let transforms = per_repo_transforms(config, repo_storages, stanza)?;
+        drain_push_spool_multi(config, &spool, repo_storages, stanza, &transforms)?;
+
+        // Confirm the requested segment actually reached the repo(s). The drain
+        // just wrote `<segment>.ok` (success) or `<segment>.error` (failure);
+        // consuming it returns `Ok(())` / the error and prevents `.ok` build-up.
+        if let Some(outcome) = consume_push_status(&spool, stanza, segment)? {
+            return outcome;
+        }
+
+        // No status was recorded for this segment (it was not in the backlog the
+        // drain processed — e.g. concurrently consumed). Fall back to verifying
+        // the segment is present in every repository before reporting success.
+        return confirm_segment_in_all_repos(config, repo_storages, stanza, segment);
     }
 
     let bytes = read_segment(pg_storage, Path::new(wal_source))?;
@@ -734,17 +770,17 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     Ok(())
 }
 
-/// Foreground half of asynchronous `archive-push`.
+/// Stage a single WAL segment into the spool *out* directory for the async
+/// drain to pick up: `archive/<stanza>/out/<segment>`.
 ///
-/// First [`consume_push_status`] checks for a `<segment>.ok` / `<segment>.error`
-/// status the previous drain wrote for this segment: an `.ok` is removed and
-/// the call returns success immediately (the segment is already in the repo);
-/// an `.error` is removed and its recorded message is surfaced as an error.
-/// When no status is present the raw segment is staged into the spool *out*
-/// directory (`archive/<stanza>/out/<segment>`) for the background drain to
-/// pick up. Staging copies the plaintext WAL — compression happens during the
-/// drain, matching pgBackRest (the async client never compresses).
-fn push_async(
+/// The raw segment is read from PG, its long-page header validated (when
+/// `archive_info` is `Some`, i.e. `archive-header-check` is on and the file is a
+/// real WAL segment), and the plaintext copy written into out/. Staging copies
+/// the plaintext WAL — compression and encryption happen during the drain,
+/// matching pgBackRest (the async client never compresses). The
+/// foreground/drain handshake status (`.ok` / `.error`) is consumed by the
+/// caller before staging.
+fn stage_push_segment(
     pg_storage: &dyn Storage,
     spool: &dyn Storage,
     stanza: &str,
@@ -752,20 +788,44 @@ fn push_async(
     wal_source: &Path,
     archive_info: Option<&InfoArchive>,
 ) -> Result<(), CommandError> {
-    if let Some(outcome) = consume_push_status(spool, stanza, segment)? {
-        return outcome;
-    }
-
-    // Not yet processed by the drain — stage the raw segment in out/ for the
-    // background drain to pick up. The WAL header is validated before staging so
-    // a mismatched segment is rejected at the foreground call (the drain only
-    // ever compresses + copies an already-validated segment).
     let bytes = read_segment(pg_storage, wal_source)?;
     if let Some(info) = archive_info {
         check_wal_header(&bytes, segment, info)?;
     }
     let staged = push_out_dir(stanza).join(segment);
     write_segment(&bytes, spool, &staged)
+}
+
+/// Confirm that `segment` is present (in any stored form) in **every**
+/// repository in `repo_storages`, returning `Ok(())` only when it is.
+///
+/// Used by the async foreground path as a final guard when the drain recorded
+/// no status file for the requested segment (e.g. it was already consumed by a
+/// concurrent run): the segment must still be durably in all repos before
+/// success is reported, or `PostgreSQL` / `check` would later time out.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the segment is absent from any repository, or
+/// the per-repository archive-id cannot be resolved. [`CommandError::Storage`]
+/// on an underlying storage failure.
+fn confirm_segment_in_all_repos(
+    config: &LoadedConfig,
+    repo_storages: &[&dyn Storage],
+    stanza: &str,
+    segment: &str,
+) -> Result<(), CommandError> {
+    let indexes = configured_repo_indexes(config);
+    for (pos, repo) in repo_storages.iter().enumerate() {
+        let index = indexes.get(pos).copied().unwrap_or(1);
+        let archive_id = load_drain_archive_id(config, *repo, index, stanza)?;
+        if !repo_has_segment(*repo, stanza, &archive_id, segment)? {
+            return Err(CommandError::Other(format!(
+                "async archive-push: {segment} did not reach repository {index} after draining the spool"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Inspect the spool *out* directory for a prior drain status of `segment`.
@@ -917,13 +977,94 @@ pub fn drain_push_spool_keyed(
     stanza: &str,
     transform: &RepoTransform,
 ) -> Result<usize, CommandError> {
+    let archive_id = load_drain_archive_id(config, repo_storage, index, stanza)?;
+    // A single-repo drain is the one-element case of the multi-repo drain: the
+    // shared loop below pushes each staged segment to every target before
+    // removing it. With one target this is byte-for-byte the old behaviour.
+    let targets = [DrainTarget {
+        repo: repo_storage,
+        transform,
+        archive_id: &archive_id,
+    }];
+    drain_out_spool(spool, stanza, &targets)
+}
+
+/// Drain the spool *out* directory into **every** configured repository.
+///
+/// This is the multi-repo counterpart of [`drain_push_spool_keyed`] and the one
+/// the async foreground `archive-push` uses. For each staged segment it pushes
+/// the (per-repo transformed) bytes to ALL repositories *before* removing the
+/// staged copy and writing a single `<segment>.ok` — so no repository is starved
+/// by an earlier one consuming the staged file. On any per-repository failure a
+/// `<segment>.error` carrying the message is written and the staged copy is left
+/// for a retry (the segment is not archived until it is in every repo).
+///
+/// `repo_storages` and `transforms` are 1:1 (same order); each repository's own
+/// archive-id is resolved from its `archive.info`, and each repository's own
+/// [`RepoTransform`] (compress + that repo's cipher) is applied — so an
+/// encrypted repo stores encrypted WAL while a plaintext repo in the same
+/// fan-out stores plaintext. The count returned is the number of segments
+/// drained successfully into every repository.
+///
+/// # Errors
+///
+/// - [`CommandError::Other`] if any repository has no `archive.info` (the
+///   archive-id cannot be resolved, so there is nowhere to drain to).
+/// - [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
+///   writing a status file itself fails (per-segment transfer failures are
+///   recorded as `.error` status, not returned).
+pub fn drain_push_spool_multi(
+    config: &LoadedConfig,
+    spool: &dyn Storage,
+    repo_storages: &[&dyn Storage],
+    stanza: &str,
+    transforms: &[RepoTransform],
+) -> Result<usize, CommandError> {
+    // Resolve each repository's own archive-id up front so the per-segment loop
+    // does not reload archive.info for every staged segment.
+    let indexes = configured_repo_indexes(config);
+    let mut archive_ids = Vec::with_capacity(repo_storages.len());
+    for (pos, repo) in repo_storages.iter().enumerate() {
+        let index = indexes.get(pos).copied().unwrap_or(1);
+        archive_ids.push(load_drain_archive_id(config, *repo, index, stanza)?);
+    }
+
+    let targets: Vec<DrainTarget> = repo_storages
+        .iter()
+        .zip(transforms.iter())
+        .zip(archive_ids.iter())
+        .map(|((repo, transform), archive_id)| DrainTarget {
+            repo: *repo,
+            transform,
+            archive_id,
+        })
+        .collect();
+
+    drain_out_spool(spool, stanza, &targets)
+}
+
+/// One repository the spool drain fans a staged segment out to: its storage,
+/// the [`RepoTransform`] (compress + that repo's cipher) to apply, and that
+/// repository's archive-id directory.
+struct DrainTarget<'a> {
+    repo: &'a dyn Storage,
+    transform: &'a RepoTransform,
+    archive_id: &'a str,
+}
+
+/// Shared drain loop for [`drain_push_spool_keyed`] and
+/// [`drain_push_spool_multi`]. For each staged segment in `out/` (status files
+/// skipped) it pushes the per-repo transformed bytes to EVERY target; only when
+/// the segment is present in all of them is the staged copy removed and a single
+/// `<segment>.ok` written. On the first per-target failure a `<segment>.error`
+/// carrying the message is written and the staged copy is left for a retry. The
+/// count returned is the number of segments drained into all targets.
+fn drain_out_spool(spool: &dyn Storage, stanza: &str, targets: &[DrainTarget]) -> Result<usize, CommandError> {
     let out_dir = push_out_dir(stanza);
     if !spool.exists(&out_dir)? {
         return Ok(0);
     }
 
-    let archive_id = load_drain_archive_id(config, repo_storage, index, stanza)?;
-    let suffix = transform.repo_suffix();
     let mut drained = 0;
     for entry in spool.list(&out_dir)? {
         let Some(segment) = entry.path.file_name().and_then(|name| name.to_str()) else {
@@ -936,7 +1077,7 @@ pub fn drain_push_spool_keyed(
         let segment = segment.to_owned();
         let staged = out_dir.join(&segment);
 
-        match drain_one_keyed(spool, repo_storage, stanza, &archive_id, &segment, suffix, &staged, transform) {
+        match drain_one_to_targets(spool, stanza, &segment, &staged, targets) {
             Ok(()) => {
                 spool.remove(&staged, false)?;
                 write_segment(b"", spool, &status_ok_path(stanza, &segment))?;
@@ -951,23 +1092,30 @@ pub fn drain_push_spool_keyed(
     Ok(drained)
 }
 
-/// Transfer a single staged segment to one repository, applying that repo's
-/// [`RepoTransform`] (compress + per-repo cipher). Used by
-/// [`drain_push_spool_keyed`]; a returned error becomes a `.error` status.
-fn drain_one_keyed(
+/// Transfer one staged segment to every target repository, applying each
+/// target's own [`RepoTransform`] (compress + per-repo cipher) and writing to
+/// that repository's archive-id directory. Used by [`drain_out_spool`]; a
+/// returned error becomes a `.error` status and the staged copy is kept. The
+/// staged bytes are read once and re-transformed per repository so each repo's
+/// cipher sub-key is honoured.
+fn drain_one_to_targets(
     spool: &dyn Storage,
-    repo_storage: &dyn Storage,
     stanza: &str,
-    archive_id: &str,
     segment: &str,
-    suffix: &str,
     staged: &Path,
-    transform: &RepoTransform,
+    targets: &[DrainTarget],
 ) -> Result<(), CommandError> {
     let bytes = read_segment(spool, staged)?;
-    let stored = transform_segment(transform, &bytes)?;
-    let dest = repo_segment_path(stanza, archive_id, &format!("{segment}{suffix}"));
-    write_segment(&stored, repo_storage, &dest)
+    for target in targets {
+        let stored = transform_segment(target.transform, &bytes)?;
+        let dest = repo_segment_path(
+            stanza,
+            target.archive_id,
+            &format!("{segment}{}", target.transform.repo_suffix()),
+        );
+        write_segment(&stored, target.repo, &dest)?;
+    }
+    Ok(())
 }
 
 /// `archive-get` — copy a WAL segment from a repository back into the PG
@@ -1791,54 +1939,44 @@ mod tests {
     }
 
     #[test]
-    fn async_push_writes_to_spool_then_drains_to_repo() {
+    fn async_push_stages_then_drains_to_repo_in_one_call() {
+        // The LIVE async foreground path: `push` (not the drain in isolation)
+        // both stages the segment AND drains the spool into the repo in the same
+        // call, returning Ok only once the segment is durably in the repo. This
+        // is the regression guard for the bug where the foreground async push
+        // staged the segment but never drained it (so WAL never reached the repo
+        // and `check`/`backup` timed out).
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         let (spool, spool_s) = spool_storage();
         seed_archive_info_generic(&repo_s, "demo");
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
 
-        // Foreground async push only stages into the spool out/ dir; nothing
-        // reaches the repo yet.
         let mut cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
         cfg.options
             .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
-        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async push should stage to spool");
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("async push should stage AND drain to the repo");
 
-        let staged = format!("archive/demo/out/{SEGMENT}");
-        assert!(
-            spool_s.exists(Path::new(&staged)).expect("exists"),
-            "segment should be staged in the spool out/ dir"
-        );
-        assert_eq!(read(&spool_s, &staged), WAL_BODY, "staged copy should match source bytes");
-        assert!(
-            !repo_s
-                .exists(Path::new(&format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}")))
-                .expect("exists"),
-            "nothing should reach the repo before the drain runs"
-        );
-
-        // Drain the spool synchronously: the segment lands in the repo, the
-        // staged copy is gone, and a .ok status is recorded.
-        let drained = drain_push_spool(&fake_config(None, vec![]), &spool_s, &repo_s, "demo", "", &no_transform)
-            .expect("drain should succeed");
-        assert_eq!(drained, 1, "exactly one segment should drain");
-
+        // The segment reached the repo at its archive-id directory.
         let repo_dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
         assert!(
             repo_s.exists(Path::new(&repo_dest)).expect("exists"),
-            "drained segment should land in the repo"
+            "async push must drain the segment into the repo in the same call"
         );
-        assert_eq!(read(&repo_s, &repo_dest), WAL_BODY, "repo copy should match the staged bytes");
+        assert_eq!(read(&repo_s, &repo_dest), WAL_BODY, "repo copy should match the source bytes");
+
+        // The staged copy was removed by the drain, and the `.ok` status it wrote
+        // was consumed by the same `push` call (so it does not accumulate).
+        let staged = format!("archive/demo/out/{SEGMENT}");
         assert!(
             !spool_s.exists(Path::new(&staged)).expect("exists"),
-            "staged copy should be removed after a successful drain"
+            "staged copy should be removed after the inline drain"
         );
         assert!(
-            spool_s
+            !spool_s
                 .exists(Path::new(&format!("archive/demo/out/{SEGMENT}.ok")))
                 .expect("exists"),
-            "a .ok status should be recorded for the drained segment"
+            ".ok status should be consumed by the same push call, not left to accumulate"
         );
     }
 
@@ -2053,6 +2191,54 @@ mod tests {
             );
             assert_eq!(read(repo, &dest), WAL_BODY, "{label} copy should match source bytes");
         }
+    }
+
+    #[test]
+    fn async_push_fans_out_to_all_repos() {
+        // Multi-repo guard for the async foreground path: a single `push` in
+        // async mode must drain the staged segment into EVERY configured
+        // repository. The hazard is that the single-repo drain removes the staged
+        // copy after the first repo, starving the second; the inline multi-repo
+        // drain must push to all repos before removing the staged file.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        // Each repo resolves its own archive-id from its own archive.info during
+        // the drain, so seed both.
+        seed_archive_info_generic(&repo1_s, "demo");
+        seed_archive_info_generic(&repo2_s, "demo");
+        let (spool, spool_s) = spool_storage();
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        // Mark repo2 as a configured group index so configured_repo_indexes
+        // enumerates {1, 2} 1:1 with the storages slice.
+        cfg.options
+            .insert(("repo-path".to_owned(), Some(2)), OptionValue::Path("/repo2".to_owned()));
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s).expect("async multi-repo push should succeed");
+
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}");
+        for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s)] {
+            assert!(
+                repo.exists(Path::new(&dest)).expect("exists"),
+                "async-drained segment should land in {label}"
+            );
+            assert_eq!(read(repo, &dest), WAL_BODY, "{label} copy should match source bytes");
+        }
+        // Staged copy removed only after BOTH repos received it.
+        assert!(
+            !spool_s
+                .exists(Path::new(&format!("archive/demo/out/{SEGMENT}")))
+                .expect("exists"),
+            "staged copy should be removed once the segment is in every repo"
+        );
     }
 
     // -----------------------------------------------------------------------
