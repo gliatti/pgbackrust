@@ -16,6 +16,9 @@ fs2 = "0.4"
 pgbr-build = { path = "../pgbr-build" }
 pgbr-compress = { path = "../pgbr-compress" }
 pgbr-config = { path = "../pgbr-config" }
+# Process-global logger (log_internal): backup / restore route their human
+# progress + warning lines through it (INFO / WARN) instead of println!/eprintln!.
+pgbr-core = { path = "../pgbr-core" }
 # libpq wrapper: lets stanza-create/upgrade learn the cluster identity from a
 # live PostgreSQL connection (server_version_num + pg_control_system()) instead
 # of only reading global/pg_control off disk.

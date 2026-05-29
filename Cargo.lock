@@ -960,6 +960,7 @@ dependencies = [
  "pgbr-build",
  "pgbr-compress",
  "pgbr-config",
+ "pgbr-core",
  "pgbr-db",
  "pgbr-error",
  "pgbr-info",

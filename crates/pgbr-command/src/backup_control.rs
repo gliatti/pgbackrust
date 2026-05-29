@@ -112,6 +112,26 @@ pub trait BackupControl {
     /// Surfaces query failures as [`CommandError::Other`].
     fn backup_stop(&mut self) -> Result<BackupStopResult, CommandError>;
 
+    /// Stop a *stale* running backup left by a crashed prior run, returning
+    /// `true` when one was actually stopped (and `false` when nothing was
+    /// running). Backs the `--stop-auto` option.
+    ///
+    /// A backup that aborted after `pg_backup_start` leaves the cluster believing
+    /// a backup is still in progress, which would make the next `pg_backup_start`
+    /// fail. `stop-auto` calls `pg_backup_stop` to clear that state first. Because
+    /// `pg_backup_stop` raises when *no* backup is running, the default
+    /// implementation treats a query error as "nothing to stop" (`Ok(false)`)
+    /// rather than failing the new backup. C ref: `dbBackupStop` invoked from
+    /// `backup.c` when `cfgOptStopAuto` is set.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation never errors (a failed stop means nothing was
+    /// running); a custom implementation may surface [`CommandError::Other`].
+    fn stop_running_backup(&mut self) -> Result<bool, CommandError> {
+        Ok(self.backup_stop().is_ok())
+    }
+
     /// Whether the cluster on this connection is in recovery (a standby).
     ///
     /// Mirrors `SELECT pg_is_in_recovery()`. Used by `backup-standby` to tell a
