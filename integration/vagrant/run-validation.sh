@@ -8,7 +8,7 @@
 #   cd integration/vagrant && PATH="/c/Program Files/Oracle/VirtualBox:$PATH" ./run-validation.sh
 set -uo pipefail
 
-PGV="${PGBR_PG_VERSION:-16}"
+PGV="${PGBR_PG_VERSION:-18}"
 PASS=0
 FAIL=0
 

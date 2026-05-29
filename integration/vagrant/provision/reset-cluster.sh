@@ -10,13 +10,24 @@
 # starts it. Run as root (it uses `sudo -u postgres` internally).
 set -euo pipefail
 
-PGV="${PGBR_PG_VERSION:-16}"
+PGV="${PGBR_PG_VERSION:-18}"
 BIN="/usr/lib/postgresql/$PGV/bin"
 PRI="/var/lib/postgresql/$PGV/principal"
 PORT=5433
 
-# Stop whatever might be running (ignore "not running"); -m immediate so a stuck
-# recovery process does not block the stop.
+# Free port 5433 from ANY running postmaster, not just $PRI: after a PG-major
+# switch a leftover cluster from the previous version (e.g. /var/lib/postgresql/
+# 16/principal) is still bound to 5433, so the freshly-initdb'd cluster cannot
+# start ("Address already in use") and every later step would silently hit the
+# stale cluster instead. Walk every data dir's postmaster.pid and stop it with
+# its own version's pg_ctl, -m immediate so a stuck recovery cannot block us.
+for pidfile in /var/lib/postgresql/*/*/postmaster.pid; do
+  [ -f "$pidfile" ] || continue
+  dir="$(dirname "$pidfile")"
+  ver="$(printf '%s\n' "$dir" | sed -E 's#.*/postgresql/([0-9]+)/.*#\1#')"
+  pgctl="/usr/lib/postgresql/$ver/bin/pg_ctl"
+  [ -x "$pgctl" ] && sudo -u postgres "$pgctl" -D "$dir" -m immediate -w stop >/dev/null 2>&1 || true
+done
 sudo -u postgres "$BIN/pg_ctl" -D "$PRI" -m immediate -w stop >/dev/null 2>&1 || true
 
 rm -rf "$PRI"

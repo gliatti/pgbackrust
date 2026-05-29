@@ -10,7 +10,7 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-PGV="${PGBR_PG_VERSION:-16}"
+PGV="${PGBR_PG_VERSION:-18}"
 ROLE="${PGBR_ROLE:-primary}"
 BIN=/usr/lib/postgresql/$PGV/bin
 
