@@ -724,6 +724,13 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let features = BackupFeatures::from_options(config);
     validate_features(config, features)?;
 
+    // Explicit block-incremental tuning overrides (`repo-block-*-map`,
+    // `repo-block-size-super*`) and the per-file copy retry policy
+    // (`job-retry` / `job-retry-interval`). Both default to "no override" /
+    // "pgBackRest defaults" when unset, leaving the prior behaviour unchanged.
+    let block_overrides = block_overrides_from_options(config);
+    let job_retry = JobRetry::from_options(config);
+
     // Surface the applied user exclusions: pgBackRest records these in the
     // manifest's `[backup:option]` metadata, but the `Manifest` struct here owns
     // no exclude field (another concern), so for this slice the applied entries
@@ -760,6 +767,8 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         standby.as_mut().map(|c| c as &mut dyn BackupControl),
         start_fast,
         features,
+        block_overrides,
+        job_retry,
         archive_copy,
         integrity,
         policy,
@@ -1268,6 +1277,95 @@ fn size_indexed(config: &LoadedConfig, name: &str, default: u64) -> u64 {
     default
 }
 
+/// Read a `Size` group option that resolved with a group index, returning
+/// `Some(value)` for the first set index or `None` when none is set. Like
+/// [`size_indexed`] but distinguishes "unset" from "set to the default value".
+fn size_grouped_opt(config: &LoadedConfig, name: &str) -> Option<u64> {
+    if let Some(OptionValue::Size(value)) = config.options.get(&(name.to_owned(), None)) {
+        return Some(*value);
+    }
+    if let Some(OptionValue::Integer(value)) = config.options.get(&(name.to_owned(), None))
+        && *value >= 0
+    {
+        return u64::try_from(*value).ok();
+    }
+    for idx in 1..=8 {
+        match config.options.get(&(name.to_owned(), Some(idx))) {
+            Some(OptionValue::Size(value)) => return Some(*value),
+            Some(OptionValue::Integer(value)) if *value >= 0 => return u64::try_from(*value).ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read a `Hash` group option (`repo-block-*-map`), checking the bare and the
+/// `repoN-`-indexed forms, and return its `BTreeMap<String, String>` entries.
+fn hash_grouped<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a std::collections::BTreeMap<String, String>> {
+    if let Some(OptionValue::Hash(map)) = config.options.get(&(name.to_owned(), None)) {
+        return Some(map);
+    }
+    for idx in 1..=8 {
+        if let Some(OptionValue::Hash(map)) = config.options.get(&(name.to_owned(), Some(idx))) {
+            return Some(map);
+        }
+    }
+    None
+}
+
+/// Parse one `repo-block-*-map` hash into a `(threshold, value)` pair list,
+/// applying `key_parse` to each key and `value_parse` to each value. Entries that
+/// fail to parse are skipped (a malformed override degrades to the heuristic
+/// rather than failing the backup). Returns an empty list when the option is
+/// unset.
+fn parse_block_map<K, V>(config: &LoadedConfig, name: &str, key_parse: K, value_parse: V) -> Vec<(u64, u64)>
+where
+    K: Fn(&str) -> Option<u64>,
+    V: Fn(&str) -> Option<u64>,
+{
+    hash_grouped(config, name).map_or_else(Vec::new, |map| {
+        map.iter()
+            .filter_map(|(k, v)| Some((key_parse(k)?, value_parse(v)?)))
+            .collect()
+    })
+}
+
+/// Parse a size string (e.g. `32KiB`, `512KiB`, `1MiB`) into bytes via the config
+/// layer's size grammar; `None` on any parse error.
+fn parse_size_str(raw: &str) -> Option<u64> {
+    match pgbr_config::parse_value(pgbr_config::OptionType::Size, raw) {
+        Ok(OptionValue::Size(bytes)) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Parse a plain unsigned integer (an age-in-days threshold, a block multiplier,
+/// or a checksum-size byte count); `None` on any parse error.
+fn parse_uint_str(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok()
+}
+
+/// Build the [`crate::block::BlockOverrides`] from the resolved `repo-block-*`
+/// options.
+///
+/// - `repo-block-size-map`: `<file size>=<block size>` — both size strings.
+/// - `repo-block-age-map`: `<age in days>=<multiplier>` — both integers.
+/// - `repo-block-checksum-size-map`: `<block size>=<checksum bytes>` — size string
+///   key, integer value.
+/// - `repo-block-size-super` / `-super-full`: super-block size strings.
+///
+/// Unset options leave the corresponding map empty / the super sizes at their
+/// defaults, so [`crate::block::BlockOverrides::none`]-equivalent behaviour
+/// results when nothing is configured.
+fn block_overrides_from_options(config: &LoadedConfig) -> crate::block::BlockOverrides {
+    let size_map = parse_block_map(config, "repo-block-size-map", parse_size_str, parse_size_str);
+    let age_map = parse_block_map(config, "repo-block-age-map", parse_uint_str, parse_uint_str);
+    let checksum_size_map = parse_block_map(config, "repo-block-checksum-size-map", parse_size_str, parse_uint_str);
+    let super_size = size_grouped_opt(config, "repo-block-size-super");
+    let super_size_full = size_grouped_opt(config, "repo-block-size-super-full");
+    crate::block::BlockOverrides::new(size_map, age_map, checksum_size_map, super_size, super_size_full)
+}
+
 /// Number of parallel file-copy workers, from the resolved `process-max` option.
 ///
 /// `process-max` is an `Integer` (default 1). Values `<= 0` clamp to one worker
@@ -1292,6 +1390,106 @@ fn checksum_page_enabled(config: &LoadedConfig) -> bool {
         config.options.get(&("checksum-page".to_owned(), None)),
         Some(OptionValue::Boolean(true))
     )
+}
+
+/// Default number of retries for a failed file-copy job (`job-retry`). pgBackRest
+/// defaults `backup`/`restore` `job-retry` to 2.
+pub(crate) const DEFAULT_JOB_RETRY: u32 = 2;
+
+/// Default delay between copy-job retries (`job-retry-interval`, 15 seconds),
+/// expressed in milliseconds to match the option's `Time` representation.
+pub(crate) const DEFAULT_JOB_RETRY_INTERVAL_MS: u64 = 15_000;
+
+/// Retry policy for a single file-copy / restore job (`job-retry` +
+/// `job-retry-interval`).
+///
+/// When a per-file copy fails, pgBackRest retries the job up to `retries` more
+/// times, sleeping `interval` between attempts, before failing the command. This
+/// covers transient I/O / network blips against the repository without aborting a
+/// long backup. C ref: `cmdBackup` / `cmdRestore` job dispatch with
+/// `cfgOptJobRetry` / `cfgOptJobRetryInterval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobRetry {
+    /// Number of *additional* attempts after the first (so total attempts =
+    /// `retries + 1`). Zero means no retry — one attempt only.
+    retries: u32,
+    /// Delay between attempts.
+    interval: std::time::Duration,
+}
+
+impl JobRetry {
+    /// No retries: a single attempt, the prior behaviour. Used by the test
+    /// wrappers so existing tests keep their exact (non-retrying) semantics.
+    #[must_use]
+    pub(crate) const fn none() -> Self {
+        Self {
+            retries: 0,
+            interval: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Build a policy from explicit values. Test-only — production code uses
+    /// [`JobRetry::from_options`] / [`JobRetry::none`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn new(retries: u32, interval: std::time::Duration) -> Self {
+        Self { retries, interval }
+    }
+
+    /// Read `job-retry` (count) and `job-retry-interval` (time, milliseconds)
+    /// from the resolved configuration, falling back to pgBackRest's defaults
+    /// (2 retries, 15s) when absent or out of range.
+    #[must_use]
+    pub(crate) fn from_options(config: &LoadedConfig) -> Self {
+        let retries = match config.options.get(&("job-retry".to_owned(), None)) {
+            Some(OptionValue::Integer(value)) if *value >= 0 => u32::try_from(*value).unwrap_or(DEFAULT_JOB_RETRY),
+            _ => DEFAULT_JOB_RETRY,
+        };
+        let interval_ms = match config.options.get(&("job-retry-interval".to_owned(), None)) {
+            Some(OptionValue::Time(ms)) => *ms,
+            Some(OptionValue::Integer(value)) if *value >= 0 => u64::try_from(*value).unwrap_or(DEFAULT_JOB_RETRY_INTERVAL_MS),
+            _ => DEFAULT_JOB_RETRY_INTERVAL_MS,
+        };
+        Self {
+            retries,
+            interval: std::time::Duration::from_millis(interval_ms),
+        }
+    }
+
+    /// Total number of attempts (`retries + 1`).
+    #[must_use]
+    pub(crate) const fn attempts(self) -> u32 {
+        self.retries.saturating_add(1)
+    }
+
+    /// Run `op`, retrying up to `self.retries` more times (sleeping `interval`
+    /// between attempts) until it succeeds. Returns the last error when every
+    /// attempt fails.
+    ///
+    /// `op` is `FnMut` so the caller can re-do per-attempt work (e.g. re-read a
+    /// source). The first attempt runs immediately; the interval sleep only
+    /// happens *before* a retry, so a success on the first try never sleeps and a
+    /// zero-retry policy never sleeps at all.
+    pub(crate) fn run<T, E, F>(self, mut op: F) -> Result<T, E>
+    where
+        F: FnMut() -> Result<T, E>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    attempt += 1;
+                    if attempt >= self.attempts() {
+                        return Err(err);
+                    }
+                    if !self.interval.is_zero() {
+                        std::thread::sleep(self.interval);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Format a full-backup label `YYYYMMDD-HHMMSSF` from a Unix timestamp.
@@ -1558,6 +1756,16 @@ struct BundledCopyCtx<'a> {
     prior_manifest: Option<&'a Manifest>,
     /// The resolved bundling / block features.
     features: BackupFeatures,
+    /// Explicit block-incremental tuning overrides (`repo-block-*-map`,
+    /// `repo-block-size-super*`). [`crate::block::BlockOverrides::none`] when none
+    /// are configured, in which case the heuristic / defaults apply unchanged.
+    block_overrides: crate::block::BlockOverrides,
+    /// Whether this is a full backup, selecting `repo-block-size-super-full` over
+    /// `repo-block-size-super` for the super-block size.
+    is_full: bool,
+    /// Per-file copy retry policy (`job-retry` / `job-retry-interval`), wrapped
+    /// around each file's read in the serial bundled pass.
+    job_retry: JobRetry,
     /// Backup start timestamp, used to compute each file's age for the block-size
     /// policy.
     timestamp_start: i64,
@@ -1600,8 +1808,12 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
         let job = job_by_rel
             .remove(&skeleton.path)
             .ok_or_else(|| CommandError::Other(format!("no copy job for {}", skeleton.path)))?;
-        let bytes =
-            std::fs::read(&job.abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+        // Read the source under the job-retry policy: a transient read failure is
+        // retried up to `job-retry` times before failing the backup.
+        let bytes = ctx
+            .job_retry
+            .run(|| std::fs::read(&job.abs_src))
+            .map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
         let checksum = plaintext_sha1(&bytes)?;
 
         // Page-checksum + page-header validation, identical to the per-file path.
@@ -1615,18 +1827,21 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
             warn_invalid_pages(&skeleton.path, &invalid_blocks);
         }
 
-        // Decide the block size for this file (age + size policy). A `Some` size
-        // means block-incremental applies; `None` means store the file whole.
+        // Decide the block size for this file (age + size policy, with any
+        // `repo-block-*-map` overrides applied on top of the heuristic). A `Some`
+        // size means block-incremental applies; `None` means store the file whole.
         let age = ctx.timestamp_start.saturating_sub(skeleton.timestamp);
         let block_size = if ctx.features.block {
-            crate::block::block_size(skeleton.size, age)
+            ctx.block_overrides.block_size(skeleton.size, age)
         } else {
             None
         };
 
         let entry = if let Some(block_size) = block_size {
             // Block-incremental file: split, store changed blocks in bundles,
-            // reference unchanged ones, record a per-file block map.
+            // reference unchanged ones, record a per-file block map. The
+            // checksum-size and super-block-size overrides shape how each block is
+            // checksummed and grouped (see `build_block_map`).
             let prior_map = ctx
                 .prior_manifest
                 .and_then(|m| m.file(&skeleton.path))
@@ -1634,6 +1849,8 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
             let block_map = build_block_map(
                 &bytes,
                 block_size,
+                ctx.block_overrides.checksum_size(block_size),
+                ctx.block_overrides.super_size(ctx.is_full),
                 ctx.transform,
                 ctx.label,
                 prior_map,
@@ -1697,14 +1914,71 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
     Ok((files, repo_size))
 }
 
+/// Truncate a lowercase-hex checksum to `checksum_size` bytes (`2 *
+/// checksum_size` hex characters). A zero / oversized size leaves the checksum
+/// untouched. This realises `repo-block-checksum-size-map`: a smaller checksum
+/// saves space in the block map at the cost of weaker change detection.
+fn truncate_checksum(checksum: &str, checksum_size: u64) -> String {
+    let hex_chars = checksum_size.saturating_mul(2);
+    match usize::try_from(hex_chars) {
+        Ok(n) if n > 0 && n < checksum.len() => checksum[..n].to_owned(),
+        _ => checksum.to_owned(),
+    }
+}
+
 /// Build a block-incremental [`BlockMap`] for one file's `bytes`.
 ///
 /// Each block is transformed (compress + encrypt) on its own. A block whose
-/// plaintext checksum matches the prior backup's block at the same index is
-/// *referenced* (its bytes are reused from the backup the prior pointed at, so
-/// nothing new is stored); otherwise the transformed block is appended to a
-/// bundle in *this* backup and the new location recorded. A full backup (no
+/// (truncated) plaintext checksum matches the prior backup's block at the same
+/// index is *referenced* (its bytes are reused from the backup the prior pointed
+/// at, so nothing new is stored); otherwise the transformed block is appended to
+/// a bundle in *this* backup and the new location recorded. A full backup (no
 /// prior map) stores every block here and the map self-references this backup.
+///
+/// Group the (stored) blocks of a file into super blocks of at most `super_size`
+/// plaintext bytes (`repo-block-size-super[-full]`). Returns the count of blocks
+/// in each super block, in order; the sum equals `block_count`.
+///
+/// At least one block per super block (a `super_size` smaller than `block_size`,
+/// or a zero of either, degrades to one block per super block). A super block
+/// groups consecutive blocks so they are stored contiguously in one bundle
+/// region, mirroring pgBackRest's "a super block contains multiple blocks to
+/// improve compression efficiency" (block reads start at the super block).
+fn super_block_layout(block_count: usize, block_size: u64, super_size: u64) -> Vec<usize> {
+    if block_count == 0 {
+        return Vec::new();
+    }
+    // A zero block size (the `None` from checked_div) degrades to one block per
+    // super block; otherwise at least one block per super block.
+    let per_super = super_size
+        .checked_div(block_size)
+        .map_or(1, |n| usize::try_from(n.max(1)).unwrap_or(usize::MAX));
+    let mut groups = Vec::new();
+    let mut remaining = block_count;
+    while remaining > 0 {
+        let take = remaining.min(per_super);
+        groups.push(take);
+        remaining -= take;
+    }
+    groups
+}
+
+/// Build a block-incremental [`BlockMap`] for one file's `bytes`.
+///
+/// Each block is transformed (compress + encrypt) on its own. A block whose
+/// (truncated) plaintext checksum matches the prior backup's block at the same
+/// index is *referenced* (its bytes are reused from the backup the prior pointed
+/// at, so nothing new is stored); otherwise the transformed block is appended to
+/// a bundle in *this* backup and the new location recorded. A full backup (no
+/// prior map) stores every block here and the map self-references this backup.
+///
+/// `checksum_size` is the recorded checksum length in bytes
+/// (`repo-block-checksum-size-map`); the stored / compared checksum is truncated
+/// to it. `super_size` is the super-block size (`repo-block-size-super[-full]`):
+/// the *stored* (changed / new) blocks are grouped into super blocks of at most
+/// `super_size` plaintext bytes via [`super_block_layout`], and each super block's
+/// transformed bytes are placed into the bundle as one contiguous unit, so a
+/// restore reads a whole super block from one bundle region.
 ///
 /// `bundle_bytes` / `packer` / `repo_size` are the shared accumulators threaded
 /// from [`run_bundled_copy`] so blocks share the same bundle objects as whole
@@ -1717,6 +1991,8 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
 fn build_block_map(
     bytes: &[u8],
     block_size: u64,
+    checksum_size: u64,
+    super_size: u64,
     transform: &RepoTransform,
     label: &str,
     prior_map: Option<&pgbr_info::manifest::BlockMap>,
@@ -1727,33 +2003,71 @@ fn build_block_map(
     use pgbr_info::manifest::{BlockMap, BlockRef};
 
     let blocks = crate::block::split_blocks(bytes, block_size);
-    let mut refs: Vec<BlockRef> = Vec::with_capacity(blocks.len());
+    // The map has one entry per block, in file order, indexed by `idx`. A `None`
+    // slot is a stored block awaiting placement; reused (referenced) blocks are
+    // filled immediately from the prior map.
+    let mut refs: Vec<Option<BlockRef>> = vec![None; blocks.len()];
+
+    // The indices of the blocks that must be physically stored this backup (those
+    // not reused from the prior map), in file order. Their transformed bytes are
+    // grouped into super blocks and placed contiguously.
+    let mut stored_idx: Vec<usize> = Vec::new();
+    let mut stored_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut stored_checksums: Vec<String> = Vec::new();
 
     for (idx, block) in blocks.iter().enumerate() {
-        let checksum = plaintext_sha1(block)?;
+        let checksum = truncate_checksum(&plaintext_sha1(block)?, checksum_size);
 
-        // Reuse an unchanged block from the prior backup when its checksum matches.
+        // Reuse an unchanged block from the prior backup when its (truncated)
+        // checksum matches the prior entry's recorded checksum.
         if let Some(prior) = prior_map.and_then(|m| m.blocks.get(idx))
             && prior.checksum == checksum
         {
-            refs.push(prior.clone());
+            refs[idx] = Some(prior.clone());
             continue;
         }
 
-        // Changed / new block: transform it and append to a bundle in this backup.
-        let repo_bytes = transform.apply_forward(block)?;
-        let repo_len = repo_bytes.len() as u64;
-        *repo_size += repo_len;
-        let slot = packer.place(repo_len);
-        bundle_bytes.entry(slot.bundle_id).or_default().extend_from_slice(&repo_bytes);
-        refs.push(BlockRef {
-            checksum,
-            reference: label.to_owned(),
-            bundle_id: slot.bundle_id,
-            offset: slot.offset,
-            size: repo_len,
-        });
+        // Changed / new block: transform it now, stash it for super-block placement.
+        stored_idx.push(idx);
+        stored_bytes.push(transform.apply_forward(block)?);
+        stored_checksums.push(checksum);
     }
+
+    // Place the stored blocks super block by super block. Each super block's
+    // blocks are appended contiguously so they share one bundle region; the
+    // per-block offset is the running cursor within that region.
+    let groups = super_block_layout(stored_idx.len(), block_size, super_size);
+    let mut next = 0usize;
+    for group_len in groups {
+        // The transformed size of this super block (sum of its blocks).
+        let super_len: u64 = stored_bytes[next..next + group_len].iter().map(|b| b.len() as u64).sum();
+        let super_slot = packer.place(super_len);
+        let mut cursor = super_slot.offset;
+        let target = bundle_bytes.entry(super_slot.bundle_id).or_default();
+        for member in 0..group_len {
+            let i = next + member;
+            let repo_bytes = &stored_bytes[i];
+            let repo_len = repo_bytes.len() as u64;
+            *repo_size += repo_len;
+            target.extend_from_slice(repo_bytes);
+            refs[stored_idx[i]] = Some(BlockRef {
+                checksum: stored_checksums[i].clone(),
+                reference: label.to_owned(),
+                bundle_id: super_slot.bundle_id,
+                offset: cursor,
+                size: repo_len,
+            });
+            cursor = cursor.saturating_add(repo_len);
+        }
+        next += group_len;
+    }
+
+    // Every slot is now filled (each block was either reused or stored).
+    let refs: Vec<BlockRef> = refs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| slot.ok_or_else(|| CommandError::Other(format!("block {idx} left unplaced"))))
+        .collect::<Result<_, _>>()?;
 
     Ok(BlockMap {
         block_size,
@@ -1905,10 +2219,16 @@ fn request_to_copy_job(request: &Request) -> Result<CopyJob, String> {
 /// `worker_count == 1` runs a single worker — byte-for-byte the prior serial
 /// behaviour. Results come back in completion order; the caller correlates them
 /// by key and re-sorts the manifest, so order does not affect the output.
+///
+/// `job_retry` wraps each per-file copy: a failed copy is retried up to
+/// `job-retry` more times (with `job-retry-interval` between attempts) inside the
+/// worker before the job — and the whole backup — fails. [`JobRetry::none`]
+/// reproduces the single-attempt behaviour exactly.
 fn run_copy_jobs(
     jobs: &[CopyJob],
     transform: &RepoTransform,
     worker_count: usize,
+    job_retry: JobRetry,
 ) -> Result<Vec<(String, CopyResult)>, CommandError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -1930,7 +2250,11 @@ fn run_copy_jobs(
     let worker_transform = transform.clone();
     let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
         let job = request_to_copy_job(request)?;
-        let copied = copy_file(&job, &worker_transform).map_err(|err| err.to_string())?;
+        // Retry the copy per `job-retry`: re-read + re-transform + re-write on
+        // each attempt so a transient failure (e.g. a flaky write) can recover.
+        let copied = job_retry
+            .run(|| copy_file(&job, &worker_transform))
+            .map_err(|err| err.to_string())?;
         Ok(Response::Ok(OkResponse {
             out: Some(json!({
                 "checksum": copied.checksum,
@@ -2118,6 +2442,8 @@ struct UnbundledCopyCtx<'a> {
     paths: &'a [ManifestPath],
     links: &'a [ManifestLink],
     process_max: usize,
+    /// Per-file copy retry policy (`job-retry` / `job-retry-interval`).
+    job_retry: JobRetry,
     timestamp_start: i64,
     manifest_save_threshold: u64,
 }
@@ -2135,7 +2461,7 @@ struct UnbundledCopyCtx<'a> {
 ///
 /// Returns the assembled file list and the total repo bytes written.
 fn run_unbundled_copy(mut ctx: UnbundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
-    let copy_results = run_copy_jobs(ctx.jobs, ctx.transform, ctx.process_max)?;
+    let copy_results = run_copy_jobs(ctx.jobs, ctx.transform, ctx.process_max, ctx.job_retry)?;
     let mut result_by_rel: std::collections::HashMap<String, CopyResult> = copy_results.into_iter().collect();
 
     // Move the skeletons + already-decided referenced files out of `ctx` so the
@@ -2462,6 +2788,8 @@ pub fn backup_inner_with_workers(
         None,
         false,
         BackupFeatures::disabled(),
+        crate::block::BlockOverrides::none(),
+        JobRetry::none(),
         false,
         IntegrityChecks::disabled(),
         BackupPolicy::test_default(),
@@ -2513,6 +2841,8 @@ fn run_backup(
     mut standby: Option<&mut dyn BackupControl>,
     start_fast: bool,
     features: BackupFeatures,
+    block_overrides: crate::block::BlockOverrides,
+    job_retry: JobRetry,
     archive_copy: bool,
     integrity: IntegrityChecks,
     policy: BackupPolicy,
@@ -2666,6 +2996,9 @@ fn run_backup(
             referenced,
             prior_manifest: prior_manifest.as_ref(),
             features,
+            block_overrides,
+            is_full: backup_type == BackupType::Full,
+            job_retry,
             timestamp_start,
         })?
     } else {
@@ -2683,6 +3016,7 @@ fn run_backup(
             paths: &plan.paths,
             links: &plan.links,
             process_max,
+            job_retry,
             timestamp_start,
             manifest_save_threshold: policy.manifest_save_threshold,
         })?
@@ -4713,6 +5047,8 @@ mod tests {
             None,
             start_fast,
             BackupFeatures::disabled(),
+            crate::block::BlockOverrides::none(),
+            JobRetry::none(),
             archive_copy,
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
@@ -4742,6 +5078,8 @@ mod tests {
             None,
             false,
             BackupFeatures::disabled(),
+            crate::block::BlockOverrides::none(),
+            JobRetry::none(),
             false,
             integrity,
             BackupPolicy::test_default(),
@@ -5350,6 +5688,8 @@ mod tests {
             None,
             true,
             BackupFeatures::disabled(),
+            crate::block::BlockOverrides::none(),
+            JobRetry::none(),
             false,
             IntegrityChecks::disabled(),
             BackupPolicy::test_default(),
@@ -5748,6 +6088,8 @@ mod tests {
             None,
             false,
             BackupFeatures::disabled(),
+            crate::block::BlockOverrides::none(),
+            JobRetry::none(),
             false,
             IntegrityChecks::disabled(),
             policy,
@@ -5930,6 +6272,7 @@ mod tests {
             paths: &paths,
             links: &links,
             process_max: 1,
+            job_retry: JobRetry::none(),
             timestamp_start: 1_704_110_400,
             manifest_save_threshold: u64::MAX,
         };
@@ -5980,6 +6323,8 @@ mod tests {
             None,
             false,
             BackupFeatures::disabled(),
+            crate::block::BlockOverrides::none(),
+            JobRetry::none(),
             false,
             IntegrityChecks::disabled(),
             policy,
@@ -6133,5 +6478,164 @@ mod tests {
         assert!(stop_auto_enabled(&c));
         assert!(!expire_auto_enabled(&c));
         assert_eq!(manifest_save_threshold(&c), 4096);
+    }
+
+    // ---- block-incremental tuning overrides --------------------------------
+
+    /// Build a minimal `LoadedConfig` from option entries for the option-reader
+    /// tests below.
+    fn opt_cfg(opts: BTreeMap<(String, Option<u32>), OptionValue>) -> LoadedConfig {
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: opts,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn block_overrides_default_to_none_when_unset() {
+        let overrides = block_overrides_from_options(&opt_cfg(BTreeMap::new()));
+        assert_eq!(overrides, crate::block::BlockOverrides::none());
+        assert!(overrides.maps_empty());
+    }
+
+    #[test]
+    fn block_overrides_parse_maps_and_super_sizes() {
+        let mut opts: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        // size map: 16KiB=8KiB, 512KiB=32KiB
+        let mut size_map = std::collections::BTreeMap::new();
+        size_map.insert("16KiB".to_owned(), "8KiB".to_owned());
+        size_map.insert("512KiB".to_owned(), "32KiB".to_owned());
+        opts.insert(("repo-block-size-map".to_owned(), None), OptionValue::Hash(size_map));
+        // age map: 7=2 (days -> multiplier)
+        let mut age_map = std::collections::BTreeMap::new();
+        age_map.insert("7".to_owned(), "2".to_owned());
+        opts.insert(("repo-block-age-map".to_owned(), None), OptionValue::Hash(age_map));
+        // checksum-size map: 32KiB=7
+        let mut cks_map = std::collections::BTreeMap::new();
+        cks_map.insert("32KiB".to_owned(), "7".to_owned());
+        opts.insert(("repo-block-checksum-size-map".to_owned(), None), OptionValue::Hash(cks_map));
+        // super sizes.
+        opts.insert(("repo-block-size-super".to_owned(), None), OptionValue::Size(2 * 1024 * 1024));
+        opts.insert(
+            ("repo-block-size-super-full".to_owned(), None),
+            OptionValue::Size(8 * 1024 * 1024),
+        );
+
+        let overrides = block_overrides_from_options(&opt_cfg(opts));
+        assert!(!overrides.maps_empty());
+
+        // A 256 MiB fresh file: size map forces the 512KiB bucket -> 32 KiB block.
+        let big = overrides
+            .block_size(256 * 1024 * 1024, 0)
+            .expect("256MiB file is block-eligible");
+        assert_eq!(big, 32 * 1024, "size map override must pick the 512KiB bucket's 32KiB block");
+        // It differs from the unmapped heuristic for this file.
+        assert_ne!(big, crate::block::block_size(256 * 1024 * 1024, 0).unwrap());
+
+        // checksum-size map: 32KiB block -> 7-byte checksum.
+        assert_eq!(overrides.checksum_size(32 * 1024), 7);
+        // super sizes select full vs incr.
+        assert_eq!(overrides.super_size(false), 2 * 1024 * 1024);
+        assert_eq!(overrides.super_size(true), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn block_overrides_read_grouped_repo_index() {
+        // The maps / super sizes also resolve from the `repoN-`-indexed form.
+        let mut opts: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        let mut size_map = std::collections::BTreeMap::new();
+        size_map.insert("16KiB".to_owned(), "8KiB".to_owned());
+        opts.insert(("repo-block-size-map".to_owned(), Some(1)), OptionValue::Hash(size_map));
+        opts.insert(
+            ("repo-block-size-super".to_owned(), Some(1)),
+            OptionValue::Size(2 * 1024 * 1024),
+        );
+        let overrides = block_overrides_from_options(&opt_cfg(opts));
+        assert_eq!(overrides.block_size(2 * 1024 * 1024, 0), Some(8 * 1024));
+        assert_eq!(overrides.super_size(false), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn truncate_checksum_honours_size() {
+        let full = "0123456789abcdef0123456789abcdef01234567"; // 40 hex chars (20 bytes)
+        // 6 bytes -> 12 hex chars.
+        assert_eq!(truncate_checksum(full, 6), &full[..12]);
+        // 0 / oversized leaves it unchanged.
+        assert_eq!(truncate_checksum(full, 0), full);
+        assert_eq!(truncate_checksum(full, 100), full);
+    }
+
+    #[test]
+    fn super_block_layout_groups_by_super_size() {
+        // 5 blocks of 8 KiB each, super size 16 KiB -> 2 blocks per super block.
+        let groups = super_block_layout(5, 8 * 1024, 16 * 1024);
+        assert_eq!(groups, vec![2, 2, 1]);
+        // super size smaller than block size -> one block per super block.
+        assert_eq!(super_block_layout(3, 8 * 1024, 4 * 1024), vec![1, 1, 1]);
+        // no blocks -> empty.
+        assert!(super_block_layout(0, 8 * 1024, 16 * 1024).is_empty());
+    }
+
+    // ---- job-retry / job-retry-interval ------------------------------------
+
+    #[test]
+    fn job_retry_defaults_and_overrides() {
+        // Defaults: 2 retries, 15s interval.
+        let def = JobRetry::from_options(&opt_cfg(BTreeMap::new()));
+        assert_eq!(def, JobRetry::new(2, std::time::Duration::from_secs(15)));
+
+        let mut opts: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        opts.insert(("job-retry".to_owned(), None), OptionValue::Integer(4));
+        opts.insert(("job-retry-interval".to_owned(), None), OptionValue::Time(500));
+        let cfg = JobRetry::from_options(&opt_cfg(opts));
+        assert_eq!(cfg, JobRetry::new(4, std::time::Duration::from_millis(500)));
+        assert_eq!(cfg.attempts(), 5);
+    }
+
+    #[test]
+    fn job_retry_succeeds_on_a_later_attempt() {
+        use std::cell::Cell;
+        // Fail the first two attempts, succeed on the third. With 2 retries
+        // (3 attempts) this must succeed.
+        let calls = Cell::new(0u32);
+        let policy = JobRetry::new(2, std::time::Duration::ZERO);
+        let result: Result<&str, &str> = policy.run(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 3 { Err("transient") } else { Ok("done") }
+        });
+        assert_eq!(result, Ok("done"));
+        assert_eq!(calls.get(), 3, "the op must run exactly three times");
+    }
+
+    #[test]
+    fn job_retry_errors_after_exhausting_retries() {
+        use std::cell::Cell;
+        // Always fail. With 1 retry (2 attempts) the op runs twice then errors.
+        let calls = Cell::new(0u32);
+        let policy = JobRetry::new(1, std::time::Duration::ZERO);
+        let result: Result<(), &str> = policy.run(|| {
+            calls.set(calls.get() + 1);
+            Err("always")
+        });
+        assert_eq!(result, Err("always"));
+        assert_eq!(calls.get(), 2, "1 retry means 2 total attempts");
+    }
+
+    #[test]
+    fn job_retry_none_runs_once() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let policy = JobRetry::none();
+        assert_eq!(policy.attempts(), 1);
+        let result: Result<(), &str> = policy.run(|| {
+            calls.set(calls.get() + 1);
+            Err("nope")
+        });
+        assert_eq!(result, Err("nope"));
+        assert_eq!(calls.get(), 1, "no-retry policy attempts exactly once");
     }
 }
