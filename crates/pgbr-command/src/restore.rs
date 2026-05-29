@@ -1164,21 +1164,31 @@ struct RestoreCopyJob {
 }
 
 /// How a worker should obtain a file's recovered plaintext.
+///
+/// Every variant carries both the absolute repo path (`abs_*`, used by the local
+/// `Posix`/`Cifs` fast path, which reads via `std::fs`) and the repo-*relative*
+/// path (`repo_*`, used by the non-local remote/object path, which reads through
+/// [`Storage::open_read`]). Only one path is consulted, decided by
+/// [`Storage::is_local`].
 #[derive(Debug, Clone)]
 enum RestoreSource {
     /// A whole file stored as its own repo object (suffix included): read the
     /// object and reverse the transform. The classic, unbundled layout.
     Standalone {
-        /// Absolute source path of the repo file.
+        /// Absolute source path of the repo file (local fast path).
         abs_src: PathBuf,
+        /// Repo-relative source path (non-local `open_read` path).
+        repo_src: PathBuf,
         /// Transform the source backup applied (reversed to recover plaintext).
         transform: RepoTransform,
     },
     /// A whole file packed into a bundle object: read `len` bytes of the bundle
     /// at `offset` and reverse the transform. File-bundling (`repo-bundle=y`).
     Bundled {
-        /// Absolute path of the bundle object.
+        /// Absolute path of the bundle object (local fast path).
         abs_bundle: PathBuf,
+        /// Repo-relative path of the bundle object (non-local `open_read` path).
+        repo_bundle: PathBuf,
         /// Byte offset of this file's (transformed) bytes within the bundle.
         offset: u64,
         /// Number of (transformed) bytes the file occupies in the bundle.
@@ -1195,8 +1205,11 @@ enum RestoreSource {
 /// One block of a block-incremental file's [`RestoreSource::Blocks`] list.
 #[derive(Debug, Clone)]
 struct BlockSource {
-    /// Absolute path of the bundle object the block's bytes live in.
+    /// Absolute path of the bundle object the block's bytes live in (local fast
+    /// path).
     abs_bundle: PathBuf,
+    /// Repo-relative path of that bundle object (non-local `open_read` path).
+    repo_bundle: PathBuf,
     /// Byte offset of the block's (transformed) bytes within that bundle.
     offset: u64,
     /// Number of (transformed) bytes the block occupies.
@@ -1208,6 +1221,9 @@ struct BlockSource {
 
 /// Read `len` bytes at `offset` from the file at `path`, recovering the plaintext
 /// of one bundled member / block by reversing `transform`.
+///
+/// The local (`Posix`/`Cifs`) fast path: seeks + reads through `std::fs` against
+/// an absolute path. The non-local counterpart is [`read_bundle_slice_storage`].
 fn read_bundle_slice(path: &Path, offset: u64, len: u64, transform: &RepoTransform) -> Result<Vec<u8>, CommandError> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|err| CommandError::Other(format!("open {}: {err}", path.display())))?;
@@ -1217,6 +1233,23 @@ fn read_bundle_slice(path: &Path, offset: u64, len: u64, transform: &RepoTransfo
     file.read_exact(&mut repo_bytes)
         .map_err(|err| CommandError::Other(format!("read {}: {err}", path.display())))?;
     Ok(transform.apply_reverse(&repo_bytes)?)
+}
+
+/// Slice `len` bytes at `offset` out of the already-buffered `bundle` bytes,
+/// recovering the plaintext of one bundled member / block by reversing
+/// `transform`. The non-local counterpart of [`read_bundle_slice`]: the whole
+/// bundle object is read once (via [`Storage::open_read`]) by the caller and the
+/// slices are taken from memory, since the `IoRead` trait has no seek and a
+/// remote backend is single-connection. A `0` offset/len out of range is a
+/// defensively-handled corrupt manifest, surfaced as an error.
+fn read_bundle_slice_buffered(bundle: &[u8], offset: u64, len: u64, transform: &RepoTransform) -> Result<Vec<u8>, CommandError> {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let count = usize::try_from(len).unwrap_or(usize::MAX);
+    let end = start
+        .checked_add(count)
+        .filter(|&end| end <= bundle.len())
+        .ok_or_else(|| CommandError::Other(format!("bundle slice {start}..+{count} out of range (len {})", bundle.len())))?;
+    Ok(transform.apply_reverse(&bundle[start..end])?)
 }
 
 /// The member offsets within one bundle object, used to derive each member's
@@ -1410,12 +1443,19 @@ impl<'a> SourceResolver<'a> {
         if let (Some(bundle_id), Some(offset)) = (holder_entry.bundle_id, holder_entry.bundle_offset) {
             let layout = self.layout(&holder_label, bundle_id)?;
             let backup_root = format!("backup/{}/{holder_label}", self.stanza);
-            let abs_bundle = self
-                .repo
-                .info(&PathBuf::from(crate::bundle::bundle_object_path(&backup_root, bundle_id)))?
-                .path;
+            let repo_bundle = PathBuf::from(crate::bundle::bundle_object_path(&backup_root, bundle_id));
+            // The local fast path needs the absolute path (resolved via `info`);
+            // the non-local path reads through `open_read` at `repo_bundle`, so it
+            // skips the `info().path` resolution and reuses the relative path as a
+            // never-read placeholder.
+            let abs_bundle = if self.repo.is_local() {
+                self.repo.info(&repo_bundle)?.path
+            } else {
+                repo_bundle.clone()
+            };
             Ok(RestoreSource::Bundled {
                 abs_bundle,
+                repo_bundle,
                 offset,
                 len: layout.member_len(offset),
                 transform: holder_transform,
@@ -1423,10 +1463,15 @@ impl<'a> SourceResolver<'a> {
         } else {
             // Standalone repo object (`<rel><suffix>`).
             let repo_rel = format!("{}{}", file.path, holder_transform.repo_suffix());
-            let src = backup_file_path(self.stanza, &holder_label, &repo_rel);
-            let abs_src = self.repo.info(&src)?.path;
+            let repo_src = backup_file_path(self.stanza, &holder_label, &repo_rel);
+            let abs_src = if self.repo.is_local() {
+                self.repo.info(&repo_src)?.path
+            } else {
+                repo_src.clone()
+            };
             Ok(RestoreSource::Standalone {
                 abs_src,
+                repo_src,
                 transform: holder_transform,
             })
         }
@@ -1440,15 +1485,17 @@ impl<'a> SourceResolver<'a> {
             let holder_label = block.reference.clone();
             let holder_transform = self.holder_transform(&holder_label);
             let backup_root = format!("backup/{}/{holder_label}", self.stanza);
-            let abs_bundle = self
-                .repo
-                .info(&PathBuf::from(crate::bundle::bundle_object_path(
-                    &backup_root,
-                    block.bundle_id,
-                )))?
-                .path;
+            let repo_bundle = PathBuf::from(crate::bundle::bundle_object_path(&backup_root, block.bundle_id));
+            // Local fast path resolves the absolute path; the non-local path reads
+            // through `open_read` at `repo_bundle` (placeholder abs path).
+            let abs_bundle = if self.repo.is_local() {
+                self.repo.info(&repo_bundle)?.path
+            } else {
+                repo_bundle.clone()
+            };
             sources.push(BlockSource {
                 abs_bundle,
+                repo_bundle,
                 offset: block.offset,
                 len: block.size,
                 transform: holder_transform,
@@ -1482,23 +1529,63 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Restore one file in a worker: read `abs_src` via `std::fs`, reverse the
-/// transform to recover the plaintext, create the destination's parent dir,
-/// write `abs_dst`, verify the recovered plaintext's SHA-1 against the
-/// manifest's recorded checksum, and re-apply the recorded Unix file mode.
-/// Because the manifest records the *plaintext* checksum, that single check
-/// validates the whole compress -> encrypt -> decrypt -> decompress round trip.
+/// Write the recovered `plaintext` to the job's destination and verify it.
 ///
-/// This is the per-file unit of work run on a dispatcher worker thread. It does
-/// all of its I/O through `std::fs` against absolute paths, so it needs no
+/// Shared by [`restore_file`] (the local `std::fs` fast path) and
+/// [`restore_file_storage`] (the non-local `open_read` path): the destination is
+/// always the local PG data dir (always a `std::fs` write — only the *source* of
+/// the repo bytes differs between paths), so the parent-dir creation, write,
+/// Unix-mode re-application, and the hard-fail plaintext SHA-1 check are written
+/// exactly once and produce identical results regardless of how the bytes were
+/// read. A checksum mismatch is a hard error so the failing job fails the whole
+/// restore.
+fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), CommandError> {
+    if let Some(parent) = job.abs_dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+    }
+    std::fs::write(&job.abs_dst, plaintext)
+        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dst.display())))?;
+
+    // Re-apply the recorded Unix file mode (if any). On non-Unix this is a no-op
+    // (no mode is ever recorded). uid/gid are recorded-only — re-applying owner
+    // needs privilege and is a documented follow-up. C ref: chmod in
+    // `src/command/restore/restore.c`.
+    apply_mode(&job.abs_dst, job.mode)?;
+
+    // Hard-fail SHA-1 check, per file. Zero-length files carry no checksum;
+    // nothing to compare.
+    let mut sha = Sha1::new();
+    let mut sink = Vec::new();
+    sha.process(plaintext, &mut sink)?;
+    let actual = sha.digest_hex();
+    if let Some(expected) = job.expected_checksum.as_deref()
+        && actual != expected
+    {
+        return Err(CommandError::Other(format!("restore checksum mismatch for {}", job.rel)));
+    }
+
+    Ok(())
+}
+
+/// Restore one file in a worker: read the repo source via `std::fs`, reverse the
+/// transform to recover the plaintext, then write + verify via
+/// [`write_and_verify`]. Because the manifest records the *plaintext* checksum,
+/// that single check validates the whole compress -> encrypt -> decrypt ->
+/// decompress round trip.
+///
+/// This is the per-file unit of work run on a dispatcher worker thread. It reads
+/// its repo source through `std::fs` against absolute paths, so it needs no
 /// `Storage` handle and nothing borrowed from the caller — only the owned
-/// `transform` carried in the job. A checksum mismatch is a hard error here, so
-/// the failing job fails the whole restore.
+/// `transform` carried in the job. This fast path is used **only** for local
+/// (`Posix`/`Cifs`) repos; remote/object repos go through
+/// [`restore_file_storage`].
 fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
     // Recover the plaintext per the source spec: a whole standalone object, a
     // bundle slice, or a reassembled block-incremental file.
     let plaintext = match &job.source {
-        RestoreSource::Standalone { abs_src, transform } => {
+        RestoreSource::Standalone { abs_src, transform, .. } => {
             let repo_bytes =
                 std::fs::read(abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", abs_src.display())))?;
             // Reverse the transform: decrypt then decompress. With the identity
@@ -1510,6 +1597,7 @@ fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
             offset,
             len,
             transform,
+            ..
         } => read_bundle_slice(abs_bundle, *offset, *len, transform)?,
         RestoreSource::Blocks(blocks) => {
             let mut out = Vec::new();
@@ -1521,33 +1609,63 @@ fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
         }
     };
 
-    if let Some(parent) = job.abs_dst.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
-    }
-    std::fs::write(&job.abs_dst, &plaintext)
-        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dst.display())))?;
+    write_and_verify(job, &plaintext)
+}
 
-    // Re-apply the recorded Unix file mode (if any). On non-Unix this is a no-op
-    // (no mode is ever recorded). uid/gid are recorded-only — re-applying owner
-    // needs privilege and is a documented follow-up. C ref: chmod in
-    // `src/command/restore/restore.c`.
-    apply_mode(&job.abs_dst, job.mode)?;
+/// Read the whole repo object at `repo_path` through the [`Storage`] trait,
+/// returning its raw (still-transformed) bytes. Used by the non-local restore
+/// path, where `std::fs` would read from the wrong machine.
+fn read_repo_object(repo: &dyn Storage, repo_path: &Path) -> Result<Vec<u8>, CommandError> {
+    let mut reader = repo.open_read(repo_path)?;
+    Ok(reader.read_all()?)
+}
 
-    // Hard-fail SHA-1 check, per file, in the worker. Zero-length files carry no
-    // checksum; nothing to compare.
-    let mut sha = Sha1::new();
-    let mut sink = Vec::new();
-    sha.process(&plaintext, &mut sink)?;
-    let actual = sha.digest_hex();
-    if let Some(expected) = job.expected_checksum.as_deref()
-        && actual != expected
-    {
-        return Err(CommandError::Other(format!("restore checksum mismatch for {}", job.rel)));
-    }
+/// Restore one file for a non-local (remote/object) repo, reading every repo
+/// source through `repo.open_read` instead of `std::fs`.
+///
+/// Mirrors [`restore_file`] exactly except for the *source* of the repo bytes:
+/// the reverse transform, block reassembly, and the write + verification go
+/// through the same [`write_and_verify`] / transform logic, so the restored file
+/// and its checksum check are byte-for-byte what the local path produces. Runs
+/// serially on the main thread because the remote storage is single-connection /
+/// `!Send` and cannot be shared across the worker pool. A bundle / bundled file
+/// is read once into memory (bounded by `repo-bundle-size`) and sliced from
+/// there, since [`pgbr_io::IoRead`] has no seek.
+fn restore_file_storage(job: &RestoreCopyJob, repo: &dyn Storage) -> Result<(), CommandError> {
+    let plaintext = match &job.source {
+        RestoreSource::Standalone { repo_src, transform, .. } => {
+            let repo_bytes = read_repo_object(repo, repo_src)?;
+            transform.apply_reverse(&repo_bytes)?
+        }
+        RestoreSource::Bundled {
+            repo_bundle,
+            offset,
+            len,
+            transform,
+            ..
+        } => {
+            let bundle = read_repo_object(repo, repo_bundle)?;
+            read_bundle_slice_buffered(&bundle, *offset, *len, transform)?
+        }
+        RestoreSource::Blocks(blocks) => {
+            // Cache each bundle object's bytes so a file whose blocks all live in
+            // one bundle reads that bundle once, not once per block.
+            let mut bundle_cache: std::collections::HashMap<PathBuf, Vec<u8>> = std::collections::HashMap::new();
+            let mut out = Vec::new();
+            for block in blocks {
+                if !bundle_cache.contains_key(&block.repo_bundle) {
+                    let bytes = read_repo_object(repo, &block.repo_bundle)?;
+                    bundle_cache.insert(block.repo_bundle.clone(), bytes);
+                }
+                let bundle = &bundle_cache[&block.repo_bundle];
+                let part = read_bundle_slice_buffered(bundle, block.offset, block.len, &block.transform)?;
+                out.extend_from_slice(&part);
+            }
+            out
+        }
+    };
 
-    Ok(())
+    write_and_verify(job, &plaintext)
 }
 
 /// Encode a [`RestoreCopyJob`]'s correlation key into a dispatcher [`Request`].
@@ -1578,8 +1696,32 @@ fn copy_request(job: &RestoreCopyJob) -> Request {
 /// `job-retry-interval` between attempts — inside the worker before the job, and
 /// the whole restore, fails. [`JobRetry::none`] reproduces the single-attempt
 /// behaviour exactly.
-fn run_restore_jobs(jobs: Vec<RestoreCopyJob>, worker_count: usize, job_retry: JobRetry) -> Result<(), CommandError> {
+///
+/// When `repo` is **not** local (a remote/object backend) the parallel `std::fs`
+/// path is unsafe — `std::fs` would read the repo bytes from the wrong machine —
+/// so the restores run serially on the main thread through
+/// [`restore_file_storage`], which reads every repo source via `repo.open_read`
+/// (the storage handle is single-connection / `!Send` and cannot cross the
+/// worker boundary). The destination write + verification is identical, so the
+/// restored cluster is the same regardless of which path ran. For local
+/// (`Posix`/`Cifs`) repos the parallel `std::fs` path below is kept verbatim.
+fn run_restore_jobs(
+    jobs: Vec<RestoreCopyJob>,
+    repo: &dyn Storage,
+    worker_count: usize,
+    job_retry: JobRetry,
+) -> Result<(), CommandError> {
     if jobs.is_empty() {
+        return Ok(());
+    }
+
+    // Non-local repo: read every file through the `Storage` trait, serially on
+    // this thread. `std::fs` (the parallel path below) would read the repo bytes
+    // off the local machine instead of the remote/object repo.
+    if !repo.is_local() {
+        for job in &jobs {
+            job_retry.run(|| restore_file_storage(job, repo))?;
+        }
         return Ok(());
     }
 
@@ -1789,7 +1931,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // path). The number of files planned for copy is the restore count. A dry-run
     // dispatches nothing — `dry_run_restore_count` is the would-be count.
     let files_restored = if dry_run { dry_run_restore_count } else { jobs.len() };
-    run_restore_jobs(jobs, process_max(config), JobRetry::from_options(config))?;
+    run_restore_jobs(jobs, repo, process_max(config), JobRetry::from_options(config))?;
 
     // 3. Delta restore removes target files absent from the manifest so the
     //    target matches the backup exactly. Walk every restored directory root
@@ -4276,11 +4418,14 @@ mod tests {
     // ---- job-retry around per-file restore ----------------------------------
 
     /// Build a `RestoreCopyJob` that reads `abs_src` (identity transform) and
-    /// writes `abs_dst`, with no checksum check.
+    /// writes `abs_dst`, with no checksum check. The `repo_src` is irrelevant for
+    /// these local (`std::fs`) tests — they exercise the parallel `Posix` path,
+    /// which reads `abs_src` — so it mirrors `abs_src`.
     fn standalone_job(rel: &str, abs_src: PathBuf, abs_dst: PathBuf) -> super::RestoreCopyJob {
         super::RestoreCopyJob {
             rel: rel.to_owned(),
             source: super::RestoreSource::Standalone {
+                repo_src: abs_src.clone(),
                 abs_src,
                 transform: crate::pipeline::RepoTransform::identity(),
             },
@@ -4294,7 +4439,7 @@ mod tests {
     /// are exhausted is retried and succeeds.
     #[test]
     fn restore_retries_a_failing_copy_until_it_succeeds() {
-        let (_repo, pg, _repo_s, _pg_s) = posix_pair();
+        let (_repo, pg, repo_s, _pg_s) = posix_pair();
         let src_dir = tempfile::tempdir().expect("src tempdir");
         let abs_src = src_dir.path().join("late_source");
         let abs_dst = pg.path().join("restored_late");
@@ -4310,7 +4455,8 @@ mod tests {
 
         let job = standalone_job("late", abs_src, abs_dst.clone());
         let policy = JobRetry::new(40, std::time::Duration::from_millis(25));
-        super::run_restore_jobs(vec![job], 1, policy).expect("retry must recover once the source appears");
+        // A local `Posix` repo exercises the parallel `std::fs` path.
+        super::run_restore_jobs(vec![job], &repo_s, 1, policy).expect("retry must recover once the source appears");
         writer.join().expect("writer thread");
 
         assert_eq!(std::fs::read(&abs_dst).expect("restored file"), b"recovered late");
@@ -4319,14 +4465,14 @@ mod tests {
     /// A restore whose source never appears fails after exhausting its retries.
     #[test]
     fn restore_errors_after_exhausting_retries() {
-        let (_repo, pg, _repo_s, _pg_s) = posix_pair();
+        let (_repo, pg, repo_s, _pg_s) = posix_pair();
         let abs_src = pg.path().join("never_exists_source");
         let abs_dst = pg.path().join("restored_never");
 
         let job = standalone_job("never", abs_src, abs_dst.clone());
         // 2 retries (3 attempts), zero interval so the test is instant.
         let policy = JobRetry::new(2, std::time::Duration::ZERO);
-        let err = super::run_restore_jobs(vec![job], 1, policy).expect_err("missing source must fail");
+        let err = super::run_restore_jobs(vec![job], &repo_s, 1, policy).expect_err("missing source must fail");
         assert!(err.to_string().contains("never"), "error must name the failing file: {err}");
         assert!(!abs_dst.exists(), "no destination is written when the copy never succeeds");
     }
@@ -4344,6 +4490,20 @@ mod tests {
         if let Some(limit) = limit {
             options.insert(("repo-bundle-limit".to_owned(), None), OptionValue::Size(limit));
         }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    /// Backup config WITHOUT bundling: each file lands as its own standalone repo
+    /// object, so an incremental can reference an unchanged file whole.
+    fn backup_cfg_plain(stanza: &str, ty: &str) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId(ty.to_owned()));
         LoadedConfig {
             command: "backup".to_owned(),
             command_role: ConfigCommandRole::Main,
@@ -4483,6 +4643,301 @@ mod tests {
             std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
             modified,
             "diff block round trip"
+        );
+    }
+
+    // ---- non-local (remote/object) repo restore ----------------------------
+
+    /// A `Storage` wrapper that reports itself **non-local** and records every
+    /// `open_read` path, while delegating real I/O to an inner [`Posix`].
+    ///
+    /// This simulates a remote/object backend (SSH / S3 / Azure / GCS / SFTP):
+    /// `is_local()` is `false`, so the restore must read every backup source
+    /// through [`Storage::open_read`] rather than `std::fs`. To *prove* `std::fs`
+    /// is never used against the source, `info()` returns a **poisoned**
+    /// `path` (a non-existent absolute path) while preserving the real `size` —
+    /// the bundle layout needs the size, but any accidental
+    /// `std::fs::read(info.path)` would fail with "no such file". The recorded
+    /// `open_read` paths then positively prove which reads went through the trait.
+    struct RecordingRepo {
+        inner: Posix,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingRepo {
+        fn new(inner: Posix) -> Self {
+            Self {
+                inner,
+                reads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn reads(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+            std::sync::Arc::clone(&self.reads)
+        }
+    }
+
+    impl Storage for RecordingRepo {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            // Keep the real metadata (size feeds the bundle layout) but poison the
+            // absolute path so any std::fs read against it fails — the non-local
+            // read path must use `open_read(<repo-relative path>)` instead.
+            let mut info = self.inner.info(path)?;
+            info.path = PathBuf::from("/nonexistent-non-local-repo").join(path);
+            Ok(info)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.reads.lock().unwrap().push(path.to_string_lossy().into_owned());
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    #[test]
+    fn restore_from_non_local_repo_reads_standalone_through_open_read() {
+        // A non-local repo must read every backup data file through the Storage
+        // trait (`open_read`), not `std::fs` — otherwise a remote restore reads
+        // the local machine and fails. `RecordingRepo` poisons `info().path`, so a
+        // std::fs read would error; the restore can only succeed by using
+        // `open_read`. Standalone (unbundled) layout.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg_dst = tempfile::tempdir().expect("pg tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+        let stanza = "demo";
+        init_stanza(&repo_inner, stanza);
+
+        let a = b"PG_VERSION contents for the non-local restore".as_slice();
+        let b = b"a small relation page captured into the repo".as_slice();
+        seed_backup_info(&repo_inner, stanza, &["20240101-120000F"]);
+        seed_backup(
+            &repo_inner,
+            stanza,
+            "20240101-120000F",
+            &[("PG_VERSION", a, Some(sha1_hex(a))), ("base/1/1259", b, Some(sha1_hex(b)))],
+            &["base", "base/1"],
+            &[],
+        );
+
+        let repo_s = RecordingRepo::new(repo_inner);
+        let reads = repo_s.reads();
+
+        let outcome = restore_inner(&cfg(Some(stanza), Some("20240101-120000F")), &repo_s, &pg_dst_s).expect("non-local restore");
+        assert_eq!(outcome.files_restored, 2);
+
+        // The bytes were recovered correctly...
+        assert_eq!(std::fs::read(pg_dst.path().join("PG_VERSION")).unwrap(), a);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(), b);
+
+        // ...and every data file was read through open_read at its repo-relative
+        // path. A buggy std::fs read would never appear here (and would have
+        // failed against the poisoned info().path).
+        let recorded = reads.lock().unwrap().clone();
+        for rel in [
+            "backup/demo/20240101-120000F/PG_VERSION",
+            "backup/demo/20240101-120000F/base/1/1259",
+        ] {
+            assert!(
+                recorded.iter().any(|p| p == rel),
+                "data file must be read via open_read at {rel}; recorded reads: {recorded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_from_non_local_repo_reads_bundled_through_open_read() {
+        // Bundled layout (`repo-bundle`): small files share a bundle object, an
+        // over-limit file gets its own standalone object. A non-local restore must
+        // read both kinds through open_read. The whole bundle is buffered and
+        // sliced in memory (IoRead has no seek).
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg_dst = tempfile::tempdir().expect("pg tempdir");
+        let pg_src = tempfile::tempdir().expect("pg src tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_inner, stanza);
+
+        let a = b"first small relation".as_slice();
+        let b = b"second small relation, a bit longer than the first one".as_slice();
+        let big = vec![3u8; 4096];
+        seed_pg_file(&pg_src_s, "PG_VERSION", b"14\n");
+        seed_pg_file(&pg_src_s, "base/1/1259", a);
+        seed_pg_file(&pg_src_s, "base/1/1260", b);
+        seed_pg_file(&pg_src_s, "base/1/1261", &big);
+
+        crate::backup::backup(&backup_cfg(stanza, "full", false, Some(100)), &repo_inner, &pg_src_s).expect("bundled backup");
+        let label = latest_label(&repo_inner, stanza);
+
+        let repo_s = RecordingRepo::new(repo_inner);
+        let reads = repo_s.reads();
+
+        let outcome = restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("non-local bundled restore");
+        assert_eq!(outcome.files_restored, 4);
+
+        assert_eq!(std::fs::read(pg_dst.path().join("PG_VERSION")).unwrap(), b"14\n");
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(), a);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1260")).unwrap(), b);
+        assert_eq!(std::fs::read(pg_dst.path().join("base/1/1261")).unwrap(), big);
+
+        // The bundle object (id 1) and the over-limit standalone object were both
+        // read through open_read.
+        let recorded = reads.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|p| p == &format!("backup/{stanza}/{label}/bundle/1")),
+            "the bundle object must be read via open_read; recorded reads: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|p| p.starts_with(&format!("backup/{stanza}/{label}/base/1/1261"))),
+            "the over-limit standalone object must be read via open_read; recorded reads: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn restore_from_non_local_repo_reads_block_incremental_through_open_read() {
+        // Block-incremental: a diff reuses unchanged blocks from the full and
+        // stores only the changed block itself. A non-local restore of the diff
+        // must read both backups' bundle objects (the holder + the reference)
+        // through open_read and reassemble the file byte-for-byte.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg_dst = tempfile::tempdir().expect("pg tempdir");
+        let pg_src = tempfile::tempdir().expect("pg src tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_inner, stanza);
+
+        let original: Vec<u8> = (0..300 * 1024u32).map(|n| (n % 251) as u8).collect();
+        seed_pg_file(&pg_src_s, "base/1/1259", &original);
+        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_inner, &pg_src_s).expect("full block backup");
+        let full_label = latest_label(&repo_inner, stanza);
+
+        let mut modified = original;
+        for byte in modified.iter_mut().take(8192) {
+            *byte = byte.wrapping_add(1);
+        }
+        seed_pg_file(&pg_src_s, "base/1/1259", &modified);
+        crate::backup::backup(&backup_cfg(stanza, "diff", true, None), &repo_inner, &pg_src_s).expect("diff block backup");
+        let diff_label = latest_label(&repo_inner, stanza);
+        assert_ne!(diff_label, full_label, "diff produced a new label");
+
+        let repo_s = RecordingRepo::new(repo_inner);
+        let reads = repo_s.reads();
+
+        restore_inner(&cfg(Some(stanza), Some(&diff_label)), &repo_s, &pg_dst_s).expect("non-local block restore");
+        assert_eq!(
+            std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
+            modified,
+            "block-incremental round trip over a non-local repo"
+        );
+
+        // Block reassembly read bundle objects from BOTH the diff (holder of the
+        // changed block) and the full (the reference for the unchanged tail) via
+        // open_read.
+        let recorded = reads.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|p| p.starts_with(&format!("backup/{stanza}/{diff_label}/bundle/"))),
+            "the diff's bundle must be read via open_read; recorded reads: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|p| p.starts_with(&format!("backup/{stanza}/{full_label}/bundle/"))),
+            "the referenced full's bundle must be read via open_read; recorded reads: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn restore_from_non_local_repo_reads_referenced_backup_through_open_read() {
+        // A whole-file `reference` to a holding (earlier) backup: an incremental
+        // backup whose file is unchanged references the full's standalone object.
+        // The non-local restore must read the *referenced* backup's object through
+        // open_read.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg_dst = tempfile::tempdir().expect("pg tempdir");
+        let pg_src = tempfile::tempdir().expect("pg src tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        init_stanza(&repo_inner, stanza);
+
+        // Unbundled (no repo-bundle) so the file is a standalone object the
+        // incremental can reference whole.
+        let kept = b"a relation that does not change between the full and the incr".as_slice();
+        seed_pg_file(&pg_src_s, "base/1/1259", kept);
+        crate::backup::backup(&backup_cfg_plain(stanza, "full"), &repo_inner, &pg_src_s).expect("full backup");
+        let full_label = latest_label(&repo_inner, stanza);
+
+        // Take an incremental without touching the file: it should reference the
+        // full for the unchanged file.
+        crate::backup::backup(&backup_cfg_plain(stanza, "incr"), &repo_inner, &pg_src_s).expect("incr backup");
+        let incr_label = latest_label(&repo_inner, stanza);
+        assert_ne!(incr_label, full_label, "incr produced a new label");
+
+        let incr_manifest = Manifest::load(&repo_inner, &super::manifest_path(stanza, &incr_label)).unwrap();
+        assert_eq!(
+            incr_manifest.file("base/1/1259").and_then(|f| f.reference.clone()),
+            Some(full_label.clone()),
+            "the unchanged file must reference the full"
+        );
+
+        let repo_s = RecordingRepo::new(repo_inner);
+        let reads = repo_s.reads();
+
+        restore_inner(&cfg(Some(stanza), Some(&incr_label)), &repo_s, &pg_dst_s).expect("non-local incr restore");
+        assert_eq!(
+            std::fs::read(pg_dst.path().join("base/1/1259")).unwrap(),
+            kept,
+            "referenced-file round trip over a non-local repo"
+        );
+
+        // The bytes physically live under the FULL backup, so the read must hit
+        // the full's object, not the incr's.
+        let recorded = reads.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|p| p.starts_with(&format!("backup/{stanza}/{full_label}/base/1/1259"))),
+            "the referenced full's object must be read via open_read; recorded reads: {recorded:?}"
         );
     }
 
