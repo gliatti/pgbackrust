@@ -157,6 +157,69 @@ pub trait CheckDb {
     fn last_wal_segment(&mut self, server_version_num: u32) -> Result<String, CommandError>;
 }
 
+/// SQL the [`CheckDb`] methods run, shared by [`ConnCheckDb`] (libpq) and
+/// [`RemoteCheckDb`] (worker) so the two paths never drift. Each returns a
+/// single scalar text value at `(0, 0)`; the trait methods parse / interpret it.
+mod sql {
+    /// `server_version_num` as text.
+    pub const VERSION: &str = "select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4::text";
+    /// `system_identifier` as text.
+    pub const SYSTEM_ID: &str = "select system_identifier::text from pg_catalog.pg_control_system()";
+    /// `pg_is_in_recovery()` as text (`t` / `f`).
+    pub const IN_RECOVERY: &str = "select pg_catalog.pg_is_in_recovery()::text";
+    /// `archive_mode` setting.
+    pub const ARCHIVE_MODE: &str = "select setting from pg_catalog.pg_settings where name = 'archive_mode'";
+    /// `archive_command` setting.
+    pub const ARCHIVE_COMMAND: &str = "select setting from pg_catalog.pg_settings where name = 'archive_command'";
+}
+
+/// Build the `pg_create_restore_point('<name>')` SQL, single-quote-escaping the
+/// (fixed-constant) name defensively.
+fn restore_point_sql(name: &str) -> String {
+    let escaped = name.replace('\'', "''");
+    format!("select pg_catalog.pg_create_restore_point('{escaped}')::text")
+}
+
+/// Build the forced-WAL-switch SQL for `server_version_num`: `pg_switch_wal()`
+/// (or `pg_switch_xlog()` pre-10) returns the LSN at the end of the
+/// just-completed segment; `pg_walfile_name()` turns it into the segment file
+/// name. Matches `dbWalSwitch` in `src/db/db.c`.
+fn switch_wal_sql(server_version_num: u32) -> String {
+    let (switch_fn, walfile_fn) = wal_function_names(server_version_num);
+    format!("select pg_catalog.{walfile_fn}(pg_catalog.{switch_fn}())")
+}
+
+/// Build the "most recent produced WAL segment" SQL for a standby, where a
+/// switch cannot be forced.
+fn last_wal_segment_sql(server_version_num: u32) -> String {
+    let (_switch_fn, walfile_fn) = wal_function_names(server_version_num);
+    let lsn_expr = if server_version_num >= 100_000 {
+        "coalesce(pg_catalog.pg_last_wal_replay_lsn(), pg_catalog.pg_last_wal_receive_lsn())"
+    } else {
+        "coalesce(pg_catalog.pg_last_xlog_replay_location(), pg_catalog.pg_last_xlog_receive_location())"
+    };
+    format!("select pg_catalog.{walfile_fn}({lsn_expr})")
+}
+
+/// Parse a `server_version_num` scalar text into a `u32`.
+fn parse_version(raw: &str) -> Result<u32, CommandError> {
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|_| CommandError::Other(format!("could not parse server_version_num {raw:?}")))
+}
+
+/// Parse a `system_identifier` scalar text into a `u64`.
+fn parse_system_id(raw: &str) -> Result<u64, CommandError> {
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| CommandError::Other(format!("could not parse system_identifier {raw:?}")))
+}
+
+/// Interpret a `pg_is_in_recovery()` scalar text as a bool.
+fn parse_in_recovery(raw: &str) -> bool {
+    matches!(raw.trim(), "t" | "true" | "on" | "1")
+}
+
 /// Real [`CheckDb`] backed by a live libpq [`Connection`].
 ///
 /// Mirrors the SQL the C `checkArchive` / `dbWalSwitch` run. Exercised only by
@@ -183,59 +246,102 @@ impl<'conn> ConnCheckDb<'conn> {
 
 impl CheckDb for ConnCheckDb<'_> {
     fn version(&mut self) -> Result<u32, CommandError> {
-        let raw =
-            self.scalar("select (select setting from pg_catalog.pg_settings where name = 'server_version_num')::int4::text")?;
-        raw.trim()
-            .parse::<u32>()
-            .map_err(|_| CommandError::Other(format!("could not parse server_version_num {raw:?}")))
+        let raw = self.scalar(sql::VERSION)?;
+        parse_version(&raw)
     }
 
     fn system_id(&mut self) -> Result<u64, CommandError> {
-        let raw = self.scalar("select system_identifier::text from pg_catalog.pg_control_system()")?;
-        raw.trim()
-            .parse::<u64>()
-            .map_err(|_| CommandError::Other(format!("could not parse system_identifier {raw:?}")))
+        let raw = self.scalar(sql::SYSTEM_ID)?;
+        parse_system_id(&raw)
     }
 
     fn is_in_recovery(&mut self) -> Result<bool, CommandError> {
-        let raw = self.scalar("select pg_catalog.pg_is_in_recovery()::text")?;
-        Ok(matches!(raw.trim(), "t" | "true" | "on" | "1"))
+        let raw = self.scalar(sql::IN_RECOVERY)?;
+        Ok(parse_in_recovery(&raw))
     }
 
     fn archive_settings(&mut self) -> Result<(String, String), CommandError> {
-        let mode = self
-            .scalar("select setting from pg_catalog.pg_settings where name = 'archive_mode'")
-            .unwrap_or_default();
-        let command = self
-            .scalar("select setting from pg_catalog.pg_settings where name = 'archive_command'")
-            .unwrap_or_default();
+        let mode = self.scalar(sql::ARCHIVE_MODE).unwrap_or_default();
+        let command = self.scalar(sql::ARCHIVE_COMMAND).unwrap_or_default();
         Ok((mode.trim().to_owned(), command.trim().to_owned()))
     }
 
     fn create_restore_point(&mut self, name: &str) -> Result<(), CommandError> {
-        // Quote the literal defensively; the name is a fixed constant here but
-        // routing it through a parameterless query keeps the trait simple.
-        let escaped = name.replace('\'', "''");
-        self.scalar(&format!("select pg_catalog.pg_create_restore_point('{escaped}')::text"))
-            .map(|_| ())
+        self.scalar(&restore_point_sql(name)).map(|_| ())
     }
 
     fn switch_wal(&mut self, server_version_num: u32) -> Result<String, CommandError> {
-        let (switch_fn, walfile_fn) = wal_function_names(server_version_num);
-        // pg_switch_wal() returns the LSN at the end of the just-completed
-        // segment; pg_walfile_name() turns it into the segment file name. This
-        // matches dbWalSwitch in src/db/db.c.
-        self.scalar(&format!("select pg_catalog.{walfile_fn}(pg_catalog.{switch_fn}())"))
+        self.scalar(&switch_wal_sql(server_version_num))
     }
 
     fn last_wal_segment(&mut self, server_version_num: u32) -> Result<String, CommandError> {
-        let (_switch_fn, walfile_fn) = wal_function_names(server_version_num);
-        let lsn_expr = if server_version_num >= 100_000 {
-            "coalesce(pg_catalog.pg_last_wal_replay_lsn(), pg_catalog.pg_last_wal_receive_lsn())"
-        } else {
-            "coalesce(pg_catalog.pg_last_xlog_replay_location(), pg_catalog.pg_last_xlog_receive_location())"
-        };
-        self.scalar(&format!("select pg_catalog.{walfile_fn}({lsn_expr})"))
+        self.scalar(&last_wal_segment_sql(server_version_num))
+    }
+}
+
+/// [`CheckDb`] backed by a remote worker.
+///
+/// Runs the **same** SQL as [`ConnCheckDb`] but through a
+/// [`crate::remote_db::RemoteDb`] (`db-query`) instead of a local libpq
+/// connection. Used in the dedicated-repo-host (pull) topology, where the
+/// cluster is on the PG host (`pgN-host`) and the worker there owns the real
+/// connection. The caller is responsible for `db-open`ing the worker connection
+/// before driving this.
+pub struct RemoteCheckDb<'db, R: IoRead, W: IoWrite> {
+    db: &'db mut crate::remote_db::RemoteDb<R, W>,
+}
+
+impl<'db, R: IoRead, W: IoWrite> RemoteCheckDb<'db, R, W> {
+    /// Wrap a [`crate::remote_db::RemoteDb`] whose connection is already open.
+    #[must_use]
+    pub const fn new(db: &'db mut crate::remote_db::RemoteDb<R, W>) -> Self {
+        Self { db }
+    }
+
+    /// Run `sql` on the worker and return the single scalar text value at
+    /// `(0, 0)`.
+    fn scalar(&mut self, sql: &str) -> Result<String, CommandError> {
+        let rows = self.db.query(sql)?;
+        rows.rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Clone::clone)
+            .ok_or_else(|| CommandError::Other(format!("remote query returned no value: {sql}")))
+    }
+}
+
+impl<R: IoRead, W: IoWrite> CheckDb for RemoteCheckDb<'_, R, W> {
+    fn version(&mut self) -> Result<u32, CommandError> {
+        let raw = self.scalar(sql::VERSION)?;
+        parse_version(&raw)
+    }
+
+    fn system_id(&mut self) -> Result<u64, CommandError> {
+        let raw = self.scalar(sql::SYSTEM_ID)?;
+        parse_system_id(&raw)
+    }
+
+    fn is_in_recovery(&mut self) -> Result<bool, CommandError> {
+        let raw = self.scalar(sql::IN_RECOVERY)?;
+        Ok(parse_in_recovery(&raw))
+    }
+
+    fn archive_settings(&mut self) -> Result<(String, String), CommandError> {
+        let mode = self.scalar(sql::ARCHIVE_MODE).unwrap_or_default();
+        let command = self.scalar(sql::ARCHIVE_COMMAND).unwrap_or_default();
+        Ok((mode.trim().to_owned(), command.trim().to_owned()))
+    }
+
+    fn create_restore_point(&mut self, name: &str) -> Result<(), CommandError> {
+        self.scalar(&restore_point_sql(name)).map(|_| ())
+    }
+
+    fn switch_wal(&mut self, server_version_num: u32) -> Result<String, CommandError> {
+        self.scalar(&switch_wal_sql(server_version_num))
+    }
+
+    fn last_wal_segment(&mut self, server_version_num: u32) -> Result<String, CommandError> {
+        self.scalar(&last_wal_segment_sql(server_version_num))
     }
 }
 
@@ -704,29 +810,110 @@ fn probe_archive_round_trip(repo_storage: &dyn Storage, stanza: &str, archive_id
     }
 }
 
+/// The `pgN` index `check` uses for its single control connection. pgBackRest's
+/// `check` drives the cluster at the active `pg` index (1 by default).
+const CHECK_PG_INDEX: u32 = 1;
+
 /// Build a [`CheckReport`], adding the live-PG checks when a cluster is reachable.
 ///
-/// A connection is derived from `config` / `DATABASE_URL`. The repo-side checks
-/// always run; the live checks run only when a cluster is configured.
+/// The repo-side checks always run. For the live-PG half:
+///
+/// - When `pg1-host` is set (the dedicated-repo-host "pull" topology), the
+///   control connection runs on the PG host: a `pgbackrest` worker is spawned
+///   there over SSH, opened against the *local* cluster (no `host=<pghost>`, so
+///   libpq uses the unix socket with peer / trust auth), and driven through a
+///   [`RemoteCheckDb`].
+/// - Otherwise, when a connection is derivable from `config` / `DATABASE_URL`, a
+///   local libpq [`Connection`] is opened and driven through a [`ConnCheckDb`].
+/// - When neither is configured, the live checks are skipped.
 ///
 /// # Errors
 ///
-/// Propagates any error from the repo-side [`check_inner`] or the live-PG
-/// [`check_pg`].
+/// Propagates any error from the repo-side [`check_inner`], the worker spawn /
+/// `db-open`, or the live-PG [`check_pg`].
 pub fn run_check(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<CheckReport, CommandError> {
-    let mut report = check_inner(config, repo_storage)?;
+    let report = check_inner(config, repo_storage)?;
 
-    // Live-PG half: only when a connection is derivable (matching stanza.rs).
+    // Remote (pull) topology: `pg1-host` set means the control connection must
+    // run on the PG host through a worker, not via a direct TCP connect here.
+    if let Some(host) = crate::remote_db::pg_host_for_index(config, CHECK_PG_INDEX) {
+        return run_check_remote(config, repo_storage, report, &host);
+    }
+
+    // Local path: open a libpq connection here when one is derivable.
     let Some(conninfo) = derive_conninfo_with_url(config, std::env::var("DATABASE_URL").ok().as_deref()) else {
         return Ok(report);
     };
+    let mut report = report;
+    let (stanza, archive) = load_check_archive(config, repo_storage)?;
+    let mut conn = Connection::open(&conninfo).map_err(|err| CommandError::Other(err.to_string()))?;
+    let mut db = ConnCheckDb::new(&mut conn);
+    let pg = check_pg(
+        &mut db,
+        &archive,
+        &report.archive_id,
+        &stanza,
+        repo_storage,
+        archive_timeout(config),
+        Duration::from_millis(250),
+        archive_mode_check(config),
+    )?;
+    report.pg = Some(pg);
+    Ok(report)
+}
 
-    // Reload the archive info for the identity cross-check / archive-id.
-    // `check_inner` already proved both info files load and agree, so this load
-    // is reliable.
-    let stanza = config.stanza.as_deref().ok_or_else(|| CommandError::MissingOption {
-        option: "stanza".to_owned(),
-    })?;
+/// Run the live-PG half against a worker on the PG host (`pg1-host` = `host`).
+///
+/// Spawns the SSH worker, opens its connection against the *local* cluster
+/// (`local_conninfo_for_index`, no `host=<pghost>`), then drives the same
+/// [`check_pg`] flow through a [`RemoteCheckDb`]. The worker connection is
+/// closed best-effort before the worker is reaped on drop.
+fn run_check_remote(
+    config: &LoadedConfig,
+    repo_storage: &dyn Storage,
+    mut report: CheckReport,
+    host: &str,
+) -> Result<CheckReport, CommandError> {
+    let (stanza, archive) = load_check_archive(config, repo_storage)?;
+
+    // The conninfo the worker opens locally: socket / port / db / user (never
+    // the remote host) plus the global timeout / keepalive params.
+    let extra = conninfo_timeout_keepalive_params(config);
+    let conninfo = crate::remote_db::local_conninfo_for_index(config, CHECK_PG_INDEX, &extra);
+
+    let mut remote = crate::remote_db::spawn_pg_worker(config, host, CHECK_PG_INDEX)?;
+    remote.open(&conninfo)?;
+    let pg = {
+        let mut db = RemoteCheckDb::new(&mut remote);
+        check_pg(
+            &mut db,
+            &archive,
+            &report.archive_id,
+            &stanza,
+            repo_storage,
+            archive_timeout(config),
+            Duration::from_millis(250),
+            archive_mode_check(config),
+        )
+    };
+    // Best-effort close before the worker is reaped on drop; surface the pg
+    // error first if there was one.
+    let _ = remote.close();
+    report.pg = Some(pg?);
+    Ok(report)
+}
+
+/// Reload the stanza name + `archive.info` for the identity cross-check /
+/// archive-id. `check_inner` already proved both info files load and agree, so
+/// this load is reliable.
+fn load_check_archive(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(String, InfoArchive), CommandError> {
+    let stanza = config
+        .stanza
+        .as_deref()
+        .ok_or_else(|| CommandError::MissingOption {
+            option: "stanza".to_owned(),
+        })?
+        .to_owned();
     let user_pass = crate::cipher::active_user_pass(config)?;
     let archive = InfoArchive::load_keyed(
         repo_storage,
@@ -735,21 +922,7 @@ pub fn run_check(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Ch
     )
     .map(|(archive, _)| archive)
     .map_err(|err| CommandError::Other(format!("stanza '{stanza}' archive.info: {err}")))?;
-
-    let mut conn = Connection::open(&conninfo).map_err(|err| CommandError::Other(err.to_string()))?;
-    let mut db = ConnCheckDb::new(&mut conn);
-    let pg = check_pg(
-        &mut db,
-        &archive,
-        &report.archive_id,
-        stanza,
-        repo_storage,
-        archive_timeout(config),
-        Duration::from_millis(250),
-        archive_mode_check(config),
-    )?;
-    report.pg = Some(pg);
-    Ok(report)
+    Ok((stanza, archive))
 }
 
 /// Whether `archive-mode-check` is enabled (default true, the option model's
@@ -1531,5 +1704,103 @@ mod tests {
             let segment = db.switch_wal(version).expect("switch wal");
             assert_eq!(segment.len(), 24, "WAL segment name should be 24 hex chars: {segment}");
         }
+    }
+
+    // -------- RemoteCheckDb over the worker protocol (no real PostgreSQL) -----
+
+    #[test]
+    fn remote_check_db_drives_check_pg_over_the_worker_protocol() {
+        use std::thread;
+
+        use pgbr_db::QueryRows;
+        use pgbr_protocol::transport::{PipeRead, PipeWrite, serve};
+        use pgbr_protocol::{OkResponse, ProtocolClient, Request, Response};
+
+        use super::RemoteCheckDb;
+        use crate::remote_db::RemoteDb;
+
+        // A fake worker: instead of a real libpq connection it answers each
+        // `db-query` with a canned scalar matched by SQL content, and `db-open` /
+        // `db-close` with success. This proves RemoteCheckDb encodes the same SQL
+        // ConnCheckDb runs as db-query requests and decodes the scalar replies —
+        // end to end through the same `check_pg` flow the local path uses.
+        fn scalar_rows(value: &str) -> Response {
+            let rows = QueryRows {
+                columns: vec!["v".to_owned()],
+                rows: vec![vec![Some(value.to_owned())]],
+            };
+            Response::Ok(OkResponse {
+                out: Some(serde_json::to_value(&rows).unwrap()),
+            })
+        }
+
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let mut handler = |req: &Request| -> Response {
+                match req.cmd.as_str() {
+                    "db-open" | "db-close" => Response::Ok(OkResponse { out: None }),
+                    "db-query" => {
+                        let sql = req.param.first().and_then(|v| v.as_str()).unwrap_or_default();
+                        if sql.contains("server_version_num") {
+                            scalar_rows("160004")
+                        } else if sql.contains("pg_control_system") {
+                            scalar_rows("6873049345984568091")
+                        } else if sql.contains("pg_is_in_recovery") {
+                            scalar_rows("f")
+                        } else if sql.contains("archive_mode") {
+                            scalar_rows("on")
+                        } else if sql.contains("archive_command") {
+                            scalar_rows("pgbackrest --stanza=demo archive-push %p")
+                        } else if sql.contains("pg_create_restore_point") {
+                            scalar_rows("0/3000000")
+                        } else if sql.contains("pg_walfile_name") {
+                            scalar_rows("000000010000000000000003")
+                        } else {
+                            scalar_rows("")
+                        }
+                    }
+                    other => panic!("unexpected worker command {other}"),
+                }
+            };
+            serve(&mut reader, &mut writer, &mut handler).unwrap();
+        });
+
+        let client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        let mut remote = RemoteDb::new(client);
+        remote.open("host=/var/run/postgresql").expect("db-open succeeds");
+
+        // The repo already has the matching segment, so the archive wait passes.
+        let (_dir, storage) = posix();
+        land_segment(&storage, "demo", "16-1", "000000010000000000000003");
+        let archive = archive_info(6_873_049_345_984_568_091, "16");
+
+        let report = {
+            let mut db = RemoteCheckDb::new(&mut remote);
+            check_pg(
+                &mut db,
+                &archive,
+                "16-1",
+                "demo",
+                &storage,
+                Duration::from_millis(50),
+                Duration::from_millis(2),
+                true,
+            )
+            .expect("remote check_pg should succeed")
+        };
+        assert!(!report.in_recovery);
+        assert_eq!(report.server_version_num, 160_004);
+        assert_eq!(report.system_id, 6_873_049_345_984_568_091);
+        assert_eq!(report.wal_segment, "000000010000000000000003");
+        assert!(report.archive_wait_ok);
+
+        // Close and shut the worker down cleanly.
+        remote.close().expect("db-close succeeds");
+        drop(remote);
+        server.join().unwrap();
     }
 }
