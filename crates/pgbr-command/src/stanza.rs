@@ -305,27 +305,38 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
         return Some(url.to_owned());
     }
 
-    let opt = |name: &str| -> Option<String> {
-        match config.options.get(&(name.to_owned(), None)) {
-            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
-            Some(OptionValue::Integer(i)) => Some(i.to_string()),
-            _ => None,
-        }
+    // Group options are stored under the base name keyed by group index — a
+    // config-file `pg1-host` resolves to `("pg-host", Some(1))`, with an
+    // ungrouped `("pg-host", None)` fallback (the scheme `storage_helper` uses).
+    // The flat `pg1-…` spelling is accepted last for unit-test fixtures.
+    let opt = |field: &str| -> Option<String> {
+        let base = format!("pg-{field}");
+        let legacy = format!("pg1-{field}");
+        config
+            .options
+            .get(&(base.clone(), Some(1)))
+            .or_else(|| config.options.get(&(base, None)))
+            .or_else(|| config.options.get(&(legacy, None)))
+            .and_then(|v| match v {
+                OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s) if !s.is_empty() => Some(s.clone()),
+                OptionValue::Integer(i) => Some(i.to_string()),
+                _ => None,
+            })
     };
 
     // Only treat the cluster as connectable when a host or a unix-socket
     // directory is configured; otherwise leave the on-disk path as the source.
     // libpq accepts a directory in `host=` and reads it as a socket dir.
-    let host = opt("pg1-host").or_else(|| opt("pg1-socket-path"))?;
+    let host = opt("host").or_else(|| opt("socket-path"))?;
 
     let mut parts: Vec<String> = vec![format!("host={host}")];
-    if let Some(p) = opt("pg1-port") {
+    if let Some(p) = opt("port") {
         parts.push(format!("port={p}"));
     }
-    if let Some(db) = opt("pg1-database") {
+    if let Some(db) = opt("database") {
         parts.push(format!("dbname={db}"));
     }
-    if let Some(user) = opt("pg1-user") {
+    if let Some(user) = opt("user") {
         parts.push(format!("user={user}"));
     }
 

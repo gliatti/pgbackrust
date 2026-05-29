@@ -263,33 +263,45 @@ fn derive_conninfo_with_url(config: &LoadedConfig, database_url: Option<&str>) -
         return Some(url.to_owned());
     }
 
-    let opt = |name: &str| -> Option<String> {
-        match config.options.get(&(name.to_owned(), None)) {
-            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
-            Some(OptionValue::Integer(i)) => Some(i.to_string()),
-            _ => None,
-        }
+    // Group options are stored under the base name keyed by group index — a
+    // config-file `pg1-host` resolves to `("pg-host", Some(1))`, with an
+    // ungrouped `("pg-host", None)` fallback (the scheme `storage_helper` uses).
+    // Looking up `("pg1-host", None)` always misses. The flat `pg1-…` spelling
+    // is accepted last so unit-test fixtures that insert it keep working.
+    let opt = |field: &str| -> Option<String> {
+        let base = format!("pg-{field}");
+        let legacy = format!("pg1-{field}");
+        config
+            .options
+            .get(&(base.clone(), Some(1)))
+            .or_else(|| config.options.get(&(base, None)))
+            .or_else(|| config.options.get(&(legacy, None)))
+            .and_then(|v| match v {
+                OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s) if !s.is_empty() => Some(s.clone()),
+                OptionValue::Integer(i) => Some(i.to_string()),
+                _ => None,
+            })
     };
 
     // `pg1-host` / `pg1-socket-path` name where the server listens; when both are
     // absent but a local data dir (`pg1-path`) is configured, the cluster is local
     // and reached via libpq's default unix-socket directory. So `host` is optional
     // — omit it for the local case so libpq uses its default socket.
-    let host = opt("pg1-host").or_else(|| opt("pg1-socket-path"));
-    if host.is_none() && opt("pg1-path").is_none() {
+    let host = opt("host").or_else(|| opt("socket-path"));
+    if host.is_none() && opt("path").is_none() {
         return None;
     }
     let mut parts: Vec<String> = Vec::new();
     if let Some(host) = host {
         parts.push(format!("host={host}"));
     }
-    if let Some(p) = opt("pg1-port") {
+    if let Some(p) = opt("port") {
         parts.push(format!("port={p}"));
     }
-    if let Some(db) = opt("pg1-database") {
+    if let Some(db) = opt("database") {
         parts.push(format!("dbname={db}"));
     }
-    if let Some(user) = opt("pg1-user") {
+    if let Some(user) = opt("user") {
         parts.push(format!("user={user}"));
     }
 

@@ -931,17 +931,24 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
 /// standby's files are read from the primary instead (the backup stays consistent
 /// because start/stop run on the primary and the standby's replay is awaited).
 fn standby_local_path(config: &LoadedConfig, index: u32) -> Option<PathBuf> {
-    let opt = |name: &str| -> Option<String> {
-        match config.options.get(&(name.to_owned(), None)) {
-            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
-            _ => None,
-        }
+    let opt = |field: &str| -> Option<String> {
+        let base = format!("pg-{field}");
+        let legacy = format!("pg{index}-{field}");
+        config
+            .options
+            .get(&(base.clone(), Some(index)))
+            .or_else(|| config.options.get(&(base, None)))
+            .or_else(|| config.options.get(&(legacy, None)))
+            .and_then(|v| match v {
+                OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
     };
     // A configured host means the standby is remote — not locally readable.
-    if opt(&format!("pg{index}-host")).is_some() {
+    if opt("host").is_some() {
         return None;
     }
-    opt(&format!("pg{index}-path")).map(PathBuf::from)
+    opt("path").map(PathBuf::from)
 }
 
 /// Whether the resolved `archive-copy` option is set.
@@ -1092,20 +1099,34 @@ enum StandbyMode {
 /// as connectable only when a `pgN-host` or `pgN-socket-path` is configured (a
 /// bare local `pgN-path` is not enough to imply a live server).
 fn derive_conninfo_for_index(config: &LoadedConfig, pg_index: u32) -> Option<String> {
-    let opt = |name: &str| -> Option<String> {
-        match config.options.get(&(name.to_owned(), None)) {
-            Some(OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s)) if !s.is_empty() => Some(s.clone()),
-            Some(OptionValue::Integer(i)) => Some(i.to_string()),
-            _ => None,
-        }
+    // Group options are stored under the base name keyed by group index — a
+    // config-file `pg1-path` resolves to `("pg-path", Some(1))`, with an
+    // ungrouped `("pg-path", None)` fallback (the scheme `storage_helper`
+    // uses). Looking up `("pgN-path", None)` always misses, which is why a
+    // file-configured local cluster previously fell through to the DB-free
+    // path. The flat `pgN-…` spelling is still accepted last so unit-test
+    // fixtures that insert it directly keep working.
+    let opt = |field: &str| -> Option<String> {
+        let base = format!("pg-{field}");
+        let legacy = format!("pg{pg_index}-{field}");
+        config
+            .options
+            .get(&(base.clone(), Some(pg_index)))
+            .or_else(|| config.options.get(&(base, None)))
+            .or_else(|| config.options.get(&(legacy, None)))
+            .and_then(|v| match v {
+                OptionValue::String(s) | OptionValue::Path(s) | OptionValue::StringId(s) if !s.is_empty() => Some(s.clone()),
+                OptionValue::Integer(i) => Some(i.to_string()),
+                _ => None,
+            })
     };
     // A `pgN-host` / `pgN-socket-path` names where the server listens; when both
     // are absent but a local data dir (`pgN-path`) is configured, the cluster is
     // local and reached through libpq's default unix-socket directory (e.g.
     // `/var/run/postgresql`) — pgBackRest connects to a local cluster without an
     // explicit host. So `host` is optional: omit it for the local case.
-    let host = opt(&format!("pg{pg_index}-host")).or_else(|| opt(&format!("pg{pg_index}-socket-path")));
-    if host.is_none() && opt(&format!("pg{pg_index}-path")).is_none() {
+    let host = opt("host").or_else(|| opt("socket-path"));
+    if host.is_none() && opt("path").is_none() {
         // Neither a host/socket nor a local data dir: this index is not a
         // connectable cluster.
         return None;
@@ -1114,13 +1135,13 @@ fn derive_conninfo_for_index(config: &LoadedConfig, pg_index: u32) -> Option<Str
     if let Some(host) = host {
         parts.push(format!("host={host}"));
     }
-    if let Some(p) = opt(&format!("pg{pg_index}-port")) {
+    if let Some(p) = opt("port") {
         parts.push(format!("port={p}"));
     }
-    if let Some(db) = opt(&format!("pg{pg_index}-database")) {
+    if let Some(db) = opt("database") {
         parts.push(format!("dbname={db}"));
     }
-    if let Some(user) = opt(&format!("pg{pg_index}-user")) {
+    if let Some(user) = opt("user") {
         parts.push(format!("user={user}"));
     }
     // db-timeout + TCP keepalive parameters are global (not per-pgN); libpq parses
