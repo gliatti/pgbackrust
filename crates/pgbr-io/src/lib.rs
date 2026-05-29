@@ -33,6 +33,63 @@ pub use crate::filter::{Sha1, Sha256, Size};
 
 use std::cmp::min;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Default copy buffer size in bytes (64 KiB).
+///
+/// Matches the fixed buffer [`copy`] used before `buffer-size` became
+/// configurable. Used as the [`copy_buffer_size`] value until the CLI overrides
+/// it from the resolved `buffer-size` option.
+pub const DEFAULT_COPY_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Process-global copy buffer size in bytes, read by [`copy`].
+///
+/// The CLI sets this once at startup from the resolved `buffer-size` option (see
+/// [`set_copy_buffer_size`]). An `AtomicUsize` keeps the read on the hot copy
+/// path lock-free; `0` is treated as "use the default" so a misconfigured value
+/// never yields a zero-length buffer (which would make [`copy`] spin forever).
+static COPY_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_COPY_BUFFER_SIZE);
+
+/// Override the process-global copy buffer size [`copy`] allocates.
+///
+/// Called by the CLI from the resolved `buffer-size` option. A `size` of `0` is
+/// ignored (the previous value is kept) so an unset / malformed option can never
+/// shrink the buffer to nothing.
+pub fn set_copy_buffer_size(size: usize) {
+    if size > 0 {
+        COPY_BUFFER_SIZE.store(size, Ordering::Relaxed);
+    }
+}
+
+/// The current process-global copy buffer size in bytes.
+#[must_use]
+pub fn copy_buffer_size() -> usize {
+    let value = COPY_BUFFER_SIZE.load(Ordering::Relaxed);
+    if value == 0 { DEFAULT_COPY_BUFFER_SIZE } else { value }
+}
+
+/// Process-global I/O timeout in milliseconds, applied to blocking socket /
+/// stream reads and writes where a backend supports a deadline.
+///
+/// `0` means "no timeout configured" (the default); the CLI sets it from the
+/// resolved `io-timeout` option at startup via [`set_io_timeout_ms`]. Backends
+/// that honour a deadline read it through [`io_timeout`].
+static IO_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Override the process-global I/O timeout (milliseconds). `0` clears it.
+pub fn set_io_timeout_ms(millis: u64) {
+    IO_TIMEOUT_MS.store(millis, Ordering::Relaxed);
+}
+
+/// The configured I/O timeout as a [`std::time::Duration`], or `None` when no
+/// timeout is set (`0`).
+#[must_use]
+pub fn io_timeout() -> Option<std::time::Duration> {
+    match IO_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => None,
+        millis => Some(std::time::Duration::from_millis(millis)),
+    }
+}
 
 /// Errors raised by [`IoRead`] / [`IoWrite`] implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,14 +249,16 @@ impl<W: IoWrite + ?Sized> IoWrite for &mut W {
 }
 
 /// Drain `reader` fully into `writer`, returning the number of bytes copied.
-/// Uses a 64 KiB heap buffer. Does NOT flush or close the writer — the
-/// caller owns the writer's lifecycle.
+///
+/// Uses a heap buffer sized by the process-global [`copy_buffer_size`] (set by
+/// the CLI from the `buffer-size` option, defaulting to 64 KiB). Does NOT flush
+/// or close the writer — the caller owns the writer's lifecycle.
 ///
 /// # Errors
 ///
 /// Propagates the first [`IoError`] from either side.
 pub fn copy<R: IoRead + ?Sized, W: IoWrite + ?Sized>(reader: &mut R, writer: &mut W) -> Result<u64, IoError> {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; copy_buffer_size()];
     let mut total: u64 = 0;
     loop {
         let n = reader.read(&mut buf)?;
@@ -566,5 +625,58 @@ mod tests {
             r.read_all().unwrap()
         }
         assert_eq!(takes(&mut MemRead::new(b"xyz")), b"xyz");
+    }
+
+    /// Serialises the tests that mutate the process-global copy-buffer / timeout
+    /// state so they cannot observe each other's writes.
+    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn copy_buffer_size_defaults_and_round_trips() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Restore the default at the end so other tests using `copy` are unaffected.
+        set_copy_buffer_size(DEFAULT_COPY_BUFFER_SIZE);
+        assert_eq!(copy_buffer_size(), DEFAULT_COPY_BUFFER_SIZE);
+
+        // A non-zero value is honoured.
+        set_copy_buffer_size(16 * 1024);
+        assert_eq!(copy_buffer_size(), 16 * 1024);
+
+        // `0` is ignored — the previous value is kept (never shrinks to zero).
+        set_copy_buffer_size(0);
+        assert_eq!(copy_buffer_size(), 16 * 1024);
+
+        set_copy_buffer_size(DEFAULT_COPY_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn copy_uses_configured_buffer_size() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Set a tiny buffer so the copy must loop several times over the input;
+        // the result must still be the complete byte stream.
+        set_copy_buffer_size(4);
+        assert_eq!(copy_buffer_size(), 4);
+
+        let mut reader = MemRead::new(b"the quick brown fox");
+        let mut writer = MemWrite::new();
+        let n = copy(&mut reader, &mut writer).unwrap();
+        assert_eq!(n, 19);
+        assert_eq!(writer.as_slice(), b"the quick brown fox");
+
+        // Restore the default for the rest of the suite.
+        set_copy_buffer_size(DEFAULT_COPY_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn io_timeout_round_trips() {
+        let _g = GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_io_timeout_ms(0);
+        assert_eq!(io_timeout(), None, "0 means no timeout configured");
+
+        set_io_timeout_ms(1500);
+        assert_eq!(io_timeout(), Some(std::time::Duration::from_millis(1500)));
+
+        set_io_timeout_ms(0);
+        assert_eq!(io_timeout(), None);
     }
 }

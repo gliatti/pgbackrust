@@ -127,7 +127,14 @@ fn build_repo_storage_at(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Stora
     // Inter-host operation: the repo lives on another host. Spawn a pgbackrest
     // worker there over SSH and proxy storage to it. The worker is rooted at the
     // remote `repo1-path`, which the worker side resolves from the same option.
-    if let Some(host) = string_option(cfg, "repo-host", index) {
+    //
+    // `repo-local` (or a worker `remote-type=repo`) forces the *local* backend
+    // even when `repo-host` is set — the worker that runs on the repo host is
+    // itself local to that repository, so it must not recurse into another SSH
+    // hop. C ref: `storageRepoGet`'s `repoIsLocal` check.
+    if !force_local(cfg, "repo-local", "repo", index)
+        && let Some(host) = string_option(cfg, "repo-host", index)
+    {
         let path = path_option(cfg, "repo-path", index).unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_PATH));
         return build_remote_host_storage(cfg, &host, "repo", "repo1-path", &path, index);
     }
@@ -225,11 +232,31 @@ pub fn build_pg_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunEr
     let root = path_option(cfg, "pg-path", PG_INDEX)
         .ok_or_else(|| CliRunError::StorageConfig("pg-path is required to build PG storage but is not set".to_owned()))?;
 
-    if let Some(host) = string_option(cfg, "pg-host", PG_INDEX) {
+    // `pg-local` (or a worker `remote-type=pg`) forces the local backend even
+    // when `pg-host` is set, mirroring the repo side: the worker running on the
+    // PG host serves its own local data dir and must not open a second SSH hop.
+    if !force_local(cfg, "pg-local", "pg", PG_INDEX)
+        && let Some(host) = string_option(cfg, "pg-host", PG_INDEX)
+    {
         return build_remote_host_storage(cfg, &host, "pg", "pg1-path", &root, PG_INDEX);
     }
 
     Ok(Box::new(Posix::new(root)))
+}
+
+/// Whether the local backend is forced for `family` (`pg` / `repo`) at group
+/// index `index`, even when a `<family>-host` is configured.
+///
+/// True when the `<family>-local` boolean option is set, or when a worker's
+/// `remote-type` string-id names this family (a `remote-type=repo` worker treats
+/// the repository as local; `remote-type=pg` treats the PG data dir as local).
+/// Mirrors the C `pgIsLocal` / `repoIsLocal` predicates in `src/storage/helper.c`.
+fn force_local(cfg: &LoadedConfig, local_option: &str, family: &str, index: u32) -> bool {
+    if boolean_option(cfg, local_option, index) == Some(true) {
+        return true;
+    }
+    // A worker invoked with `--remote-type=<family>` is local to that family.
+    string_option(cfg, "remote-type", index).is_some_and(|t| t == family)
 }
 
 /// Build the inter-host storage transport for `host`, selecting SSH or TLS by
@@ -1470,5 +1497,91 @@ mod tests {
             Ok(_) => panic!("expected StorageConfig(unknown host-type), got Ok(storage)"),
             Err(other) => panic!("expected StorageConfig(unknown host-type), got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // repo-local / pg-local / remote-type force-local routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repo_local_forces_local_posix_despite_repo_host() {
+        // `repo-host` is set (which would normally route to the SSH/TLS remote
+        // path) but `repo-local=true` forces the local posix backend. We prove
+        // it is local by round-tripping a file through the repo-path tempdir —
+        // the remote path never touches the local filesystem.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("repo-local", Some(1), OptionValue::Boolean(true)),
+                ("repo-path", Some(1), OptionValue::Path(repo.path().display().to_string())),
+            ],
+        );
+        let storage = build_repo_storage(&config).expect("repo-local must build a local posix backend");
+        put(storage.as_ref(), "local.txt", b"x");
+        assert!(
+            repo.path().join("local.txt").exists(),
+            "repo-local should force a local backend rooted at repo-path"
+        );
+    }
+
+    #[test]
+    fn repo_local_false_still_routes_remote() {
+        // With `repo-local=false` (the default) and `repo-host` set, the remote
+        // path is taken — proven by the absence of NotSupportedYet and an
+        // Ok/Protocol outcome from the SSH spawn (never a local posix build).
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("repo-local", Some(1), OptionValue::Boolean(false)),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Ok(_) | Err(CliRunError::Protocol(_)) => {}
+            Err(other) => panic!("expected SSH spawn outcome (Ok or Protocol), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_local_forces_local_posix_despite_pg_host() {
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let config = cfg(
+            "backup",
+            &[
+                ("pg-host", Some(1), OptionValue::String("db.example.com".to_owned())),
+                ("pg-local", Some(1), OptionValue::Boolean(true)),
+                ("pg-path", Some(1), OptionValue::Path(pg.path().display().to_string())),
+            ],
+        );
+        let storage = build_pg_storage(&config).expect("pg-local must build a local posix backend");
+        std::fs::write(pg.path().join("PG_VERSION"), b"16").expect("seed");
+        assert!(
+            storage.exists(Path::new("PG_VERSION")).expect("exists"),
+            "pg-local should force a local backend rooted at pg-path"
+        );
+    }
+
+    #[test]
+    fn remote_type_repo_forces_local_repo_backend() {
+        // A worker invoked with `--remote-type=repo` treats the repository as
+        // local even though `repo-host` is configured.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
+                ("remote-type", None, OptionValue::StringId("repo".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path(repo.path().display().to_string())),
+            ],
+        );
+        let storage = build_repo_storage(&config).expect("remote-type=repo must build a local backend");
+        put(storage.as_ref(), "rt.txt", b"y");
+        assert!(
+            repo.path().join("rt.txt").exists(),
+            "remote-type=repo should force a local repo backend"
+        );
     }
 }

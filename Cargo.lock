@@ -938,9 +938,11 @@ dependencies = [
 name = "pgbr-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "pgbr-build",
  "pgbr-command",
  "pgbr-config",
+ "pgbr-core",
  "pgbr-info",
  "pgbr-io",
  "pgbr-postgres",
