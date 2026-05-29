@@ -21,14 +21,16 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
   apt-get update -qq
 fi
 
-# libpq is required at runtime by the pgbr-db crate.
-apt-get install -y -qq libpq5 >/dev/null || true
+# Runtime shared libraries the pgbackrest binary links (readelf NEEDED):
+# libpq (pgbr-db), libbz2 (bz2 compress), libssl/libcrypto, libz (gz). All but
+# libpq are part of the Debian base, but install them explicitly to be safe.
+apt-get install -y -qq libpq5 libbz2-1.0 libssl3 zlib1g >/dev/null || true
 
 # --- pgBackRest runtime directories (KB layout) ----------------------------
 echo "[common] runtime directories"
 install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest 2>/dev/null || install -d -m 0750 /var/log/pgbackrest
 install -d -m 0750 /var/spool/pgbackrest
-install -d -m 0750 /etc/pgbackrest /etc/pgbackrest/conf.d
+install -d -m 0755 /etc/pgbackrest /etc/pgbackrest/conf.d
 install -d -m 0750 /etc/certs
 
 # --- install the Rust pgbackrest binary (uploaded to /tmp by Vagrant) -------
