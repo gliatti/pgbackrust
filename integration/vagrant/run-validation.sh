@@ -34,7 +34,9 @@ assert_contains() {
 ok() {
   local desc="$1" node="$2"; shift 2
   local out rc
-  out=$(pg "$node" "$*"); rc=$?
+  # Hard 600s cap per command so a hang (e.g. a stuck pg_backup_stop waiting on
+  # a never-archived WAL) fails the step instead of blocking the whole run.
+  out=$(pg "$node" "timeout 600 $*"); rc=$?
   if [ "$rc" -eq 0 ]; then pass "$desc"; else printf '%s\n' "$out" | grep -v 'Connection to' | tail -5 >&2; fail "$desc (exit $rc)"; fi
 }
 

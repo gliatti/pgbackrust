@@ -560,6 +560,20 @@ fn check_wal_header(bytes: &[u8], segment: &str, info: &InfoArchive) -> Result<(
     Ok(())
 }
 
+/// Whether `name` is a real WAL segment whose first page carries a long header
+/// the `archive-header-check` can validate.
+///
+/// True for a full 24-hex segment (`0000000100000000000000AB`) and for a partial
+/// segment (`…AB.partial`); false for the non-WAL files `PostgreSQL` also hands
+/// to `archive-push` — a backup history file (`<seg>.<off>.backup`) and a
+/// timeline history file (`<tli>.history`) — which have no WAL page header and
+/// must be archived verbatim rather than header-checked (and rejected).
+/// Mirrors pgBackRest's `walIsSegment()`.
+fn is_checkable_wal_segment(name: &str) -> bool {
+    let base = name.strip_suffix(".partial").unwrap_or(name);
+    parse_wal_segment(base).is_some()
+}
+
 /// Load the stanza's `archive.info` from the first repository that has it,
 /// decrypting it with that repository's cipher passphrase when the repo is
 /// encrypted. Used to resolve the archive-id directory (`<db-version>-<db-id>`)
@@ -712,8 +726,15 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     // archive-header-check: validate the WAL segment's long-page header against
     // the stanza's archive.info before storing, rejecting a segment that belongs
     // to a different cluster / version / timeline. Skipped when the option is
-    // disabled.
-    let header_info = archive_header_check(config).then_some(&archive_info);
+    // disabled, AND only ever applied to a real WAL segment: a backup history
+    // file (`<seg>.<off>.backup`) or a timeline history file (`<tli>.history`)
+    // carries no WAL page header, so header-checking it would wrongly reject it.
+    // PostgreSQL's archiver retries the SAME file until it succeeds and never
+    // advances the queue, so rejecting a `.backup` file blocks every later
+    // segment — including the stop-segment `pg_backup_stop(wait_for_archive)`
+    // waits on — and the backup hangs forever. Mirrors pgBackRest gating the
+    // header check on `walIsSegment()`.
+    let header_info = (archive_header_check(config) && is_checkable_wal_segment(segment)).then_some(&archive_info);
 
     // Asynchronous mode: stage the segment in the spool out/ directory and let
     // the background drain move it to the repository. Before staging, consume
