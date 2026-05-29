@@ -542,6 +542,34 @@ if [ "$rows" = "1500" ]; then pass "async repo restored data (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "async repo restored data (got: $rows)"; fi
 
 ############################################################################
+hd "Scenario 13 — restore to an alternate datadir (--pg1-path=<other>)"
+# pgBackRest's restore can target a different PGDATA directory via --pg1-path
+# (command.html). The restored cluster must start on its own port and serve
+# the backed-up data; recovery requires that PG's restore_command — which runs
+# `pgbackrest archive-get %f "%p"` with cwd=PGDATA — actually delivers the
+# fetched WAL to the cwd-relative %p (not under pg1-path). This scenario
+# regression-guards that contract, fixed in c4ef0bb30.
+ALT=/var/lib/postgresql/$PGV/alt-restore
+prepare_principal
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup (for alt restore)" principal "pgbackrest --stanza=demo --type=full backup"
+pg principal "$BIN/pg_ctl -D $ALT -m fast -w stop" >/dev/null 2>&1 || true
+on principal "rm -rf $ALT; install -d -o postgres -g postgres -m 0700 $ALT"
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "restore --pg1-path=$ALT (alternate datadir)" principal "pgbackrest --stanza=demo --pg1-path=$ALT --delta restore"
+pv=$(on principal "test -f $ALT/PG_VERSION && cat $ALT/PG_VERSION || echo MISSING")
+assert_contains "$pv" "$PGV" "alt-restore PG_VERSION present"
+pg principal "$BIN/pg_ctl -D $ALT -o '-p 5434' -l $ALT/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5434 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "1500" ]; then pass "alt cluster recovered + serves 1500 rows on port 5434"
+else pg principal "tail -25 $ALT/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "alt cluster rows (got: $rows)"; fi
+pg principal "$BIN/pg_ctl -D $ALT -m fast -w stop" >/dev/null 2>&1
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w start" >/dev/null 2>&1
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
