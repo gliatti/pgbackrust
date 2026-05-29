@@ -384,6 +384,41 @@ fn db_list(config: &LoadedConfig, name: &str) -> Vec<String> {
 /// `recovery.conf` of earlier versions. Mirrors C's `PG_VERSION_RECOVERY_GUC`.
 const PG_VERSION_RECOVERY_GUC: u32 = 12;
 
+/// `PostgreSQL` runtime directories restore always re-creates (empty) so a
+/// fresh-PGDATA restore yields a startable cluster.
+///
+/// The backup keeps the transient runtime *directories* themselves in the
+/// manifest but never descends into them (their contents are transient and not
+/// worth capturing). Their required *subdirectories* — most critically
+/// `pg_wal/archive_status`, where `PostgreSQL` writes `.ready` / `.done`
+/// markers during archive recovery — are therefore absent from the manifest. A
+/// restore into an empty PGDATA must materialise the full skeleton or the
+/// server FATALs at start (e.g. `could not open directory "pg_notify"`).
+///
+/// Only directories are listed (restore creates no files). `replorigin_checkpoint`
+/// under `pg_logical` is a file `PostgreSQL` writes itself, so it is intentionally
+/// omitted. Paths are PG-data-relative, `/`-separated. Each is created
+/// recursively + idempotently, so one already made by a manifest path (or a
+/// parent listed earlier here) is a no-op. Mirrors the empty directories
+/// pgBackRest's restore lays down for a complete cluster skeleton.
+const PG_RUNTIME_SKELETON_DIRS: &[&str] = &[
+    "pg_wal",
+    "pg_wal/archive_status",
+    "pg_notify",
+    "pg_replslot",
+    "pg_serial",
+    "pg_snapshots",
+    "pg_dynshmem",
+    "pg_stat_tmp",
+    "pg_subtrans",
+    "pg_stat",
+    "pg_logical",
+    "pg_logical/snapshots",
+    "pg_logical/mappings",
+    "pg_commit_ts",
+    "pg_tblspc",
+];
+
 /// The resolved `--type` (recovery target type) for a restore. Mirrors C's
 /// `CFGOPTVAL_RESTORE_TYPE_*`. Only the variants this slice acts on are modelled;
 /// `preserve` is treated like `default` here (its leave-existing-file behaviour is
@@ -1907,6 +1942,23 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         paths_created += 1;
     }
 
+    // 1b. Guarantee the PostgreSQL runtime-directory skeleton exists. The backup
+    //     keeps the transient runtime *directories* in the manifest (recreated by
+    //     step 1) but never descends into them, so their required *subdirectories*
+    //     (e.g. `pg_wal/archive_status`, `pg_logical/snapshots`) are not recorded.
+    //     A fresh-PGDATA restore (the standard way to seed a streaming standby)
+    //     would then leave PostgreSQL unable to start — e.g. `FATAL: could not
+    //     open directory "pg_notify"`. Recreate the full skeleton here, mirroring
+    //     pgBackRest restoring the complete cluster directory layout. Each create
+    //     is recursive/idempotent (an already-present dir, e.g. one a manifest
+    //     path just made, is a no-op success). Skipped on dry-run. C ref: the
+    //     directories pgBackRest's `manifestBuildInfo` always records as empty.
+    if !dry_run {
+        for dir in PG_RUNTIME_SKELETON_DIRS {
+            pg.create_path(Path::new(dir), true)?;
+        }
+    }
+
     // 2. Plan every file copy on the main thread — reference resolution,
     //    db-include/exclude filtering, delta matching, and source-backup /
     //    transform selection all stay here, exactly as the serial path decided
@@ -2505,6 +2557,80 @@ mod tests {
             let info = pg_s.info(Path::new(dir)).unwrap_or_else(|_| panic!("dir {dir} should exist"));
             assert_eq!(info.kind, pgbr_storage::StorageKind::Path, "{dir} should be a directory");
         }
+    }
+
+    #[test]
+    fn restore_into_fresh_pgdata_creates_runtime_dir_skeleton() {
+        // Restoring into a FRESH/empty PGDATA (how a streaming standby is seeded)
+        // must materialise the full PostgreSQL runtime-directory skeleton, even
+        // though the backup never descends into those transient dirs. The critical
+        // one is `pg_wal/archive_status` (PG writes `.ready`/`.done` markers there
+        // during archive recovery); without it the cluster FATALs at start. This
+        // is the restore half of the fix for `FATAL: could not open directory
+        // "pg_notify"`.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        // A real post-fix manifest records the bare runtime dirs (pg_notify,
+        // pg_wal, …) as empty paths but NOT their subdirectories. Seed only a
+        // couple of them plus a relation dir; the restore must fill in the rest.
+        seed_backup(&repo_s, stanza, label, &[], &["base", "base/1", "pg_notify", "pg_wal"], &[]);
+
+        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.files_restored, 0);
+
+        // Every required runtime directory exists after restore, including the
+        // deep subdirs absent from the manifest (`pg_wal/archive_status`,
+        // `pg_logical/snapshots`, …).
+        for dir in [
+            "pg_wal",
+            "pg_wal/archive_status",
+            "pg_notify",
+            "pg_replslot",
+            "pg_serial",
+            "pg_snapshots",
+            "pg_dynshmem",
+            "pg_stat_tmp",
+            "pg_subtrans",
+            "pg_stat",
+            "pg_logical",
+            "pg_logical/snapshots",
+            "pg_logical/mappings",
+            "pg_commit_ts",
+            "pg_tblspc",
+        ] {
+            let info = pg_s
+                .info(Path::new(dir))
+                .unwrap_or_else(|_| panic!("runtime dir {dir} must exist after fresh-PGDATA restore"));
+            assert_eq!(info.kind, pgbr_storage::StorageKind::Path, "{dir} must be a directory");
+        }
+        // The manifest's own relation dirs were created too.
+        assert_eq!(
+            pg_s.info(Path::new("base/1")).expect("base/1").kind,
+            pgbr_storage::StorageKind::Path
+        );
+    }
+
+    #[test]
+    fn restore_dry_run_skips_runtime_dir_skeleton() {
+        // A dry-run must not mutate the target: the runtime-dir skeleton is
+        // created only on a real restore.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["pg_notify"], &[]);
+
+        restore_inner(&cfg_dry_run(Some(stanza), None), &repo_s, &pg_s).expect("dry-run restore");
+
+        assert!(
+            pg_s.info(Path::new("pg_wal/archive_status")).is_err(),
+            "dry-run must not create the runtime-dir skeleton"
+        );
+        assert!(pg_s.info(Path::new("pg_notify")).is_err(), "dry-run must create no dirs");
     }
 
     #[test]

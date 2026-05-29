@@ -450,6 +450,18 @@ fn is_excluded(rel: &str) -> bool {
     is_pg_internal_init(basename)
 }
 
+/// Whether a PG-data-relative path is **exactly** one of [`EXCLUDE_PREFIXES`]
+/// (the directory itself, not a path beneath it).
+///
+/// pgBackRest keeps these transient runtime directories in the manifest as
+/// *empty* paths so restore recreates the directory, while still excluding
+/// every file/subdir under them. This distinguishes the directory (recorded)
+/// from its contents (skipped). Used by [`plan_backup`] and to gate recursion
+/// in [`walk_into`].
+fn is_excluded_dir(rel: &str) -> bool {
+    EXCLUDE_PREFIXES.contains(&rel)
+}
+
 /// Whether a basename is `pg_internal.init` or a `pg_internal.init.<digits>`
 /// temp variant.
 ///
@@ -672,8 +684,15 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
                 } else {
                     dir.join(&name)
                 };
+                let descend = !is_excluded_dir(&rel);
                 out.push(WalkEntry { rel: rel.clone(), info });
-                walk_into(storage, &child_dir, &rel, out)?;
+                // A built-in excluded runtime directory (`pg_notify`, `pg_wal`, …)
+                // is emitted as a path so restore recreates the empty dir, but we
+                // never descend into it: its contents are transient (and may
+                // vanish mid-walk), and pgBackRest captures only the dir itself.
+                if descend {
+                    walk_into(storage, &child_dir, &rel, out)?;
+                }
             }
             _ => out.push(WalkEntry { rel, info }),
         }
@@ -2866,6 +2885,16 @@ fn plan_backup(
     };
 
     for entry in walk(pg_storage, Path::new("."))? {
+        // A built-in excluded runtime directory (`pg_notify`, `pg_wal`, …) is
+        // kept in the manifest as an *empty* path so a fresh-PGDATA restore
+        // recreates it, but its contents are never captured. The walk does not
+        // descend into these dirs, so only the bare directory entry arrives.
+        if is_excluded_dir(&entry.rel) && entry.info.kind == StorageKind::Path && !is_user_excluded(&entry.rel, excludes) {
+            plan.paths.push(ManifestPath { path: entry.rel });
+            continue;
+        }
+        // Anything underneath an excluded runtime dir, an excluded root file,
+        // `pg_internal.init`, or a user `--exclude` match is dropped entirely.
         if is_excluded(&entry.rel) || is_user_excluded(&entry.rel, excludes) {
             continue;
         }
@@ -4271,6 +4300,63 @@ mod tests {
             let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
             assert!(!backup_root.join(excluded).exists(), "{excluded} must not be copied");
         }
+        // The real relation survives.
+        assert!(manifest.file("base/1/1259").is_some(), "real relation must be backed up");
+    }
+
+    #[test]
+    fn backup_records_excluded_runtime_dir_as_empty_path_not_its_contents() {
+        // A transient runtime directory (`pg_notify`) holding a file must be kept
+        // in the manifest as an EMPTY path so a fresh-PGDATA restore recreates the
+        // directory, while its contents are never captured. This is the backup
+        // half of the fix for `FATAL: could not open directory "pg_notify"`.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"keep this relation");
+        // pg_notify with content (mirrors a live cluster's NOTIFY SLRU segments).
+        seed_file(&pg_s, "pg_notify/0000", b"transient notify slru");
+        // A second excluded runtime dir, also with content.
+        seed_file(&pg_s, "pg_subtrans/0000", b"transient subtrans slru");
+
+        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        // The directory itself is recorded as an (empty) manifest path...
+        let path_set: Vec<&str> = manifest.paths.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            path_set.contains(&"pg_notify"),
+            "pg_notify dir must be a manifest path: {path_set:?}"
+        );
+        assert!(
+            path_set.contains(&"pg_subtrans"),
+            "pg_subtrans dir must be a manifest path: {path_set:?}"
+        );
+        // ...recorded exactly once.
+        assert_eq!(
+            path_set.iter().filter(|p| **p == "pg_notify").count(),
+            1,
+            "pg_notify recorded once"
+        );
+
+        // ...but its contents are NOT recorded as files.
+        let listed: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !listed.iter().any(|p| p.starts_with("pg_notify/")),
+            "pg_notify contents must be excluded: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|p| p.starts_with("pg_subtrans/")),
+            "pg_subtrans contents must be excluded: {listed:?}"
+        );
+        // The contents were not physically copied either.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+        assert!(
+            !backup_root.join("pg_notify/0000").exists(),
+            "pg_notify content must not be copied"
+        );
         // The real relation survives.
         assert!(manifest.file("base/1/1259").is_some(), "real relation must be backed up");
     }
