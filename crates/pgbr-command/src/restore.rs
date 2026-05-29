@@ -1238,7 +1238,9 @@ fn read_bundle_slice(path: &Path, offset: u64, len: u64, transform: &RepoTransfo
     let mut repo_bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
     file.read_exact(&mut repo_bytes)
         .map_err(|err| CommandError::Other(format!("read {}: {err}", path.display())))?;
-    Ok(transform.apply_reverse(&repo_bytes)?)
+    // Keyed (SHA-1 KDF) reverse chain, the exact inverse of the keyed forward
+    // chain the backup wrote with; identity-equal to the legacy path with no key.
+    Ok(transform.apply_reverse_keyed(&repo_bytes)?)
 }
 
 /// Slice `len` bytes at `offset` out of the already-buffered `bundle` bytes,
@@ -1255,7 +1257,7 @@ fn read_bundle_slice_buffered(bundle: &[u8], offset: u64, len: u64, transform: &
         .checked_add(count)
         .filter(|&end| end <= bundle.len())
         .ok_or_else(|| CommandError::Other(format!("bundle slice {start}..+{count} out of range (len {})", bundle.len())))?;
-    Ok(transform.apply_reverse(&bundle[start..end])?)
+    Ok(transform.apply_reverse_keyed(&bundle[start..end])?)
 }
 
 /// The member offsets within one bundle object, used to derive each member's
@@ -1316,6 +1318,20 @@ fn bundle_layout(
     })
 }
 
+/// Build the restore transform for a backup from its recorded `backup.info`
+/// metadata, overriding the cipher key with the resolved repository `sub_key`.
+///
+/// [`RepoTransform::from_metadata`] reads the compress-type / encrypted flag the
+/// backup recorded but sources the cipher password from the (non-existent for
+/// restore) `cipher-pass` option, so it would leave the key empty on an encrypted
+/// repo. The real key is the repository sub-key, recovered from the decrypted
+/// `archive.info`; inject it here so the reverse chain can decrypt. `sub_key`
+/// `None` (unencrypted repo) leaves the transform a plain decompress/identity.
+fn restore_transform(metadata: &serde_json::Value, config: &LoadedConfig, sub_key: Option<&str>) -> RepoTransform {
+    let base = RepoTransform::from_metadata(metadata, config);
+    RepoTransform::with_key(base.compress_type, base.compress_level, sub_key.map(str::to_owned))
+}
+
 /// Resolves each manifest file to a physical [`RestoreSource`], following a
 /// whole-file `reference` to the backup that holds the bytes and caching the
 /// referenced manifests + bundle layouts it loads.
@@ -1328,6 +1344,11 @@ struct SourceResolver<'a> {
     transform: &'a RepoTransform,
     manifest: &'a Manifest,
     info: &'a InfoBackup,
+    /// The resolved repository sub-key (`None` for an unencrypted repo). Used to
+    /// decrypt referenced / holder manifests and to key their transforms — the
+    /// sub-key is the repository's, so the same value applies to every backup in
+    /// the stanza.
+    sub_key: Option<String>,
     /// Cache of loaded referenced-backup manifests, keyed by label.
     manifest_cache: BTreeMap<String, Manifest>,
     /// Cache of bundle layouts, keyed by `(holder label, bundle id)`.
@@ -1344,6 +1365,7 @@ impl<'a> SourceResolver<'a> {
         transform: &'a RepoTransform,
         manifest: &'a Manifest,
         info: &'a InfoBackup,
+        sub_key: Option<String>,
     ) -> Self {
         Self {
             repo,
@@ -1353,21 +1375,22 @@ impl<'a> SourceResolver<'a> {
             transform,
             manifest,
             info,
+            sub_key,
             manifest_cache: BTreeMap::new(),
             layout_cache: BTreeMap::new(),
         }
     }
 
     /// The transform a backup `holder_label` applied, from its `backup.info`
-    /// entry (cipher password from the restore options). Falls back to the
-    /// restored backup's transform when the holder has no recorded metadata.
+    /// entry, keyed with the repository sub-key. Falls back to the restored
+    /// backup's transform when the holder has no recorded metadata.
     fn holder_transform(&self, holder_label: &str) -> RepoTransform {
         if holder_label == self.label {
             return self.transform.clone();
         }
         self.info.current.get(holder_label).map_or_else(
             || self.transform.clone(),
-            |entry| RepoTransform::from_metadata(entry, self.config),
+            |entry| restore_transform(entry, self.config, self.sub_key.as_deref()),
         )
     }
 
@@ -1377,12 +1400,15 @@ impl<'a> SourceResolver<'a> {
         match self.manifest_cache.entry(holder_label.to_owned()) {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(e) => {
-                let m = Manifest::load(self.repo, &manifest_path(self.stanza, holder_label)).map_err(|err| match err {
-                    InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
-                        path: manifest_path(self.stanza, holder_label),
-                    }),
-                    other => CommandError::Other(other.to_string()),
-                })?;
+                // A referenced backup's manifest is encrypted with the same
+                // repository sub-key; load it keyed (`None` == plaintext).
+                let m = Manifest::load_keyed(self.repo, &manifest_path(self.stanza, holder_label), self.sub_key.as_deref())
+                    .map_err(|err| match err {
+                        InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
+                            path: manifest_path(self.stanza, holder_label),
+                        }),
+                        other => CommandError::Other(other.to_string()),
+                    })?;
                 Ok(e.insert(m))
             }
         }
@@ -1594,9 +1620,9 @@ fn restore_file(job: &RestoreCopyJob) -> Result<(), CommandError> {
         RestoreSource::Standalone { abs_src, transform, .. } => {
             let repo_bytes =
                 std::fs::read(abs_src).map_err(|err| CommandError::Other(format!("read {}: {err}", abs_src.display())))?;
-            // Reverse the transform: decrypt then decompress. With the identity
-            // transform this returns the bytes unchanged.
-            transform.apply_reverse(&repo_bytes)?
+            // Reverse the keyed transform: decrypt then decompress. With no key
+            // (and no compression) this returns the bytes unchanged.
+            transform.apply_reverse_keyed(&repo_bytes)?
         }
         RestoreSource::Bundled {
             abs_bundle,
@@ -1641,7 +1667,7 @@ fn restore_file_storage(job: &RestoreCopyJob, repo: &dyn Storage) -> Result<(), 
     let plaintext = match &job.source {
         RestoreSource::Standalone { repo_src, transform, .. } => {
             let repo_bytes = read_repo_object(repo, repo_src)?;
-            transform.apply_reverse(&repo_bytes)?
+            transform.apply_reverse_keyed(&repo_bytes)?
         }
         RestoreSource::Bundled {
             repo_bundle,
@@ -1851,12 +1877,20 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
 
     let (label, metadata, info) = select_backup(config, repo, stanza)?;
 
-    // The transform the restored backup applied — read from the recorded
-    // metadata, with the resolved options supplying the cipher password (never
-    // stored in the repo) and any value the metadata omits.
-    let transform = RepoTransform::from_metadata(&metadata, config);
+    // On an encrypted repository the data files and `backup.manifest` are
+    // encrypted with the repository sub-key (recovered from the decrypted
+    // `archive.info`), the same key the backup wrote them with. `None` for an
+    // unencrypted repo (the plaintext path). The sub-key is the repository's, so
+    // it decrypts every backup in the stanza — including any referenced /
+    // holder backups resolved below.
+    let sub_key = crate::cipher::active_sub_key(repo, config, stanza)?;
 
-    let manifest = Manifest::load(repo, &manifest_path(stanza, &label)).map_err(|err| match err {
+    // The transform the restored backup applied — compress-type / encrypted flag
+    // come from the recorded metadata; the cipher key is the resolved repository
+    // sub-key (never stored in the repo).
+    let transform = restore_transform(&metadata, config, sub_key.as_deref());
+
+    let manifest = Manifest::load_keyed(repo, &manifest_path(stanza, &label), sub_key.as_deref()).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
             path: manifest_path(stanza, &label),
         }),
@@ -1890,7 +1924,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     // builds the physical source (standalone / bundled / block map). It caches
     // referenced manifests + bundle layouts so a multi-file backup loads each
     // referenced manifest at most once.
-    let mut resolver = SourceResolver::new(repo, stanza, config, &label, &transform, &manifest, &info);
+    let mut resolver = SourceResolver::new(repo, stanza, config, &label, &transform, &manifest, &info, sub_key);
     for file in &manifest.files {
         let dst = PathBuf::from(&file.path);
 
@@ -3388,7 +3422,7 @@ mod tests {
 
     // ---- end-to-end backup -> restore round trips --------------------------
 
-    use crate::backup::backup_inner;
+    use crate::backup::{backup_inner, backup_inner_keyed};
     use crate::pipeline::{CompressType, RepoTransform};
 
     /// Pre-create `backup.info` with an empty `[backup:current]` so `backup_inner`
@@ -3416,6 +3450,77 @@ mod tests {
         repo.create_path(Path::new(&format!("backup/{stanza}")), true)
             .expect("create backup/<stanza>");
         info.save(repo, &super::backup_info_path(stanza)).expect("save backup.info");
+    }
+
+    /// Seed an **encrypted** repository: `backup.info` encrypted under
+    /// `user_pass`, plus an `archive.info` carrying `sub_key` in its `[cipher]`
+    /// section (also under `user_pass`). This is what `restore_inner` reads — it
+    /// decrypts `backup.info` with the user pass and recovers the repository
+    /// sub-key (which decrypts the data files + manifest) from `archive.info`,
+    /// matching the on-disk layout stanza-create writes for an encrypted repo.
+    fn init_stanza_encrypted(repo: &Posix, stanza: &str, user_pass: &str, sub_key: &str) {
+        let mut backup_history = BTreeMap::new();
+        backup_history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current: BTreeMap::new(),
+            history: backup_history,
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup/<stanza>");
+        // backup.info is encrypted under the user passphrase; the recorded
+        // `[cipher]` sub-key is the repository sub-key.
+        info.save_keyed(repo, &super::backup_info_path(stanza), Some(user_pass), Some(sub_key))
+            .expect("save encrypted backup.info");
+
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+        let archive = pgbr_info::InfoArchive {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            history,
+        };
+        repo.create_path(Path::new(&format!("archive/{stanza}")), true)
+            .expect("create archive/<stanza>");
+        archive
+            .save_keyed(
+                repo,
+                Path::new(&format!("archive/{stanza}/archive.info")),
+                Some(user_pass),
+                Some(sub_key),
+            )
+            .expect("save encrypted archive.info");
+    }
+
+    /// `repo-cipher-type=aes-256-cbc` + `repo-cipher-pass=<user_pass>` options for
+    /// a restore against an encrypted repo (the user passphrase, which unlocks the
+    /// recorded sub-key — not the sub-key itself).
+    fn repo_cipher_opts(user_pass: &str) -> Vec<((&str, Option<u32>), OptionValue)> {
+        vec![
+            (("repo-cipher-type", Some(1)), OptionValue::StringId("aes-256-cbc".to_owned())),
+            (("repo-cipher-pass", Some(1)), OptionValue::String(user_pass.to_owned())),
+        ]
     }
 
     /// Write `bytes` to a PG-data-relative path under `pg`, creating parents.
@@ -3549,18 +3654,31 @@ mod tests {
 
         let stanza = "demo";
         let label = "20240101-120000F";
-        init_stanza(&repo_s, stanza);
+        // Encrypted repo: the sub-key "backup-secret" is recorded in archive.info
+        // under the user passphrase "user-pass". backup_inner is handed the
+        // sub-key directly via the transform; restore_inner recovers the same key
+        // from archive.info — both agree, as on a real encrypted repo.
+        init_stanza_encrypted(&repo_s, stanza, "user-pass", "backup-secret");
         for (rel, bytes) in FILES {
             seed_pg_file(&pg_src_s, rel, bytes);
         }
 
-        // zst + AES-256-CBC.
+        // zst + AES-256-CBC (repo sub-key as the cipher pass).
         let transform = RepoTransform {
             compress_type: CompressType::Zst,
             compress_level: 3,
             cipher_pass: Some("backup-secret".to_owned()),
         };
-        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("backup");
+        backup_inner_keyed(
+            stanza,
+            &repo_s,
+            &pg_src_s,
+            label,
+            1_704_110_400,
+            &transform,
+            Some("user-pass"),
+        )
+        .expect("backup");
 
         for (rel, bytes) in FILES {
             let repo_path = repo_dir.path().join(format!("backup/{stanza}/{label}/{rel}.zst"));
@@ -3578,15 +3696,89 @@ mod tests {
             );
         }
 
-        // Restore must supply the cipher password (not stored in the repo); the
-        // compress-type comes from the recorded metadata.
-        let cfg = restore_cfg(
-            stanza,
-            vec![(("cipher-pass", None), OptionValue::String("backup-secret".to_owned()))],
-        );
+        // Restore supplies the user passphrase (`repo-cipher-pass`), which unlocks
+        // the recorded sub-key; the compress-type comes from the recorded metadata.
+        let cfg = restore_cfg(stanza, repo_cipher_opts("user-pass"));
         let outcome = restore_inner(&cfg, &repo_s, &pg_dst_s).expect("restore");
         assert_eq!(outcome.files_restored, FILES.len());
 
+        for (rel, bytes) in FILES {
+            let restored = {
+                let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored");
+                r.read_all().expect("read restored")
+            };
+            assert_eq!(restored.as_slice(), *bytes, "round trip mismatch for {rel}");
+        }
+    }
+
+    /// End-to-end encrypted-repo round trip exercising the real two-level key
+    /// flow: the repository sub-key is resolved from an encrypted `archive.info`
+    /// (exactly as `backup` / `restore` do via `cipher::active_sub_key`), the
+    /// backup encrypts both the data files and `backup.manifest` with it, and the
+    /// restore recovers the seeded bytes. Asserts the stored data file and the
+    /// manifest are actually encrypted (OpenSSL `Salted__` framing), not plaintext.
+    #[test]
+    fn encrypted_repo_backup_restore_round_trip() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_dst = tempfile::tempdir().unwrap();
+        let repo_s = Posix::new(repo_dir.path());
+        let pg_src_s = Posix::new(pg_src.path());
+        let pg_dst_s = Posix::new(pg_dst.path());
+
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let user_pass = "user-pass";
+        let sub_key = "repo-sub-key-secret";
+        // Encrypted repo: archive.info records the sub-key under the user pass.
+        init_stanza_encrypted(&repo_s, stanza, user_pass, sub_key);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+
+        // Build the backup transform exactly as `backup()` does: resolve the
+        // repository sub-key from archive.info, then key the transform with it.
+        // `compress-type` left unset (= none) so the stored data file is purely
+        // encrypted — its first bytes are the cipher's `Salted__` header, with no
+        // compression framing in front.
+        let backup_cfg = restore_cfg(stanza, repo_cipher_opts(user_pass));
+        let resolved_sub = crate::cipher::active_sub_key(&repo_s, &backup_cfg, stanza)
+            .expect("resolve sub-key")
+            .expect("encrypted repo yields a sub-key");
+        assert_eq!(resolved_sub, sub_key, "resolved sub-key must match the recorded one");
+        let transform = RepoTransform::from_options_with_key(&backup_cfg, Some(resolved_sub));
+        backup_inner_keyed(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform, Some(user_pass)).expect("backup");
+
+        // (a) The stored data file for global/pg_control is encrypted: it carries
+        //     the OpenSSL `Salted__` magic and does NOT equal the plaintext.
+        let control_repo = repo_dir.path().join(format!("backup/{stanza}/{label}/global/pg_control"));
+        assert!(control_repo.exists(), "expected stored data file global/pg_control");
+        let control_bytes = std::fs::read(&control_repo).unwrap();
+        assert!(
+            control_bytes.starts_with(b"Salted__"),
+            "stored data file must be Salted__-framed (encrypted), got {:?}",
+            &control_bytes[..control_bytes.len().min(8)]
+        );
+        let control_plain = FILES
+            .iter()
+            .find(|(r, _)| *r == "global/pg_control")
+            .map(|(_, b)| *b)
+            .unwrap();
+        assert_ne!(control_bytes.as_slice(), control_plain, "data file must not be plaintext");
+
+        // (b) backup.manifest is encrypted with the same sub-key.
+        let manifest_repo = repo_dir.path().join(format!("backup/{stanza}/{label}/backup.manifest"));
+        let manifest_bytes = std::fs::read(&manifest_repo).unwrap();
+        assert!(
+            manifest_bytes.starts_with(b"Salted__"),
+            "backup.manifest must be Salted__-framed (encrypted)"
+        );
+
+        // (c) Restore reproduces the seeded file bytes. The restore resolves the
+        //     same sub-key from archive.info given only the user passphrase.
+        let restore_cfg = restore_cfg(stanza, repo_cipher_opts(user_pass));
+        let outcome = restore_inner(&restore_cfg, &repo_s, &pg_dst_s).expect("restore");
+        assert_eq!(outcome.files_restored, FILES.len());
         for (rel, bytes) in FILES {
             let restored = {
                 let mut r = pg_dst_s.open_read(Path::new(rel)).expect("open restored");
@@ -4304,7 +4496,9 @@ mod tests {
 
         let stanza = "demo";
         let label = "20240101-120000F";
-        init_stanza(&repo_s, stanza);
+        // Encrypted repo: "parallel-secret" is the recorded sub-key, unlocked by
+        // the user passphrase "user-pass".
+        init_stanza_encrypted(&repo_s, stanza, "user-pass", "parallel-secret");
 
         // A spread of files across several directories so the copy phase has
         // real work to fan out across workers.
@@ -4334,7 +4528,16 @@ mod tests {
             compress_level: 6,
             cipher_pass: Some("parallel-secret".to_owned()),
         };
-        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("backup");
+        backup_inner_keyed(
+            stanza,
+            &repo_s,
+            &pg_src_s,
+            label,
+            1_704_110_400,
+            &transform,
+            Some("user-pass"),
+        )
+        .expect("backup");
 
         // Restore into two fresh targets: one serial, one with four workers.
         let pg_serial = tempfile::tempdir().unwrap();
@@ -4342,24 +4545,16 @@ mod tests {
         let pg_serial_s = Posix::new(pg_serial.path());
         let pg_parallel_s = Posix::new(pg_parallel.path());
 
-        // The cipher password is supplied via options; the compress-type comes
-        // from the recorded metadata.
-        let cfg1 = restore_cfg(
-            stanza,
-            vec![
-                (("set", None), OptionValue::String(label.to_owned())),
-                (("process-max", None), OptionValue::Integer(1)),
-                (("cipher-pass", None), OptionValue::String("parallel-secret".to_owned())),
-            ],
-        );
-        let cfg4 = restore_cfg(
-            stanza,
-            vec![
-                (("set", None), OptionValue::String(label.to_owned())),
-                (("process-max", None), OptionValue::Integer(4)),
-                (("cipher-pass", None), OptionValue::String("parallel-secret".to_owned())),
-            ],
-        );
+        // The user passphrase is supplied via options; the compress-type comes
+        // from the recorded metadata, the cipher key from the recorded sub-key.
+        let mut cfg1_opts = repo_cipher_opts("user-pass");
+        cfg1_opts.push((("set", None), OptionValue::String(label.to_owned())));
+        cfg1_opts.push((("process-max", None), OptionValue::Integer(1)));
+        let cfg1 = restore_cfg(stanza, cfg1_opts);
+        let mut cfg4_opts = repo_cipher_opts("user-pass");
+        cfg4_opts.push((("set", None), OptionValue::String(label.to_owned())));
+        cfg4_opts.push((("process-max", None), OptionValue::Integer(4)));
+        let cfg4 = restore_cfg(stanza, cfg4_opts);
 
         let serial = restore_inner(&cfg1, &repo_s, &pg_serial_s).expect("serial restore");
         let parallel = restore_inner(&cfg4, &repo_s, &pg_parallel_s).expect("parallel restore");

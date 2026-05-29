@@ -781,12 +781,12 @@ fn render_set(config: &LoadedConfig, repo_storage: &dyn Storage, label: &str) ->
     let backup = find_backup(&summary, label)
         .ok_or_else(|| CommandError::Other(format!("backup '{label}' does not exist in stanza '{stanza}'")))?;
 
-    // The backup.manifest is currently written in plaintext even on an encrypted
-    // repository (the backup WRITE path does not yet encrypt the manifest with
-    // the repository sub-key — see the crate-level note in `cipher.rs`), so it is
-    // read in plaintext to match. `Manifest::load_keyed(None)` == the plaintext
-    // load; the sub-key path becomes live once the write side encrypts manifests.
-    let manifest = load_set_manifest(repo_storage, stanza, label, None);
+    // The backup.manifest is encrypted with the repository sub-key on an encrypted
+    // repository (backup writes it keyed); resolve that sub-key and load the
+    // manifest keyed. `None` (unencrypted repo) is the byte-for-byte plaintext
+    // load.
+    let sub_key = crate::cipher::active_sub_key(repo_storage, config, stanza)?;
+    let manifest = load_set_manifest(repo_storage, stanza, label, sub_key.as_deref());
 
     if want_json(config) {
         let format = summary.backrest_format.unwrap_or(0);

@@ -703,7 +703,18 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let backup_type = BackupType::from_options(config);
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let timestamp_start = i64::try_from(secs).unwrap_or(i64::MAX);
-    let transform = RepoTransform::from_options(config);
+    // On an encrypted repository the data files and `backup.manifest` are
+    // encrypted with the repository *sub-key* (recovered from the decrypted
+    // `archive.info` `[cipher]` section), not the user passphrase — the same key
+    // archive-push uses for WAL. `from_options` reads the `cipher-type`/
+    // `cipher-pass` options, which only exist for `repo-get`/`repo-put`, so it
+    // would leave `backup` writing plaintext on an encrypted repo. Build the
+    // transform from the resolved sub-key instead so the data + manifest are
+    // encrypted (SHA-1 KDF, matching the info files and WAL). For an unencrypted
+    // repo the sub-key is `None`, leaving the byte-for-byte plaintext+compress
+    // behaviour unchanged.
+    let sub_key = crate::cipher::active_sub_key(repo_storage, config, stanza)?;
+    let transform = RepoTransform::from_options_with_key(config, sub_key);
     let process_max = process_max(config);
     let checksum_page = checksum_page_enabled(config);
     let excludes = excludes_from_config(config);
@@ -1822,7 +1833,11 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
         (None, Vec::new())
     };
 
-    let repo_bytes = transform.apply_forward(bytes)?;
+    // Keyed (SHA-1 KDF) chain: matches the manifest / info / WAL encryption so
+    // an encrypted repo is internally consistent. With no sub-key the chain is
+    // identical to the legacy path (compression only), so unencrypted repos are
+    // byte-for-byte unchanged.
+    let repo_bytes = transform.apply_forward_keyed(bytes)?;
     let result = CopyResult {
         checksum,
         repo_bytes: repo_bytes.len() as u64,
@@ -2018,8 +2033,10 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
             }
         } else {
             // Whole file. Transform once; bundle it when it fits the limit,
-            // otherwise write it as its own repo object (unbundled layout).
-            let repo_bytes = ctx.transform.apply_forward(&bytes)?;
+            // otherwise write it as its own repo object (unbundled layout). The
+            // keyed (SHA-1 KDF) chain keeps the bundle bytes consistent with the
+            // manifest / WAL encryption (and is identity-equal with no sub-key).
+            let repo_bytes = ctx.transform.apply_forward_keyed(&bytes)?;
             let repo_len = repo_bytes.len() as u64;
             repo_size += repo_len;
             if repo_len <= ctx.features.bundle_limit {
@@ -2188,9 +2205,11 @@ fn build_block_map(
             continue;
         }
 
-        // Changed / new block: transform it now, stash it for super-block placement.
+        // Changed / new block: transform it now, stash it for super-block
+        // placement. Keyed (SHA-1 KDF) so block bytes match the rest of an
+        // encrypted repo; identity-equal with no sub-key.
         stored_idx.push(idx);
-        stored_bytes.push(transform.apply_forward(block)?);
+        stored_bytes.push(transform.apply_forward_keyed(block)?);
         stored_checksums.push(checksum);
     }
 
@@ -2318,6 +2337,45 @@ pub fn backup_inner(
         Some(label),
         timestamp_start,
         transform,
+    )
+}
+
+/// DB-free full backup like [`backup_inner`], threading the user passphrase.
+///
+/// `repo_user_pass` lets `backup.info` be loaded / re-saved encrypted on an
+/// encrypted repository (the manifest + data files are keyed via `transform`'s
+/// sub-key). Mirrors what the real `backup()` command does for an encrypted repo;
+/// `repo_user_pass = None` is byte-for-byte identical to [`backup_inner`].
+pub fn backup_inner_keyed(
+    stanza: &str,
+    repo_storage: &dyn Storage,
+    pg_storage: &dyn Storage,
+    label: &str,
+    timestamp_start: i64,
+    transform: &RepoTransform,
+    repo_user_pass: Option<&str>,
+) -> Result<BackupOutcome, CommandError> {
+    run_backup(
+        stanza,
+        repo_storage,
+        pg_storage,
+        BackupType::Full,
+        Some(label),
+        timestamp_start,
+        transform,
+        DEFAULT_PROCESS_MAX,
+        false,
+        &[],
+        None,
+        None,
+        false,
+        BackupFeatures::disabled(),
+        crate::block::BlockOverrides::none(),
+        JobRetry::none(),
+        false,
+        IntegrityChecks::disabled(),
+        BackupPolicy::test_default(),
+        repo_user_pass,
     )
 }
 
@@ -2535,12 +2593,15 @@ impl ResumeContext {
     /// `None` when there is nothing to resume or the partial manifest is
     /// unreadable (resume is best-effort — a bad partial just falls back to a
     /// full re-copy).
-    fn detect(repo_storage: &dyn Storage, backup_root: &str) -> Option<Self> {
+    fn detect(repo_storage: &dyn Storage, backup_root: &str, sub_key: Option<&str>) -> Option<Self> {
         let manifest_path = PathBuf::from(format!("{backup_root}/backup.manifest"));
         if !repo_storage.exists(&manifest_path).unwrap_or(false) {
             return None;
         }
-        let manifest = Manifest::load(repo_storage, &manifest_path).ok()?;
+        // The partial manifest was saved keyed with the repo sub-key on an
+        // encrypted repo; load it keyed so resume can read it (`None` == the
+        // plaintext load on an unencrypted repo).
+        let manifest = Manifest::load_keyed(repo_storage, &manifest_path, sub_key).ok()?;
         Some(Self {
             manifest,
             backup_root: backup_root.to_owned(),
@@ -2727,10 +2788,15 @@ fn save_partial_manifest(ctx: &UnbundledCopyCtx<'_>, files: &[ManifestFile]) -> 
         paths,
         links,
     };
+    // Encrypt the in-progress manifest with the same repository sub-key the data
+    // files use (carried in the transform); `None` (unencrypted) writes plaintext
+    // exactly as before. A resumed run reads it back keyed (see
+    // `ResumeContext::detect`).
     partial
-        .save(
+        .save_keyed(
             ctx.repo_storage,
             &PathBuf::from(format!("{}/backup.manifest", ctx.backup_root)),
+            ctx.transform.cipher_pass.as_deref(),
         )
         .map_err(|err| CommandError::Other(err.to_string()))
 }
@@ -2847,6 +2913,7 @@ fn resolve_prior(
     stanza: &str,
     backup_type: BackupType,
     info: &InfoBackup,
+    sub_key: Option<&str>,
 ) -> Result<(Option<String>, Option<Manifest>), CommandError> {
     let prior_label = match backup_type {
         BackupType::Full => return Ok((None, None)),
@@ -2857,9 +2924,12 @@ fn resolve_prior(
         }
     };
 
-    let prior_manifest = Manifest::load(
+    // The prior backup's manifest is encrypted with the repository sub-key on an
+    // encrypted repo; load it keyed (`None` == plaintext load).
+    let prior_manifest = Manifest::load_keyed(
         repo_storage,
         &PathBuf::from(format!("backup/{stanza}/{prior_label}/backup.manifest")),
+        sub_key,
     )
     .map_err(|err| CommandError::Other(err.to_string()))?;
 
@@ -3092,7 +3162,7 @@ fn run_backup(
 
     // For a diff/incr, resolve the prior backup and load its manifest so
     // unchanged files can be detected by (size, checksum).
-    let (prior_label, prior_manifest) = resolve_prior(repo_storage, stanza, backup_type, &info)?;
+    let (prior_label, prior_manifest) = resolve_prior(repo_storage, stanza, backup_type, &info, transform.cipher_pass.as_deref())?;
 
     let label = label.map_or_else(
         || derive_label(backup_type, prior_label.as_deref(), timestamp_start),
@@ -3109,7 +3179,7 @@ fn run_backup(
     // bundled path (a bundle object is rewritten wholesale, so partial reuse is
     // not safe). C ref: backup.c's manifestLoadFile of `backup.manifest.copy`.
     let resume_ctx = if policy.resume && !policy.dry_run && !features.bundle {
-        ResumeContext::detect(repo_storage, &backup_root)
+        ResumeContext::detect(repo_storage, &backup_root, transform.cipher_pass.as_deref())
     } else {
         None
     };
@@ -3319,9 +3389,15 @@ fn run_backup(
 
     // The backup root was created up front (before planning copies), so it
     // exists even for an improbably empty cluster and the manifest write has a
-    // home.
+    // home. On an encrypted repository the manifest is encrypted with the same
+    // repository sub-key the data files used (carried in `transform.cipher_pass`);
+    // `None` (unencrypted) writes the byte-for-byte plaintext manifest.
     manifest
-        .save(repo_storage, &PathBuf::from(format!("{backup_root}/backup.manifest")))
+        .save_keyed(
+            repo_storage,
+            &PathBuf::from(format!("{backup_root}/backup.manifest")),
+            transform.cipher_pass.as_deref(),
+        )
         .map_err(|err| CommandError::Other(err.to_string()))?;
 
     let mut entry = json!({
@@ -3604,7 +3680,9 @@ fn copy_archive_wal(
             ))
         })?;
         let checksum = plaintext_sha1(&bytes)?;
-        let repo_bytes = transform.apply_forward(&bytes)?;
+        // Keyed (SHA-1 KDF) chain, consistent with the data-file / manifest /
+        // WAL-archive encryption; identity-equal with no sub-key.
+        let repo_bytes = transform.apply_forward_keyed(&bytes)?;
 
         let rel = format!("pg_wal/{segment}");
         let dest = format!("{backup_root}/{rel}{suffix}");
