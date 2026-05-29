@@ -50,6 +50,9 @@ done
 
 ############################################################################
 hd "Scenario 1 — local minimal backup on principal (KB Exemple 1)"
+# Reset the repository so the run is deterministic (stanza-create is fresh).
+on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
+
 # principal is its own repo host (local repo). Write the minimal config to the
 # binary's default path (/etc/pgbackrest/pgbackrest.conf).
 on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF

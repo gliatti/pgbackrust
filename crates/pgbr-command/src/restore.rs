@@ -1985,7 +1985,18 @@ fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<Vec<PathBuf>, Co
 
     let mut present = Vec::new();
     for root in &roots {
-        collect_target_files(pg, root, &mut present)?;
+        // A first path component can be a top-level DIRECTORY (e.g. `base` from
+        // `base/1/PG_VERSION`) or a root-level FILE (e.g. `PG_VERSION`, whose only
+        // component is the file itself). Walking a file as a directory would
+        // `read_dir` it → ENOTDIR, so dispatch on the on-disk kind: recurse into
+        // directories, record a root-level file as present, skip what's absent.
+        match pg.info(root) {
+            Ok(info) if info.kind == StorageKind::Path => collect_target_files(pg, root, &mut present)?,
+            Ok(info) if info.kind == StorageKind::File => present.push(root.clone()),
+            // symlink / special, or recorded-but-absent on the target: nothing to walk.
+            Ok(_) | Err(StorageError::NotFound { .. }) => {}
+            Err(err) => return Err(CommandError::Storage(err)),
+        }
     }
 
     let mut stray = Vec::new();
