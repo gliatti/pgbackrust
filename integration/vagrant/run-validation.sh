@@ -723,6 +723,34 @@ if [ "$in_rec" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "PIT
 else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(xid) outcome (in_recovery=$in_rec rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+hd "Scenario 16 — PITR to a WAL LSN (--type=lsn + --target-action=promote)"
+# Completes the PITR target-type matrix: --type=name (S2), --type=time (S8),
+# --type=xid (S15), --type=lsn here (command.html). Backup with 1000 rows,
+# capture pg_current_wal_lsn(), insert 1000 future rows, restore --type=lsn to
+# that LSN, assert in_recovery=f and rows<=1000.
+prepare_principal
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "PITR(lsn) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+psql_on principal 5433 "CHECKPOINT" >/dev/null
+TGT_LSN=$(psql_on principal 5433 "SELECT pg_current_wal_lsn()::text" | grep -oE '^[0-9A-Fa-f]+/[0-9A-Fa-f]+$' | head -1)
+if [ -n "$TGT_LSN" ]; then pass "captured target lsn ($TGT_LSN)"
+else fail "could not capture target lsn"; fi
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,2000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+sleep 5
+pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
+ok "PITR restore (--type=lsn --target=$TGT_LSN --target-action=promote)" principal \
+  "pgbackrest --stanza=demo --type=lsn --target=$TGT_LSN --target-action=promote --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 10
+in_rec=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$in_rec" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "PITR(lsn) recovered to target + promoted ($rows rows, future dropped)"
+else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(lsn) outcome (in_recovery=$in_rec rows=$rows, want f / <=1000)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
