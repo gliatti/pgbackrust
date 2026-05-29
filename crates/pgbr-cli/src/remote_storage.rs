@@ -281,15 +281,31 @@ impl RemoteTlsStorage {
     /// `server_name` and presenting the client cert in `client_config`), then
     /// drive the remote storage protocol over it.
     ///
+    /// `sck_block` is the resolved `sck-block` option: `true` explicitly puts the
+    /// connecting socket in blocking mode; `false` (the `sck-block` default) is a
+    /// no-op since the protocol transport relies on blocking std I/O — forcing
+    /// non-blocking mode would break it (best-effort, mirroring the server side).
+    ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::Spawn`] if the TLS connection or handshake
     /// fails (the variant is reused for "could not establish the remote
     /// transport", mirroring the SSH spawn-failure mapping).
-    pub fn connect(addr: &str, server_name: &str, client_config: Arc<ClientConfig>) -> Result<Self, ProtocolError> {
+    pub fn connect(
+        addr: &str,
+        server_name: &str,
+        client_config: Arc<ClientConfig>,
+        sck_block: bool,
+    ) -> Result<Self, ProtocolError> {
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| ProtocolError::Spawn(format!("invalid tls server name `{server_name}`: {e}")))?;
         let socket = TcpStream::connect(addr).map_err(|e| ProtocolError::Spawn(format!("tls connect {addr}: {e}")))?;
+        // Only enforce blocking mode when the operator opted in; the default
+        // (non-blocking) is left as-is because the synchronous protocol loop
+        // here cannot drive a non-blocking socket.
+        if sck_block && let Err(e) = socket.set_nonblocking(false) {
+            return Err(ProtocolError::Spawn(format!("tls set blocking {addr}: {e}")));
+        }
         let conn = ClientConnection::new(client_config, name).map_err(|e| ProtocolError::Spawn(format!("tls client new: {e}")))?;
         let io = SyncTlsIo::new(StreamOwned::new(conn, socket));
         let client = ProtocolClient::new(io.clone_handle(), io.clone_handle());

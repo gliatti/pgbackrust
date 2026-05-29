@@ -331,10 +331,43 @@ fn build_ssh_host_storage(
         remote_args.push(format!("--stanza={stanza}"));
     }
     remote_args.push(format!("--{path_flag}={}", remote_path.display()));
+    append_host_config_args(cfg, family, index, &mut remote_args);
 
     let storage = RemoteProcessStorage::spawn_ssh(host, ssh_port, ssh_user.as_deref(), &remote_program, &remote_args)
         .map_err(CliRunError::Protocol)?;
     Ok(Box::new(storage))
+}
+
+/// Append the `<family>-host-config*` family to a remote worker's argv so the
+/// spawned worker loads the operator-specified config file / paths on the remote
+/// host instead of its own defaults.
+///
+/// pgBackRest lets the operator point a remote worker at a non-default config
+/// location with `repo-host-config` / `pg-host-config` (the main config file),
+/// `*-host-config-path` (the base config directory) and
+/// `*-host-config-include-path` (the `*.conf` include directory). Each, when set,
+/// is forwarded as the corresponding global option the worker understands:
+///
+/// - `<family>-host-config` -> `--config=<…>`
+/// - `<family>-host-config-path` -> `--config-path=<…>`
+/// - `<family>-host-config-include-path` -> `--config-include-path=<…>`
+///
+/// Only options explicitly set at the active index (or the ungrouped fallback)
+/// are appended; unset options leave the worker on its own defaults. C ref:
+/// `protocolRemoteParam` in `src/protocol/helper.c` (the `cfgOptRepoHostConfig*`
+/// / `cfgOptPgHostConfig*` pass-through).
+fn append_host_config_args(cfg: &LoadedConfig, family: &str, index: u32, args: &mut Vec<String>) {
+    // (host-config option suffix, remote worker flag) pairs, in a stable order.
+    const FORWARDED: &[(&str, &str)] = &[
+        ("host-config", "config"),
+        ("host-config-path", "config-path"),
+        ("host-config-include-path", "config-include-path"),
+    ];
+    for (suffix, flag) in FORWARDED {
+        if let Some(value) = string_option(cfg, &format!("{family}-{suffix}"), index) {
+            args.push(format!("--{flag}={value}"));
+        }
+    }
 }
 
 /// Resolve the TLS host transport's connect address `<host>:<port>` from the
@@ -350,22 +383,30 @@ fn tls_host_address(cfg: &LoadedConfig, host: &str) -> String {
 /// Open a mutual-TLS connection to `host`'s running `pgbackrest server` and wrap
 /// it in a [`RemoteTlsStorage`] proxy running the same storage protocol.
 ///
-/// The `<family>-host-ca-file` (required) is the CA the client trusts for the
-/// server certificate; `<family>-host-cert-file` / `<family>-host-key-file`
-/// (both required for mutual TLS) are the client certificate the peer authorizes
-/// by its Common Name against `tls-server-auth`. `tls-cipher-12` /
-/// `tls-cipher-13`, when set, restrict the negotiated ciphers. The peer serves a
-/// `pgbackrest server` rooted at its configured path, so no remote argv / root
-/// is passed here (unlike the SSH worker).
+/// The `<family>-host-ca-file` (a single CA PEM) and/or `<family>-host-ca-path`
+/// (a directory of CA PEMs) supply the CA roots the client trusts for the server
+/// certificate — at least one is required and both are additive;
+/// `<family>-host-cert-file` / `<family>-host-key-file` (both required for mutual
+/// TLS) are the client certificate the peer authorizes by its Common Name
+/// against `tls-server-auth`. `tls-cipher-12` / `tls-cipher-13`, when set,
+/// restrict the negotiated ciphers. The peer serves a `pgbackrest server` rooted
+/// at its configured path, so no remote argv / root is passed here (unlike the
+/// SSH worker).
 ///
 /// # Errors
 ///
-/// Returns [`CliRunError::Command`] when a required `*-host-{ca,cert,key}-file`
-/// is missing or a PEM file is invalid, and [`CliRunError::Protocol`] when the
-/// TLS connection or handshake fails.
+/// Returns [`CliRunError::StorageConfig`] when neither `*-host-ca-file` nor
+/// `*-host-ca-path` is set, [`CliRunError::Command`] when a PEM file / directory
+/// is invalid or a required `*-host-{cert,key}-file` is rejected, and
+/// [`CliRunError::Protocol`] when the TLS connection or handshake fails.
 fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u32) -> Result<Box<dyn Storage>, CliRunError> {
-    let ca_file = string_option(cfg, &format!("{family}-host-ca-file"), index)
-        .ok_or_else(|| CliRunError::StorageConfig(format!("{family}-host-type=tls requires {family}-host-ca-file")))?;
+    let ca_file = string_option(cfg, &format!("{family}-host-ca-file"), index);
+    let ca_path = string_option(cfg, &format!("{family}-host-ca-path"), index);
+    if ca_file.is_none() && ca_path.is_none() {
+        return Err(CliRunError::StorageConfig(format!(
+            "{family}-host-type=tls requires {family}-host-ca-file or {family}-host-ca-path"
+        )));
+    }
     let cert_file = string_option(cfg, &format!("{family}-host-cert-file"), index);
     let key_file = string_option(cfg, &format!("{family}-host-key-file"), index);
 
@@ -376,12 +417,20 @@ fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u
         .filter_map(|name| string_option(cfg, name, 1))
         .collect();
 
-    let client_config =
-        pgbr_command::server::build_client_config_from_files(&ca_file, cert_file.as_deref(), key_file.as_deref(), &cipher_names)
-            .map_err(CliRunError::Command)?;
+    let client_config = pgbr_command::server::build_client_config_from_files(
+        ca_file.as_deref(),
+        ca_path.as_deref(),
+        cert_file.as_deref(),
+        key_file.as_deref(),
+        &cipher_names,
+    )
+    .map_err(CliRunError::Command)?;
 
     let addr = tls_host_address(cfg, host);
-    let storage = RemoteTlsStorage::connect(&addr, host, Arc::new(client_config)).map_err(CliRunError::Protocol)?;
+    // `sck-block` (default false) toggles blocking socket mode on the connecting
+    // socket; only enforced when set (the transport relies on blocking I/O).
+    let sck_block = boolean_option(cfg, "sck-block", 1).unwrap_or(false);
+    let storage = RemoteTlsStorage::connect(&addr, host, Arc::new(client_config), sck_block).map_err(CliRunError::Protocol)?;
     Ok(Box::new(storage))
 }
 
@@ -874,8 +923,8 @@ mod tests {
     use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
 
     use super::{
-        active_repo_index, build_all_repo_storages, build_pg_storage, build_repo_storage, configured_repo_indexes,
-        sftp_config_from, tls_host_address,
+        active_repo_index, append_host_config_args, build_all_repo_storages, build_pg_storage, build_repo_storage,
+        configured_repo_indexes, sftp_config_from, tls_host_address,
     };
     use crate::CliRunError;
     use pgbr_storage::SftpAuth;
@@ -1583,5 +1632,148 @@ mod tests {
             repo.path().join("rt.txt").exists(),
             "remote-type=repo should force a local repo backend"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // host-config forwarding to the remote worker argv
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_config_args_forwards_repo_family() {
+        // repo-host-config* options are appended as the matching global worker
+        // flags (--config / --config-path / --config-include-path).
+        let config = cfg(
+            "info",
+            &[
+                (
+                    "repo-host-config",
+                    Some(1),
+                    OptionValue::Path("/etc/pgbackrest.conf".to_owned()),
+                ),
+                (
+                    "repo-host-config-path",
+                    Some(1),
+                    OptionValue::Path("/etc/pgbackrest".to_owned()),
+                ),
+                (
+                    "repo-host-config-include-path",
+                    Some(1),
+                    OptionValue::Path("/etc/pgbackrest/conf.d".to_owned()),
+                ),
+            ],
+        );
+        let mut args = Vec::new();
+        append_host_config_args(&config, "repo", 1, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--config=/etc/pgbackrest.conf".to_owned(),
+                "--config-path=/etc/pgbackrest".to_owned(),
+                "--config-include-path=/etc/pgbackrest/conf.d".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_config_args_forwards_pg_family() {
+        // The pg side maps symmetrically from pg-host-config*.
+        let config = cfg(
+            "backup",
+            &[
+                ("pg-host-config", Some(1), OptionValue::Path("/db/pgbackrest.conf".to_owned())),
+                (
+                    "pg-host-config-include-path",
+                    Some(1),
+                    OptionValue::Path("/db/conf.d".to_owned()),
+                ),
+            ],
+        );
+        let mut args = Vec::new();
+        append_host_config_args(&config, "pg", 1, &mut args);
+        // Only the two set options are forwarded; config-path (unset) is absent.
+        assert_eq!(
+            args,
+            vec![
+                "--config=/db/pgbackrest.conf".to_owned(),
+                "--config-include-path=/db/conf.d".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_config_args_absent_when_unset() {
+        // No host-config options → nothing appended (the worker keeps its
+        // defaults).
+        let config = cfg("info", &[]);
+        let mut args = vec!["backup:remote".to_owned()];
+        append_host_config_args(&config, "repo", 1, &mut args);
+        assert_eq!(args, vec!["backup:remote".to_owned()], "nothing should be appended");
+    }
+
+    #[test]
+    fn host_config_args_respects_active_index() {
+        // repo2-host-config is read at index 2 only; index 1 sees nothing.
+        let config = cfg(
+            "info",
+            &[("repo-host-config", Some(2), OptionValue::Path("/two.conf".to_owned()))],
+        );
+        let mut at_one = Vec::new();
+        append_host_config_args(&config, "repo", 1, &mut at_one);
+        assert!(at_one.is_empty(), "index 1 must not see repo2's config");
+
+        let mut at_two = Vec::new();
+        append_host_config_args(&config, "repo", 2, &mut at_two);
+        assert_eq!(at_two, vec!["--config=/two.conf".to_owned()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // host-ca-path acceptance on the TLS transport
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tls_host_accepts_ca_path_instead_of_ca_file() {
+        // `repo-host-type=tls` with only `repo-host-ca-path` (a directory) set
+        // must NOT be rejected for a missing ca-file: the ca-path is an accepted
+        // CA source. With a nonexistent directory the failure surfaces from the
+        // CA-loading / TLS path (Command/Protocol), never the
+        // "requires ca-file/ca-path" StorageConfig error.
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
+                ("repo-host-ca-path", Some(1), OptionValue::Path("/no/such/cadir".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Err(CliRunError::Command(_) | CliRunError::Protocol(_)) => {}
+            Err(CliRunError::StorageConfig(msg)) => {
+                panic!("ca-path should satisfy the CA requirement, but got StorageConfig: {msg}")
+            }
+            Ok(_) => panic!("expected a TLS-path error (no server / bad ca dir), got Ok(storage)"),
+            Err(other) => panic!("expected Command/Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_host_requires_ca_file_or_ca_path() {
+        // Neither ca-file nor ca-path → a clear configuration error naming both.
+        let config = cfg(
+            "info",
+            &[
+                ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
+                ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+            ],
+        );
+        match build_repo_storage(&config) {
+            Err(CliRunError::StorageConfig(msg)) => {
+                assert!(msg.contains("repo-host-ca-file"), "msg was {msg}");
+                assert!(msg.contains("repo-host-ca-path"), "msg was {msg}");
+            }
+            Ok(_) => panic!("expected StorageConfig(ca-file/ca-path required), got Ok(storage)"),
+            Err(other) => panic!("expected StorageConfig(ca-file/ca-path required), got {other:?}"),
+        }
     }
 }
