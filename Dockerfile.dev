@@ -11,17 +11,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 ARG RUST_VERSION=1.95.0
 
-# Native libraries kept because Rust crates link them: libpq (pgbr-db), libssh2 (pgbr-storage
-# sftp backend), and the zlib/bz2/lz4/zstd family (pgbr-compress codecs). libssl/libxml are kept
-# for transitive -sys crates. meson/ninja/cbindgen are gone with the C build.
+# Native libraries kept because Rust crates link them:
+#   - libpq    -> libpq-sys     (pgbr-db)
+#   - libssh2  -> ssh2 / libssh2-sys (pgbr-storage sftp backend)
+#   - libssl   -> openssl-sys   (pgbr-crypto)
+#   - zlib / libbz2 / liblz4 / libzstd -> libz-sys / bzip2-sys / lz4-sys / zstd-sys (pgbr-compress codecs)
+# XML in this workspace comes from the pure-Rust quick-xml crate, so no libxml2-dev is needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git rsync pkg-config build-essential cmake \
-        libssl-dev libpq-dev libxml2-dev liblz4-dev libyaml-dev libbz2-dev zlib1g-dev \
+        libssl-dev libpq-dev liblz4-dev libbz2-dev zlib1g-dev \
         libssh2-1-dev libzstd-dev \
         gzip bzip2 lz4 zstd \
         python3 python3-pip \
-        perl libperl-dev libdbd-pg-perl libdbi-perl \
-        libxml-checker-perl libxml-libxml-perl libjson-pp-perl libyaml-libyaml-perl \
         clang lld \
     && rm -rf /var/lib/apt/lists/*
 

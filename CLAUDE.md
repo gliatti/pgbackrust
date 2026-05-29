@@ -10,7 +10,6 @@ The original C tree (`src/`), the Meson build, the cbindgen FFI header generator
 
 What remains before the migration is fully "done":
 
-- **`test/` + `test.pl`** — the Perl integration-test harness and the orphaned C unit tests under `test/src/module/` are C-era and still need to be retired / rewired to drive the Rust binary. This is the last big piece.
 - Assorted docs (`CODING.md`, `CONTRIBUTING.md`, `README.md`, `doc/`) still describe the C project and have not been rewritten.
 
 ## Docker dev environment (REQUIRED — Rust is not installed locally)
@@ -78,9 +77,7 @@ These are embedded into `pgbr-build` at compile time, so a plain `cargo build` p
 
 ## Testing
 
-`cargo test --workspace` runs all unit + integration tests. Per-module tests live in `#[cfg(test)] mod tests` inside the owning crate (migrated from the old `test/src/module/*Test.c`). Cloud-backend and DB round-trip tests that need a live endpoint are `#[ignore]`d and gated on env vars (`PGBR_S3_*`, `PGBR_AZURE_*`, `PGBR_GCS_*`, `PGBR_SFTP_*`, `DATABASE_URL`).
-
-The legacy `test/test.pl` Perl harness and the C unit tests under `test/src/` are **not wired into the Rust build** and are pending retirement/rewrite — do not rely on them.
+`cargo test --workspace` runs all unit + integration tests. Per-module tests live in `#[cfg(test)] mod tests` inside the owning crate. Cloud-backend and DB round-trip tests that need a live endpoint are `#[ignore]`d and gated on env vars (`PGBR_S3_*`, `PGBR_AZURE_*`, `PGBR_GCS_*`, `PGBR_SFTP_*`, `DATABASE_URL`).
 
 ## CI gating
 
