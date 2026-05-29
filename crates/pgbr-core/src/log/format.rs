@@ -4,8 +4,9 @@
 //! Builds the prefix (timestamp, process id, level name, error code, dry-run tag, debug
 //! `file::function` suffix), appends the message body, then dispatches to up to three
 //! file descriptors (stdout / stderr / file) via `write(2)`. The output is byte-identical
-//! to the legacy C formatter — `logTest.c` exercises every prefix variant and asserts
-//! the exact bytes through the existing `harnessLog` capture.
+//! to the legacy C formatter; the in-crate `#[cfg(test)] mod tests` exercises every
+//! prefix variant and asserts the exact bytes through the [`capture`](super::capture)
+//! sink.
 //!
 //! State (levels / fds / flags / process metadata / shared scratchpad) lives in the
 //! parent module; this submodule reads it through the `super::*` accessors. The 32 KiB
@@ -657,7 +658,7 @@ mod tests {
         let _g = fresh_state();
         init(LOG_LEVEL_TRACE, LOG_LEVEL_OFF, LOG_LEVEL_OFF, false, 0, 999, false);
         let r = log_pre(LOG_LEVEL_TRACE, 0, "test.c", "test_func", 0);
-        // process_max=999 → process_size=3, matches the C `logTest.c` invocation.
+        // process_max=999 → process_size=3.
         assert_eq!(buffer_str(r.buffer_pos), "P000  TRACE:         test::test_func: ");
     }
 

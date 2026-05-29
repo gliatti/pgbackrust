@@ -1890,9 +1890,8 @@ mod tests {
     #[test]
     fn switch_back_errors_when_top_is_new() {
         let _g = fresh_state();
-        // Mirror the legacy test sequence at memContextTest.c:205–209: switch first so the
-        // current cursor advances above 0, push_new on top, then assert switch_back errors
-        // because the stack-top is a New entry (not a Switch).
+        // Switch first so the current cursor advances above 0, push_new on top, then assert
+        // switch_back errors because the stack-top is a New entry (not a Switch).
         let switched = 0x2900usize as *mut c_void;
         let new_ctx = 0x3000usize as *mut c_void;
         // SAFETY: sentinel pointers.

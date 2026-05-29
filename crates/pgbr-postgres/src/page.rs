@@ -267,7 +267,7 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             *byte = (state >> 56) as u8;
         }
-        // Non-zero pd_checksum, matching the C harness, to exercise zeroing.
+        // Non-zero pd_checksum to exercise the algorithm's zeroing step.
         page[8] = 0xAB;
         page[9] = 0xCD;
         page

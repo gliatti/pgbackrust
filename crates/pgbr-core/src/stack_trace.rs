@@ -359,8 +359,8 @@ pub fn frame_at(idx: usize) -> Option<StackFrame> {
 }
 
 /// Test-only: bump `stack_size` by 1 without writing a new frame. Used by the
-/// `stackTraceTestFileLineSet` test in `stackTraceTest.c` which manually advances the
-/// cursor before calling the setter.
+/// stack-trace file/line setter test which manually advances the cursor before
+/// calling the setter.
 pub fn test_size_inc() {
     // SAFETY: see `state_mut`.
     let state = unsafe { state_mut() };

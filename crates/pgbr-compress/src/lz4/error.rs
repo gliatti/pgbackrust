@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn known_error_codes_match_legacy_messages() {
-        // Same fixtures the C compressTest uses (size_t cast of -2 → ERROR_maxBlockSize_invalid).
+        // Reuses the legacy fixtures (size_t cast of -2 → ERROR_maxBlockSize_invalid).
         #[allow(clippy::cast_sign_loss)]
         let neg2 = -2_isize as usize;
         match classify(neg2) {

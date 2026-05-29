@@ -7,9 +7,8 @@
 //! token the legacy `OBJ_NEW_BEGIN(String, ...)` macro produced.
 //!
 //! The layout assumption is GCC + little-endian, which is what every CI VM in
-//! `.github/workflows/test.yml` runs on (u22 / d11 / f43 / rh8 — all `x86_64`) and what
-//! the `compile_assert_string_layout` C-side test in `typecTest.c` verifies on every
-//! build. A `const_assert` here pins the Rust mirror to the same shape.
+//! `.github/workflows/test.yml` runs on (u22 / d11 / f43 / rh8 — all `x86_64`).
+//! A `const_assert` here pins the Rust mirror to the same shape.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -680,9 +679,7 @@ mod tests {
     use super::*;
 
     // The end-to-end allocation behaviour requires the C-side mem-context machinery;
-    // these pure-Rust tests pin down the layout and the size/extra accessor algebra
-    // that the C-side `compile_assert_string_layout` test in `typecTest.c` is the
-    // build-time companion to.
+    // these pure-Rust tests pin down the layout and the size/extra accessor algebra.
 
     #[test]
     fn string_pub_is_two_words() {

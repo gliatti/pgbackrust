@@ -33,10 +33,11 @@ pub const LOG_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Actual size of the heap-allocated scratch buffer.
 ///
-/// `test/src/meson.build` compiles the unit-test binary with `-DLOG_BUFFER_SIZE=262144`
-/// (256 KiB) so very long error messages don't get truncated mid-test. The Rust side
-/// can't see that compile-time override, so the heap buffer is permanently sized to the
-/// larger value to satisfy both builds. The extra 224 KiB is per-process and one-shot.
+/// The legacy C unit-test binary was compiled with `-DLOG_BUFFER_SIZE=262144` (256 KiB)
+/// so very long error messages did not get truncated mid-test. The heap buffer is
+/// permanently sized to that larger value so unit tests can exercise the wide
+/// error-message path without a compile-time override. The extra 224 KiB is per-process
+/// and one-shot.
 ///
 /// The trailing 4 KiB padding absorbs glibc's SIMD-vectorised `strncpy` / `memset`
 /// over-writes: those routines may scribble up to a full vector beyond the logical end

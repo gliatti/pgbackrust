@@ -262,9 +262,8 @@ mod tests {
 
     #[test]
     fn roundtrip_large_pattern() {
-        // 1 MiB with a repeating ASCII pattern — same shape as the
-        // `compress a large non-zero input buffer into small output buffer` test in
-        // `compressTest.c`.
+        // 1 MiB with a repeating ASCII pattern — exercises the
+        // `compress a large non-zero input buffer into small output buffer` path.
         let mut plaintext = vec![0u8; 1024 * 1024 - 1];
         for (idx, b) in plaintext.iter_mut().enumerate() {
             *b = (idx % 94 + 32) as u8;

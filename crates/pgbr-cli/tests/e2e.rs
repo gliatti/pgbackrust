@@ -1,7 +1,7 @@
 //! Cargo-native end-to-end tests for the pgBackRest Rust port.
 //!
 //! These run in CI under plain `cargo test` — no live `PostgreSQL`, no Docker,
-//! no Perl harness. They exercise two layers:
+//! no external driver. They exercise two layers:
 //!
 //! 1. The command stack (`pgbr_command::dispatch`) over `Posix` tempdirs,
 //!    driving a realistic lifecycle: seed a synthetic PG data dir with a real

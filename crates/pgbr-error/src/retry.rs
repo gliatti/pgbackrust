@@ -4,12 +4,11 @@
 //! `src/common/error/retry.c`. It records the first error seen and, for every subsequent
 //! retry, either deduplicates against an existing entry by message text or appends a new
 //! entry. [`RetryState::format_message`] reproduces the legacy multi-line summary
-//! verbatim — the differential test in `errorRetryTest.c` asserts byte equality against a
+//! verbatim — the in-crate `#[cfg(test)] mod tests` block asserts byte equality against a
 //! `legacy_*` re-implementation of the original C code.
 //!
-//! The C side passes wall-clock millisecond timestamps in: this module never reads the
-//! clock. That keeps the Rust state deterministic for unit tests and lets the harness
-//! drive `hrnTimeMSecSet` without crossing the FFI boundary.
+//! Wall-clock millisecond timestamps are passed in by the caller: this module never reads
+//! the clock. That keeps the Rust state deterministic for unit tests.
 
 use std::ffi::CString;
 
@@ -256,9 +255,9 @@ mod tests {
 
     #[test]
     fn full_scenario_matches_legacy_c_byte_for_byte() {
-        // Mirrors the "retry (detail enabled)" test case in errorRetryTest.c.
-        // hrnTimeMSecSet({0, 50, 75, 150}) is consumed by the C harness; here we pass the
-        // millisecond values directly to add(now_ms = ...).
+        // Mirrors the "retry (detail enabled)" legacy test case. The original C harness
+        // injected wall-clock millis via `hrnTimeMSecSet({0, 50, 75, 150})`; here we pass
+        // the millisecond values directly to `add(now_ms = ...)`.
         let mut s = RetryState::new(0);
         s.add(format_error_code(), "message1", 0);
         s.add(format_error_code(), "message1", 50);

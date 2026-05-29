@@ -1,15 +1,8 @@
-//! In-memory log capture used by `test/src/common/harnessLog.c`.
-//!
-//! The legacy harness intercepted the log write path through the meson `SHIM_MODULE`
-//! mechanism (which inlined `src/common/log.c` into the test binary so the harness could
-//! redefine `logWrite`). Phase 31 sub-issue B already moved every formatter helper to
-//! Rust, leaving the SHIM as nothing but an `#include` of `log.c`. This sub-issue (C)
-//! removes the last legacy state-coupling: the harness now drives an in-memory capture
-//! buffer through FFI accessors, so the harness no longer needs the C log internals at
-//! all.
+//! In-memory log capture sink used by the in-crate `#[cfg(test)] mod tests` blocks
+//! across the workspace.
 //!
 //! When [`is_installed`] is true, [`super::format::log_post`] routes the file sink (the
-//! `level_file` channel) to [`append`] instead of `write(2)`. The harness reads the
+//! `level_file` channel) to [`append`] instead of `write(2)`. Test code reads the
 //! captured bytes via [`drain`] / [`contains`] and clears them between assertions.
 //!
 //! Threading model is the same single-threaded fork-per-process invariant as the rest of

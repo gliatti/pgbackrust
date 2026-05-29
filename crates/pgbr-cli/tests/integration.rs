@@ -1,8 +1,7 @@
 //! Integration test suite for the pgBackRest Rust port.
 //!
-//! This complements the lifecycle smoke test in `tests/e2e.rs`. It carries the
-//! integration role the (now-removed) Perl `test/test.pl` harness used to own,
-//! but cargo-native: no Perl, no shell drivers.
+//! This complements the lifecycle smoke test in `tests/e2e.rs` and is purely
+//! cargo-native: no shell drivers, no external orchestrator.
 //!
 //! Two layers:
 //!
