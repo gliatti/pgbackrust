@@ -177,15 +177,28 @@ fn dry_run_option(config: &LoadedConfig) -> bool {
     )
 }
 
-/// Emit a human-facing progress / plan line to the log sink (stderr).
+/// Emit a human-facing progress / plan line at `INFO` through the
+/// `pgbr_core::log` formatter.
 ///
-/// pgBackRest routes progress lines to its log (stderr by default), keeping
-/// stdout free for machine-readable command output. The dedicated `pgbr-core`
-/// logger is not reachable from this crate's dependency graph, so this is a thin,
-/// level-prefixed `stderr` writer matching the logger's `INFO: ` convention.
-#[allow(clippy::print_stderr)]
+/// pgBackRest routes progress lines to its log (the console at
+/// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
+/// free for machine-readable command output. This is the Rust analogue of the C
+/// `LOG_INFO` macro: the message lands on whichever sinks the logger has open, so
+/// it is level-filtered like every other command's output. `process_id` is
+/// `u32::MAX` so the formatter uses the process-global id set by `logInit`; `code`
+/// is `0` (no error-code segment). A formatting / write failure is intentionally
+/// swallowed: progress chatter must never turn a successful command into an error.
 fn log_info(message: &str) {
-    eprintln!("INFO: {message}");
+    let _ = pgbr_core::log::format::log_internal(
+        pgbr_core::log::LOG_LEVEL_INFO,
+        pgbr_core::log::LOG_LEVEL_MIN,
+        pgbr_core::log::LOG_LEVEL_MAX,
+        u32::MAX,
+        "expire.c",
+        "cmdExpire",
+        0,
+        message,
+    );
 }
 
 /// Forward transitive closure of dependents: every backup in `current` that
@@ -1370,9 +1383,9 @@ pub fn expire(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), C
     let dry_run = dry_run_option(config);
     let summary = expire_inner(config, repo_storage)?;
     // `expire` produces no machine-readable result on stdout; the summary is
-    // human-facing progress, so it is routed to the log sink (stderr) via
-    // `log_info`. In --dry-run mode the wording reflects that nothing was
-    // actually removed.
+    // human-facing progress, so it is routed through the `pgbr_core::log`
+    // formatter (INFO) via `log_info`. In --dry-run mode the wording reflects
+    // that nothing was actually removed.
     let verb = if dry_run { "would remove" } else { "removed" };
     if summary.expired_labels.is_empty() {
         log_info(&format!("expire: nothing to expire ({} kept)", summary.kept_labels.len()));

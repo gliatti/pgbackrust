@@ -740,8 +740,9 @@ fn archive_mode_check(config: &LoadedConfig) -> bool {
 pub fn check(config: &LoadedConfig, repo_storage: &dyn Storage, _pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let report = run_check(config, repo_storage)?;
     // `check` emits no machine-readable result on stdout; the summary is
-    // human-facing progress, so it is routed to the log sink (stderr) via
-    // `log_info`, leaving stdout free for commands that produce structured data.
+    // human-facing progress, so it is routed through the `pgbr_core::log`
+    // formatter (INFO) via `log_info`, leaving stdout free for commands that
+    // produce structured data.
     log_info(&format!(
         "stanza '{}' check ok: db-version={} db-system-id={} repo-writable={} archive-id={} archive-ok={}",
         report.stanza, report.db_version, report.db_system_id, report.repo_writable, report.archive_id, report.archive_ok
@@ -755,15 +756,28 @@ pub fn check(config: &LoadedConfig, repo_storage: &dyn Storage, _pg_storage: &dy
     Ok(())
 }
 
-/// Emit a human-facing progress line to the log sink (stderr).
+/// Emit a human-facing progress line at `INFO` through the `pgbr_core::log`
+/// formatter.
 ///
-/// pgBackRest routes progress lines to its log (stderr by default), keeping
-/// stdout free for machine-readable command output. The dedicated `pgbr-core`
-/// logger is not reachable from this crate's dependency graph, so this is a thin,
-/// level-prefixed `stderr` writer matching the logger's `INFO: ` convention.
-#[allow(clippy::print_stderr)]
+/// pgBackRest routes progress lines to its log (the console at
+/// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
+/// free for machine-readable command output. This is the Rust analogue of the C
+/// `LOG_INFO` macro: the message lands on whichever sinks the logger has open, so
+/// it is level-filtered like every other command's output. `process_id` is
+/// `u32::MAX` so the formatter uses the process-global id set by `logInit`; `code`
+/// is `0` (no error-code segment). A formatting / write failure is intentionally
+/// swallowed: progress chatter must never turn a successful command into an error.
 fn log_info(message: &str) {
-    eprintln!("INFO: {message}");
+    let _ = pgbr_core::log::format::log_internal(
+        pgbr_core::log::LOG_LEVEL_INFO,
+        pgbr_core::log::LOG_LEVEL_MIN,
+        pgbr_core::log::LOG_LEVEL_MAX,
+        u32::MAX,
+        "check.c",
+        "cmdCheck",
+        0,
+        message,
+    );
 }
 
 #[cfg(test)]

@@ -462,9 +462,9 @@ fn push_queue_exceeded(queue_max: Option<u64>, backlog: u64) -> bool {
 ///
 /// pgBackRest returns success to `PostgreSQL` so PG recycles the WAL (rather than
 /// the partition filling), logging a warning that the segment was dropped. The
-/// message is human-facing diagnostic output, so it is routed to the log sink
-/// ([`log_warn`], stderr) rather than stdout, which is reserved for
-/// machine-readable command output.
+/// message is human-facing diagnostic output, so it is routed through the
+/// `pgbr_core::log` formatter ([`log_warn`]) rather than stdout, which is
+/// reserved for machine-readable command output.
 fn warn_queue_dropped(segment: &str, backlog: u64, limit: u64) {
     log_warn(&format!(
         "dropped WAL segment {segment} because the unarchived WAL backlog ({backlog} bytes) \
@@ -472,16 +472,28 @@ fn warn_queue_dropped(segment: &str, backlog: u64, limit: u64) {
     ));
 }
 
-/// Emit a human-facing `WARN` diagnostic to the log sink (stderr).
+/// Emit a human-facing `WARN` diagnostic through the `pgbr_core::log` formatter.
 ///
-/// pgBackRest sends progress / warning lines to its log (stderr by default),
-/// keeping stdout free for machine-readable command output. The dedicated
-/// `pgbr-core` logger is not reachable from this crate's dependency graph, so
-/// this is a thin, level-prefixed `stderr` writer matching the logger's `WARN: `
-/// prefix convention.
-#[allow(clippy::print_stderr)]
+/// pgBackRest sends progress / warning lines to its log (the console at
+/// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
+/// free for machine-readable command output. This routes the warning through the
+/// migrated logger — the Rust analogue of the C `LOG_WARN` macro — so it is
+/// level-filtered like every other command's output. `process_id` is `u32::MAX`
+/// so the formatter uses the process-global id set by `logInit`; `code` is `0`
+/// (no error-code segment). A formatting / write failure is intentionally
+/// swallowed: progress chatter must never turn a successful command into an
+/// error.
 fn log_warn(message: &str) {
-    eprintln!("WARN: {message}");
+    let _ = pgbr_core::log::format::log_internal(
+        pgbr_core::log::LOG_LEVEL_WARN,
+        pgbr_core::log::LOG_LEVEL_MIN,
+        pgbr_core::log::LOG_LEVEL_MAX,
+        u32::MAX,
+        "push.c",
+        "archivePush",
+        0,
+        message,
+    );
 }
 
 /// Validate a WAL segment's long-page header against the stanza's `archive.info`
