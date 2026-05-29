@@ -30,9 +30,12 @@
 //!   stanza-level `backup.info` header (the only copy this fork stores).
 //! - `database.repo-key` / `archive[].database.repo-key` — always `1`; this
 //!   fork is single-repo, so there is no per-backup repo index to report.
-//! - `lsn`, `error`, `annotation`, `database-ref`, `link`, `tablespace` — only
-//!   produced by the C side when a manifest is loaded for a specific `--set`;
-//!   omitted here.
+//! - `lsn`, `error`, `database-ref`, `link`, `tablespace` — only produced by
+//!   the C side when a manifest is loaded for a specific `--set`; omitted here.
+//! - `annotation` — user-supplied key/value labels attached via the `annotate`
+//!   command. Emitted per-backup in the repo-wide listing whenever the backup
+//!   has any (matching stock pgBackRest's `formatTextBackup` behaviour), and
+//!   also inherited by the `--set` detail view.
 //! - text timestamps are rendered in UTC (`YYYY-MM-DD HH:MM:SS+0000`) rather
 //!   than the C side's local time + computed offset, to keep rendering pure
 //!   and deterministic without pulling in a timezone database.
@@ -55,6 +58,7 @@
 //! `--set` requires `--stanza`. An unknown label errors; an unreadable manifest
 //! degrades to a note (the summary still renders) rather than failing.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +135,11 @@ pub struct BackupSummary {
     pub repo_size: Option<u64>,
     /// `db-id` of the cluster this backup belongs to.
     pub db_id: Option<u32>,
+    /// `backup-annotation` — user-supplied key/value labels attached via the
+    /// `annotate` command. Empty when the backup has no annotations. Stored as
+    /// a [`BTreeMap`] so iteration yields deterministic sorted output (matching
+    /// stock pgBackRest's `formatTextBackup` ordering).
+    pub annotation: BTreeMap<String, String>,
 }
 
 /// Summary of one stanza, suitable for display or programmatic inspection.
@@ -236,6 +245,18 @@ fn decode_backup(label: &str, value: &Value) -> BackupSummary {
     let info_size = value.get("backup-info-size").and_then(Value::as_u64);
     let repo_size = value.get("backup-info-repo-size").and_then(Value::as_u64);
     let db_id = value.get("db-id").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+    // `annotate` stores values as JSON strings (see `crates/pgbr-command/src/annotate.rs`),
+    // so non-string entries are silently skipped to keep the projection a clean
+    // `BTreeMap<String, String>`.
+    let annotation = value
+        .get("backup-annotation")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     BackupSummary {
         label: label.to_owned(),
         backup_type,
@@ -248,6 +269,7 @@ fn decode_backup(label: &str, value: &Value) -> BackupSummary {
         info_size,
         repo_size,
         db_id,
+        annotation,
     }
 }
 
@@ -423,6 +445,18 @@ fn render_backup_text(out: &mut String, b: &BackupSummary) {
     if !b.reference.is_empty() {
         let _ = writeln!(out, "            backup reference list: {}", b.reference.join(", "));
     }
+
+    // Annotations — emitted last per backup, mirroring stock pgBackRest's
+    // `formatTextBackup` rendering (12-space header indent, 20-space k: v
+    // indent). Omitted entirely when the backup has no annotations so backups
+    // without any render byte-for-byte unchanged. Iteration order is
+    // `BTreeMap`'s sorted-key order, so the output is deterministic.
+    if !b.annotation.is_empty() {
+        out.push_str("            backup annotation(s):\n");
+        for (k, v) in &b.annotation {
+            let _ = writeln!(out, "                {k}: {v}");
+        }
+    }
 }
 
 /// Render the full per-stanza database/backup text block, grouping backups by
@@ -482,28 +516,44 @@ fn backup_json(b: &BackupSummary, format: u32, version: &str) -> Value {
     let info_size = b.info_size.unwrap_or(0);
     let repo_size = b.repo_size.unwrap_or(0);
 
-    json!({
-        "label": b.label,
-        "type": b.backup_type,
-        // backup-prior / backup-reference are emitted as-is; null / [] when absent.
-        "prior": b.prior,
-        "reference": b.reference,
-        "archive": {
+    // Build the object as a `serde_json::Map` directly so the optional
+    // `annotation` key can be inserted conditionally without re-cloning the
+    // whole literal. When the annotation map is empty the key is omitted, so
+    // backups without annotations render byte-for-byte identical to the
+    // pre-annotation output.
+    let mut obj = serde_json::Map::new();
+    obj.insert("label".to_owned(), json!(b.label));
+    obj.insert("type".to_owned(), json!(b.backup_type));
+    // backup-prior / backup-reference are emitted as-is; null / [] when absent.
+    obj.insert("prior".to_owned(), json!(b.prior));
+    obj.insert("reference".to_owned(), json!(b.reference));
+    obj.insert(
+        "archive".to_owned(),
+        json!({
             "start": b.archive_start,
             "stop": b.archive_stop,
-        },
-        "backrest": {
+        }),
+    );
+    obj.insert(
+        "backrest".to_owned(),
+        json!({
             // Per-backup backrest format/version are not stored; mirror the
             // stanza-level backup.info header (documented placeholder).
             "format": format,
             "version": version,
-        },
-        "database": {
+        }),
+    );
+    obj.insert(
+        "database".to_owned(),
+        json!({
             "id": repo_key,
             // Single-repo fork: repo-key is always 1.
             "repo-key": 1,
-        },
-        "info": {
+        }),
+    );
+    obj.insert(
+        "info".to_owned(),
+        json!({
             "size": info_size,
             // size-delta not recorded per backup; mirror size.
             "delta": info_size,
@@ -512,12 +562,28 @@ fn backup_json(b: &BackupSummary, format: u32, version: &str) -> Value {
                 // repository.delta not recorded per backup; mirror size.
                 "delta": repo_size,
             },
-        },
-        "timestamp": {
+        }),
+    );
+    obj.insert(
+        "timestamp".to_owned(),
+        json!({
             "start": b.start_timestamp.unwrap_or(0),
             "stop": b.stop_timestamp.unwrap_or(0),
-        },
-    })
+        }),
+    );
+
+    // Conditional `annotation` key: a flat string-to-string object mirroring the
+    // map's `BTreeMap` sorted-key iteration. Omitted entirely when the map is
+    // empty so backups without annotations are byte-for-byte unchanged.
+    if !b.annotation.is_empty() {
+        let mut ann = serde_json::Map::new();
+        for (k, v) in &b.annotation {
+            ann.insert(k.clone(), Value::String(v.clone()));
+        }
+        obj.insert("annotation".to_owned(), Value::Object(ann));
+    }
+
+    Value::Object(obj)
 }
 
 /// Build the JSON value for one stanza (the array element). Mirrors the
@@ -839,8 +905,8 @@ mod tests {
     use pgbr_config::OptionValue;
 
     use super::{
-        CommandError, StanzaStatus, format_timestamp, info, info_inner, render_json, render_set, render_text, want_json,
-        want_report,
+        BackupSummary, CommandError, StanzaStatus, backup_json, decode_backup, format_timestamp, info, info_inner,
+        render_backup_text, render_json, render_set, render_text, want_json, want_report,
     };
 
     fn fake_config(stanza: Option<&str>) -> LoadedConfig {
@@ -1525,5 +1591,139 @@ mod tests {
         let (_dir, storage) = initialized_demo_with_manifest(label);
         let cfg = fake_config_set(Some("demo"), label, None);
         info(&cfg, &storage).expect("info --set should succeed");
+    }
+
+    /// Build a minimal `BackupSummary` for the JSON / text annotation tests so
+    /// each test can set the `annotation` field without restating every other
+    /// field.
+    fn minimal_backup_summary(label: &str) -> BackupSummary {
+        BackupSummary {
+            label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            prior: None,
+            reference: Vec::new(),
+            start_timestamp: Some(1_700_000_000),
+            stop_timestamp: Some(1_700_000_123),
+            archive_start: Some("000000010000000000000002".to_owned()),
+            archive_stop: Some("000000010000000000000003".to_owned()),
+            info_size: Some(8195),
+            repo_size: Some(4096),
+            db_id: Some(1),
+            annotation: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn decode_backup_extracts_annotation() {
+        // A `[backup:current]` entry carrying `backup-annotation` must surface
+        // as a sorted `BTreeMap<String, String>` on `BackupSummary`.
+        let value = json!({
+            "backup-info-size": 100,
+            "backup-info-repo-size": 50,
+            "backup-label": "20260101-100000F",
+            "backup-timestamp-stop": 1_700_000_000,
+            "backup-type": "full",
+            "backup-annotation": {
+                "note": "hello",
+                "ticket": "PGB-42",
+            },
+        });
+        let summary = decode_backup("20260101-100000F", &value);
+        let mut expected = BTreeMap::new();
+        expected.insert("note".to_owned(), "hello".to_owned());
+        expected.insert("ticket".to_owned(), "PGB-42".to_owned());
+        assert_eq!(summary.annotation, expected);
+    }
+
+    #[test]
+    fn decode_backup_no_annotation_gives_empty_map() {
+        // No `backup-annotation` key in the on-disk entry => empty map (not
+        // `None`) so renderers can rely on `.is_empty()` to decide whether to
+        // emit anything.
+        let value = json!({
+            "backup-info-size": 100,
+            "backup-info-repo-size": 50,
+            "backup-label": "20260101-100000F",
+            "backup-timestamp-stop": 1_700_000_000,
+            "backup-type": "full",
+        });
+        let summary = decode_backup("20260101-100000F", &value);
+        assert!(summary.annotation.is_empty(), "expected empty annotation map");
+    }
+
+    #[test]
+    fn backup_json_emits_annotation_when_present() {
+        // Non-empty annotation => the per-backup JSON object carries an
+        // `annotation` key with a flat string-to-string object mirroring the
+        // map's sorted-key iteration.
+        let mut backup = minimal_backup_summary("20260101-100000F");
+        backup.annotation.insert("note".to_owned(), "hello".to_owned());
+        backup.annotation.insert("ticket".to_owned(), "PGB-42".to_owned());
+
+        let value = backup_json(&backup, 5, "2.58");
+        let annotation = value.get("annotation").expect("annotation key present");
+        assert_eq!(annotation["note"], json!("hello"));
+        assert_eq!(annotation["ticket"], json!("PGB-42"));
+        // The object should contain exactly the supplied entries.
+        let obj = annotation.as_object().expect("annotation object");
+        assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn backup_json_omits_annotation_when_empty() {
+        // Empty annotation => no `annotation` key at all, so backups without
+        // annotations render byte-for-byte identical to the pre-change output.
+        let backup = minimal_backup_summary("20260101-100000F");
+        let value = backup_json(&backup, 5, "2.58");
+        assert!(
+            value.get("annotation").is_none(),
+            "annotation key must be omitted when map is empty: {value}"
+        );
+    }
+
+    #[test]
+    fn render_backup_text_emits_annotation_block_when_present() {
+        // Non-empty annotation => a trailing `backup annotation(s):` block with
+        // each `key: value` line. Entries are emitted in `BTreeMap` sorted
+        // order so the output is deterministic.
+        let mut backup = minimal_backup_summary("20260101-100000F");
+        backup.annotation.insert("ticket".to_owned(), "PGB-42".to_owned());
+        backup.annotation.insert("note".to_owned(), "hello".to_owned());
+
+        let mut out = String::new();
+        render_backup_text(&mut out, &backup);
+
+        assert!(
+            out.contains("            backup annotation(s):\n"),
+            "missing annotation header (12-space indent):\n{out}"
+        );
+        assert!(
+            out.contains("                note: hello\n"),
+            "missing 'note: hello' entry (20-space indent):\n{out}"
+        );
+        assert!(
+            out.contains("                ticket: PGB-42\n"),
+            "missing 'ticket: PGB-42' entry (20-space indent):\n{out}"
+        );
+        // Sorted alphabetically: `note` must appear before `ticket`.
+        let note_idx = out.find("note: hello").expect("note line");
+        let ticket_idx = out.find("ticket: PGB-42").expect("ticket line");
+        assert!(
+            note_idx < ticket_idx,
+            "annotation lines must be sorted alphabetically by key:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_backup_text_omits_annotation_block_when_empty() {
+        // Empty annotation => no `backup annotation(s):` header anywhere in
+        // the rendered text.
+        let backup = minimal_backup_summary("20260101-100000F");
+        let mut out = String::new();
+        render_backup_text(&mut out, &backup);
+        assert!(
+            !out.contains("backup annotation(s):"),
+            "empty annotation map must not produce a header:\n{out}"
+        );
     }
 }
