@@ -31,22 +31,14 @@ install -d -m 0750 /var/spool/pgbackrest
 install -d -m 0750 /etc/pgbackrest /etc/pgbackrest/conf.d
 install -d -m 0750 /etc/certs
 
-# --- install the Rust pgbackrest binary ------------------------------------
-ARTIFACT=/vagrant_repo/integration/artifacts/pgbackrest
-if [ -x "$ARTIFACT" ]; then
+# --- install the Rust pgbackrest binary (uploaded to /tmp by Vagrant) -------
+ARTIFACT=/tmp/pgbackrest.bin
+if [ -s "$ARTIFACT" ]; then
   echo "[common] installing prebuilt pgbackrest binary"
   install -m 0755 "$ARTIFACT" /usr/bin/pgbackrest
 else
-  echo "[common] prebuilt binary missing; building in-VM with rustup (slow)"
-  if ! command -v cargo >/dev/null 2>&1; then
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
-    # shellcheck disable=SC1090
-    source "$HOME/.cargo/env"
-  fi
-  apt-get install -y -qq build-essential pkg-config libpq-dev libssl-dev \
-    zlib1g-dev libbz2-dev liblz4-dev libzstd-dev libssh2-1-dev >/dev/null
-  ( cd /vagrant_repo && cargo build --release -p pgbr-cli )
-  install -m 0755 /vagrant_repo/target/release/pgbackrest /usr/bin/pgbackrest
+  echo "[common] ERROR: prebuilt binary /tmp/pgbackrest.bin missing — run ../build-binary.sh on the host first" >&2
+  exit 1
 fi
 
 pgbackrest version || true
