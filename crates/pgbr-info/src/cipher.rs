@@ -339,9 +339,24 @@ mod tests {
     }
 
     #[test]
-    fn info_decrypt_wrong_passphrase_fails() {
-        let cipher = encrypt_info("right", b"some info text").unwrap();
-        assert!(decrypt_info("wrong", &cipher).is_err());
+    fn info_decrypt_wrong_passphrase_does_not_recover_plaintext() {
+        // AES-CBC + PKCS#7 padding produces a deterministic failure on the
+        // wrong key only when the random decrypted last block does NOT happen
+        // to end in valid padding (probability ~1/256 of an accidental valid
+        // pad otherwise). Asserting `.is_err()` on a single ciphertext therefore
+        // flakes ~0.4% of the time. The cryptographically meaningful invariant
+        // is that the wrong key cannot RECOVER the original plaintext — either
+        // decryption errors out, or it succeeds but yields garbage. Assert that.
+        let plaintext: &[u8] = b"some info text";
+        let cipher = encrypt_info("right", plaintext).unwrap();
+        match decrypt_info("wrong", &cipher) {
+            Err(_) => {}
+            Ok(out) => assert_ne!(
+                out.as_slice(),
+                plaintext,
+                "wrong passphrase decrypted to the original plaintext — that would break AES-CBC",
+            ),
+        }
     }
 
     #[test]
