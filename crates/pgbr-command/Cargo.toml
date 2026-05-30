@@ -25,6 +25,11 @@ pgbr-core = { path = "../pgbr-core" }
 # live PostgreSQL connection (server_version_num + pg_control_system()) instead
 # of only reading global/pg_control off disk.
 pgbr-db = { path = "../pgbr-db" }
+# Binary <-> printable string encoders. Bundled-copy worker responses base64-encode
+# the transformed repo bytes so a JSON-shaped dispatcher response can carry them
+# across the worker boundary (the main thread base64-decodes and appends to the
+# in-memory bundle in deterministic skeleton order).
+pgbr-encode = { path = "../pgbr-encode" }
 pgbr-error = { path = "../pgbr-error" }
 pgbr-info = { path = "../pgbr-info" }
 pgbr-io = { path = "../pgbr-io" }

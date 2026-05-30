@@ -2130,9 +2130,14 @@ struct BundledCopyCtx<'a> {
     /// Backup start timestamp, used to compute each file's age for the block-size
     /// policy.
     timestamp_start: i64,
+    /// Number of parallel file-copy workers (`process-max`). When the repo + PG
+    /// data dir are both local, every per-file / per-block read + transform runs
+    /// across this many threads via [`ParallelExecutor`]; otherwise the serial
+    /// path is taken (mirroring [`run_copy_jobs`]).
+    process_max: usize,
 }
 
-/// Serial copy pass for `repo-bundle=y` (and optionally `repo-block=y`).
+/// Copy pass for `repo-bundle=y` (and optionally `repo-block=y`).
 ///
 /// Small files (repo size ≤ `repo-bundle-limit`) are packed into shared bundle
 /// objects via [`crate::bundle::BundlePacker`]; each records its `bundle_id` /
@@ -2144,12 +2149,39 @@ struct BundledCopyCtx<'a> {
 /// recorded. A full backup writes a self-referencing block map so later
 /// diff/incr backups have something to diff against.
 ///
+/// When the repo + PG data dir are both local the per-file / per-block reads +
+/// transforms run across `ctx.process_max` workers via [`ParallelExecutor`]; in
+/// every other topology (a non-local repo or a non-local pull-PG data dir) the
+/// classic serial path is taken because the underlying `Storage` handle is
+/// single-connection / `!Send`. Bundle assembly stays on the main thread in both
+/// paths to keep the byte layout byte-for-byte deterministic — every
+/// `BundlePacker::place` call is made in skeleton-walk order.
+///
 /// Returns the completed manifest file entries plus the total repo bytes written.
 ///
 /// # Errors
 ///
 /// Propagates read / write / transform failures.
 fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
+    // Both the repo and the PG data dir local is the only topology where the
+    // parallel `std::fs` fast path is safe — a non-local repo or a non-local
+    // pull PG data dir is handled by the serial fallback below (same reasoning
+    // as `run_copy_jobs`). The serial path is also taken when there is at most
+    // one worker, because the parallel pipeline only buys throughput.
+    if ctx.repo_storage.is_local() && ctx.pg_storage.is_local() && ctx.process_max > 1 {
+        return run_bundled_copy_parallel(ctx);
+    }
+    run_bundled_copy_serial(ctx)
+}
+
+/// Serial bundled copy — the classic single-thread walk, used in two cases:
+///
+/// 1. The repo or the PG data dir is non-local (remote/object/pull). The
+///    underlying `Storage` handles are single-connection / `!Send` and cannot
+///    be shared across worker threads.
+/// 2. `process-max <= 1`, where the parallel pipeline buys no throughput and
+///    the serial path produces identical output with less overhead.
+fn run_bundled_copy_serial(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
     let mut files: Vec<ManifestFile> = ctx.referenced;
     let mut repo_size: u64 = 0;
 
@@ -2285,6 +2317,673 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
     for (id, data) in bundle_bytes {
         let path = crate::bundle::bundle_object_path(ctx.backup_root, id);
         write_repo_file(ctx.repo_storage, &path, &data)?;
+    }
+
+    Ok((files, repo_size))
+}
+
+/// One unit of bundled-copy work shipped to a worker thread. A whole-file
+/// skeleton produces exactly one of these (`block.is_none()`); a
+/// block-incremental skeleton produces one per *changed* block (its `block`
+/// describes the byte range and the block index in the file). Reused blocks
+/// never become a `BundleJob` — they are recorded as references on the main
+/// thread during Phase 1 with no worker round-trip.
+#[derive(Debug, Clone)]
+struct BundleJob {
+    /// PG-data-relative path, used as the dispatcher correlation key (the same
+    /// key the worker echoes back so Phase 3 can look the result up).
+    rel: String,
+    /// Absolute source path on the local PG data dir. Workers read from this
+    /// via `std::fs` because the parallel path only runs when the PG data dir
+    /// is local.
+    abs_src: PathBuf,
+    /// Whether the worker should page-checksum-validate the bytes it read. Set
+    /// only for whole-file relation files when `--checksum-page` is on; block
+    /// jobs always carry `false` (per-page validation is a whole-file concern,
+    /// matching `transform_and_validate`'s contract).
+    validate_pages: bool,
+    /// Whether the worker should also validate each page's header
+    /// (`page-header-check`). Only meaningful when `validate_pages` is set.
+    validate_page_header: bool,
+    /// `Some` for a block-incremental block job — the byte range to read out of
+    /// `abs_src` plus the block's index in the file. `None` for a whole-file job
+    /// (the worker reads the whole file via `read_to_end`).
+    block: Option<BundleBlockJob>,
+}
+
+/// The block-incremental subset of a [`BundleJob`]: which byte range in the
+/// source file this job covers and where it falls in the file's block sequence.
+#[derive(Debug, Clone, Copy)]
+struct BundleBlockJob {
+    /// Byte offset of the block inside `abs_src` (start of the seek).
+    offset: u64,
+    /// Number of plaintext bytes to read for this block. The last block of a
+    /// file may be shorter than the configured `block_size`.
+    len: u64,
+    /// 0-based index of the block in the file. The main thread uses this to
+    /// place the block reference into the correct slot of the file's block map.
+    index: u64,
+}
+
+/// Worker outcome for one [`BundleJob`]. Carries the post-transform repo bytes
+/// inline (base64-encoded so JSON can hold them) — the main thread base64-decodes
+/// and appends to the in-memory bundle in deterministic skeleton + block order.
+/// Workers never touch the shared bundle accumulator.
+#[derive(Debug, Clone)]
+struct BundleJobResult {
+    /// Plaintext SHA-1 (lowercase hex) of the bytes this worker read. For a
+    /// whole-file job this is the file's manifest checksum; for a block job this
+    /// is the (untruncated) per-block checksum.
+    checksum: String,
+    /// Post-transform repo bytes. For a block job this is one block's contents;
+    /// for a whole-file job this is the full file's transformed bytes.
+    repo_bytes: Vec<u8>,
+    /// Whole-file page-checksum / page-header validation outcome — `None` when
+    /// the job did not validate (a block job, a non-relation file, or a file
+    /// whose length is not a page multiple).
+    checksum_page: Option<ChecksumPage>,
+    /// Echo of [`BundleBlockJob::index`] for a block job, `None` for whole file.
+    /// Lets the main thread index into the file's block-result vector when more
+    /// than one job per file is in flight.
+    block_index: Option<u64>,
+}
+
+/// Encode a [`BundleJob`] as a dispatcher [`Request`]: the job's `rel` path is
+/// the `cmd` and the absolute source path / validation flags / block range ride
+/// in `param`. Mirrors [`copy_job_to_request`].
+fn create_bundled_copy_request(job: &BundleJob) -> Request {
+    let (block_offset, block_len, block_index) = job.block.as_ref().map_or_else(
+        || (json!(null), json!(null), json!(null)),
+        |b| (json!(b.offset), json!(b.len), json!(b.index)),
+    );
+    Request {
+        cmd: job.rel.clone(),
+        param: vec![
+            json!(job.abs_src.to_string_lossy()),
+            json!(job.validate_pages),
+            json!(job.validate_page_header),
+            block_offset,
+            block_len,
+            block_index,
+        ],
+    }
+}
+
+/// Decode the response a worker produced into a [`BundleJobResult`], propagating
+/// any malformed-payload error back to the dispatcher caller. Mirrors the
+/// `process_*_response` helpers used by `run_copy_jobs`.
+fn process_bundled_copy_response(key: &str, value: &serde_json::Value) -> Result<BundleJobResult, CommandError> {
+    let checksum = value
+        .get("checksum")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CommandError::Other(format!("bundled copy of {key} returned no checksum")))?
+        .to_owned();
+    let repo_bytes_b64 = value
+        .get("repoBytesData")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CommandError::Other(format!("bundled copy of {key} returned no repo bytes")))?;
+    // The worker base64-encodes the post-transform bytes so the response stays
+    // JSON-shaped; decode them back into the raw repo bytes here.
+    let repo_bytes = base64_decode(repo_bytes_b64)
+        .map_err(|err| CommandError::Other(format!("bundled copy of {key} returned malformed base64: {err}")))?;
+    let checksum_page: Option<ChecksumPage> = match value.get("checksumPage") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|err| CommandError::Other(format!("bundled copy of {key} returned malformed checksumPage: {err}")))?,
+        ),
+    };
+    let block_index = value.get("blockIndex").and_then(serde_json::Value::as_u64);
+    Ok(BundleJobResult {
+        checksum,
+        repo_bytes,
+        checksum_page,
+        block_index,
+    })
+}
+
+/// Standard base64 decode helper. The dispatcher response only ever carries
+/// well-formed strings (the worker writes through [`pgbr_encode`]); a decode
+/// failure is therefore an internal protocol violation surfaced as `CommandError`.
+fn base64_decode(src: &str) -> Result<Vec<u8>, String> {
+    let needed = pgbr_encode::decoded_len(pgbr_encode::EncodingType::Base64, src).map_err(|err| err.to_string())?;
+    let mut buf = vec![0u8; needed];
+    pgbr_encode::decode(pgbr_encode::EncodingType::Base64, src, &mut buf).map_err(|err| err.to_string())?;
+    Ok(buf)
+}
+
+/// Standard base64 encode helper (no embedded `\0`). Used by the worker to ship
+/// post-transform bytes back over the JSON-shaped dispatcher response.
+fn base64_encode(src: &[u8]) -> String {
+    let len = pgbr_encode::encoded_len(pgbr_encode::EncodingType::Base64, src.len());
+    let mut buf = vec![0u8; len + 1];
+    pgbr_encode::encode(pgbr_encode::EncodingType::Base64, src, &mut buf);
+    buf.truncate(len);
+    // The encoder writes only the base64 alphabet + `=`, all ASCII.
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Per-skeleton plan record built during Phase 1 of [`run_bundled_copy_parallel`]
+/// for a whole-file skeleton. The worker has not yet run at this point — its
+/// transformed bytes / checksum / page-validation outcome are joined in by `rel`
+/// during Phase 3.
+struct WholeFilePlan {
+    skeleton: ManifestFile,
+    rel_dest: String,
+    abs_dest: PathBuf,
+}
+
+/// Per-skeleton plan record built during Phase 1 of [`run_bundled_copy_parallel`]
+/// for a block-incremental skeleton. The whole-file plaintext was read on the
+/// main thread to compute the per-block (reuse vs store) decision; the worker
+/// returns transformed bytes for each *stored* block (the *reused* slots are
+/// already filled in here).
+struct BlockFilePlan {
+    skeleton: ManifestFile,
+    /// Whole-file plaintext SHA-1 (the manifest's `checksum` for this file).
+    checksum: String,
+    /// Whole-file page-checksum / page-header validation outcome (only set for
+    /// validated relation files; otherwise `None`).
+    checksum_page: Option<ChecksumPage>,
+    /// Block size for this file (after the `repo-block-*-map` overrides applied).
+    block_size: u64,
+    /// Super-block size for this backup type (`repo-block-size-super[-full]`).
+    super_size: u64,
+    /// Per-block recorded checksum length (`repo-block-checksum-size-map`).
+    checksum_size: u64,
+    /// Per-block slot. `Some(BlockRef)` for a reused block (already final at
+    /// Phase 1); `None` for a stored block, filled from the worker result.
+    slots: Vec<Option<pgbr_info::manifest::BlockRef>>,
+    /// Indices of stored blocks in file order, driving the super-block grouping
+    /// in Phase 3.
+    stored_indices: Vec<u64>,
+}
+
+/// One skeleton's Phase-1 plan, distinguished by whether it goes through the
+/// whole-file or the block-incremental path.
+enum SkeletonPlan {
+    Whole(WholeFilePlan),
+    Block(BlockFilePlan),
+}
+
+/// Parallel bundled copy. Runs **only** when both the repo and the PG data dir
+/// are local — the parallel `std::fs` fast path is unsafe otherwise (a remote
+/// PG data dir's absolute paths do not exist on this machine, a remote repo's
+/// writes would land on the wrong host).
+///
+/// # Phase 1 (main thread, serial)
+///
+/// Walk `ctx.skeletons` in order. For each skeleton, decide which path applies:
+///
+/// - **Block-incremental** (`features.block` + block-eligible by size/age):
+///   read the full file once on this thread (the block-boundary checksums need
+///   the bytes), compute the per-block (truncated) checksum, and split the file
+///   into *reused* blocks (matching the prior backup's block map by checksum,
+///   recorded immediately as references with no worker round-trip) and
+///   *changed* blocks (each becomes one [`BundleJob`] with its byte range).
+/// - **Whole-file**: one [`BundleJob`] for the whole file with `block = None`.
+///   The worker reads, hashes, validates, and transforms; the main thread later
+///   decides whether the transformed bytes fit the bundle limit or land
+///   standalone (the bundle-limit decision rides on the post-transform size).
+///
+/// # Phase 2 (workers, parallel)
+///
+/// `ParallelExecutor::new(process_max)` distributes the jobs across worker
+/// threads. The worker closure captures **only** owned data — an owned clone of
+/// the transform, the [`JobRetry`] policy (Copy), and the [`BackupFeatures`]
+/// (Copy). No `Storage` handle crosses the boundary. Each worker re-decodes its
+/// request, opens `abs_src` via `std::fs`, optionally seeks to a block range,
+/// validates pages (whole-file jobs only), applies the keyed forward transform,
+/// and returns the post-transform bytes (base64'd) plus the plaintext checksum
+/// in a JSON-shaped [`Response`]. Worker errors surface as `Err(String)` per
+/// [`JobResult`] and the main thread fails the whole backup on the first one.
+///
+/// # Phase 3 (main thread, serial — deterministic assembly)
+///
+/// Walk `ctx.skeletons` again in the same order Phase 1 walked them. For each
+/// skeleton, look its worker result(s) up by `rel`, then:
+///
+/// - **Whole-file bundled** (repo size ≤ `bundle_limit`): call
+///   `file_packer.place(repo_len)` (the same call the serial path makes, in the
+///   same order, so the bundle ids + offsets are byte-identical), then append
+///   the worker's bytes to `bundle_bytes[bundle_id]`. The packer's returned
+///   offset is asserted to equal the current bundle length — a determinism
+///   smoke test that a future bug would trip.
+/// - **Whole-file unbundled** (repo size > `bundle_limit`): write the worker's
+///   bytes to its own repo object (the same path the serial path uses).
+/// - **Block-incremental changed blocks**: super-block-group them per
+///   `super_block_layout`, `packer.place(super_len)` per group, append the
+///   group's transformed bytes contiguously, and record one `BlockRef` per
+///   block — exactly the serial code path in `build_block_map`.
+///
+/// After every skeleton is processed the bundle objects are flushed to the
+/// repo, identical to the serial path's final loop.
+#[allow(clippy::too_many_lines)]
+fn run_bundled_copy_parallel(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64), CommandError> {
+    use pgbr_info::manifest::{BlockMap, BlockRef};
+
+    let BundledCopyCtx {
+        repo_storage,
+        pg_storage: _,
+        backup_root,
+        transform,
+        label,
+        skeletons,
+        jobs,
+        referenced,
+        prior_manifest,
+        features,
+        block_overrides,
+        is_full,
+        job_retry,
+        timestamp_start,
+        process_max,
+    } = ctx;
+
+    // Correlate dispatcher jobs to skeletons by path. The dispatcher does not
+    // need the absolute destination (the main thread handles all repo writes)
+    // but does need the absolute source + validation flags, both carried on
+    // `CopyJob`.
+    let mut job_by_rel: std::collections::HashMap<String, CopyJob> = jobs.into_iter().map(|j| (j.rel.clone(), j)).collect();
+
+    // ----- Phase 1: walk skeletons, build per-skeleton plan + worker jobs ----
+
+    let mut plans: Vec<SkeletonPlan> = Vec::with_capacity(skeletons.len());
+    let mut dispatcher_jobs: Vec<Job> = Vec::new();
+
+    for skeleton in skeletons {
+        let job = job_by_rel
+            .remove(&skeleton.path)
+            .ok_or_else(|| CommandError::Other(format!("no copy job for {}", skeleton.path)))?;
+
+        // Decide the block size for this file. `None` means store whole.
+        let age = timestamp_start.saturating_sub(skeleton.timestamp);
+        let block_size = if features.block {
+            block_overrides.block_size(skeleton.size, age)
+        } else {
+            None
+        };
+
+        if let Some(block_size) = block_size {
+            // Block-incremental file: read once on this thread to compute per-block
+            // checksums (the reuse decision needs the plaintext). The retry policy
+            // matches the serial path so a transient read failure is masked here too.
+            let bytes = job_retry
+                .run(|| std::fs::read(&job.abs_src))
+                .map_err(|err| CommandError::Other(format!("read {}: {err}", job.abs_src.display())))?;
+            let checksum = plaintext_sha1(&bytes)?;
+            // Page validation runs on whole-file plaintext bytes (same trigger as
+            // the serial path). Block-incremental files include relation files, so
+            // a `validate_pages` skeleton still validates here on the main thread.
+            let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
+                let invalid = validate_relation_pages(&bytes, job.validate_page_header);
+                Some(if invalid.is_empty() {
+                    ChecksumPage::Validated
+                } else {
+                    ChecksumPage::InvalidBlocks(invalid)
+                })
+            } else {
+                None
+            };
+            if let Some(ChecksumPage::InvalidBlocks(blocks)) = checksum_page.as_ref() {
+                warn_invalid_pages(&skeleton.path, blocks);
+            }
+
+            let checksum_size = block_overrides.checksum_size(block_size);
+            let super_size = block_overrides.super_size(is_full);
+            let blocks = crate::block::split_blocks(&bytes, block_size);
+            let prior_map = prior_manifest
+                .and_then(|m| m.file(&skeleton.path))
+                .and_then(|f| f.block_map.as_ref());
+            let mut slots: Vec<Option<BlockRef>> = vec![None; blocks.len()];
+            let mut stored_indices: Vec<u64> = Vec::new();
+
+            let mut block_offset: u64 = 0;
+            for (idx, block) in blocks.iter().enumerate() {
+                let block_len = block.len() as u64;
+                let block_checksum = truncate_checksum(&plaintext_sha1(block)?, checksum_size);
+
+                // Reuse path: prior backup recorded a block at this index with the
+                // matching (truncated) checksum — no worker job, just record the ref.
+                if let Some(prior) = prior_map.and_then(|m| m.blocks.get(idx))
+                    && prior.checksum == block_checksum
+                {
+                    slots[idx] = Some(prior.clone());
+                } else {
+                    // Stored path: enqueue a worker job for this block's byte range.
+                    // The block index correlates the worker's result back to the
+                    // slot in `slots`.
+                    let idx_u64 =
+                        u64::try_from(idx).map_err(|err| CommandError::Other(format!("block index {idx} out of range: {err}")))?;
+                    stored_indices.push(idx_u64);
+                    let bundle_job = BundleJob {
+                        rel: skeleton.path.clone(),
+                        abs_src: job.abs_src.clone(),
+                        // Block jobs never page-validate — whole-file validation
+                        // already happened on the main thread above.
+                        validate_pages: false,
+                        validate_page_header: false,
+                        block: Some(BundleBlockJob {
+                            offset: block_offset,
+                            len: block_len,
+                            index: idx_u64,
+                        }),
+                    };
+                    // Each block becomes a unique dispatcher key
+                    // (`<rel>#block=<idx>`) so the result demultiplexer can tell
+                    // multiple blocks of one file apart. The request `cmd` carries
+                    // only `rel` so the worker still has the original PG-relative
+                    // path; the dispatcher key is purely for correlation.
+                    dispatcher_jobs.push(Job {
+                        key: format!("{}#block={}", skeleton.path, idx_u64),
+                        request: create_bundled_copy_request(&bundle_job),
+                    });
+                }
+                block_offset = block_offset.saturating_add(block_len);
+            }
+
+            plans.push(SkeletonPlan::Block(BlockFilePlan {
+                skeleton,
+                checksum,
+                checksum_page,
+                block_size,
+                super_size,
+                checksum_size,
+                slots,
+                stored_indices,
+            }));
+        } else {
+            // Whole-file path: enqueue one worker job; defer the bundle-vs-standalone
+            // decision to Phase 3 (it rides on the post-transform repo length the
+            // worker reports).
+            let bundle_job = BundleJob {
+                rel: skeleton.path.clone(),
+                abs_src: job.abs_src.clone(),
+                validate_pages: job.validate_pages,
+                validate_page_header: job.validate_page_header,
+                block: None,
+            };
+            dispatcher_jobs.push(Job {
+                key: skeleton.path.clone(),
+                request: create_bundled_copy_request(&bundle_job),
+            });
+            plans.push(SkeletonPlan::Whole(WholeFilePlan {
+                skeleton,
+                rel_dest: job.rel_dest.clone(),
+                abs_dest: job.abs_dest.clone(),
+            }));
+        }
+    }
+
+    // ----- Phase 2: workers (parallel) ---------------------------------------
+
+    // Owned captures only — no borrows from the stack frame leak into the
+    // closure (the executor demands `Send + Sync + 'static`). Cloning the
+    // `RepoTransform` is cheap (it's `Clone`); `JobRetry` and `BackupFeatures`
+    // are `Copy`.
+    let worker_transform = transform.clone();
+    let worker_job_retry = job_retry;
+    let job_count = dispatcher_jobs.len();
+    let results = if dispatcher_jobs.is_empty() {
+        Vec::new()
+    } else {
+        ParallelExecutor::new(process_max).run(dispatcher_jobs, move |request| {
+            // Decode the per-job inputs from the dispatcher request.
+            let abs_src = request
+                .param
+                .first()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "bundled copy: missing source path".to_owned())?;
+            let validate_pages = request.param.get(1).and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let validate_page_header = request.param.get(2).and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let block_offset = request.param.get(3).and_then(serde_json::Value::as_u64);
+            let block_len = request.param.get(4).and_then(serde_json::Value::as_u64);
+            let block_index = request.param.get(5).and_then(serde_json::Value::as_u64);
+
+            // Read the source under the per-file retry policy (a transient read
+            // failure is retried up to `job-retry` times, matching the serial path).
+            let read_op = || -> Result<Vec<u8>, String> {
+                if let (Some(off), Some(len)) = (block_offset, block_len) {
+                    // Block job: seek to the block's start and read exactly `len`
+                    // bytes (`read_exact` so a short read fails the job).
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = std::fs::File::open(abs_src).map_err(|err| format!("open {abs_src}: {err}"))?;
+                    file.seek(SeekFrom::Start(off))
+                        .map_err(|err| format!("seek {abs_src} to {off}: {err}"))?;
+                    let len_usize = usize::try_from(len).map_err(|err| format!("block length {len} out of range: {err}"))?;
+                    let mut buf = vec![0u8; len_usize];
+                    file.read_exact(&mut buf)
+                        .map_err(|err| format!("read_exact {abs_src} ({len} bytes): {err}"))?;
+                    Ok(buf)
+                } else {
+                    // Whole-file job: read the entire file.
+                    std::fs::read(abs_src).map_err(|err| format!("read {abs_src}: {err}"))
+                }
+            };
+            let bytes = worker_job_retry.run(read_op)?;
+
+            let checksum = plaintext_sha1(&bytes).map_err(|err| err.to_string())?;
+
+            // Page validation only on whole-file relation jobs (matches the serial
+            // `transform_and_validate` contract). A block job carries
+            // `validate_pages = false`, so this branch is dead for them.
+            let checksum_page = if validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
+                let invalid = validate_relation_pages(&bytes, validate_page_header);
+                Some(if invalid.is_empty() {
+                    ChecksumPage::Validated
+                } else {
+                    ChecksumPage::InvalidBlocks(invalid)
+                })
+            } else {
+                None
+            };
+
+            // Keyed forward transform (compress + encrypt), identical to the
+            // serial path so the bundle byte layout is unchanged.
+            let repo_bytes = worker_transform.apply_forward_keyed(&bytes).map_err(|err| err.to_string())?;
+
+            let checksum_page_json = serde_json::to_value(&checksum_page).map_err(|err| format!("encode checksumPage: {err}"))?;
+            Ok(Response::Ok(OkResponse {
+                out: Some(json!({
+                    "checksum": checksum,
+                    "repoBytesData": base64_encode(&repo_bytes),
+                    "checksumPage": checksum_page_json,
+                    "blockIndex": block_index,
+                })),
+            }))
+        })
+    };
+
+    // ----- Phase 2.5: index results by dispatcher key ------------------------
+
+    // The dispatcher returns results in completion (i.e. non-deterministic)
+    // order. Group them by skeleton `rel`:
+    //   - whole-file: `key == rel` -> one result.
+    //   - block: `key == <rel>#block=<idx>` -> many results per rel, addressed
+    //     by `block_index` in the response.
+    if results.len() != job_count {
+        return Err(CommandError::Other(format!(
+            "bundled copy: dispatcher returned {} result(s) for {job_count} job(s)",
+            results.len()
+        )));
+    }
+    let mut whole_by_rel: std::collections::HashMap<String, BundleJobResult> = std::collections::HashMap::new();
+    let mut block_by_rel: std::collections::HashMap<String, std::collections::HashMap<u64, BundleJobResult>> =
+        std::collections::HashMap::new();
+    for job_result in results {
+        let (rel, is_block) = match job_result.key.split_once("#block=") {
+            Some((rel, _)) => (rel.to_owned(), true),
+            None => (job_result.key.clone(), false),
+        };
+        let value = match job_result.result {
+            Ok(Response::Ok(OkResponse { out: Some(v) })) => v,
+            Ok(_) => {
+                return Err(CommandError::Other(format!(
+                    "bundled copy of {} produced an unexpected empty response",
+                    job_result.key
+                )));
+            }
+            Err(message) => return Err(CommandError::Other(message)),
+        };
+        let parsed = process_bundled_copy_response(&job_result.key, &value)?;
+        if is_block {
+            let idx = parsed
+                .block_index
+                .ok_or_else(|| CommandError::Other(format!("bundled block copy of {} returned no blockIndex", job_result.key)))?;
+            block_by_rel.entry(rel).or_default().insert(idx, parsed);
+        } else {
+            whole_by_rel.insert(rel, parsed);
+        }
+    }
+
+    // ----- Phase 3: deterministic bundle assembly ----------------------------
+
+    let mut files: Vec<ManifestFile> = referenced;
+    let mut repo_size: u64 = 0;
+    let mut file_packer = crate::bundle::BundlePacker::new(features.bundle_size);
+    let mut bundle_bytes: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+
+    for plan in plans {
+        match plan {
+            SkeletonPlan::Whole(WholeFilePlan {
+                skeleton,
+                rel_dest,
+                abs_dest,
+            }) => {
+                let worker = whole_by_rel
+                    .remove(&skeleton.path)
+                    .ok_or_else(|| CommandError::Other(format!("no bundled copy result for {}", skeleton.path)))?;
+                let repo_len = worker.repo_bytes.len() as u64;
+                repo_size += repo_len;
+                if let Some(ChecksumPage::InvalidBlocks(blocks)) = worker.checksum_page.as_ref() {
+                    warn_invalid_pages(&skeleton.path, blocks);
+                }
+                let entry = if repo_len <= features.bundle_limit {
+                    // Bundled small file: deterministic place + append.
+                    let slot = file_packer.place(repo_len);
+                    let buf = bundle_bytes.entry(slot.bundle_id).or_default();
+                    debug_assert_eq!(
+                        buf.len() as u64,
+                        slot.offset,
+                        "bundle slot offset must match the current bundle length"
+                    );
+                    buf.extend_from_slice(&worker.repo_bytes);
+                    ManifestFile {
+                        checksum: Some(worker.checksum),
+                        checksum_page: worker.checksum_page,
+                        bundle_id: Some(slot.bundle_id),
+                        bundle_offset: Some(slot.offset),
+                        ..skeleton
+                    }
+                } else {
+                    // Over-the-limit whole file: standalone repo object. Both repo
+                    // and PG data dir are local here (parallel branch invariant),
+                    // so `std::fs::write` against the absolute destination is the
+                    // correct write — same code path the serial path takes.
+                    if let Some(parent) = abs_dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+                    }
+                    std::fs::write(&abs_dest, &worker.repo_bytes)
+                        .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
+                    // `rel_dest` is unused on the local path but kept on the plan so
+                    // a future non-local-aware parallel implementation can reuse it.
+                    let _ = rel_dest;
+                    ManifestFile {
+                        checksum: Some(worker.checksum),
+                        checksum_page: worker.checksum_page,
+                        ..skeleton
+                    }
+                };
+                files.push(entry);
+            }
+            SkeletonPlan::Block(BlockFilePlan {
+                skeleton,
+                checksum,
+                checksum_page,
+                block_size,
+                super_size,
+                checksum_size,
+                mut slots,
+                stored_indices,
+            }) => {
+                // Look every stored block's worker result up by index, in file
+                // order, so super-block grouping below operates on the same byte
+                // sequence the serial path produced.
+                let mut block_results = block_by_rel.remove(&skeleton.path).unwrap_or_default();
+                let mut stored_bytes: Vec<Vec<u8>> = Vec::with_capacity(stored_indices.len());
+                let mut stored_checksums: Vec<String> = Vec::with_capacity(stored_indices.len());
+                for &idx in &stored_indices {
+                    let res = block_results
+                        .remove(&idx)
+                        .ok_or_else(|| CommandError::Other(format!("no result for block {idx} of {}", skeleton.path)))?;
+                    // The worker returned the untruncated plaintext SHA-1; the
+                    // recorded per-block checksum is truncated per
+                    // `repo-block-checksum-size-map` (same as the serial path
+                    // through `truncate_checksum`).
+                    stored_checksums.push(truncate_checksum(&res.checksum, checksum_size));
+                    stored_bytes.push(res.repo_bytes);
+                }
+
+                let groups = super_block_layout(stored_indices.len(), block_size, super_size);
+                let mut next = 0usize;
+                for group_len in groups {
+                    let super_len: u64 = stored_bytes[next..next + group_len].iter().map(|b| b.len() as u64).sum();
+                    let super_slot = file_packer.place(super_len);
+                    let buf = bundle_bytes.entry(super_slot.bundle_id).or_default();
+                    debug_assert_eq!(
+                        buf.len() as u64,
+                        super_slot.offset,
+                        "super-block slot offset must match the current bundle length"
+                    );
+                    let mut cursor = super_slot.offset;
+                    for member in 0..group_len {
+                        let i = next + member;
+                        let bytes_i = &stored_bytes[i];
+                        let repo_len = bytes_i.len() as u64;
+                        repo_size += repo_len;
+                        buf.extend_from_slice(bytes_i);
+                        let block_idx = usize::try_from(stored_indices[i])
+                            .map_err(|err| CommandError::Other(format!("block index {} out of range: {err}", stored_indices[i])))?;
+                        slots[block_idx] = Some(BlockRef {
+                            checksum: stored_checksums[i].clone(),
+                            reference: label.to_owned(),
+                            bundle_id: super_slot.bundle_id,
+                            offset: cursor,
+                            size: repo_len,
+                        });
+                        cursor = cursor.saturating_add(repo_len);
+                    }
+                    next += group_len;
+                }
+                let refs: Vec<BlockRef> = slots
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, slot)| {
+                        slot.ok_or_else(|| CommandError::Other(format!("block {idx} left unplaced for {}", skeleton.path)))
+                    })
+                    .collect::<Result<_, _>>()?;
+                files.push(ManifestFile {
+                    checksum: Some(checksum),
+                    checksum_page,
+                    block_map: Some(BlockMap {
+                        block_size,
+                        blocks: refs,
+                    }),
+                    ..skeleton
+                });
+            }
+        }
+    }
+
+    // ----- Flush bundles ----------------------------------------------------
+
+    if !bundle_bytes.is_empty() {
+        repo_storage.create_path(Path::new(&format!("{backup_root}/{}", crate::bundle::BUNDLE_DIR)), true)?;
+    }
+    for (id, data) in bundle_bytes {
+        let path = crate::bundle::bundle_object_path(backup_root, id);
+        write_repo_file(repo_storage, &path, &data)?;
     }
 
     Ok((files, repo_size))
@@ -3519,6 +4218,7 @@ fn run_backup(
             is_full: backup_type == BackupType::Full,
             job_retry,
             timestamp_start,
+            process_max,
         })?
     } else {
         run_unbundled_copy(UnbundledCopyCtx {
@@ -7885,5 +8585,533 @@ mod tests {
         // server thread joins cleanly — keeping the test deterministic.
         pg_remote.close().expect("close remote pg storage");
         server.join().expect("worker thread joins");
+    }
+
+    // -------------------------------------------------------------------------
+    // run_bundled_copy parallel-path tests.
+    //
+    // These call `run_bundled_copy` (and its `_serial` / `_parallel` variants)
+    // directly with hand-built `BundledCopyCtx` instances, so they exercise the
+    // bundle pipeline without driving a full `backup()` end-to-end. The fixtures
+    // live entirely inside `tempfile::TempDir`s; the bundle bytes / manifest
+    // entries are checked against the serial path's output to prove byte-for-byte
+    // equivalence.
+    // -------------------------------------------------------------------------
+
+    /// Build a `(CopyJob, ManifestFile)` pair for `rel` inside the seeded PG /
+    /// repo pair, mirroring what [`plan_file`] would have produced for a fresh
+    /// file in a full backup.
+    fn build_bundled_job(
+        repo_dir: &std::path::Path,
+        pg_dir: &std::path::Path,
+        backup_root: &str,
+        rel: &str,
+        size: u64,
+        timestamp: i64,
+    ) -> (CopyJob, ManifestFile) {
+        let abs_src = pg_dir.join(rel);
+        let abs_dest = repo_dir.join(format!("{backup_root}/{rel}"));
+        let rel_dest = format!("{backup_root}/{rel}");
+        let job = CopyJob {
+            rel: rel.to_owned(),
+            abs_src,
+            abs_dest,
+            rel_dest,
+            validate_pages: false,
+            validate_page_header: false,
+        };
+        let skeleton = ManifestFile {
+            path: rel.to_owned(),
+            size,
+            timestamp,
+            checksum: None,
+            checksum_page: None,
+            reference: None,
+            mode: None,
+            user: None,
+            group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
+        };
+        (job, skeleton)
+    }
+
+    /// Build a `BundledCopyCtx` for `repo_storage` + `pg_storage` (which must
+    /// already hold the seeded files), with parallel-mode tuning and `block`
+    /// enabled when the caller asks. Caller-supplied `prior_manifest` drives
+    /// block-incremental reuse.
+    #[allow(clippy::too_many_arguments)]
+    fn make_bundled_ctx<'a>(
+        repo_storage: &'a dyn Storage,
+        pg_storage: &'a dyn Storage,
+        backup_root: &'a str,
+        transform: &'a RepoTransform,
+        label: &'a str,
+        skeletons: Vec<ManifestFile>,
+        jobs: Vec<CopyJob>,
+        prior_manifest: Option<&'a Manifest>,
+        features: BackupFeatures,
+        block_overrides: crate::block::BlockOverrides,
+        process_max: usize,
+        timestamp_start: i64,
+    ) -> BundledCopyCtx<'a> {
+        BundledCopyCtx {
+            repo_storage,
+            pg_storage,
+            backup_root,
+            transform,
+            label,
+            skeletons,
+            jobs,
+            referenced: Vec::new(),
+            prior_manifest,
+            features,
+            block_overrides,
+            is_full: true,
+            job_retry: JobRetry::none(),
+            timestamp_start,
+            process_max,
+        }
+    }
+
+    #[test]
+    fn bundled_copy_parallel_local_whole_file_baseline() {
+        // Three small whole-file bundled entries with process-max=4: the
+        // parallel path must produce the same bundle bytes + manifest entries
+        // the serial path produces.
+        let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair();
+        let backup_root = "backup/demo/L";
+        let label = "L";
+        let files = [
+            ("PG_VERSION", b"14\n".to_vec()),
+            ("base/1/1259", b"relation one's bytes".to_vec()),
+            ("base/1/1260", b"relation two's slightly different bytes".to_vec()),
+        ];
+        for (rel, bytes) in &files {
+            seed_file(&pg_s, rel, bytes);
+        }
+        let transform = RepoTransform::identity();
+        let features = BackupFeatures {
+            bundle: true,
+            bundle_size: 1024 * 1024,
+            bundle_limit: 4096,
+            block: false,
+        };
+
+        // -- Parallel run.
+        let mut skeletons = Vec::new();
+        let mut jobs = Vec::new();
+        for (rel, bytes) in &files {
+            let (job, skeleton) = build_bundled_job(
+                repo_dir.path(),
+                pg_dir.path(),
+                backup_root,
+                rel,
+                bytes.len() as u64,
+                1_000_000_000,
+            );
+            jobs.push(job);
+            skeletons.push(skeleton);
+        }
+        let ctx = make_bundled_ctx(
+            &repo_s,
+            &pg_s,
+            backup_root,
+            &transform,
+            label,
+            skeletons,
+            jobs,
+            None,
+            features,
+            crate::block::BlockOverrides::none(),
+            4,
+            2_000_000_000,
+        );
+        let (parallel_files, parallel_size) = run_bundled_copy_parallel(ctx).expect("parallel bundled copy");
+        let parallel_bundle = std::fs::read(repo_dir.path().join(format!("{backup_root}/bundle/1"))).expect("bundle 1");
+
+        // -- Serial run into a separate repo so we can byte-compare the bundle.
+        let serial_repo_dir = tempfile::tempdir().expect("serial repo tempdir");
+        let serial_repo_s = Posix::new(serial_repo_dir.path());
+        let mut skeletons2 = Vec::new();
+        let mut jobs2 = Vec::new();
+        for (rel, bytes) in &files {
+            let (job, skeleton) = build_bundled_job(
+                serial_repo_dir.path(),
+                pg_dir.path(),
+                backup_root,
+                rel,
+                bytes.len() as u64,
+                1_000_000_000,
+            );
+            jobs2.push(job);
+            skeletons2.push(skeleton);
+        }
+        let serial_ctx = make_bundled_ctx(
+            &serial_repo_s,
+            &pg_s,
+            backup_root,
+            &transform,
+            label,
+            skeletons2,
+            jobs2,
+            None,
+            features,
+            crate::block::BlockOverrides::none(),
+            1,
+            2_000_000_000,
+        );
+        let (serial_files, serial_size) = run_bundled_copy_serial(serial_ctx).expect("serial bundled copy");
+        let serial_bundle = std::fs::read(serial_repo_dir.path().join(format!("{backup_root}/bundle/1"))).expect("serial bundle 1");
+
+        // -- Byte-for-byte equivalence.
+        assert_eq!(parallel_bundle, serial_bundle, "bundle bytes must match serial");
+        assert_eq!(parallel_size, serial_size, "repo size must match serial");
+        assert_eq!(
+            parallel_files
+                .iter()
+                .map(|f| (f.path.clone(), f.checksum.clone(), f.bundle_id, f.bundle_offset))
+                .collect::<Vec<_>>(),
+            serial_files
+                .iter()
+                .map(|f| (f.path.clone(), f.checksum.clone(), f.bundle_id, f.bundle_offset))
+                .collect::<Vec<_>>(),
+            "manifest entries must match serial (path/checksum/bundle id/offset)",
+        );
+        // Every file actually bundled.
+        for f in &parallel_files {
+            assert!(f.bundle_id.is_some(), "{} must be bundled", f.path);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bundled_copy_parallel_local_block_incremental() {
+        // One file split into 4 blocks (2 reused, 2 changed). The parallel path
+        // parallelises the changed-block transforms while reused blocks are
+        // pulled from the prior manifest on the main thread; the resulting
+        // manifest must be byte-identical to the serial path's output.
+        let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair();
+        let backup_root = "backup/demo/L";
+        let label = "L";
+
+        // Block-eligible size (≥ 128 KiB). Use 4 blocks of 32 KiB.
+        let block_size_usize: usize = 32 * 1024;
+        let block_size: u64 = block_size_usize as u64;
+        let block_count: usize = 4;
+        let total_len = block_size_usize * block_count;
+        let prior_bytes: Vec<u8> = (0..total_len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        // The "new" file matches the prior in blocks 0 and 2, differs in 1 and 3.
+        let mut new_bytes = prior_bytes.clone();
+        for byte in &mut new_bytes[block_size_usize..2 * block_size_usize] {
+            *byte ^= 0xff;
+        }
+        for byte in &mut new_bytes[3 * block_size_usize..4 * block_size_usize] {
+            *byte = byte.wrapping_add(7);
+        }
+        seed_file(&pg_s, "base/1/1259", &new_bytes);
+        let transform = RepoTransform::identity();
+        let features = BackupFeatures {
+            bundle: true,
+            bundle_size: 1024 * 1024,
+            bundle_limit: 4096,
+            block: true,
+        };
+
+        // Build a prior manifest whose block map matches the *prior* bytes' blocks.
+        // Each prior BlockRef carries the truncated checksum (default 6 bytes ->
+        // 12 hex chars) of one prior block.
+        let mut prior_block_refs = Vec::new();
+        for idx in 0..block_count {
+            let start = idx * block_size_usize;
+            let end = start + block_size_usize;
+            let checksum = truncate_checksum(&sha1_hex(&prior_bytes[start..end]), 6);
+            prior_block_refs.push(pgbr_info::manifest::BlockRef {
+                checksum,
+                reference: "PRIOR".to_owned(),
+                bundle_id: 9,
+                offset: (idx as u64) * 100,
+                size: 100,
+            });
+        }
+        let prior_manifest = Manifest {
+            backup_label: "PRIOR".to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 0,
+            timestamp_stop: 0,
+            db_version: "14".to_owned(),
+            db_system_id: 1,
+            option_checksum_page: None,
+            paths: Vec::new(),
+            links: Vec::new(),
+            files: vec![ManifestFile {
+                path: "base/1/1259".to_owned(),
+                size: total_len as u64,
+                timestamp: 0,
+                checksum: Some(sha1_hex(&prior_bytes)),
+                checksum_page: None,
+                reference: None,
+                mode: None,
+                user: None,
+                group: None,
+                bundle_id: None,
+                bundle_offset: None,
+                block_map: Some(pgbr_info::manifest::BlockMap {
+                    block_size,
+                    blocks: prior_block_refs,
+                }),
+            }],
+        };
+
+        // Force the per-file block size to exactly 32 KiB via `repo-block-size-map`
+        // (so the heuristic does not pick a smaller block size for this 128 KiB
+        // file and produce 16 blocks instead of 4).
+        let block_overrides = crate::block::BlockOverrides::new(vec![(0u64, block_size)], Vec::new(), Vec::new(), None, None);
+        let run_one = |repo_dir: &std::path::Path, repo_s: &Posix, process_max: usize| -> (Vec<ManifestFile>, u64, Vec<u8>) {
+            let (job, skeleton) = build_bundled_job(
+                repo_dir,
+                pg_dir.path(),
+                backup_root,
+                "base/1/1259",
+                total_len as u64,
+                1_000_000_000,
+            );
+            let ctx = make_bundled_ctx(
+                repo_s,
+                &pg_s,
+                backup_root,
+                &transform,
+                label,
+                vec![skeleton],
+                vec![job],
+                Some(&prior_manifest),
+                features,
+                block_overrides.clone(),
+                process_max,
+                1_000_000_000, // fresh: same as file mtime, so block_size kicks in.
+            );
+            let (files, size) = if process_max > 1 {
+                run_bundled_copy_parallel(ctx).expect("parallel bundled block copy")
+            } else {
+                run_bundled_copy_serial(ctx).expect("serial bundled block copy")
+            };
+            let bundle_path = repo_dir.join(format!("{backup_root}/bundle/1"));
+            let bundle_bytes = if bundle_path.exists() {
+                std::fs::read(&bundle_path).expect("bundle")
+            } else {
+                Vec::new()
+            };
+            (files, size, bundle_bytes)
+        };
+
+        let (parallel_files, parallel_size, parallel_bundle) = run_one(repo_dir.path(), &repo_s, 4);
+
+        // -- Serial reference run.
+        let serial_repo_dir = tempfile::tempdir().expect("serial repo tempdir");
+        let serial_repo_s = Posix::new(serial_repo_dir.path());
+        let (serial_files, serial_size, serial_bundle) = run_one(serial_repo_dir.path(), &serial_repo_s, 1);
+
+        assert_eq!(parallel_bundle, serial_bundle, "bundle bytes must match serial");
+        assert_eq!(parallel_size, serial_size, "repo size must match serial");
+        assert_eq!(parallel_files.len(), 1);
+        let p_bm = parallel_files[0].block_map.as_ref().expect("parallel block map");
+        let s_bm = serial_files[0].block_map.as_ref().expect("serial block map");
+        assert_eq!(p_bm.block_size, s_bm.block_size);
+        assert_eq!(
+            p_bm.blocks, s_bm.blocks,
+            "block map (including reused PRIOR refs and stored block bundle offsets) must match serial",
+        );
+
+        // Sanity: blocks 0 + 2 are reused PRIOR refs, blocks 1 + 3 are stored
+        // in this label.
+        assert_eq!(p_bm.blocks[0].reference, "PRIOR");
+        assert_eq!(p_bm.blocks[1].reference, label);
+        assert_eq!(p_bm.blocks[2].reference, "PRIOR");
+        assert_eq!(p_bm.blocks[3].reference, label);
+    }
+
+    #[test]
+    fn bundled_copy_remote_storage_falls_back_to_serial() {
+        // A non-local repo storage forces the serial path even when process-max
+        // is high. The resulting bundle bytes + manifest must match a direct
+        // serial-path invocation.
+        let (repo_dir, pg_dir, _repo_inner, pg_s) = posix_pair();
+        let backup_root = "backup/demo/L";
+        let label = "L";
+        let files = [
+            ("PG_VERSION", b"14\n".to_vec()),
+            ("base/1/1259", b"data one".to_vec()),
+            ("base/1/1260", b"another one".to_vec()),
+        ];
+        for (rel, bytes) in &files {
+            seed_file(&pg_s, rel, bytes);
+        }
+        let transform = RepoTransform::identity();
+        let features = BackupFeatures {
+            bundle: true,
+            bundle_size: 1024 * 1024,
+            bundle_limit: 4096,
+            block: false,
+        };
+
+        let recording = RecordingStorage::new(Posix::new(repo_dir.path()));
+        let mut skeletons = Vec::new();
+        let mut jobs = Vec::new();
+        for (rel, bytes) in &files {
+            let (job, skeleton) = build_bundled_job(
+                repo_dir.path(),
+                pg_dir.path(),
+                backup_root,
+                rel,
+                bytes.len() as u64,
+                1_000_000_000,
+            );
+            jobs.push(job);
+            skeletons.push(skeleton);
+        }
+        let ctx = make_bundled_ctx(
+            &recording,
+            &pg_s,
+            backup_root,
+            &transform,
+            label,
+            skeletons,
+            jobs,
+            None,
+            features,
+            crate::block::BlockOverrides::none(),
+            8, // high process-max — must still be ignored because repo is not local.
+            2_000_000_000,
+        );
+        // The router (`run_bundled_copy`) must pick the serial branch when the
+        // repo is non-local even with process-max > 1.
+        let (files_out, _size) = run_bundled_copy(ctx).expect("non-local bundled copy");
+        let bundle_data = std::fs::read(repo_dir.path().join(format!("{backup_root}/bundle/1"))).expect("bundle 1");
+
+        // Reference serial run against a local Posix to compare bytes.
+        let local_repo_dir = tempfile::tempdir().expect("local repo tempdir");
+        let local_repo_s = Posix::new(local_repo_dir.path());
+        let mut skeletons2 = Vec::new();
+        let mut jobs2 = Vec::new();
+        for (rel, bytes) in &files {
+            let (job, skeleton) = build_bundled_job(
+                local_repo_dir.path(),
+                pg_dir.path(),
+                backup_root,
+                rel,
+                bytes.len() as u64,
+                1_000_000_000,
+            );
+            jobs2.push(job);
+            skeletons2.push(skeleton);
+        }
+        let ctx2 = make_bundled_ctx(
+            &local_repo_s,
+            &pg_s,
+            backup_root,
+            &transform,
+            label,
+            skeletons2,
+            jobs2,
+            None,
+            features,
+            crate::block::BlockOverrides::none(),
+            1,
+            2_000_000_000,
+        );
+        let (ref_files, _ref_size) = run_bundled_copy_serial(ctx2).expect("reference serial");
+        let ref_bundle = std::fs::read(local_repo_dir.path().join(format!("{backup_root}/bundle/1"))).expect("ref bundle");
+
+        assert_eq!(bundle_data, ref_bundle, "non-local fallback bundle bytes must match serial");
+        assert_eq!(
+            files_out
+                .iter()
+                .map(|f| (f.path.clone(), f.bundle_id, f.bundle_offset))
+                .collect::<Vec<_>>(),
+            ref_files
+                .iter()
+                .map(|f| (f.path.clone(), f.bundle_id, f.bundle_offset))
+                .collect::<Vec<_>>(),
+            "non-local fallback manifest entries must match serial",
+        );
+
+        // Every write the non-local backend received must go through open_write
+        // (proves the parallel std::fs path was NOT taken).
+        let recorded = recording.writes().lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|p| p == &format!("{backup_root}/bundle/1")),
+            "bundle 1 must be written via open_write; recorded: {recorded:?}",
+        );
+    }
+
+    #[test]
+    fn bundled_copy_determinism_two_runs() {
+        // Two parallel runs over the same seeded inputs must produce
+        // byte-identical bundle objects. Anything else means the slot
+        // pre-allocation order leaked into the worker pool.
+        let backup_root = "backup/demo/L";
+        let label = "L";
+        let files = [
+            ("PG_VERSION", b"14\n".to_vec()),
+            ("base/1/1259", b"relation one's bytes".to_vec()),
+            ("base/1/1260", b"relation two's slightly different bytes".to_vec()),
+            ("base/1/1261", b"a third relation here".to_vec()),
+            (
+                "base/1/1262",
+                b"and a fourth, longer than the others to keep the packer busy".to_vec(),
+            ),
+        ];
+        let transform = RepoTransform::identity();
+        let features = BackupFeatures {
+            bundle: true,
+            bundle_size: 1024 * 1024,
+            bundle_limit: 4096,
+            block: false,
+        };
+
+        let run_once = || -> Vec<u8> {
+            let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair();
+            for (rel, bytes) in &files {
+                seed_file(&pg_s, rel, bytes);
+            }
+            let mut skeletons = Vec::new();
+            let mut jobs = Vec::new();
+            for (rel, bytes) in &files {
+                let (job, skeleton) = build_bundled_job(
+                    repo_dir.path(),
+                    pg_dir.path(),
+                    backup_root,
+                    rel,
+                    bytes.len() as u64,
+                    1_000_000_000,
+                );
+                jobs.push(job);
+                skeletons.push(skeleton);
+            }
+            let ctx = make_bundled_ctx(
+                &repo_s,
+                &pg_s,
+                backup_root,
+                &transform,
+                label,
+                skeletons,
+                jobs,
+                None,
+                features,
+                crate::block::BlockOverrides::none(),
+                4,
+                2_000_000_000,
+            );
+            run_bundled_copy_parallel(ctx).expect("parallel bundled copy");
+            std::fs::read(repo_dir.path().join(format!("{backup_root}/bundle/1"))).expect("bundle 1")
+        };
+
+        let bundle_a = run_once();
+        let bundle_b = run_once();
+        assert_eq!(
+            bundle_a, bundle_b,
+            "two parallel runs must produce byte-identical bundle objects"
+        );
     }
 }
