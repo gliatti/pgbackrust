@@ -83,13 +83,41 @@ impl Roots {
     const NONE: Self = Self { repo: false, pg: false };
 }
 
+/// Commands whose option model accepts `--lock-path`. See `config.yaml`'s
+/// `lock-path` entry: only the commands listed there may carry the option, so
+/// passing it to (say) `version` or `repo-ls` is itself an
+/// `OptionNotValidForCommand` resolution error.
+const LOCK_PATH_COMMANDS: &[&str] = &[
+    "annotate",
+    "archive-get",
+    "archive-push",
+    "backup",
+    "expire",
+    "info",
+    "restore",
+    "stanza-create",
+    "stanza-delete",
+    "stanza-upgrade",
+    "start",
+    "stop",
+];
+
 /// Run `command` with a per-command argv (stanza + the storage roots its model
 /// accepts + `extra`), asserting it reaches dispatch.
 fn check_command(command: &str, roots: Roots, extra: &[&str]) {
     let repo = tempfile::tempdir().expect("repo tempdir");
     let pg = tempfile::tempdir().expect("pg tempdir");
+    // Always isolate `--lock-path` to a per-test tempdir for the commands
+    // that accept it: `stop` writes `<lock-path>/<stanza>.stop` LOCALLY, and
+    // `backup`/`archive-push`/… now gate on the same file, so a leaked sentinel
+    // under the shared default `/tmp/pgbackrest` would break sibling tests
+    // (e2e backup, lib.rs dispatch) in the same `cargo test` invocation.
+    let lock = tempfile::tempdir().expect("lock tempdir");
 
     let mut args = vec![command.to_owned(), "--stanza=demo".to_owned()];
+    if LOCK_PATH_COMMANDS.contains(&command) {
+        args.push(format!("--lock-path={}", lock.path().display()));
+    }
     if roots.repo {
         args.push(format!("--repo1-path={}", repo.path().display()));
     }

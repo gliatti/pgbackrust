@@ -742,6 +742,13 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
 /// reachable standby.
 pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // Refuse to run when the operator has called `stop` for this stanza (or
+    // `stop --force` which writes `all.stop` and blocks every stanza). The
+    // gate runs BEFORE acquiring the backup lock so a stopped stanza doesn't
+    // even create a lock file. C ref: cmdLockAcquire's lockStopTest check.
+    if crate::lock::is_stopped(config)? {
+        return Err(CommandError::Other(format!("stop file exists for stanza {stanza}")));
+    }
     // Hold the backup lock for the whole command. C ref: lockAcquire(lockTypeBackup).
     let _locks = acquire_command_lock(config, LockType::Backup)?;
     let backup_type = BackupType::from_options(config);
@@ -4760,6 +4767,33 @@ mod tests {
         assert!(
             !expected_lock.exists(),
             "lock file must be removed after the command releases it"
+        );
+    }
+
+    #[test]
+    fn backup_refuses_when_stop_file_exists() {
+        // Pre-place `<lock-path>/demo.stop` on the local filesystem. A
+        // subsequent `backup` must refuse with a clear "stop file exists for
+        // stanza demo" error BEFORE it acquires the backup lock — the gate
+        // check sits ahead of `acquire_command_lock`.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let cfg = typed_cfg_locked("demo", "full", lock_dir.path());
+
+        // Seed the stop file for the demo stanza.
+        std::fs::write(lock_dir.path().join("demo.stop"), b"").expect("seed stop file");
+
+        let err = backup(&cfg, &repo_s, &pg_s).expect_err("backup must refuse when stopped");
+        let msg = err.to_string();
+        assert!(msg.contains("stop file exists for stanza demo"), "unexpected error: {msg}");
+
+        // The backup lock must NOT have been created — the gate runs first.
+        assert!(
+            !lock_dir.path().join("demo-backup.lock").exists(),
+            "stop-gate must run before lock acquisition"
         );
     }
 

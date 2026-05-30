@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
-use pgbr_storage::Storage;
 
 use crate::CommandError;
 
@@ -62,41 +61,61 @@ fn stop_file(config: &LoadedConfig) -> PathBuf {
 /// rest of pgBackRest refuses new commands. With `--force`, the file body
 /// records `force=1\n`.
 ///
+/// Stop files are intrinsically LOCAL to the host running `pgbackrest`
+/// (stock pgBackRest C uses `storageLocalWrite` in
+/// `src/command/control/stop.c`). Going through a `Storage` backend would
+/// route the path through whichever repository is configured — on S3 /
+/// Azure / GCS / SFTP it would create an object key inside the bucket
+/// instead of a local sentinel file, so subsequent local `is_stopped`
+/// checks would never see it. We use `std::fs` directly, mirroring
+/// [`lock_acquire`] which already touches the same `lock_path` locally.
+///
+/// The file is published via a write-then-rename so a concurrent
+/// [`is_stopped`] never observes a partial body.
+///
 /// # Errors
 ///
-/// Returns [`CommandError::Storage`] / [`CommandError::Io`] if the
-/// underlying storage call fails.
-pub fn stop(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+/// Returns [`CommandError::Other`] if creating the lock directory,
+/// writing the temporary file, or renaming it into place fails.
+pub fn stop(config: &LoadedConfig) -> Result<(), CommandError> {
     let path = stop_file(config);
     // Best-effort: ensure the lock-path directory exists.
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        repo_storage.create_path(parent, true).or_else(|err| match err {
-            pgbr_storage::StorageError::AlreadyExists { .. } => Ok(()),
-            other => Err(other),
-        })?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| CommandError::Other(format!("unable to create lock path '{}': {err}", parent.display())))?;
     }
 
-    let mut writer = repo_storage.open_write(&path)?;
-    if force_flag(config) {
-        writer.write(b"force=1\n")?;
-    }
-    writer.close()?;
+    let body: &[u8] = if force_flag(config) { b"force=1\n" } else { b"" };
+    // Atomic-ish publish: write to a temp file, then rename. This keeps a
+    // concurrent `is_stopped` from observing a partial file.
+    let tmp = path.with_extension("stop.tmp");
+    std::fs::write(&tmp, body)
+        .map_err(|err| CommandError::Other(format!("unable to write stop file '{}': {err}", tmp.display())))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|err| CommandError::Other(format!("unable to publish stop file '{}': {err}", path.display())))?;
     Ok(())
 }
 
-/// Remove the stop file written by [`stop`]. Idempotent: a missing file is
-/// not an error.
+/// Remove the stop file written by [`stop`].
+///
+/// Idempotent: a missing file is not an error. Operates on the local
+/// filesystem for the same reason [`stop`] does — stop files are LOCAL host
+/// sentinels, not repository objects.
 ///
 /// # Errors
 ///
-/// Returns [`CommandError::Storage`] if the underlying storage call fails
-/// for a reason other than "missing".
-pub fn start(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+/// Returns [`CommandError::Other`] if the underlying `unlink` fails for a
+/// reason other than "missing".
+pub fn start(config: &LoadedConfig) -> Result<(), CommandError> {
     let path = stop_file(config);
-    repo_storage.remove(&path, false)?;
-    Ok(())
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CommandError::Other(format!(
+            "unable to remove stop file '{}': {err}",
+            path.display()
+        ))),
+    }
 }
 
 /// Resolve where the stop file lives without writing it. Exposed for tests
@@ -122,12 +141,26 @@ pub const fn default_lock_path() -> &'static str {
 /// Probe whether a stop file exists for the given config. Used by other
 /// commands that must refuse to run when the operator has called `stop`.
 ///
+/// Two sentinels are checked, both on the LOCAL filesystem (matching
+/// [`stop`]): the stanza-scoped `<lock-path>/<stanza>.stop` file written by
+/// `stop --stanza=<stanza>`, AND `<lock-path>/all.stop` written by `stop
+/// --force` (or `stop` with no stanza) which blocks every stanza. Either
+/// being present blocks the calling command.
+///
 /// # Errors
 ///
-/// Propagates any [`pgbr_storage::StorageError`] other than `NotFound`.
-pub fn is_stopped(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<bool, CommandError> {
-    let path = stop_file(config);
-    Ok(repo_storage.exists(&path)?)
+/// This call is currently infallible — both checks are pure `Path::exists`
+/// probes — but the result is wrapped in `Result` so future
+/// permission-error reporting can plumb through without breaking the
+/// signature.
+#[allow(clippy::unnecessary_wraps)]
+pub fn is_stopped(config: &LoadedConfig) -> Result<bool, CommandError> {
+    let stanza_stop = stop_file(config);
+    if stanza_stop.exists() {
+        return Ok(true);
+    }
+    let all_stop = lock_path(config).join("all.stop");
+    Ok(all_stop.exists())
 }
 
 /// Internal helper exposed only for tests in this crate.
@@ -427,5 +460,110 @@ mod tests {
     fn stop_file_uses_all_when_no_stanza() {
         let cfg = config_with(None, vec![("lock-path", OptionValue::Path("/l".to_owned()))]);
         assert_eq!(stop_file_path(&cfg), PathBuf::from("/l/all.stop"));
+    }
+
+    /// Build a config rooted under `lock_path` on the local filesystem. The
+    /// stop-file commands MUST operate on this local path, not on any
+    /// `Storage` backend, so a posix-rooted tempdir is the right fixture.
+    fn config_local_locked(stanza: Option<&str>, lock_path: &Path, extra: Vec<(&str, OptionValue)>) -> LoadedConfig {
+        let mut opts = vec![("lock-path", OptionValue::Path(lock_path.to_string_lossy().into_owned()))];
+        opts.extend(extra);
+        config_with(stanza, opts)
+    }
+
+    #[test]
+    fn stop_creates_stanza_stop_file_locally() {
+        // `stop --stanza=demo` must write `<lock-path>/demo.stop` on the host
+        // filesystem (NOT via any Storage backend). The file appears under
+        // the configured lock-path even when the lock-path dir does not yet
+        // exist (created on demand).
+        let lock_dir = TempDir::new().expect("lock tempdir");
+        // Use a not-yet-created subdirectory so `stop` exercises the
+        // create-dir-all path.
+        let lock_path = lock_dir.path().join("inner");
+        assert!(!lock_path.exists(), "precondition: lock-path must not exist yet");
+        let cfg = config_local_locked(Some("demo"), &lock_path, Vec::new());
+
+        stop(&cfg).expect("stop should succeed");
+
+        let expected = lock_path.join("demo.stop");
+        assert!(
+            expected.exists(),
+            "stop file must exist on the local filesystem at {expected:?}"
+        );
+        // Body is empty when --force is not set.
+        let body = std::fs::read(&expected).expect("read stop file");
+        assert!(body.is_empty(), "stop file body must be empty without --force, got {body:?}");
+    }
+
+    #[test]
+    fn start_removes_stanza_stop_file() {
+        // Pre-create a stop file then `start` removes it. After the call the
+        // sentinel is gone from the local filesystem.
+        let lock_dir = TempDir::new().expect("lock tempdir");
+        let lock_path = lock_dir.path();
+        let cfg = config_local_locked(Some("demo"), lock_path, Vec::new());
+
+        let stop_path = lock_path.join("demo.stop");
+        std::fs::write(&stop_path, b"").expect("seed stop file");
+        assert!(stop_path.exists());
+
+        start(&cfg).expect("start should succeed");
+        assert!(!stop_path.exists(), "start must remove the stop file");
+    }
+
+    #[test]
+    fn start_when_no_file_is_idempotent_ok() {
+        // No stop file present → `start` returns Ok(()). Calling it twice in
+        // a row must also be a no-op.
+        let lock_dir = TempDir::new().expect("lock tempdir");
+        let cfg = config_local_locked(Some("demo"), lock_dir.path(), Vec::new());
+        let stop_path = lock_dir.path().join("demo.stop");
+        assert!(!stop_path.exists(), "precondition: no stop file");
+
+        start(&cfg).expect("idempotent start (1)");
+        start(&cfg).expect("idempotent start (2)");
+        assert!(!stop_path.exists());
+    }
+
+    #[test]
+    fn is_stopped_sees_stanza_and_all_stop() {
+        // The stanza-scoped `<stanza>.stop` blocks the calling stanza, AND
+        // an `all.stop` (set by stock `stop --force` or `stop` with no
+        // stanza) blocks every stanza too. With neither file present,
+        // is_stopped returns false.
+        let lock_dir = TempDir::new().expect("lock tempdir");
+        let lock_path = lock_dir.path();
+        let cfg = config_local_locked(Some("demo"), lock_path, Vec::new());
+
+        assert!(!is_stopped(&cfg).expect("is_stopped: clean"), "no files → not stopped");
+
+        // Stanza-scoped sentinel.
+        let stanza_stop = lock_path.join("demo.stop");
+        std::fs::write(&stanza_stop, b"").expect("seed demo.stop");
+        assert!(is_stopped(&cfg).expect("is_stopped: stanza"), "demo.stop → stopped");
+        std::fs::remove_file(&stanza_stop).expect("remove demo.stop");
+
+        // Cluster-wide sentinel.
+        let all_stop = lock_path.join("all.stop");
+        std::fs::write(&all_stop, b"").expect("seed all.stop");
+        assert!(is_stopped(&cfg).expect("is_stopped: all"), "all.stop → stopped");
+        std::fs::remove_file(&all_stop).expect("remove all.stop");
+
+        assert!(!is_stopped(&cfg).expect("is_stopped: clean again"), "cleanup → not stopped");
+    }
+
+    #[test]
+    fn stop_with_force_writes_force_marker() {
+        // With `--force` set, `stop` records `force=1\n` in the file body so
+        // a peer process can tell a forced stop from a graceful one.
+        let lock_dir = TempDir::new().expect("lock tempdir");
+        let lock_path = lock_dir.path();
+        let cfg = config_local_locked(Some("demo"), lock_path, vec![("force", OptionValue::Boolean(true))]);
+
+        stop(&cfg).expect("stop --force should succeed");
+
+        let body = std::fs::read(lock_path.join("demo.stop")).expect("read stop file");
+        assert_eq!(body, b"force=1\n", "force=1\\n marker expected, got {body:?}");
     }
 }

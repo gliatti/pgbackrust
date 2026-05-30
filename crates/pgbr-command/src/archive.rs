@@ -687,6 +687,13 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
             "archive-push requires at least one repository".to_owned(),
         ));
     }
+    // Refuse to run when the operator has called `stop` for this stanza (or
+    // `stop --force` which writes `all.stop` and blocks every stanza). The
+    // gate runs BEFORE acquiring the archive lock so a stopped stanza doesn't
+    // create a lock file. C ref: cmdLockAcquire's lockStopTest check.
+    if crate::lock::is_stopped(config)? {
+        return Err(CommandError::Other(format!("stop file exists for stanza {stanza}")));
+    }
     // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
     let _locks = acquire_command_lock(config, LockType::Archive)?;
     let wal_source = config.params.first().ok_or_else(|| CommandError::MissingOption {
@@ -1195,6 +1202,13 @@ pub fn get(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &d
     })?;
     if repo_storages.is_empty() {
         return Err(CommandError::Other("archive-get requires at least one repository".to_owned()));
+    }
+    // Refuse to run when the operator has called `stop` for this stanza (or
+    // `stop --force` which writes `all.stop` and blocks every stanza). The
+    // gate runs BEFORE acquiring the archive lock so a stopped stanza doesn't
+    // create a lock file. C ref: cmdLockAcquire's lockStopTest check.
+    if crate::lock::is_stopped(config)? {
+        return Err(CommandError::Other(format!("stop file exists for stanza {stanza}")));
     }
     // Hold the archive lock for the whole command. C ref: lockAcquire(lockTypeArchive).
     let _locks = acquire_command_lock(config, LockType::Archive)?;
@@ -1961,6 +1975,61 @@ mod tests {
 
         drop(held);
         push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push succeeds once the lock is free");
+    }
+
+    #[test]
+    fn archive_push_refuses_when_stop_file_exists() {
+        // Pre-place `<lock-path>/demo.stop` on the local filesystem. A
+        // subsequent `archive-push` must refuse with a clear "stop file
+        // exists for stanza demo" error BEFORE it acquires the archive lock.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = fake_config_locked(Some("demo"), vec![wal_source], lock_dir.path());
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+
+        // Seed the stop file for the demo stanza.
+        std::fs::write(lock_dir.path().join("demo.stop"), b"").expect("seed stop file");
+
+        let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("push must refuse when stopped");
+        let msg = err.to_string();
+        assert!(msg.contains("stop file exists for stanza demo"), "unexpected error: {msg}");
+
+        // The archive lock must NOT have been created — the gate runs first.
+        assert!(
+            !lock_dir.path().join("demo-archive.lock").exists(),
+            "stop-gate must run before lock acquisition"
+        );
+    }
+
+    #[test]
+    fn archive_get_refuses_when_stop_file_exists() {
+        // Same stop-file gate applies to `archive-get`.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let dest = format!("pg_wal/{SEGMENT}");
+        let cfg = fake_config_locked(Some("demo"), vec![SEGMENT.to_owned(), dest], lock_dir.path());
+
+        // Pin cwd: archive-get resolves a relative dest against cwd.
+        let _cwd = CwdGuard::new(pg.path());
+
+        // Seed the stop file for the demo stanza.
+        std::fs::write(lock_dir.path().join("demo.stop"), b"").expect("seed stop file");
+
+        let err = get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("get must refuse when stopped");
+        let msg = err.to_string();
+        assert!(msg.contains("stop file exists for stanza demo"), "unexpected error: {msg}");
+        assert!(
+            !lock_dir.path().join("demo-archive.lock").exists(),
+            "stop-gate must run before lock acquisition"
+        );
     }
 
     #[test]

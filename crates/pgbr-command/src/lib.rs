@@ -165,8 +165,8 @@ pub fn dispatch_multi(
     match config.command.as_str() {
         "version" => control::version(config),
         "help" => help::help(config),
-        "start" => lock::start(config, repo_storage),
-        "stop" => lock::stop(config, repo_storage),
+        "start" => lock::start(config),
+        "stop" => lock::stop(config),
         "stanza-create" => stanza::create(config, repo_storages, pg_storage),
         "stanza-delete" => stanza::delete(config, repo_storages),
         "stanza-upgrade" => stanza::upgrade(config, repo_storages, pg_storage),
