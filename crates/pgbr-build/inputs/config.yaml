@@ -1649,6 +1649,7 @@ option:
       repo-put: {}
       repo-rm: {}
       restore: {}
+      server: {}
       stanza-create:
         command-role:
           remote: {}

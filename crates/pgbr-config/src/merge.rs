@@ -1617,6 +1617,27 @@ option:
         }
     }
 
+    #[test]
+    fn repo_path_resolves_for_server_command_from_global_section() {
+        // The TLS `server` daemon resolves its repo location from the
+        // `[global]` section just like any other command. Before the
+        // config.yaml fix that authorized `repo-*` options for command
+        // `server`, the option simply wasn't in the merged map and the
+        // daemon fell back to `.` as the filesystem root.
+        let parsed = pgbr_build::parse_config(pgbr_build::inputs::CONFIG_YAML).unwrap();
+        let cfg = crate::compile::compile(&parsed).unwrap();
+        let cli = parse_cli(["server"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ini = crate::ini::parse_ini("[global]\nrepo1-path=/var/lib/pgbackrest\n").unwrap();
+        let loaded =
+            load_config(resolved, &ini, &cfg).expect("server must resolve against the real config.yaml with a [global] repo1-path");
+        assert_eq!(
+            loaded.options.get(&("repo-path".to_owned(), Some(1))),
+            Some(&OptionValue::Path("/var/lib/pgbackrest".into())),
+            "repo-path must be present in the resolved options for command `server`",
+        );
+    }
+
     // ---- dynamic and per-flavor defaults -----------------------------------
 
     /// Config with a `default-type: dynamic` option (`cmd`, like config.yaml's

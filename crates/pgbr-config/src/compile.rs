@@ -1035,4 +1035,36 @@ option:
         // override (None), so the option-level required applies.
         assert_eq!(stanza.commands["backup"].required, None);
     }
+
+    #[test]
+    fn fixture_repo_storage_options_authorized_for_server_command() {
+        // The TLS `server` daemon needs the repo-storage options so it can
+        // know where its repo lives. The `repo` option enumerates `server`
+        // explicitly; every downstream repo-* option inherits its command
+        // list via `+inherit: repo` or `command: repo-type`. Regression
+        // guard: if any of these slip out of the `server` command set, the
+        // server daemon falls back to filesystem root `.` at runtime.
+        let cfg = load_fixture();
+        for opt_name in [
+            "repo",
+            "repo-type",
+            "repo-path",
+            "repo-cipher-type",
+            "repo-cipher-pass",
+            "repo-s3-bucket",
+            "repo-gcs-bucket",
+            "repo-azure-container",
+            "repo-sftp-host",
+        ] {
+            let opt = cfg
+                .options
+                .get(opt_name)
+                .unwrap_or_else(|| panic!("option `{opt_name}` missing from compiled fixture"));
+            assert!(
+                opt.commands.contains_key("server"),
+                "option `{opt_name}` is not authorized for command `server` (commands = {:?})",
+                opt.commands.keys().collect::<Vec<_>>(),
+            );
+        }
+    }
 }
