@@ -635,6 +635,15 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 ///   than "missing".
 pub fn delete(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)]) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
+    // REQUIRE a stop file before wiping the stanza. This is the operator's
+    // explicit "this stanza is offline, it's safe to remove" signal. Stock
+    // pgBackRest enforces the same guard in `src/command/stanza/delete.c`
+    // (`lockStopTest(false)`). The semantics are INVERTED relative to
+    // backup/archive: those commands refuse to run when stopped, this one
+    // refuses to run when NOT stopped.
+    if !crate::lock::is_stopped(config)? {
+        return Err(CommandError::Other(format!("stop file does not exist for stanza {stanza}")));
+    }
     // Hold both archive+backup locks for the whole command. C ref: lockAcquire(lockTypeAll).
     let _locks = acquire_command_lock(config, LockType::All)?;
 
@@ -886,12 +895,53 @@ mod tests {
         let mut cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
         cfg.command = "stanza-delete".to_owned();
 
+        // stanza-delete now requires the stop file to exist — pass through the new gate.
+        crate::lock::stop(&cfg).expect("seed stop file");
+
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Archive).expect("pre-acquire archive lock");
         let err = delete(&cfg, &[(1, &repo_s as &dyn Storage)]).expect_err("delete must fail while a component lock is held");
         assert!(err.to_string().contains("running"), "unexpected error: {err}");
 
         drop(held);
         delete(&cfg, &[(1, &repo_s as &dyn Storage)]).expect("delete succeeds once the locks are free");
+    }
+
+    /// stanza-delete must refuse to run unless the operator first ran
+    /// `stop` (or `stop --force` to write `all.stop`). This is the safety
+    /// guard that prevents accidentally wiping a live, actively-archived
+    /// stanza. Mirrors stock pgBackRest's `lockStopTest(false)` check in
+    /// `src/command/stanza/delete.c`.
+    #[test]
+    fn stanza_delete_refuses_without_stop_file() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let repo_s = Posix::new(repo.path());
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
+        cfg.command = "stanza-delete".to_owned();
+
+        // Pre-seed both stanza subtrees so we can prove the gate ran BEFORE
+        // any removal — if the gate slipped, these directories would vanish.
+        repo_s
+            .create_path(Path::new("archive/demo"), true)
+            .expect("seed archive/demo");
+        repo_s.create_path(Path::new("backup/demo"), true).expect("seed backup/demo");
+
+        let err = delete(&cfg, &[(1, &repo_s as &dyn Storage)]).expect_err("stanza-delete must refuse to run without a stop file");
+        assert!(
+            err.to_string().contains("stop file does not exist for stanza demo"),
+            "unexpected error: {err}"
+        );
+
+        // The gate must short-circuit before any subtree removal happens.
+        assert!(
+            repo_s.exists(Path::new("archive/demo")).expect("exists"),
+            "archive/demo must still exist when the gate refuses"
+        );
+        assert!(
+            repo_s.exists(Path::new("backup/demo")).expect("exists"),
+            "backup/demo must still exist when the gate refuses"
+        );
     }
 
     #[test]
@@ -1496,15 +1546,18 @@ mod tests {
         let repo1 = tempfile::tempdir().expect("repo1 tempdir");
         let repo2 = tempfile::tempdir().expect("repo2 tempdir");
         let pg = tempfile::tempdir().expect("pg tempdir");
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
         write_pg_control(&pg_s, 7, &SUPPORTED[0]);
 
-        let mut cfg = config_with_stanza(Some("demo"));
+        let mut cfg = config_with_stanza_locked(Some("demo"), lock_dir.path());
         create(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)], &pg_s).expect("seed both repos");
 
         cfg.command = "stanza-delete".to_owned();
+        // stanza-delete now requires the stop file to exist — pass through the new gate.
+        crate::lock::stop(&cfg).expect("seed stop file");
         delete(&cfg, &[(1, &repo1_s as &dyn Storage), (2, &repo2_s as &dyn Storage)]).expect("delete from both repos");
 
         for repo in [&repo1_s, &repo2_s] {

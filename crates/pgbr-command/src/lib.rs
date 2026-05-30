@@ -431,6 +431,7 @@ mod tests {
     fn stanza_delete_removes_archive_and_backup_subtrees() {
         let repo_dir = tempfile::tempdir().expect("repo tempdir");
         let pg_dir = tempfile::tempdir().expect("pg tempdir");
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
         let repo_storage = Posix::new(repo_dir.path());
         let pg_storage = Posix::new(pg_dir.path());
 
@@ -444,7 +445,10 @@ mod tests {
         assert!(repo_dir.path().join("archive/demo").exists());
         assert!(repo_dir.path().join("backup/demo").exists());
 
-        let cfg = fake_config("stanza-delete", Some("demo"), None);
+        let cfg = fake_config("stanza-delete", Some("demo"), Some(lock_dir.path()));
+        // stanza-delete requires the operator to have first run `stop` —
+        // the stop file is the "this stanza is offline" safety signal.
+        crate::lock::stop(&cfg).expect("seed stop file");
         dispatch(&cfg, &repo_storage, &pg_storage).expect("stanza-delete should succeed");
 
         assert!(!repo_dir.path().join("archive/demo").exists());
