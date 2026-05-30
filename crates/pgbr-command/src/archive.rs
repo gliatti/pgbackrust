@@ -782,7 +782,12 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
         // skipped (the single-repo `drain_push_spool_keyed` would delete the
         // staged file after the first repo and starve the rest).
         let transforms = per_repo_transforms(config, repo_storages, stanza)?;
-        drain_push_spool_multi(config, &spool, repo_storages, stanza, &transforms)?;
+        // Reuse the foreground-resolved archive-id rather than re-loading
+        // `archive.info` per repo inside the drain: the archive-id is
+        // stanza-level and identical across every repo, and the redundant load
+        // doubles the TLS round-trip count on the very first async push (which
+        // was observed to hang against a fresh TLS daemon).
+        drain_push_spool_multi(&spool, repo_storages, stanza, &archive_id, &transforms)?;
 
         // Confirm the requested segment actually reached the repo(s). The drain
         // just wrote `<segment>.ok` (success) or `<segment>.error` (failure);
@@ -1046,41 +1051,39 @@ pub fn drain_push_spool_keyed(
 /// `<segment>.error` carrying the message is written and the staged copy is left
 /// for a retry (the segment is not archived until it is in every repo).
 ///
-/// `repo_storages` and `transforms` are 1:1 (same order); each repository's own
-/// archive-id is resolved from its `archive.info`, and each repository's own
-/// [`RepoTransform`] (compress + that repo's cipher) is applied — so an
-/// encrypted repo stores encrypted WAL while a plaintext repo in the same
-/// fan-out stores plaintext. The count returned is the number of segments
-/// drained successfully into every repository.
+/// `repo_storages` and `transforms` are 1:1 (same order); the shared
+/// `archive_id` is the stanza's `<db-version>-<db-id>` (already resolved once by
+/// the foreground [`push`] via its single `archive.info` load) and is reused for
+/// every repository — it is stanza-level metadata, identical across repos, so
+/// re-loading per repo here would be a needless extra round-trip per backend
+/// (and on a fresh TLS connection that storm has been observed to hang the
+/// first call). Each repository's own [`RepoTransform`] (compress + that repo's
+/// cipher) is still applied — so an encrypted repo stores encrypted WAL while a
+/// plaintext repo in the same fan-out stores plaintext. The count returned is
+/// the number of segments drained successfully into every repository.
 ///
 /// # Errors
 ///
-/// - [`CommandError::Other`] if any repository has no `archive.info` (the
-///   archive-id cannot be resolved, so there is nowhere to drain to).
-/// - [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
-///   writing a status file itself fails (per-segment transfer failures are
-///   recorded as `.error` status, not returned).
+/// [`CommandError::Storage`] / [`CommandError::Io`] if listing the spool or
+/// writing a status file itself fails (per-segment transfer failures are
+/// recorded as `.error` status, not returned).
 pub fn drain_push_spool_multi(
-    config: &LoadedConfig,
     spool: &dyn Storage,
     repo_storages: &[&dyn Storage],
     stanza: &str,
+    archive_id: &str,
     transforms: &[RepoTransform],
 ) -> Result<usize, CommandError> {
-    // Resolve each repository's own archive-id up front so the per-segment loop
-    // does not reload archive.info for every staged segment.
-    let indexes = configured_repo_indexes(config);
-    let mut archive_ids = Vec::with_capacity(repo_storages.len());
-    for (pos, repo) in repo_storages.iter().enumerate() {
-        let index = indexes.get(pos).copied().unwrap_or(1);
-        archive_ids.push(load_drain_archive_id(config, *repo, index, stanza)?);
-    }
-
+    // Reuse the foreground-resolved archive-id for every repo: the archive-id
+    // (`<db-version>-<db-id>`) is stanza-level metadata, identical across all
+    // configured repositories, and `push()` has already loaded it once from the
+    // first reachable repo's `archive.info`. Re-loading it per repo here would
+    // double the TLS round-trips and has been observed to hang the first async
+    // call against a fresh TLS daemon.
     let targets: Vec<DrainTarget> = repo_storages
         .iter()
         .zip(transforms.iter())
-        .zip(archive_ids.iter())
-        .map(|((repo, transform), archive_id)| DrainTarget {
+        .map(|(repo, transform)| DrainTarget {
             repo: *repo,
             transform,
             archive_id,
@@ -1605,9 +1608,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandError, check_wal_header, drain_push_spool, drain_push_spool_keyed, fetch_segment_with_retry, get, get_in_dir,
-        per_repo_transforms, prefetch_get_spool, push, push_out_dir, push_queue_exceeded, read_archived_segment, status_error_path,
-        status_ok_path, wal_backlog_bytes,
+        CommandError, check_wal_header, drain_push_spool, drain_push_spool_keyed, drain_push_spool_multi, fetch_segment_with_retry,
+        get, get_in_dir, per_repo_transforms, prefetch_get_spool, push, push_out_dir, push_queue_exceeded, read_archived_segment,
+        status_error_path, status_ok_path, wal_backlog_bytes,
     };
     use crate::pipeline::{CompressType, RepoTransform};
     use pgbr_info::InfoArchive;
@@ -3268,5 +3271,156 @@ mod tests {
         )
         .expect("prefetch");
         assert_eq!(prefetched, 2, "no cap fetches every requested segment");
+    }
+
+    /// `drain_push_spool_multi` must fan a staged segment out to every repo using
+    /// the single caller-supplied `archive_id`, not by re-loading `archive.info`
+    /// from each repo. Three repos, none seeded with `archive.info`, and the
+    /// drain still lands the segment in `archive/demo/18-1/<segment>` on every
+    /// one of them — proving the redundant per-repo load is gone (and the
+    /// 2N+1 → N+1 TLS round-trip reduction that fixes the first-call hang
+    /// against a fresh TLS daemon is in place).
+    #[test]
+    fn drain_push_spool_multi_uses_passed_archive_id_for_all_repos() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo3 = tempfile::tempdir().expect("repo3 tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let repo3_s = Posix::new(repo3.path());
+        let (_spool, spool_s) = spool_storage();
+
+        // Stage one segment in out/. Note: NO `archive.info` is seeded on any of
+        // the three repos — `drain_push_spool_multi` must not depend on it.
+        put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
+
+        // Three no-op transforms (one per repo) so the segment is stored as raw
+        // bytes under the supplied archive-id on every repo.
+        let transforms = vec![
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+        ];
+
+        let drained = drain_push_spool_multi(
+            &spool_s,
+            &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage, &repo3_s as &dyn Storage],
+            "demo",
+            "18-1",
+            &transforms,
+        )
+        .expect("multi drain should succeed without loading archive.info");
+        assert_eq!(drained, 1, "exactly one segment should drain");
+
+        // The segment landed at `archive/demo/18-1/<segment>` on every repo,
+        // matching the caller-supplied archive-id.
+        for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s), ("repo3", &repo3_s)] {
+            let dest = format!("archive/demo/18-1/{SEGMENT}");
+            assert!(
+                repo.exists(Path::new(&dest)).expect("exists"),
+                "{label}: segment must land at {dest}",
+            );
+            assert_eq!(read(repo, &dest), WAL_BODY, "{label}: segment bytes round-trip");
+        }
+    }
+
+    /// A storage wrapper around an inner [`Posix`] that panics on any read of an
+    /// `archive.info*` path. Used to prove `drain_push_spool_multi` does NOT
+    /// touch `archive.info` on any backing repository — which is the entire
+    /// point of plumbing the archive-id through from the foreground call (the
+    /// per-repo re-load was the source of the first-call TLS hang).
+    struct NoArchiveInfoStorage {
+        inner: Posix,
+    }
+
+    impl Storage for NoArchiveInfoStorage {
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "exists");
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "info");
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "list");
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "open_read");
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "open_write");
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            assert_archive_info_untouched(path, "remove");
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            assert_archive_info_untouched(source, "rename source");
+            assert_archive_info_untouched(target, "rename target");
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    /// Panic if `path` looks like an `archive.info` / `archive.info.copy` lookup
+    /// — the drain must never touch them now that the archive-id is plumbed
+    /// through.
+    fn assert_archive_info_untouched(path: &Path, op: &str) {
+        let s = path.to_string_lossy();
+        assert!(
+            !s.contains("archive.info"),
+            "drain_push_spool_multi must not access archive.info — {op}({s}) was attempted",
+        );
+    }
+
+    /// The fix's contract: with the redundant per-repo `archive.info` load
+    /// removed, `drain_push_spool_multi` succeeds even against repositories that
+    /// would PANIC on any `archive.info*` access. Asserts the elimination of the
+    /// 2N+1 → N+1 TLS round-trip storm that hung the first archive-push.
+    #[test]
+    fn drain_push_spool_multi_does_not_load_archive_info() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = NoArchiveInfoStorage {
+            inner: Posix::new(repo1.path()),
+        };
+        let repo2_s = NoArchiveInfoStorage {
+            inner: Posix::new(repo2.path()),
+        };
+        let (_spool, spool_s) = spool_storage();
+
+        put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
+
+        let transforms = vec![
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+        ];
+
+        let drained = drain_push_spool_multi(
+            &spool_s,
+            &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage],
+            "demo",
+            "16-1",
+            &transforms,
+        )
+        .expect("drain must not touch archive.info");
+        assert_eq!(drained, 1, "exactly one segment should drain");
     }
 }
