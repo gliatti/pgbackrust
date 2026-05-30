@@ -1142,6 +1142,11 @@ option:
     command-role:
       main: {}
 
+  # `checksum-page` has NO static `default:` because its real default is
+  # *dynamic*: backup reads `global/pg_control.data_checksum_version` and
+  # auto-enables page validation when the cluster has data checksums on.
+  # That resolution lives in pgbr-command (`backup::resolve_checksum_page`),
+  # which honours an explicit user value (true / false) when present.
   checksum-page:
     section: global
     type: boolean

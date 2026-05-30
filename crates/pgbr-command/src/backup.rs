@@ -62,8 +62,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
+use pgbr_info::manifest::ChecksumPage;
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
+use pgbr_postgres::control::read_pg_control_data;
 use pgbr_postgres::lsn::{lsn_text_to_wal_segment, parse_lsn, wal_segment_range};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
@@ -610,10 +612,13 @@ fn validate_relation_pages(bytes: &[u8], check_header: bool) -> Vec<u32> {
 
 /// Emit a `WARN` line naming a relation file's invalid pages.
 ///
-/// The `ManifestFile` records only a `checksum_page = Some(false)` bool — it
-/// has no invalid-page-list field (another concern owns that) — so the failing
-/// block numbers surface here through the `WARN` logger, matching pgBackRest's
-/// `WARN: invalid page checksum(s) found in file ...` diagnostic.
+/// The `ManifestFile` now records the invalid block list itself, in its
+/// `checksum_page` field (the [`ChecksumPage::InvalidBlocks`] variant), so
+/// consumers like `verify` / `info` can see which blocks failed without
+/// re-reading the file. This helper additionally surfaces the same diagnostic
+/// through the `WARN` logger so a `backup` run still mirrors pgBackRest's
+/// `WARN: invalid page checksum(s) found in file ...` line in the log stream
+/// — the on-disk manifest array and the streamed warning carry the same data.
 fn warn_invalid_pages(rel: &str, invalid_blocks: &[u32]) {
     let blocks = invalid_blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     log_warn(&format!("invalid page checksum(s) found in file {rel} at block(s) {blocks}"));
@@ -735,7 +740,10 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let sub_key = crate::cipher::active_sub_key(repo_storage, config, stanza)?;
     let transform = RepoTransform::from_options_with_key(config, sub_key);
     let process_max = process_max(config);
-    let checksum_page = checksum_page_enabled(config);
+    // Resolve the effective `--checksum-page` value: honour an explicit user
+    // value, else read `global/pg_control` and default to the cluster's
+    // `data_checksum_version` (the dynamic default stock pgBackRest uses).
+    let checksum_page = resolve_checksum_page(config, pg_storage);
     let excludes = excludes_from_config(config);
     let start_fast = start_fast_enabled(config);
     let archive_copy = archive_copy_enabled(config);
@@ -1561,18 +1569,58 @@ fn process_max(config: &LoadedConfig) -> usize {
     }
 }
 
-/// Whether `--checksum-page` page validation is enabled, from the resolved option.
+/// Resolve the effective `--checksum-page` value.
 ///
-/// `checksum-page` is a `Boolean`. For this slice the option is honoured as-is
-/// and defaults to `false` when absent (pgBackRest's true default ties this to
-/// whether the cluster has `data_checksums` enabled, which is resolved
-/// elsewhere). When on, eligible relation files have every page's stored
-/// checksum verified during the copy.
-fn checksum_page_enabled(config: &LoadedConfig) -> bool {
-    matches!(
-        config.options.get(&("checksum-page".to_owned(), None)),
-        Some(OptionValue::Boolean(true))
-    )
+/// pgBackRest's documented behaviour is: when the user explicitly sets
+/// `--checksum-page` / `--no-checksum-page`, that value wins; otherwise the
+/// default is **dynamic** — `on` when the cluster has `data_checksums` enabled
+/// (`pg_control.data_checksum_version != 0`) and `off` otherwise. This matches
+/// the C `checkpage` resolution in `src/command/backup/backup.c`, which keys
+/// the default off `pgControlFromFile()`.
+///
+/// The dynamic default is resolved here by reading `global/pg_control` through
+/// `pg_storage`, decoding it with the [`pgbr_postgres::control`] helpers, and
+/// consulting [`PgControlData::page_checksums_enabled`]. If the read or decode
+/// fails for any reason (e.g. an unimplemented `pg_control` layout on a future
+/// PG release) we fall back to `false` and log a one-line `INFO` note: a
+/// conservative miss is safer than a hard backup failure, and the operator can
+/// always pass `--checksum-page` explicitly.
+///
+/// When this returns `true`, eligible relation files have every page's stored
+/// `pd_checksum` verified during the copy and any mismatch is surfaced through
+/// `WARN` + the manifest's `checksum-page` array.
+fn resolve_checksum_page(config: &LoadedConfig, pg_storage: &dyn Storage) -> bool {
+    // Explicit user override wins, in either direction.
+    if let Some(OptionValue::Boolean(explicit)) = config.options.get(&("checksum-page".to_owned(), None)) {
+        return *explicit;
+    }
+    // Dynamic default: read pg_control. A failure (missing file, unknown
+    // layout, short read) leaves the option off and logs a single INFO line so
+    // an operator can see why validation did not engage.
+    let mut reader = match pg_storage.open_read(Path::new("global/pg_control")) {
+        Ok(reader) => reader,
+        Err(err) => {
+            log_info(&format!(
+                "checksum-page: could not read global/pg_control ({err}); defaulting to off"
+            ));
+            return false;
+        }
+    };
+    let data = match read_pg_control_data(&mut reader) {
+        Ok(data) => data,
+        Err(err) => {
+            log_info(&format!(
+                "checksum-page: could not decode global/pg_control ({err}); defaulting to off"
+            ));
+            return false;
+        }
+    };
+    data.page_checksums_enabled().unwrap_or_else(|| {
+        log_info(
+            "checksum-page: pg_control layout not modelled for this PG version; defaulting to off (pass --checksum-page to force on)",
+        );
+        false
+    })
 }
 
 /// Default number of retries for a failed file-copy job (`job-retry`). pgBackRest
@@ -1759,14 +1807,13 @@ struct CopyResult {
     checksum: String,
     /// Number of bytes physically written to the repo (post-transform).
     repo_bytes: u64,
-    /// Page-checksum-validation outcome for this file: `None` when the file was
-    /// not validated (checksum-page off, not a relation file, or not
-    /// page-aligned); `Some(true)` when every page validated; `Some(false)` when
-    /// one or more pages failed. When `Some(false)`, `invalid_blocks` lists them.
-    checksum_page: Option<bool>,
-    /// Block numbers whose stored checksum failed validation (empty unless
-    /// `checksum_page == Some(false)`), used to emit a warning on the main thread.
-    invalid_blocks: Vec<u32>,
+    /// Per-file page-checksum-validation outcome. `None` when the file was not
+    /// validated (checksum-page off, not a relation file, or not page-aligned);
+    /// `Some(ChecksumPage::Validated)` when every page passed; and
+    /// `Some(ChecksumPage::InvalidBlocks(blocks))` when one or more pages
+    /// failed (the block numbers identify them; the main thread also surfaces
+    /// them via [`warn_invalid_pages`]).
+    checksum_page: Option<ChecksumPage>,
 }
 
 /// Outcome of planning one PG-data file: either a finished (referenced) manifest
@@ -1902,11 +1949,15 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
     // its size is an exact multiple of `PAGE_SIZE`; an unaligned file (or a
     // non-relation file, which is never flagged) is left unvalidated
     // (`checksum_page == None`).
-    let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len().is_multiple_of(PAGE_SIZE) {
+    let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len().is_multiple_of(PAGE_SIZE) {
         let invalid = validate_relation_pages(bytes, job.validate_page_header);
-        (Some(invalid.is_empty()), invalid)
+        Some(if invalid.is_empty() {
+            ChecksumPage::Validated
+        } else {
+            ChecksumPage::InvalidBlocks(invalid)
+        })
     } else {
-        (None, Vec::new())
+        None
     };
 
     // Keyed (SHA-1 KDF) chain: matches the manifest / info / WAL encryption so
@@ -1918,7 +1969,6 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
         checksum,
         repo_bytes: repo_bytes.len() as u64,
         checksum_page,
-        invalid_blocks,
     };
     Ok((repo_bytes, result))
 }
@@ -2101,14 +2151,18 @@ fn run_bundled_copy(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>, u64),
         let checksum = plaintext_sha1(&bytes)?;
 
         // Page-checksum + page-header validation, identical to the per-file path.
-        let (checksum_page, invalid_blocks) = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
+        let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
             let invalid = validate_relation_pages(&bytes, job.validate_page_header);
-            (Some(invalid.is_empty()), invalid)
+            Some(if invalid.is_empty() {
+                ChecksumPage::Validated
+            } else {
+                ChecksumPage::InvalidBlocks(invalid)
+            })
         } else {
-            (None, Vec::new())
+            None
         };
-        if checksum_page == Some(false) {
-            warn_invalid_pages(&skeleton.path, &invalid_blocks);
+        if let Some(ChecksumPage::InvalidBlocks(blocks)) = checksum_page.as_ref() {
+            warn_invalid_pages(&skeleton.path, blocks);
         }
 
         // Decide the block size for this file (age + size policy, with any
@@ -2638,14 +2692,17 @@ fn run_copy_jobs(
         let copied = job_retry
             .run(|| copy_file(&job, &worker_transform))
             .map_err(|err| err.to_string())?;
+        // `checksum_page` is `Option<ChecksumPage>`: it serialises to `null` for
+        // `None`, JSON `true` for `Validated`, and a JSON array of block numbers
+        // for `InvalidBlocks` — i.e. the same wire shape stock pgBackRest writes
+        // in the manifest. The decoder below maps each variant back.
+        let checksum_page_json =
+            serde_json::to_value(&copied.checksum_page).map_err(|err| format!("encode checksumPage for {}: {err}", job.rel))?;
         Ok(Response::Ok(OkResponse {
             out: Some(json!({
                 "checksum": copied.checksum,
                 "repoBytes": copied.repo_bytes,
-                // `checksum_page` is `Option<bool>`: serialises to `null` when the
-                // file was not validated, and the decoder maps `null` back to `None`.
-                "checksumPage": copied.checksum_page,
-                "invalidBlocks": copied.invalid_blocks,
+                "checksumPage": checksum_page_json,
             })),
         }))
     });
@@ -2663,29 +2720,27 @@ fn run_copy_jobs(
                     .get("repoBytes")
                     .and_then(serde_json::Value::as_u64)
                     .ok_or_else(|| CommandError::Other(format!("copy of {} returned no repo size", job_result.key)))?;
-                // `checksumPage` is absent/`null` (not validated) or a bool.
-                let checksum_page = match value.get("checksumPage") {
+                // `checksumPage` is absent / `null` (not validated), JSON `true`
+                // (every page valid → [`ChecksumPage::Validated`]), or a JSON
+                // array of block numbers (one or more invalid pages →
+                // [`ChecksumPage::InvalidBlocks`]). The wire shape mirrors the
+                // manifest, so a single deserialise via [`ChecksumPage`]'s own
+                // `Deserialize` impl handles all three cases.
+                let checksum_page: Option<ChecksumPage> = match value.get("checksumPage") {
                     None | Some(serde_json::Value::Null) => None,
-                    Some(v) => Some(v.as_bool().ok_or_else(|| {
-                        CommandError::Other(format!("copy of {} returned a non-bool checksumPage", job_result.key))
+                    Some(v) => Some(serde_json::from_value(v.clone()).map_err(|err| {
+                        CommandError::Other(format!(
+                            "copy of {} returned a malformed checksumPage value: {err}",
+                            job_result.key
+                        ))
                     })?),
                 };
-                let invalid_blocks = value
-                    .get("invalidBlocks")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
-                            .collect::<Vec<u32>>()
-                    })
-                    .unwrap_or_default();
                 out.push((
                     job_result.key,
                     CopyResult {
                         checksum,
                         repo_bytes,
                         checksum_page,
-                        invalid_blocks,
                     },
                 ));
             }
@@ -2805,7 +2860,7 @@ impl ResumeContext {
         let _ = &self.backup_root;
         Some(ManifestFile {
             checksum: Some(checksum),
-            checksum_page: prior.checksum_page,
+            checksum_page: prior.checksum_page.clone(),
             ..skeleton.clone()
         })
     }
@@ -2877,12 +2932,13 @@ fn run_unbundled_copy(mut ctx: UnbundledCopyCtx<'_>) -> Result<(Vec<ManifestFile
             .ok_or_else(|| CommandError::Other(format!("no copy result for {}", skeleton.path)))?;
         repo_size += copied.repo_bytes;
         bytes_since_save += copied.repo_bytes;
-        // A file with one or more invalid pages records `checksum_page = Some(false)`
-        // and a warning naming the bad blocks (the `ManifestFile` has no invalid-page
-        // list field — another concern owns that — so the blocks surface only in the
-        // warning, exactly as the task scopes it).
-        if copied.checksum_page == Some(false) {
-            warn_invalid_pages(&skeleton.path, &copied.invalid_blocks);
+        // A file with one or more invalid pages records its invalid block list
+        // in `checksum_page` and emits a `WARN` line naming the bad blocks —
+        // the same diagnostic stock pgBackRest surfaces. The manifest then
+        // carries the array form (`[0, 3, …]`) so consumers like `verify` can
+        // see which blocks failed without re-reading the file.
+        if let Some(ChecksumPage::InvalidBlocks(blocks)) = copied.checksum_page.as_ref() {
+            warn_invalid_pages(&skeleton.path, blocks);
         }
         files.push(ManifestFile {
             checksum: Some(copied.checksum),
@@ -2929,6 +2985,12 @@ fn save_partial_manifest(ctx: &UnbundledCopyCtx<'_>, files: &[ManifestFile]) -> 
         db_version: ctx.db_version.to_owned(),
         db_system_id: ctx.db_system_id,
         files: sorted_files,
+        // The in-progress save is only used to drive `--resume` of an aborted
+        // backup; the resume codepath does not consume `option-checksum-page`
+        // so we leave it unset (the final save in `run_backup` writes the
+        // authoritative value). Keeping it `None` also matches the
+        // byte-on-disk shape of manifests written by the prior code path.
+        option_checksum_page: None,
         paths,
         links,
     };
@@ -3535,6 +3597,12 @@ fn run_backup(
         db_version: info.db_version.clone(),
         db_system_id: info.db_system_id,
         files,
+        // Record the resolved `--checksum-page` value in `[backup:option]`.
+        // pgBackRest stock emits this so `info` / `verify` can show whether the
+        // backup actually validated relation pages; the value is the bool the
+        // caller resolved (either explicit user setting or the dynamic
+        // `pg_control.data_checksum_version` default).
+        option_checksum_page: Some(checksum_page),
         paths,
         links,
     };
@@ -5301,8 +5369,8 @@ mod tests {
     #[test]
     fn backup_checksum_page_valid_records_some_true() {
         // A relation file made of valid pages, backed up with checksum-page on,
-        // records checksum_page = Some(true). A non-relation file (PG_VERSION)
-        // is never validated, so it stays None.
+        // records `checksum_page = Some(ChecksumPage::Validated)`. A
+        // non-relation file (PG_VERSION) is never validated, so it stays `None`.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         let relation = valid_relation(3);
@@ -5318,8 +5386,8 @@ mod tests {
         let relfile = manifest.file("base/1/1259").expect("relation in manifest");
         assert_eq!(
             relfile.checksum_page,
-            Some(true),
-            "all-valid relation pages must record checksum_page=Some(true)"
+            Some(ChecksumPage::Validated),
+            "all-valid relation pages must record ChecksumPage::Validated"
         );
         // Non-relation files are not validated.
         let version = manifest.file("PG_VERSION").expect("PG_VERSION in manifest");
@@ -5329,8 +5397,9 @@ mod tests {
     #[test]
     fn backup_checksum_page_corrupt_records_some_false() {
         // A relation file with one deliberately corrupted page checksum records
-        // checksum_page = Some(false). Build a 2-page file, corrupt block 1's
-        // stored checksum so it no longer matches.
+        // its invalid block list. Build a 2-page file, corrupt block 1's
+        // stored checksum so it no longer matches; the manifest entry must
+        // carry `ChecksumPage::InvalidBlocks(vec![1])`.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         let mut relation = valid_relation(2);
@@ -5347,8 +5416,8 @@ mod tests {
         let relfile = manifest.file("base/1/1259").expect("relation in manifest");
         assert_eq!(
             relfile.checksum_page,
-            Some(false),
-            "a corrupted page checksum must record checksum_page=Some(false)"
+            Some(ChecksumPage::InvalidBlocks(vec![1])),
+            "a corrupted page checksum must record the bad block in InvalidBlocks"
         );
         // The relation's plaintext checksum/size are still recorded.
         assert_eq!(relfile.size, relation.len() as u64);
@@ -5357,7 +5426,9 @@ mod tests {
 
     #[test]
     fn backup_checksum_page_off_leaves_none() {
-        // Without --checksum-page, even a valid relation file is not validated.
+        // Without explicit --checksum-page and without a readable pg_control
+        // (the test cluster does not seed one), the dynamic default falls back
+        // to off, so no relation file is validated.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         seed_file(&pg_s, "base/1/1259", &valid_relation(2));
@@ -5398,8 +5469,8 @@ mod tests {
 
     #[test]
     fn backup_checksum_page_all_zero_pages_valid() {
-        // An all-zero, page-aligned relation file validates as Some(true)
-        // (empty-page handling).
+        // An all-zero, page-aligned relation file validates as
+        // `ChecksumPage::Validated` (empty-page handling).
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         seed_file(&pg_s, "base/1/1259", &vec![0u8; BLCKSZ * 2]);
@@ -5412,9 +5483,212 @@ mod tests {
         let relfile = manifest.file("base/1/1259").expect("relation in manifest");
         assert_eq!(
             relfile.checksum_page,
-            Some(true),
-            "all-zero pages must validate as Some(true)"
+            Some(ChecksumPage::Validated),
+            "all-zero pages must validate as ChecksumPage::Validated"
         );
+    }
+
+    // ---- dynamic --checksum-page default (resolve_checksum_page) ----------
+
+    /// Build a synthetic `global/pg_control` buffer for PG 14 (the cluster
+    /// `init_stanza` records) with the given `data_checksum_version`. The
+    /// layout mirrors the wide `ControlFileData` offsets used by PG 13-16
+    /// (`state` @ 16, `checkpoint` @ 32, `blcksz` @ 216, `xlog_seg_size` @ 228,
+    /// `data_checksum_version` @ 252) so the public `read_pg_control_data`
+    /// decodes it as a PG 14 cluster with or without page checksums.
+    fn synth_pg_control_v14(data_checksum_version: u32) -> Vec<u8> {
+        // 256 bytes covers every field through `data_checksum_version + 4`.
+        let mut buf = vec![0u8; 256];
+        // system_identifier (any non-zero value)
+        buf[0..8].copy_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
+        // pg_control_version = 1300 (PG 13–16 share this)
+        buf[8..12].copy_from_slice(&1300u32.to_le_bytes());
+        // catalog_version_no = 202_107_181 (PG 14 — matches `init_stanza`'s
+        // recorded db-control-version)
+        buf[12..16].copy_from_slice(&202_107_181u32.to_le_bytes());
+        // state @ 16: DB_IN_PRODUCTION = 6 (any value the decoder accepts)
+        buf[16..20].copy_from_slice(&6u32.to_le_bytes());
+        // check_point @ 32
+        buf[32..40].copy_from_slice(&0x1_2345_6789u64.to_le_bytes());
+        // blcksz @ 216
+        buf[216..220].copy_from_slice(&8192u32.to_le_bytes());
+        // xlog_seg_size @ 228
+        buf[228..232].copy_from_slice(&(16u32 * 1024 * 1024).to_le_bytes());
+        // data_checksum_version @ 252 — the bit the resolver keys off
+        buf[252..256].copy_from_slice(&data_checksum_version.to_le_bytes());
+        buf
+    }
+
+    /// A backup config that does NOT set `--checksum-page`, so the dynamic
+    /// `pg_control.data_checksum_version` default kicks in.
+    fn default_full_cfg(stanza: &str) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("type".to_owned(), None), OptionValue::StringId("full".to_owned()));
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    /// Repository-relative path of a backup's manifest under `<stanza>`.
+    fn manifest_for_only_backup(repo: &Posix, stanza: &str) -> Manifest {
+        let info = InfoBackup::load(repo, &backup_info_path(stanza)).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("exactly one backup");
+        Manifest::load(repo, Path::new(&format!("backup/{stanza}/{label}/backup.manifest"))).expect("load manifest")
+    }
+
+    /// Serialises `pgbr_core::log` state across capture-using tests in this crate.
+    /// Mirrors the pattern in `annotate.rs`.
+    static CHECKSUM_PAGE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_checksum_page_explicit_override_wins() {
+        // Even with a checksummed pg_control on disk, an explicit
+        // --no-checksum-page must beat the dynamic default.
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(1));
+        let mut cfg = default_full_cfg("demo");
+        cfg.options
+            .insert(("checksum-page".to_owned(), None), OptionValue::Boolean(false));
+        assert!(!resolve_checksum_page(&cfg, &pg_s));
+
+        // Symmetric: --checksum-page beats a non-checksummed cluster.
+        let (_repo2, _pg2, _repo_s2, pg_s2) = posix_pair();
+        seed_file(&pg_s2, "global/pg_control", &synth_pg_control_v14(0));
+        let mut cfg2 = default_full_cfg("demo");
+        cfg2.options
+            .insert(("checksum-page".to_owned(), None), OptionValue::Boolean(true));
+        assert!(resolve_checksum_page(&cfg2, &pg_s2));
+    }
+
+    #[test]
+    fn resolve_checksum_page_dynamic_default_from_pg_control() {
+        // No explicit option: the resolver reads pg_control and follows its
+        // data_checksum_version (0 → off, non-zero → on).
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(1));
+        let cfg = default_full_cfg("demo");
+        assert!(
+            resolve_checksum_page(&cfg, &pg_s),
+            "data_checksum_version=1 must default checksum-page on"
+        );
+
+        let (_repo2, _pg2, _repo_s2, pg_s2) = posix_pair();
+        seed_file(&pg_s2, "global/pg_control", &synth_pg_control_v14(0));
+        assert!(
+            !resolve_checksum_page(&cfg, &pg_s2),
+            "data_checksum_version=0 must default checksum-page off"
+        );
+    }
+
+    #[test]
+    fn resolve_checksum_page_missing_pg_control_falls_back_off() {
+        // No file at global/pg_control: the resolver logs an INFO note and
+        // returns false rather than failing the backup.
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+        let cfg = default_full_cfg("demo");
+        assert!(!resolve_checksum_page(&cfg, &pg_s), "missing pg_control must default off");
+    }
+
+    #[test]
+    fn backup_dynamic_default_on_checksummed_cluster_validates_pages() {
+        // The integration test for the silent-corruption regression:
+        //
+        // - The user does NOT pass --checksum-page (the production scenario
+        //   where the bug surfaced).
+        // - The cluster's pg_control records data_checksum_version=1, so the
+        //   dynamic default must engage and validate every relation page.
+        // - One page is deliberately corrupted (its stored checksum bit-flipped).
+        //
+        // Stock pgBackRest emits a WARN line naming the bad block AND records
+        // the invalid block list in the manifest's per-file checksum-page
+        // field. Both of those must now happen here.
+        let _guard = CHECKSUM_PAGE_LOG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pgbr_core::log::capture::install();
+        pgbr_core::log::set_level_file(pgbr_core::log::LOG_LEVEL_WARN);
+        pgbr_core::log::set_file_banner(false);
+
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        // Checksummed cluster: data_checksum_version=1 in pg_control.
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(1));
+        // Build a 2-page relation file and corrupt block 0's stored
+        // pd_checksum so it no longer matches the page bytes.
+        let mut relation = valid_relation(2);
+        relation[8] ^= 0x01; // bit-flip in block 0's stored pd_checksum
+        seed_file(&pg_s, "base/1/16384", &relation);
+
+        backup(&default_full_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes utf-8");
+        pgbr_core::log::capture::uninstall();
+
+        // (a) The WARN line stock pgBackRest emits names the relation + bad block.
+        assert!(
+            captured.contains("invalid page checksum(s) found in file base/1/16384 at block(s) 0"),
+            "expected WARN naming the bad block, got: {captured:?}"
+        );
+
+        // (b) The manifest entry records the invalid block list (NOT just a
+        // bool), so consumers like `verify` see exactly which blocks failed.
+        let manifest = manifest_for_only_backup(&repo_s, "demo");
+        let relfile = manifest.file("base/1/16384").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(ChecksumPage::InvalidBlocks(vec![0])),
+            "dynamic default must validate pages and record InvalidBlocks(vec![0])"
+        );
+
+        // (c) `[backup:option].option-checksum-page` records the resolved
+        // effective value (`true` here, because pg_control flagged checksums).
+        assert_eq!(
+            manifest.option_checksum_page,
+            Some(true),
+            "manifest must record the resolved option-checksum-page=y"
+        );
+    }
+
+    #[test]
+    fn backup_dynamic_default_on_checksummed_cluster_clean_relation_marks_validated() {
+        // The positive twin of `backup_dynamic_default_on_checksummed_cluster_validates_pages`:
+        // a checksummed cluster + a clean relation must record
+        // `ChecksumPage::Validated` and emit NO WARN line. Together they prove
+        // the dynamic default both engages and does not falsely flag.
+        let _guard = CHECKSUM_PAGE_LOG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pgbr_core::log::capture::install();
+        pgbr_core::log::set_level_file(pgbr_core::log::LOG_LEVEL_WARN);
+        pgbr_core::log::set_file_banner(false);
+
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(1));
+        seed_file(&pg_s, "base/1/16384", &valid_relation(2));
+
+        backup(&default_full_cfg("demo"), &repo_s, &pg_s).expect("backup");
+
+        let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes utf-8");
+        pgbr_core::log::capture::uninstall();
+
+        assert!(
+            !captured.contains("invalid page checksum"),
+            "no WARN line on a clean relation, got: {captured:?}"
+        );
+
+        let manifest = manifest_for_only_backup(&repo_s, "demo");
+        let relfile = manifest.file("base/1/16384").expect("relation in manifest");
+        assert_eq!(
+            relfile.checksum_page,
+            Some(ChecksumPage::Validated),
+            "a clean relation under the dynamic default must record ChecksumPage::Validated"
+        );
+        assert_eq!(manifest.option_checksum_page, Some(true));
     }
 
     // ---- backup-control protocol (pg_backup_start/stop) --------------------
@@ -6467,7 +6741,8 @@ mod tests {
     fn backup_page_header_check_flags_corrupt_header() {
         // checksum-page on (so the page pass runs) + page-header-check on (the
         // default): a relation page with a valid checksum but broken header is
-        // flagged checksum_page=Some(false).
+        // flagged as an invalid block (the per-file invalid-block list, not
+        // just a bool, so the bad block surfaces in the manifest).
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         let relation = corrupt_header_page(0);
@@ -6482,7 +6757,7 @@ mod tests {
         let relfile = manifest.file("base/1/1259").expect("relation in manifest");
         assert_eq!(
             relfile.checksum_page,
-            Some(false),
+            Some(ChecksumPage::InvalidBlocks(vec![0])),
             "a page with a broken header must be flagged even though its checksum is valid"
         );
     }
@@ -6490,7 +6765,8 @@ mod tests {
     #[test]
     fn backup_page_header_check_off_ignores_header() {
         // With page-header-check=n, the same checksum-valid/broken-header page
-        // passes (Some(true)) because only the checksum is verified.
+        // passes (ChecksumPage::Validated) because only the checksum is
+        // verified.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         seed_file(&pg_s, "base/1/1259", &corrupt_header_page(0));
@@ -6506,7 +6782,7 @@ mod tests {
         let relfile = manifest.file("base/1/1259").expect("relation in manifest");
         assert_eq!(
             relfile.checksum_page,
-            Some(true),
+            Some(ChecksumPage::Validated),
             "with header-check off only the (valid) checksum is enforced"
         );
     }
@@ -6746,6 +7022,7 @@ mod tests {
                 bundle_offset: None,
                 block_map: None,
             }],
+            option_checksum_page: None,
             paths: Vec::new(),
             links: Vec::new(),
         };

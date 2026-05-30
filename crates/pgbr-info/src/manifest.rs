@@ -47,6 +47,8 @@ use std::path::Path;
 
 use pgbr_io::{IoRead, IoWrite};
 use pgbr_storage::Storage;
+use serde::de::{self, Deserializer, Visitor};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::InfoError;
@@ -59,6 +61,12 @@ use crate::format::{self, BACKREST_SECTION, InfoFile};
 const BACKUP_SECTION: &str = "backup";
 /// Section that holds the backed-up cluster's identity.
 const BACKUP_DB_SECTION: &str = "backup:db";
+/// Section that records the per-backup applied option values. Mirrors
+/// pgBackRest's `[backup:option]` section, which surfaces the effective value of
+/// each user-visible toggle (e.g. `option-checksum-page`) for tooling like
+/// `info` / `verify` / `expire`. Booleans use the `y`/`n` short form, matching
+/// the C writer.
+const BACKUP_OPTION_SECTION: &str = "backup:option";
 /// Section that lists every file in the backup, keyed by repository-relative path.
 const TARGET_FILE_SECTION: &str = "target:file";
 /// Section that lists every path (directory) in the backup, keyed by path.
@@ -74,11 +82,100 @@ const KEY_TIMESTAMP_START: &str = "backup-timestamp-start";
 const KEY_TIMESTAMP_STOP: &str = "backup-timestamp-stop";
 const KEY_DB_SYSTEM_ID: &str = "db-system-id";
 const KEY_DB_VERSION: &str = "db-version";
+/// `[backup:option]` key that records whether page-checksum validation was
+/// applied to relation files in this backup. Mirrors pgBackRest's
+/// `option-checksum-page`.
+const KEY_OPTION_CHECKSUM_PAGE: &str = "option-checksum-page";
 
 /// pgBackRest on-disk format version this writer emits.
 const BACKREST_FORMAT: u32 = 5;
 /// pgBackRest version string this writer stamps into the file.
 const BACKREST_VERSION: &str = "2.58";
+
+/// Per-file page-checksum-validation outcome. Mirrors stock pgBackRest's
+/// `"checksum-page"` field on a relation file's `[target:file]` manifest entry:
+///
+/// - [`ChecksumPage::Validated`] renders / parses as JSON `true` — every page
+///   in the file passed validation.
+/// - [`ChecksumPage::InvalidBlocks`] renders as a JSON array of block numbers
+///   (e.g. `[0, 3, 17]`) — those blocks failed the page-checksum (and / or
+///   page-header) check. Order is preserved by the caller; the backup pipeline
+///   produces ascending block numbers.
+/// - An absent field (i.e. `Option<ChecksumPage>::None`) means the file was
+///   not eligible for validation (non-relation, page-unaligned, or
+///   `--checksum-page` disabled).
+///
+/// pgBackRest stock writes `true` per validated relation file and an
+/// invalid-block list per file with corrupt pages, so widening from the prior
+/// `Option<bool>` (which could not represent the array form) is required to
+/// surface corruption faithfully in the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumPage {
+    /// Every page in the file passed validation.
+    Validated,
+    /// One or more pages failed validation; the contained vector holds their
+    /// block numbers (file-order ascending in pipeline output, but the type
+    /// imposes no ordering constraint).
+    InvalidBlocks(Vec<u32>),
+}
+
+impl Serialize for ChecksumPage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Validated => serializer.serialize_bool(true),
+            Self::InvalidBlocks(blocks) => blocks.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChecksumPage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ChecksumPageVisitor;
+
+        impl<'de> Visitor<'de> for ChecksumPageVisitor {
+            type Value = ChecksumPage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`true` for a validated file or an array of u32 block numbers for invalid pages")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // `true` is the validated marker pgBackRest writes; `false`
+                // is not part of the on-disk vocabulary (an invalid file
+                // always renders as the block-list array form) but accept it
+                // as the validated marker's complement to keep the
+                // deserialiser robust against hand-edited fixtures.
+                if v {
+                    Ok(ChecksumPage::Validated)
+                } else {
+                    Ok(ChecksumPage::InvalidBlocks(Vec::new()))
+                }
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut blocks = Vec::new();
+                while let Some(block) = seq.next_element::<u32>()? {
+                    blocks.push(block);
+                }
+                Ok(ChecksumPage::InvalidBlocks(blocks))
+            }
+        }
+
+        deserializer.deserialize_any(ChecksumPageVisitor)
+    }
+}
 
 /// JSON shape of a `[target:file]` value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,8 +184,16 @@ struct FileValue {
     timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checksum: Option<String>,
+    /// Per-file page-checksum-validation outcome. See [`ChecksumPage`].
+    ///
+    /// Renders as JSON `true` for [`ChecksumPage::Validated`] and as a sorted
+    /// array of block numbers (e.g. `[0, 3, 17]`) for
+    /// [`ChecksumPage::InvalidBlocks`]. Absent when `None` (the file was not
+    /// eligible / not validated). The deserialiser accepts the same shapes
+    /// plus an absent key for backward compatibility with manifests written
+    /// before this widening.
     #[serde(rename = "checksum-page", default, skip_serializing_if = "Option::is_none")]
-    checksum_page: Option<bool>,
+    checksum_page: Option<ChecksumPage>,
     /// Label of the backup the file's bytes actually live in. `None` for a file
     /// copied into *this* backup; `Some(label)` for a file a differential /
     /// incremental backup defers to an earlier backup. Absent from the JSON when
@@ -210,8 +315,13 @@ pub struct ManifestFile {
     pub timestamp: i64,
     /// SHA-1 checksum (lowercase hex). `None` for zero-length files.
     pub checksum: Option<String>,
-    /// Whether page-checksum validation was applied to this file. `None` when absent.
-    pub checksum_page: Option<bool>,
+    /// Per-file page-checksum-validation outcome. `None` when the file was not
+    /// eligible (non-relation, page-unaligned, or `--checksum-page` disabled);
+    /// `Some(ChecksumPage::Validated)` when every page passed; and
+    /// `Some(ChecksumPage::InvalidBlocks(blocks))` when one or more pages
+    /// failed (the contained block numbers identify the bad pages, matching
+    /// stock pgBackRest's manifest array form).
+    pub checksum_page: Option<ChecksumPage>,
     /// Backup the file's bytes are stored in. `None` when this backup holds the
     /// bytes itself; `Some(label)` when a differential / incremental backup
     /// references an earlier backup's copy instead of re-copying the file.
@@ -276,6 +386,14 @@ pub struct Manifest {
     pub db_system_id: u64,
     /// Every file captured by the backup.
     pub files: Vec<ManifestFile>,
+    /// The effective `--checksum-page` value applied to this backup, recorded
+    /// in the manifest's `[backup:option]` section as `option-checksum-page`.
+    /// `None` when the manifest predates the section / does not record it (old
+    /// manifests). Pgbackrest's true default ties the option to whether the
+    /// source cluster has `data_checksums` enabled (`pg_control`'s
+    /// `data_checksum_version`); the producer fills this with the resolved
+    /// effective value so tooling like `info` / `verify` can surface it.
+    pub option_checksum_page: Option<bool>,
     /// Every path (directory) captured by the backup.
     pub paths: Vec<ManifestPath>,
     /// Every symlink captured by the backup.
@@ -408,6 +526,19 @@ impl Manifest {
         let db_version = parse_required_string(file, BACKUP_DB_SECTION, KEY_DB_VERSION)?;
         let db_system_id = parse_required_u64(file, BACKUP_DB_SECTION, KEY_DB_SYSTEM_ID)?;
 
+        // `[backup:option].option-checksum-page` is optional (manifests written
+        // before this section was emitted simply do not carry it). Stock
+        // pgBackRest renders booleans here as the `y`/`n` short form, with the
+        // historical `true`/`false` and `1`/`0` spellings also tolerated.
+        let option_checksum_page = file
+            .get(BACKUP_OPTION_SECTION, KEY_OPTION_CHECKSUM_PAGE)
+            .map(parse_y_n_bool)
+            .transpose()
+            .map_err(|()| InfoError::MissingField {
+                section: BACKUP_OPTION_SECTION,
+                key: KEY_OPTION_CHECKSUM_PAGE,
+            })?;
+
         let mut files = Vec::new();
         if let Some(rows) = file.sections.get(TARGET_FILE_SECTION) {
             for (path, raw_value) in rows {
@@ -475,6 +606,7 @@ impl Manifest {
             db_version,
             db_system_id,
             files,
+            option_checksum_page,
             paths,
             links,
         })
@@ -492,6 +624,13 @@ impl Manifest {
         // [backup:db]
         file.set(BACKUP_DB_SECTION, KEY_DB_SYSTEM_ID, self.db_system_id.to_string());
         file.set(BACKUP_DB_SECTION, KEY_DB_VERSION, json_string(&self.db_version));
+
+        // [backup:option] — only emitted when at least one key has been
+        // populated, so manifests that record no options stay byte-unchanged
+        // vs older writers (no empty section header).
+        if let Some(value) = self.option_checksum_page {
+            file.set(BACKUP_OPTION_SECTION, KEY_OPTION_CHECKSUM_PAGE, bool_y_n(value));
+        }
 
         // [target:file]
         for entry in &self.files {
@@ -513,7 +652,7 @@ impl Manifest {
                 size: entry.size,
                 timestamp: entry.timestamp,
                 checksum: entry.checksum.clone(),
-                checksum_page: entry.checksum_page,
+                checksum_page: entry.checksum_page.clone(),
                 reference: entry.reference.clone(),
                 mode: entry.mode,
                 user: entry.user,
@@ -557,6 +696,25 @@ fn parse_required_i64(file: &InfoFile, section: &'static str, key: &'static str)
         .map_err(|_| InfoError::MissingField { section, key })
 }
 
+/// Render a `bool` as pgBackRest's `y` / `n` short form used in info-file
+/// section keys (e.g. `[backup:option]`).
+const fn bool_y_n(value: bool) -> &'static str {
+    if value { "y" } else { "n" }
+}
+
+/// Parse a pgBackRest info-file boolean. Accepts the canonical `y` / `n`
+/// short form, plus the `true` / `false` and `1` / `0` spellings tolerated by
+/// the C parser for forward / backward compatibility. Returns `Err(())` when
+/// the value is none of those, leaving the caller free to map it onto a
+/// section-specific error type.
+fn parse_y_n_bool(raw: &str) -> Result<bool, ()> {
+    match raw.trim() {
+        "y" | "true" | "1" => Ok(true),
+        "n" | "false" | "0" => Ok(false),
+        _ => Err(()),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -595,7 +753,7 @@ mod tests {
                     size: 8192,
                     timestamp: 1_704_110_400,
                     checksum: Some("a0b1c2d3".to_owned()),
-                    checksum_page: Some(true),
+                    checksum_page: Some(ChecksumPage::Validated),
                     reference: None,
                     mode: None,
                     user: None,
@@ -605,6 +763,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: vec![ManifestPath {
                 path: "pg_data".to_owned(),
             }],
@@ -638,7 +797,7 @@ mod tests {
         let manifest = sample();
         let found = manifest.file("pg_data/base/1/1259").unwrap();
         assert_eq!(found.size, 8192);
-        assert_eq!(found.checksum_page, Some(true));
+        assert_eq!(found.checksum_page, Some(ChecksumPage::Validated));
         assert!(manifest.file("pg_data/does/not/exist").is_none());
     }
 
@@ -685,6 +844,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: vec![ManifestPath {
                 path: "pg_data".to_owned(),
             }],
@@ -757,6 +917,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: vec![ManifestPath {
                 path: "pg_data".to_owned(),
             }],
@@ -841,6 +1002,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: Vec::new(),
             links: Vec::new(),
         };
@@ -924,6 +1086,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: Vec::new(),
             links: Vec::new(),
         };

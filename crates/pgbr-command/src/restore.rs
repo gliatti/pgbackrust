@@ -2469,6 +2469,7 @@ mod tests {
             db_version: db_version.to_owned(),
             db_system_id: 6_873_049_345_984_568_091,
             files: manifest_files,
+            option_checksum_page: None,
             paths: paths.iter().map(|p| ManifestPath { path: (*p).to_owned() }).collect(),
             links: links
                 .iter()

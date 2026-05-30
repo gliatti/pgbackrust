@@ -1412,7 +1412,7 @@ mod tests {
                     size: 8192,
                     timestamp: 1_700_000_000,
                     checksum: Some("a0b1c2d3".to_owned()),
-                    checksum_page: Some(true),
+                    checksum_page: Some(pgbr_info::ChecksumPage::Validated),
                     reference: None,
                     mode: None,
                     user: None,
@@ -1422,6 +1422,7 @@ mod tests {
                     block_map: None,
                 },
             ],
+            option_checksum_page: None,
             paths: vec![ManifestPath {
                 path: "pg_data".to_owned(),
             }],

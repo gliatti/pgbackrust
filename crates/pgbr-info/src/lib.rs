@@ -42,7 +42,7 @@ pub use crate::archive::{DbHistoryEntry, InfoArchive};
 pub use crate::backup::InfoBackup;
 pub use crate::cipher::{CipherType, RepoKeys, cipher_pass_gen, decrypt_info, encrypt_info};
 pub use crate::format::{InfoFile, InfoFormatError};
-pub use crate::manifest::{Manifest, ManifestFile, ManifestLink, ManifestPath};
+pub use crate::manifest::{ChecksumPage, Manifest, ManifestFile, ManifestLink, ManifestPath};
 
 /// Failure surface for the `pgbr-info` crate.
 #[derive(Debug)]
