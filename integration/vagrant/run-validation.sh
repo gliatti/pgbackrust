@@ -787,6 +787,32 @@ if [ "${#REMAINING[@]}" = "1" ] && [ "${REMAINING[0]}" = "$LABEL2" ]; then pass 
 else fail "expire --set wrong outcome (remaining ${#REMAINING[@]}: ${REMAINING[*]}, want only $LABEL2)"; fi
 
 ############################################################################
+hd "Scenario 18 — annotate command (set / update / delete key=value metadata)"
+# annotate attaches arbitrary user-supplied key/value labels to a backup's
+# metadata (command.html). The annotation is persisted in backup.info under
+# "backup-annotation":{...} and surfaced by `info --output=json` per backup.
+# Companion to 01e5eae1f (fix(info): surface backup-annotation in info text +
+# JSON), which wired the previously-missing rendering. Asserts the three
+# documented operations: add a new annotation, update an existing key's
+# value, and remove an annotation by setting it to an empty value.
+prepare_principal
+psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
+ok "full backup (for annotate)" principal "pgbackrest --stanza=demo --type=full backup"
+LABEL=$(pg principal "pgbackrest --stanza=demo info --output=json" | grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | head -1)
+ok "annotate --set=$LABEL --annotation=note=hello" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note=hello"
+js1=$(pg principal "pgbackrest --stanza=demo info --output=json")
+if printf '%s' "$js1" | grep -qE '"note"[[:space:]]*:[[:space:]]*"hello"'; then pass "info --output=json renders annotation note=hello"
+else fail "annotation note=hello not visible in info json"; fi
+ok "annotate update (note=updated, same key)" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note=updated"
+js2=$(pg principal "pgbackrest --stanza=demo info --output=json")
+if printf '%s' "$js2" | grep -qE '"note"[[:space:]]*:[[:space:]]*"updated"' && ! printf '%s' "$js2" | grep -qE '"note"[[:space:]]*:[[:space:]]*"hello"'; then pass "annotation value updated (hello -> updated)"
+else fail "annotation update failed"; fi
+ok "annotate delete (--annotation=note= empty)" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note="
+js3=$(pg principal "pgbackrest --stanza=demo info --output=json")
+if ! printf '%s' "$js3" | grep -qE '"note"[[:space:]]*:[[:space:]]*"'; then pass "annotation removed (empty value deletes the key)"
+else fail "annotation NOT removed"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
