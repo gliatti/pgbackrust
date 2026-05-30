@@ -329,22 +329,15 @@ impl RemoteTlsStorage<SyncTlsIo, SyncTlsIo> {
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| ProtocolError::Spawn(format!("invalid tls server name `{server_name}`: {e}")))?;
         let socket = TcpStream::connect(addr).map_err(|e| ProtocolError::Spawn(format!("tls connect {addr}: {e}")))?;
-        // Apply the process-global `io-timeout` to the underlying TCP socket so
-        // a stalled peer fails fast instead of hanging the worker indefinitely.
-        // Without this the rustls handshake (and every subsequent JSON-line
-        // protocol read/write) blocks forever on a TLS daemon that accepted the
-        // TCP connect but never sent its ServerHello — observed against a fresh
-        // `pgbackrest server` start where the first async `archive-push` would
-        // hang. The same timeout is published by `crate::lib::run_with_context`
-        // via `pgbr_io::set_io_timeout_ms` from the resolved `io-timeout`.
-        if let Some(timeout) = pgbr_io::io_timeout() {
-            socket
-                .set_read_timeout(Some(timeout))
-                .map_err(|e| ProtocolError::Spawn(format!("tls set read timeout {addr}: {e}")))?;
-            socket
-                .set_write_timeout(Some(timeout))
-                .map_err(|e| ProtocolError::Spawn(format!("tls set write timeout {addr}: {e}")))?;
-        }
+        // We intentionally do NOT apply SO_RCVTIMEO / SO_SNDTIMEO here. On
+        // Linux those make the underlying TCP read/write return EAGAIN
+        // (errno 11) once the timer elapses, but rustls' synchronous I/O
+        // path treats EAGAIN as a hard error rather than retrying — the
+        // observed failure mode on the second archive-push from PG's
+        // archive_command was `tls write: Resource temporarily unavailable
+        // (os error 11)`. Stall protection has to live one layer up (e.g.
+        // a watchdog in the protocol loop) instead. The connect itself is
+        // already bounded by `TcpStream::connect` defaults.
         // Only enforce blocking mode when the operator opted in; the default
         // (non-blocking) is left as-is because the synchronous protocol loop
         // here cannot drive a non-blocking socket.
@@ -621,73 +614,4 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// `RemoteTlsStorage::connect` must apply the process-global `io-timeout`
-    /// to the underlying TCP socket so a stalled TLS peer fails fast instead of
-    /// hanging the worker indefinitely. The fix this guards: archive-async's
-    /// first foreground `archive-push` against a fresh `pgbackrest server` was
-    /// observed to hang because the rustls handshake had no deadline.
-    ///
-    /// The test stands up a TCP listener that accepts the connection but never
-    /// writes a `ServerHello` (the production peer-stall signature), sets a
-    /// 500 ms `io-timeout`, and asserts `connect()` returns an error in well
-    /// under 2 seconds — proving the timeout was actually applied to the
-    /// socket. The error kind is not asserted (a `WouldBlock` from the
-    /// read-timeout firing surfaces through rustls as an opaque
-    /// `ProtocolError::Spawn`); the time budget alone is enough to demonstrate
-    /// the timeout fired.
-    #[test]
-    fn remote_tls_storage_connect_applies_io_timeout() {
-        use rustls::RootCertStore;
-        use std::net::TcpListener;
-        use std::time::Instant;
-
-        // Stall server: accept the connection, hold it, and never write.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let stall = thread::spawn(move || {
-            // Accept and park the socket; dropping at the end of the closure
-            // would close it, which is what we want once the test finishes.
-            let _accepted = listener.accept().ok();
-            // Park briefly so the connecting side has time to time out before
-            // we let the socket drop.
-            thread::sleep(std::time::Duration::from_secs(3));
-        });
-
-        // Set a 500 ms io-timeout so the connecting side gives up fast.
-        pgbr_io::set_io_timeout_ms(500);
-
-        // Ensure rustls' ring provider is installed (the production wiring
-        // does this before calling `connect`, but the unit test must too).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
-
-        let start = Instant::now();
-        let result = RemoteTlsStorage::connect(
-            &format!("127.0.0.1:{port}"),
-            "localhost",
-            Arc::new(client_config),
-            false,
-            None,
-        );
-        let elapsed = start.elapsed();
-
-        // Reset the global timeout so unrelated tests aren't affected.
-        pgbr_io::set_io_timeout_ms(0);
-
-        assert!(
-            result.is_err(),
-            "connect against a stalled TLS peer must fail (got Ok within {elapsed:?})",
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "connect must give up in well under 2s when io-timeout is 500ms, took {elapsed:?}",
-        );
-
-        // Let the parking server thread finish; the listener is dropped when
-        // the closure returns.
-        let _ = stall.join();
-    }
 }
