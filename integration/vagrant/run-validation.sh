@@ -813,6 +813,36 @@ if ! printf '%s' "$js3" | grep -qE '"note"[[:space:]]*:[[:space:]]*"'; then pass
 else fail "annotation NOT removed"; fi
 
 ############################################################################
+hd "Scenario 19 — PITR --target-action=pause (cluster stays in recovery until promoted)"
+# Scenarios 2/8/15/16 covered --target-action=promote (the default). pause is
+# the alternative: when recovery reaches the target the cluster STAYS in
+# recovery (paused), allowing an operator to inspect the state before
+# committing to a promotion. pg_promote() then exits recovery normally.
+prepare_principal
+psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "PITR(pause) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+psql_on principal 5433 "CHECKPOINT" >/dev/null
+TGT_LSN=$(psql_on principal 5433 "SELECT pg_current_wal_lsn()::text" | grep -oE '^[0-9A-Fa-f]+/[0-9A-Fa-f]+$' | head -1)
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,2000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+sleep 5
+pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
+ok "PITR restore --type=lsn --target-action=pause" principal \
+  "pgbackrest --stanza=demo --type=lsn --target=$TGT_LSN --target-action=pause --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 8
+in_rec=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
+if [ "$in_rec" = "t" ]; then pass "cluster stays in recovery (paused) after reaching the target"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "cluster did not pause (in_recovery=$in_rec)"; fi
+psql_on principal 5433 "SELECT pg_promote()" >/dev/null
+sleep 6
+in_rec2=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$in_rec2" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "pg_promote() exits recovery + data matches pause-target ($rows rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "post-promote state (in_recovery=$in_rec2 rows=$rows, want f / <=1000)"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
