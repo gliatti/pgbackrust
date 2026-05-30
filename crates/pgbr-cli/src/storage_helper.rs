@@ -430,7 +430,13 @@ fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u
     // `sck-block` (default false) toggles blocking socket mode on the connecting
     // socket; only enforced when set (the transport relies on blocking I/O).
     let sck_block = boolean_option(cfg, "sck-block", 1).unwrap_or(false);
-    let storage = RemoteTlsStorage::connect(&addr, host, Arc::new(client_config), sck_block).map_err(CliRunError::Protocol)?;
+    // The peer's `pgbackrest server` is typically started without `--stanza`
+    // so it can serve many stanzas off one listener; CN authorization must
+    // run against the *client's* stanza, which the greeting noOp carries.
+    // `cfg.stanza` is the resolved `--stanza=<name>` for this run.
+    let stanza = cfg.stanza.as_deref();
+    let storage =
+        RemoteTlsStorage::connect(&addr, host, Arc::new(client_config), sck_block, stanza).map_err(CliRunError::Protocol)?;
     Ok(Box::new(storage))
 }
 

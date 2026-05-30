@@ -361,38 +361,82 @@ fn split(stream: TcpStream) -> Result<(TcpIo, TcpIo), CommandError> {
     Ok((TcpIo::new(read_half), TcpIo::new(stream)))
 }
 
-/// Accept connections on an already-bound [`TcpListener`] and run [`serve`]
-/// on each until the listener is exhausted.
+/// Long-running TCP accept loop for the `server` command.
 ///
-/// This slice handles a single connection then returns: each accepted socket
-/// is served to its `exit`/EOF, after which the function stops. That keeps the
-/// transport simple and makes loopback tests deterministic; serving multiple
-/// connections in a loop is a follow-up (wrap the body in `for stream in
-/// listener.incoming()`).
+/// Runs [`serve`] on each accepted connection. A per-connection protocol /
+/// I/O error is logged and the loop continues so a single malformed peer
+/// does not bring the listener down; only an unrecoverable
+/// [`accept`](TcpListener::accept) failure (an I/O error other than
+/// `Interrupted` / `WouldBlock`) returns. `serve_tcp` and the configured
+/// `server` command keep the listener alive across many pgBackRest
+/// connections through this entry point. Tests drive the loop with a
+/// shutdown predicate via [`serve_listener_with_continue`].
 ///
 /// # Errors
 ///
-/// [`CommandError::Other`] on an accept / clone failure, or whatever [`serve`]
-/// returns for a protocol or write error.
+/// [`CommandError::Other`] on a non-retryable accept failure.
 pub fn serve_listener(listener: &TcpListener) -> Result<(), CommandError> {
     serve_listener_with(listener, KeepAlive::default(), false)
 }
 
-/// [`serve_listener`] with explicit keepalive + `sck-block` settings applied to
-/// the accepted socket. The config-driven `server` path threads the resolved
-/// [`KeepAlive`] and `sck-block` flag here; the public [`serve_listener`] uses
-/// the defaults.
+/// [`serve_listener`] with explicit keepalive + `sck-block` settings applied
+/// to the accepted socket. The config-driven `server` path threads the
+/// resolved [`KeepAlive`] and `sck-block` flag here; the public
+/// [`serve_listener`] uses the defaults.
 fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive, sck_block: bool) -> Result<(), CommandError> {
-    let (stream, _peer) = listener
-        .accept()
-        .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
-    keepalive.apply(&stream);
-    apply_sck_block(&stream, sck_block);
-    let (mut reader, mut writer) = split(stream)?;
-    serve(&mut reader, &mut writer)?;
-    // Signal a clean EOF to the peer; ignore an already-closed socket.
-    let _ = writer.close();
-    Ok(())
+    serve_listener_with_continue(listener, keepalive, sck_block, || true)
+}
+
+/// Accept-loop core used by [`serve_listener_with`] and (via a shutdown flag)
+/// by the unit tests.
+///
+/// Per accepted connection: applies keepalive + `sck-block`, splits the
+/// socket into reader / writer halves, runs [`serve`], and closes the
+/// writer. A per-connection error is logged and the loop continues; only a
+/// non-retryable [`accept`](TcpListener::accept) error (i.e. anything other
+/// than `Interrupted` / `WouldBlock`) breaks out.
+///
+/// `should_continue` is polled before each accept (and after every
+/// `WouldBlock` retry); returning `false` ends the loop cleanly. Production
+/// passes `|| true`, so the loop runs until the listener is torn down.
+fn serve_listener_with_continue(
+    listener: &TcpListener,
+    keepalive: KeepAlive,
+    sck_block: bool,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<(), CommandError> {
+    loop {
+        if !should_continue() {
+            return Ok(());
+        }
+        let (stream, _peer) = match listener.accept() {
+            Ok(v) => v,
+            // `Interrupted` is benign (a signal); retry immediately.
+            // `WouldBlock` only happens when the listener was set to
+            // non-blocking — wait briefly so `should_continue` can flip a
+            // shutdown flag without busy-spinning.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(CommandError::Other(format!("tcp accept: {e}"))),
+        };
+        keepalive.apply(&stream);
+        apply_sck_block(&stream, sck_block);
+        let (mut reader, mut writer) = match split(stream) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::control::log_info(&format!("tcp connection setup failed: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = serve(&mut reader, &mut writer) {
+            crate::control::log_info(&format!("tcp serve ended: {e}"));
+        }
+        // Signal a clean EOF to the peer; ignore an already-closed socket.
+        let _ = writer.close();
+    }
 }
 
 /// Bind a [`TcpListener`] to `addr` and serve a connection via
@@ -1153,74 +1197,177 @@ pub fn serve_tls(
     Ok(())
 }
 
-/// Accept one TLS connection on `listener` and serve the **storage** protocol.
+/// Accept TLS connections on `listener` in a loop and serve the **storage**
+/// protocol on each.
 ///
 /// This is the server side of the `repo-host-type=tls` / `pg-host-type=tls`
-/// transport — the same protocol the SSH `--remote` worker serves, but over a
-/// mutual-TLS socket. A remote pgBackRest connects presenting its client
-/// certificate; the handshake validates it against the configured client CA, and
-/// the certificate's CN is checked against `auth` for `stanza`. An authorized
-/// connection is served from a [`Posix`](pgbr_storage::Posix) rooted at `root`
-/// via the shared worker handler, so the peer can drive every `storage-*`
-/// request as well as `noOp` / `exit`. C reference:
+/// transport — the same protocol the SSH `--remote` worker serves, but over
+/// a mutual-TLS socket. A remote pgBackRest connects presenting its client
+/// certificate; the handshake validates it against the configured client CA;
+/// the connection's first request is the no-op greeting that declares the
+/// stanza the client is operating on; the certificate's CN is then checked
+/// against `auth` for *that* greeting stanza (not whatever stanza the daemon
+/// itself was started with, which is typically none). An authorized
+/// connection is served from a [`Posix`](pgbr_storage::Posix) rooted at
+/// `root` via the shared worker handler, so the peer can drive every
+/// `storage-*` request as well as `noOp` / `exit`. C reference:
 /// `src/command/server/server.c`.
 ///
-/// When `auth` is empty, authorization is skipped (the server still presents its
-/// own certificate but does not require / inspect a client one) — preserving the
-/// no-mTLS fallback while still serving the storage protocol.
+/// Per-connection errors (TLS handshake, malformed greeting, CN rejection,
+/// worker protocol failure) are logged and the accept loop continues; only
+/// a non-retryable [`accept`](TcpListener::accept) failure ends the listener
+/// (so a single malformed peer cannot take the daemon down).
+///
+/// When `auth` is empty, authorization is skipped (the server still
+/// presents its own certificate but does not require / inspect a client
+/// one) — preserving the no-mTLS fallback while still serving the storage
+/// protocol.
 ///
 /// # Errors
 ///
-/// [`CommandError::Other`] on an accept failure, an invalid cert/key, a TLS
-/// handshake failure, or a CN that is not authorized for `stanza`; plus whatever
-/// the worker serve loop returns.
+/// [`CommandError::Other`] on a non-retryable accept failure or an invalid
+/// server cert/key. Per-connection failures do not propagate.
 pub fn serve_tls_storage(
     listener: &TcpListener,
-    server_config: Arc<ServerConfig>,
+    server_config: &Arc<ServerConfig>,
     auth: &BTreeMap<String, Vec<String>>,
-    stanza: Option<&str>,
     root: &std::path::Path,
 ) -> Result<(), CommandError> {
-    serve_tls_storage_with(listener, server_config, auth, stanza, root, KeepAlive::default(), false)
+    serve_tls_storage_with(listener, server_config, auth, root, KeepAlive::default(), false)
 }
 
-/// [`serve_tls_storage`] with explicit keepalive + `sck-block` settings applied
-/// to the accepted socket before the TLS handshake. The config-driven `server`
-/// path threads the resolved [`KeepAlive`] and `sck-block` flag here.
+/// [`serve_tls_storage`] with explicit keepalive + `sck-block` settings
+/// applied to each accepted socket before the TLS handshake. The
+/// config-driven `server` path threads the resolved [`KeepAlive`] and
+/// `sck-block` flag here.
 fn serve_tls_storage_with(
     listener: &TcpListener,
-    server_config: Arc<ServerConfig>,
+    server_config: &Arc<ServerConfig>,
     auth: &BTreeMap<String, Vec<String>>,
-    stanza: Option<&str>,
     root: &std::path::Path,
     keepalive: KeepAlive,
     sck_block: bool,
 ) -> Result<(), CommandError> {
-    let (stream, _peer) = listener
-        .accept()
-        .map_err(|e| CommandError::Other(format!("tcp accept: {e}")))?;
-    keepalive.apply(&stream);
-    apply_sck_block(&stream, sck_block);
+    serve_tls_storage_with_continue(listener, server_config, auth, root, keepalive, sck_block, || true)
+}
 
-    let mut conn = ServerConnection::new(server_config).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
+/// Accept-loop core used by [`serve_tls_storage_with`] and (via a shutdown
+/// flag) by the unit tests.
+///
+/// Per accepted connection: completes the rustls handshake, reads the
+/// connection-greeting no-op to learn the client's stanza, runs
+/// [`authorize_client`] against that stanza, replies to the greeting, and
+/// serves the worker protocol for the rest of the connection's life. Any
+/// per-connection error is logged and the loop continues; only a
+/// non-retryable accept failure breaks out.
+///
+/// `should_continue` is polled before each accept (and after every
+/// `WouldBlock` retry); returning `false` ends the loop cleanly.
+fn serve_tls_storage_with_continue(
+    listener: &TcpListener,
+    server_config: &Arc<ServerConfig>,
+    auth: &BTreeMap<String, Vec<String>>,
+    root: &std::path::Path,
+    keepalive: KeepAlive,
+    sck_block: bool,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<(), CommandError> {
+    loop {
+        if !should_continue() {
+            return Ok(());
+        }
+        let (stream, _peer) = match listener.accept() {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(CommandError::Other(format!("tcp accept: {e}"))),
+        };
+        keepalive.apply(&stream);
+        apply_sck_block(&stream, sck_block);
 
-    // Complete the handshake before inspecting the peer certificate: rustls only
-    // populates `peer_certificates()` once the handshake has progressed far
-    // enough to receive the client's Certificate message.
+        if let Err(e) = handle_tls_connection(server_config, auth, root, stream) {
+            crate::control::log_info(&format!("tls connection ended: {e}"));
+        }
+    }
+}
+
+/// Run the full per-connection flow for one accepted TCP stream: TLS
+/// handshake, connection-greeting noOp, CN authorization, greeting ack,
+/// and worker serve loop. Any failure is returned so the accept loop can
+/// log it and move on.
+///
+/// The greeting is read while the `TlsServerIo` is still uniquely owned,
+/// so `authorize_client` can borrow the rustls `ServerConnection` directly
+/// for `peer_certificates()`. Only after authorization succeeds is the
+/// `TlsServerIo` wrapped in a `SharedTlsIo` (Rc/RefCell) to drive the
+/// worker's separate reader / writer handles.
+fn handle_tls_connection(
+    server_config: &Arc<ServerConfig>,
+    auth: &BTreeMap<String, Vec<String>>,
+    root: &std::path::Path,
+    stream: TcpStream,
+) -> Result<(), CommandError> {
+    use pgbr_protocol::transport::NOOP_COMMAND;
+    use pgbr_protocol::{Message, OkResponse, Response, read_message, write_message};
+
+    let mut conn =
+        ServerConnection::new(Arc::clone(server_config)).map_err(|e| CommandError::Other(format!("tls server new: {e}")))?;
+
+    // Complete the handshake before inspecting the peer certificate: rustls
+    // only populates `peer_certificates()` once the handshake has progressed
+    // far enough to receive the client's Certificate message.
     conn.complete_io(&mut TcpHandshake(&stream))
         .map_err(|e| CommandError::Other(format!("tls handshake: {e}")))?;
 
-    // Authorize the client CN against `tls-server-auth` for the requested
-    // stanza; a failure closes the connection (the `?` drops `conn` / the
-    // socket).
-    let _cn = authorize_client(&conn, auth, stanza)?;
+    // Owned TlsIo — read the greeting and authorize before sharing.
+    let mut tls = TlsServerIo::new(StreamOwned::new(conn, stream));
 
-    let io = SharedTlsIo::new(TlsServerIo::new(StreamOwned::new(conn, stream)));
+    // Read the first request: the greeting that declares the stanza.
+    let greeting = match read_message(&mut tls).map_err(|e| CommandError::Other(format!("tls greeting read: {e}")))? {
+        Some(Message::Request(req)) => req,
+        Some(Message::Response(_)) => {
+            return Err(CommandError::Other("tls greeting: expected request, got response".to_owned()));
+        }
+        None => {
+            return Err(CommandError::Other("tls greeting: peer closed before greeting".to_owned()));
+        }
+    };
+
+    // Anything other than a noOp at this position is a protocol violation
+    // — the client must send the greeting (a noOp possibly carrying a
+    // `stanza=<name>` param) before any storage request.
+    if greeting.cmd != NOOP_COMMAND {
+        return Err(CommandError::Other(format!(
+            "tls greeting: expected `{NOOP_COMMAND}`, got `{}`",
+            greeting.cmd
+        )));
+    }
+
+    // Pull the stanza out of the greeting's `param` list (when set), then
+    // authorize the client CN for *that* stanza. The rustls connection is
+    // still accessible exclusively via `tls.stream.conn`.
+    let stanza = crate::worker::WorkerHandler::parse_stanza_param(&greeting.param);
+    authorize_client(&tls.stream.conn, auth, stanza.as_deref())?;
+
+    // Acknowledge the greeting with a plain Ok so the client's `greet`
+    // call completes; from here on the worker drives the request loop.
+    let ack = Message::Response(Response::Ok(OkResponse { out: None }));
+    write_message(&mut tls, &ack).map_err(|e| CommandError::Other(format!("tls greeting ack: {e}")))?;
+    tls.flush()
+        .map_err(|e| CommandError::Other(format!("tls greeting flush: {e}")))?;
+
+    // Wrap in a shared handle so the worker can take separate reader /
+    // writer halves over the single rustls stream, then run the worker
+    // protocol for the rest of the connection's life.
+    let io = SharedTlsIo::new(tls);
     let mut reader = io.clone_handle();
     let mut writer = io.clone_handle();
-    crate::worker::serve_worker(root, &mut reader, &mut writer)?;
+    let outcome = crate::worker::serve_worker(root, &mut reader, &mut writer);
     let _ = writer.close();
-    Ok(())
+    outcome
 }
 
 /// Minimal [`Read`] + [`Write`] shim over a borrowed [`TcpStream`], so
@@ -1394,15 +1541,10 @@ pub fn server(config: &LoadedConfig, _repo_storage: &dyn Storage) -> Result<(), 
             // Human-facing progress line goes to the logger; the served protocol
             // is the command's machine-readable output on the socket.
             crate::control::log_info(&format!("server listening (tls) on {addr}"));
-            serve_tls_storage_with(
-                &listener,
-                server_config,
-                &auth,
-                config.stanza.as_deref(),
-                &root,
-                keepalive,
-                sck_block,
-            )
+            // The per-connection stanza is now read from the client's
+            // greeting noOp, so this loop is started without the daemon's
+            // own stanza (which is typically `None`).
+            serve_tls_storage_with(&listener, &server_config, &auth, &root, keepalive, sck_block)
         }
         _ => serve_tcp_with(&addr, keepalive, sck_block),
     }
@@ -1714,13 +1856,27 @@ mod tests {
 
     #[test]
     fn tcp_ping_round_trip() {
-        // Bind on an ephemeral port, read the assigned address BEFORE moving
-        // the listener into the server thread, then ping it from the main
-        // thread and join.
+        // Bind on an ephemeral port and drive the accept loop through the
+        // `_continue` helper so the test can flip a shutdown flag once the
+        // client's ping has completed (the production `serve_listener`
+        // wrapper loops forever, which is the desired daemon behaviour but
+        // would hang a test).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Non-blocking accept so the loop polls the shutdown flag between
+        // peers; the loop's `WouldBlock` arm sleeps briefly to avoid busy-spin.
+        listener.set_nonblocking(true).unwrap();
 
-        let server = std::thread::spawn(move || serve_listener(&listener));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_listener_with_continue(&listener, KeepAlive::default(), false, || {
+                !stop_for_server.load(Ordering::Acquire)
+            })
+        });
 
         // Connect, set a read timeout so a hung server fails the test fast
         // rather than blocking CI, then run the ping exchange.
@@ -1729,17 +1885,54 @@ mod tests {
         let (mut reader, mut writer) = split(stream).unwrap();
         ping_exchange(&mut reader, &mut writer).unwrap();
 
-        // `ping_exchange` issues a `noOp` but no `exit`, so the server's read
-        // loop only ends when it sees EOF. Close the write half and drop both
-        // client handles so the socket is torn down, giving the server a clean
-        // EOF; otherwise the join below would block on a still-open socket.
+        // `ping_exchange` issues a `noOp` but no `exit`, so the per-connection
+        // `serve` loop only ends when it sees EOF. Close the write half and
+        // drop both client handles so the socket is torn down, giving the
+        // server a clean EOF.
         writer.close().unwrap();
         drop(reader);
         drop(writer);
 
-        // The server thread completed without error after serving the
-        // connection to its clean EOF.
+        // Signal the accept loop to stop on the next iteration.
+        stop.store(true, Ordering::Release);
         server.join().expect("server thread panicked").expect("serve_listener");
+    }
+
+    /// The accept loop continues across multiple connections: connect once
+    /// and run a ping, close, then connect again and run another ping.
+    /// Before this loop existed the second connect would time out because
+    /// the server returned after one connection.
+    #[test]
+    fn tcp_serve_loop_continues_after_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_listener_with_continue(&listener, KeepAlive::default(), false, || {
+                !stop_for_server.load(Ordering::Acquire)
+            })
+        });
+
+        // Two independent connections, each running a ping round trip,
+        // proving the accept loop kept going after the first one closed.
+        for _ in 0..2 {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (mut reader, mut writer) = split(stream).unwrap();
+            ping_exchange(&mut reader, &mut writer).unwrap();
+            writer.close().unwrap();
+            drop(reader);
+            drop(writer);
+        }
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("serve_listener loop");
     }
 
     // --- TLS transport -----------------------------------------------------
@@ -2317,13 +2510,20 @@ mod tests {
     /// requested stanza. `expect_ok` asserts whether the client's storage
     /// request round trip should succeed (authorized) or fail (rejected).
     ///
-    /// The client drives the storage protocol directly over the TLS stream via a
-    /// [`ProtocolClient`] (issuing a `storage-exists` request) rather than
-    /// through [`RemoteStorage`], whose `Storage` impl requires `Send` reader /
-    /// writer that the `Rc`-backed [`SharedTlsIo`] does not provide — the
-    /// `Send`-able transport lives in the `pgbr-cli` crate. This still exercises
-    /// the mTLS handshake, CN authorization, and the server's storage serve loop.
+    /// The server is driven through the `_continue` helper so the test can
+    /// flip a shutdown flag once the client's session has completed (the
+    /// production `serve_tls_storage` wrapper loops forever, which is the
+    /// desired daemon behaviour but would hang a test).
+    ///
+    /// The client first issues the connection greeting (a `noOp` with the
+    /// requested `stanza=<name>` token), which is what the server keys CN
+    /// authorization on — *not* whatever stanza the daemon was started with.
+    /// On the authorized path it then runs a `storage-exists` round trip to
+    /// prove the worker protocol is reachable.
     fn run_mtls_round_trip(client_cn: &str, stanza: Option<&str>, expect_ok: bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         use pgbr_protocol::ProtocolClient;
         use pgbr_storage::remote::command::EXISTS;
 
@@ -2332,8 +2532,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().to_path_buf();
 
-        // Server config: present the server cert, require client certs signed by
-        // the shared CA, authorize CN `client.example` for stanza `demo`.
+        // Server config: present the server cert, require client certs signed
+        // by the shared CA, authorize CN `client.example` for stanza `demo`.
         let mut server_roots = RootCertStore::empty();
         for c in cert_chain_from_pem(&ca_pem) {
             server_roots.add(c).unwrap();
@@ -2349,13 +2549,24 @@ mod tests {
         );
         let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
         auth.insert("client.example".to_owned(), vec!["demo".to_owned()]);
-        let stanza_owned = stanza.map(str::to_owned);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
 
-        let server =
-            std::thread::spawn(move || serve_tls_storage(&listener, server_config, &auth, stanza_owned.as_deref(), &root_path));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_tls_storage_with_continue(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
 
         // Client: trust the CA, present the client cert.
         let mut client_roots = RootCertStore::empty();
@@ -2377,9 +2588,12 @@ mod tests {
             stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let io = SharedTlsIo::new(TlsClientIo::new(stream));
             let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
-            // A storage round trip: `storage-exists` on a missing path returns
-            // Ok(false) when authorized, or errors (the server closed the
-            // connection) when the CN was rejected.
+
+            // 1. Greeting (carries the stanza the server authorizes against).
+            client.greet(stanza).map_err(|e| CommandError::Other(format!("greet: {e}")))?;
+            // 2. Storage round trip: `storage-exists` on a missing path
+            // returns Ok(false) when authorized. (Reached only on the
+            // authorized path; the rejected path errors out of `greet`.)
             let outcome = client
                 .execute(&Request {
                     cmd: EXISTS.to_owned(),
@@ -2387,23 +2601,273 @@ mod tests {
                 })
                 .map(|_| ())
                 .map_err(|e| CommandError::Other(format!("{e}")));
-            // On the authorized path, shut the protocol down cleanly (exit +
-            // close_notify) so the server's serve loop ends and joins without a
-            // truncation error; ignore failures (the rejected path is already
-            // torn down).
+            // Shut the protocol down cleanly so the server's per-connection
+            // worker loop ends without a truncation error; ignore failures.
             let _ = client.close();
             outcome
         };
 
         let result = connect();
+        // Tell the accept loop to stop so the server thread can join.
+        stop.store(true, Ordering::Release);
         let server_result = server.join().expect("server thread panicked");
+
         if expect_ok {
-            server_result.expect("authorized server should serve the storage round trip");
-            result.expect("authorized client should complete a storage round trip");
+            server_result.expect("authorized server's accept loop should end cleanly");
+            result.expect("authorized client should complete a greeting + storage round trip");
         } else {
-            // The rejected client must not complete a round trip; the server
-            // either rejected the CN (Err) or saw the connection drop.
+            // The rejected client must not complete a round trip: the server
+            // rejected the CN inside `handle_tls_connection`, the per-
+            // connection error was logged, and the accept loop continued.
             assert!(result.is_err(), "unauthorized client must not complete a round trip");
+            // The loop should still have stopped cleanly when we signaled.
+            server_result.expect("loop must end cleanly even after rejecting a connection");
         }
+    }
+
+    /// Without the connection-greeting noOp, an mTLS client whose CN is
+    /// authorized for a specific stanza is rejected because the server now
+    /// keys auth on the greeting stanza, which is `None` here. This is the
+    /// regression guard for bug A's pre-fix behaviour (`<none>` in the
+    /// log message).
+    #[test]
+    fn mtls_storage_rejects_when_greeting_omits_stanza_for_exact_match_auth() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use pgbr_protocol::ProtocolClient;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+            shared_ca_pair("server.local", "principal");
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        // CN `principal` is authorized only for stanza `demo`.
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("principal".to_owned(), vec!["demo".to_owned()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_tls_storage_with_continue(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
+
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let addr = format!("127.0.0.1:{port}");
+        let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config)).unwrap();
+        stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let io = SharedTlsIo::new(TlsClientIo::new(stream));
+        let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+        // Greeting with no stanza — server has CN -> [`demo`], no wildcard.
+        let greet_result = client.greet(None);
+        assert!(greet_result.is_err(), "exact-match auth must reject a stanza-less greeting");
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
+    }
+
+    /// `*`-wildcard auth still passes for a greeting without a stanza,
+    /// matching the documented `tls-server-auth` semantics. This pins the
+    /// behaviour of [`cn_authorized_for_stanza`] over the greeting path.
+    #[test]
+    fn mtls_storage_authorizes_wildcard_cn_against_greeting_without_stanza() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use pgbr_protocol::ProtocolClient;
+        use pgbr_storage::remote::command::EXISTS;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) = shared_ca_pair("server.local", "admin");
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("admin".to_owned(), vec!["*".to_owned()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_tls_storage_with_continue(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
+
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let addr = format!("127.0.0.1:{port}");
+        let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config)).unwrap();
+        stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let io = SharedTlsIo::new(TlsClientIo::new(stream));
+        let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+
+        client.greet(None).expect("wildcard CN must accept stanza-less greeting");
+        client
+            .execute(&Request {
+                cmd: EXISTS.to_owned(),
+                param: vec![serde_json::Value::String("nope.txt".to_owned())],
+            })
+            .expect("authorized wildcard client should run a storage round trip");
+        let _ = client.close();
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
+    }
+
+    /// The TLS accept loop continues after one connection ends: the daemon
+    /// (started without `--stanza`) must accept a second client just as it
+    /// accepted the first. Before the loop landed, the server returned
+    /// immediately after the first connection and a second connect would
+    /// time out / refuse — this is the regression guard for bug B.
+    #[test]
+    fn tls_server_accept_loop_continues_after_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use pgbr_protocol::ProtocolClient;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+            shared_ca_pair("server.local", "principal");
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("principal".to_owned(), vec!["demo".to_owned()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_tls_storage_with_continue(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
+
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let addr = format!("127.0.0.1:{port}");
+
+        // Two independent connections, each greeting with `stanza=demo`; the
+        // second succeeding is the proof the accept loop kept going.
+        for attempt in 1..=2 {
+            let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config))
+                .unwrap_or_else(|e| panic!("attempt {attempt}: connect: {e}"));
+            stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let io = SharedTlsIo::new(TlsClientIo::new(stream));
+            let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+            client
+                .greet(Some("demo"))
+                .unwrap_or_else(|e| panic!("attempt {attempt}: greet: {e}"));
+            let _ = client.close();
+        }
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
     }
 }

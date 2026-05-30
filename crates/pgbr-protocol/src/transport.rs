@@ -233,6 +233,44 @@ impl<R: IoRead, W: IoWrite> ProtocolClient<R, W> {
         }
     }
 
+    /// Send the connection-greeting handshake that carries the requested
+    /// stanza to the server side.
+    ///
+    /// The first message on a freshly-opened mutual-TLS connection to a
+    /// `pgbackrest server` is a no-op whose `param` list optionally carries a
+    /// single `stanza=<name>` token. The server reads it before calling
+    /// `authorize_client`, so the CN authorization runs against the *client's*
+    /// requested stanza rather than whatever stanza (if any) the server
+    /// process was itself started with (the daemon is typically started
+    /// without `--stanza`, which would otherwise resolve to `<none>` and
+    /// reject every authorized CN). The server replies with a plain success
+    /// response, which this method consumes; the rest of the connection then
+    /// runs the regular storage/db protocol.
+    ///
+    /// `stanza == None` produces a noOp with an empty `param` vector — useful
+    /// for the `*`-wildcard auth case, and as the regression guard for
+    /// `greet(None)` in the unit tests. Callers issue it exactly once, right
+    /// after the transport is built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Codec`] on a framing/serialization failure,
+    /// [`ProtocolError::Io`] on a flush failure, or [`ProtocolError::Worker`]
+    /// if the server rejected the greeting (typically: CN not authorized for
+    /// the requested stanza).
+    pub fn greet(&mut self, stanza: Option<&str>) -> Result<(), ProtocolError> {
+        let mut param = Vec::new();
+        if let Some(s) = stanza {
+            param.push(serde_json::Value::String(format!("stanza={s}")));
+        }
+        let req = Request {
+            cmd: NOOP_COMMAND.to_owned(),
+            param,
+        };
+        let _ = self.execute(&req)?;
+        Ok(())
+    }
+
     /// Send the `exit` handshake so the worker's [`serve`] loop terminates
     /// cleanly, then close the writer so the peer reads EOF.
     ///
@@ -859,5 +897,72 @@ mod tests {
         let _ = reader.read_all();
         let status = child.wait().expect("wait for cat");
         assert!(status.success());
+    }
+
+    /// `ProtocolClient::greet(Some("demo"))` sends exactly one noOp request
+    /// whose `param` list carries the `stanza=demo` token, and consumes the
+    /// matching `Ok` response. Asserting both directions on a pipe pair pins
+    /// the wire shape the TLS server side decodes.
+    #[test]
+    fn greet_sends_noop_with_stanza_param_and_consumes_response() {
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        // Fake server: read one request, assert it is the greeting, reply Ok.
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let msg = read_message(&mut reader).unwrap().expect("greeting message");
+            match msg {
+                Message::Request(req) => {
+                    assert_eq!(req.cmd, NOOP_COMMAND, "greet must send a noOp");
+                    assert_eq!(
+                        req.param,
+                        vec![json!("stanza=demo")],
+                        "greet must carry stanza=<name> as its sole param"
+                    );
+                }
+                other @ Message::Response(_) => panic!("expected a Request, got {other:?}"),
+            }
+            let resp = Message::Response(Response::Ok(OkResponse { out: None }));
+            write_message(&mut writer, &resp).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let mut client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        client.greet(Some("demo")).expect("greet must succeed on Ok reply");
+
+        // The server thread completed without panicking; the read+reply round
+        // trip confirms both directions of the greeting.
+        server.join().expect("server thread");
+    }
+
+    /// `ProtocolClient::greet(None)` produces an empty-param noOp — the
+    /// `*`-wildcard auth case where the client does not name a stanza.
+    #[test]
+    fn greet_none_sends_noop_with_empty_param() {
+        let (req_r, req_w) = os_pipe::pipe().unwrap();
+        let (resp_r, resp_w) = os_pipe::pipe().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut reader = PipeRead::new(req_r);
+            let mut writer = PipeWrite::new(resp_w);
+            let msg = read_message(&mut reader).unwrap().expect("greeting message");
+            match msg {
+                Message::Request(req) => {
+                    assert_eq!(req.cmd, NOOP_COMMAND);
+                    assert!(req.param.is_empty(), "greet(None) must produce an empty param vec");
+                }
+                other @ Message::Response(_) => panic!("expected a Request, got {other:?}"),
+            }
+            let resp = Message::Response(Response::Ok(OkResponse { out: None }));
+            write_message(&mut writer, &resp).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let mut client = ProtocolClient::new(PipeRead::new(resp_r), PipeWrite::new(req_w));
+        client.greet(None).expect("greet(None) must succeed on Ok reply");
+
+        server.join().expect("server thread");
     }
 }

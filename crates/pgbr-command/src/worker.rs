@@ -38,10 +38,11 @@ use std::path::{Path, PathBuf};
 use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
 use pgbr_db::{DB_PROTOCOL_PREFIX, DbRequestHandler};
 use pgbr_io::{IoRead, IoWrite};
-use pgbr_protocol::transport::{PipeRead, PipeWrite, RequestHandler, serve};
+use pgbr_protocol::transport::{NOOP_COMMAND, PipeRead, PipeWrite, RequestHandler, serve};
 use pgbr_protocol::{ErrResponse, Request, Response};
 use pgbr_storage::Posix;
 use pgbr_storage::remote::StorageRequestHandler;
+use serde_json::Value;
 
 use crate::CommandError;
 
@@ -49,6 +50,13 @@ use crate::CommandError;
 /// `storage-write`, ...). Requests with this prefix are delegated to the
 /// wrapped [`StorageRequestHandler`].
 const STORAGE_PREFIX: &str = "storage-";
+
+/// `param`-token prefix used by the connection-greeting noOp to declare the
+/// stanza the caller is operating on (`stanza=<name>`). The TLS server side
+/// parses it before `authorize_client`, so per-connection CN authorization
+/// keys on the *client's* stanza rather than whatever stanza (if any) the
+/// `pgbackrest server` process was started with.
+const GREETING_STANZA_PREFIX: &str = "stanza=";
 
 /// Error code carried by [`ErrResponse`] for a request the worker refuses to
 /// handle. The message is the load-bearing part; the numeric code mirrors the
@@ -65,19 +73,74 @@ const WORKER_ERR_CODE: u32 = 1;
 /// The [`DbRequestHandler`]'s [`pgbr_db::Connection`] is `!Send`, but a worker
 /// process is single-threaded and serves requests one at a time, so the
 /// connection never crosses a thread boundary.
+///
+/// A worker also records the stanza its caller declared in the
+/// connection-greeting noOp (see [`Self::record_greeting`]). The TLS `server`
+/// command consumes that stanza before `authorize_client`; the SSH-piped
+/// worker does not authorize anything itself but still records the value so
+/// the wire shape is symmetric across both transports.
 pub struct WorkerHandler {
     storage: StorageRequestHandler<Posix>,
     db: DbRequestHandler,
+    /// Stanza the caller declared in the connection-greeting noOp, when set.
+    stanza: Option<String>,
 }
 
 impl WorkerHandler {
     /// Build a worker handler serving a local [`Posix`] rooted at `root`, with
-    /// no DB connection open yet (the first `db-open` request opens one).
+    /// no DB connection open yet (the first `db-open` request opens one) and
+    /// no greeting stanza recorded.
     #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
             storage: StorageRequestHandler::new(Posix::new(root)),
             db: DbRequestHandler::new(),
+            stanza: None,
+        }
+    }
+
+    /// The stanza the caller declared in its connection-greeting noOp, when
+    /// set. `None` until [`Self::record_greeting`] sees a recognised
+    /// `stanza=<name>` token.
+    #[must_use]
+    pub fn stanza(&self) -> Option<&str> {
+        self.stanza.as_deref()
+    }
+
+    /// Parse a connection-greeting noOp's `param` vector into the declared
+    /// stanza name, if any.
+    ///
+    /// The greeting carries at most one `stanza=<name>` token; the first one
+    /// wins and any others are ignored. Any other shape (no `stanza=` token,
+    /// an empty value after the `=`, a non-string element) yields `None`,
+    /// which the TLS server treats as "no stanza requested" — `*`-wildcard
+    /// auth still passes, an exact-match auth entry does not.
+    #[must_use]
+    pub fn parse_stanza_param(param: &[Value]) -> Option<String> {
+        for value in param {
+            if let Value::String(token) = value
+                && let Some(name) = token.strip_prefix(GREETING_STANZA_PREFIX)
+                && !name.is_empty()
+            {
+                return Some(name.to_owned());
+            }
+        }
+        None
+    }
+
+    /// Record the stanza carried by a connection-greeting noOp, when `req` is
+    /// such a greeting. Returns `true` when the greeting was recognised and
+    /// the stanza recorded; `false` otherwise (the request is then handled by
+    /// the regular protocol path).
+    pub fn record_greeting(&mut self, req: &Request) -> bool {
+        if req.cmd != NOOP_COMMAND {
+            return false;
+        }
+        if let Some(stanza) = Self::parse_stanza_param(&req.param) {
+            self.stanza = Some(stanza);
+            true
+        } else {
+            false
         }
     }
 }
@@ -342,5 +405,89 @@ mod tests {
             }
             other => panic!("expected MissingOption, got {other:?}"),
         }
+    }
+
+    /// Feeding a noOp whose `param` carries `stanza=<name>` records that
+    /// stanza on the [`WorkerHandler`]; `record_greeting` returns `true`. The
+    /// TLS `server` command keys CN authorization on this value, so the
+    /// recording step must work in isolation regardless of which transport
+    /// later consumes it.
+    #[test]
+    fn record_greeting_records_stanza_from_noop_param() {
+        use pgbr_protocol::Request;
+        use serde_json::Value;
+
+        let dir = TempDir::new().unwrap();
+        let mut handler = super::WorkerHandler::new(dir.path());
+        assert_eq!(handler.stanza(), None, "fresh handler has no stanza");
+
+        let req = Request {
+            cmd: "noOp".to_owned(),
+            param: vec![Value::String("stanza=demo".to_owned())],
+        };
+        assert!(handler.record_greeting(&req), "noOp with stanza= is a recognised greeting");
+        assert_eq!(handler.stanza(), Some("demo"));
+    }
+
+    /// A noOp without a `stanza=` token is not a greeting — the handler stays
+    /// untouched and `record_greeting` returns `false`. Same for a non-noOp.
+    #[test]
+    fn record_greeting_ignores_non_greeting_requests() {
+        use pgbr_protocol::Request;
+
+        let dir = TempDir::new().unwrap();
+        let mut handler = super::WorkerHandler::new(dir.path());
+
+        // noOp with no param: not a stanza-carrying greeting.
+        let bare_noop = Request {
+            cmd: "noOp".to_owned(),
+            param: Vec::new(),
+        };
+        assert!(!handler.record_greeting(&bare_noop));
+        assert_eq!(handler.stanza(), None);
+
+        // Non-noOp: not a greeting at all.
+        let storage_req = Request {
+            cmd: "storage-exists".to_owned(),
+            param: vec![serde_json::Value::String("nope.txt".to_owned())],
+        };
+        assert!(!handler.record_greeting(&storage_req));
+        assert_eq!(handler.stanza(), None);
+    }
+
+    /// `parse_stanza_param` is a pure helper: it picks the first
+    /// `stanza=<name>` token from a `param` vector and rejects malformed /
+    /// empty / non-string entries.
+    #[test]
+    fn parse_stanza_param_picks_first_stanza_token() {
+        use serde_json::Value;
+
+        assert_eq!(
+            super::WorkerHandler::parse_stanza_param(&[Value::String("stanza=demo".to_owned())]),
+            Some("demo".to_owned())
+        );
+        // Empty value after `=` is rejected.
+        assert_eq!(
+            super::WorkerHandler::parse_stanza_param(&[Value::String("stanza=".to_owned())]),
+            None
+        );
+        // No stanza= prefix anywhere -> None.
+        assert_eq!(
+            super::WorkerHandler::parse_stanza_param(&[Value::String("other=value".to_owned())]),
+            None
+        );
+        // First stanza token wins.
+        assert_eq!(
+            super::WorkerHandler::parse_stanza_param(&[
+                Value::String("stanza=first".to_owned()),
+                Value::String("stanza=second".to_owned()),
+            ]),
+            Some("first".to_owned())
+        );
+        // Non-string entries are skipped.
+        assert_eq!(
+            super::WorkerHandler::parse_stanza_param(&[Value::Number(42.into()), Value::String("stanza=after-skip".to_owned()),]),
+            Some("after-skip".to_owned())
+        );
     }
 }

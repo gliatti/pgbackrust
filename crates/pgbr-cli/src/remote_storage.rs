@@ -278,24 +278,37 @@ pub struct RemoteTlsStorage {
 
 impl RemoteTlsStorage {
     /// Open a TLS connection to `addr` (validating the server cert against
-    /// `server_name` and presenting the client cert in `client_config`), then
-    /// drive the remote storage protocol over it.
+    /// `server_name` and presenting the client cert in `client_config`),
+    /// send the connection-greeting noOp carrying `stanza`, then drive the
+    /// remote storage protocol over it.
     ///
-    /// `sck_block` is the resolved `sck-block` option: `true` explicitly puts the
-    /// connecting socket in blocking mode; `false` (the `sck-block` default) is a
-    /// no-op since the protocol transport relies on blocking std I/O — forcing
-    /// non-blocking mode would break it (best-effort, mirroring the server side).
+    /// `sck_block` is the resolved `sck-block` option: `true` explicitly puts
+    /// the connecting socket in blocking mode; `false` (the `sck-block`
+    /// default) is a no-op since the protocol transport relies on blocking
+    /// std I/O — forcing non-blocking mode would break it (best-effort,
+    /// mirroring the server side).
+    ///
+    /// `stanza` is the stanza the caller is operating on. The peer's
+    /// `pgbackrest server` daemon was typically started without `--stanza`
+    /// (it serves many stanzas off one listener), so its own per-process
+    /// stanza would resolve to `<none>` and reject every authorized CN.
+    /// Sending the stanza in the greeting lets the server authorize the
+    /// connection's CN against the *client's* stanza instead. Pass `None`
+    /// for the `*`-wildcard auth case.
     ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::Spawn`] if the TLS connection or handshake
     /// fails (the variant is reused for "could not establish the remote
-    /// transport", mirroring the SSH spawn-failure mapping).
+    /// transport", mirroring the SSH spawn-failure mapping), or any other
+    /// [`ProtocolError`] surfaced by [`ProtocolClient::greet`] (typically:
+    /// the server rejected the CN for the requested stanza).
     pub fn connect(
         addr: &str,
         server_name: &str,
         client_config: Arc<ClientConfig>,
         sck_block: bool,
+        stanza: Option<&str>,
     ) -> Result<Self, ProtocolError> {
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| ProtocolError::Spawn(format!("invalid tls server name `{server_name}`: {e}")))?;
@@ -308,7 +321,11 @@ impl RemoteTlsStorage {
         }
         let conn = ClientConnection::new(client_config, name).map_err(|e| ProtocolError::Spawn(format!("tls client new: {e}")))?;
         let io = SyncTlsIo::new(StreamOwned::new(conn, socket));
-        let client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+        let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+        // Send the connection greeting before handing the client off to
+        // `RemoteStorage::new`: the server reads it as its very first
+        // request and authorizes the client CN against the carried stanza.
+        client.greet(stanza)?;
         Ok(Self {
             inner: RemoteStorage::new(client),
         })
