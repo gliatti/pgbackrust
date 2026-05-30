@@ -38,13 +38,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_info::{InfoArchive, InfoBackup, InfoError, Manifest};
 use pgbr_io::{Filter, IoRead, Sha1};
+use pgbr_protocol::message::{OkResponse, Request, Response};
+use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageError, StorageKind};
+use serde_json::json;
 
 use crate::CommandError;
+use crate::backup::JobRetry;
 use crate::pipeline::RepoTransform;
 
 /// Length of a SHA-1 digest rendered as lowercase hexadecimal.
@@ -326,6 +331,226 @@ fn sha1_hex(bytes: &[u8]) -> String {
     sha.digest_hex()
 }
 
+/// Number of parallel hash workers, from the resolved `process-max` option.
+///
+/// Mirrors [`crate::backup::process_max`] verbatim: `process-max` is an
+/// `Integer` (default 1). Values `<= 0` clamp to one worker so the verify pass
+/// always makes progress; the dispatcher additionally caps the thread count at
+/// the number of files to hash.
+fn process_max(config: &LoadedConfig) -> usize {
+    match config.options.get(&("process-max".to_owned(), None)) {
+        Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// A single per-file unit of work for the verify hasher: the manifest-relative
+/// path (used as the dispatcher correlation key and as the user-visible path in
+/// any [`VerifyProblem`]), the storage-relative path of the on-disk file
+/// (suffix included, used by the non-local serial path through
+/// [`Storage::open_read`]), the absolute path of that same file (used by the
+/// local parallel `std::fs` path), the holder backup label (the key into the
+/// per-pass [`RepoTransform`] map shared with the workers), and the expected
+/// plaintext size + SHA-1 from the manifest so the main thread can build
+/// [`VerifyProblem`] entries from the worker's primitive (sha, size) reply.
+#[derive(Debug, Clone)]
+struct VerifyJob {
+    /// Manifest-relative path, e.g. `pg_data/base/1/1259`. Echoed back as the
+    /// [`pgbr_protocol::parallel::JobResult::key`] for correlation.
+    rel: String,
+    /// Storage-relative on-disk path (suffix included), used by the serial
+    /// (non-local) fallback through the [`Storage`] trait.
+    storage_path: PathBuf,
+    /// Absolute on-disk path (suffix included), used by the parallel local
+    /// `std::fs` path. Empty / meaningless on the non-local serial path.
+    abs_path: PathBuf,
+    /// Holder backup label — the key into the shared `Arc<HashMap<String,
+    /// RepoTransform>>` the workers look up to reverse the on-disk transform.
+    holder: String,
+    /// Plaintext SHA-1 the manifest recorded for this file.
+    expected_sha: String,
+    /// Plaintext size the manifest recorded for this file.
+    expected_size: u64,
+}
+
+/// Per-file result from a verify worker: the plaintext SHA-1 + size recomputed
+/// from the on-disk bytes. Both stay primitives so they can ride through the
+/// dispatcher's JSON `Response` without serialising the [`RepoTransform`] or
+/// the [`VerifyProblem`] enum (neither of which implements `Serialize`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifyResult {
+    /// SHA-1 of the reversed (plaintext) bytes, lowercase hex.
+    actual_sha: String,
+    /// Length of the reversed (plaintext) bytes.
+    actual_size: u64,
+}
+
+/// Encode a [`VerifyJob`] as a dispatcher [`Request`]: the job's `rel` path is
+/// the `cmd` (and the dispatcher correlation key), and three JSON strings ride
+/// in `param` — the absolute on-disk path, the holder label, and the
+/// transform's repo suffix. The transform itself is NOT serialised; workers
+/// look it up by holder in the [`Arc<HashMap<String, RepoTransform>>`] the
+/// worker closure captures.
+fn verify_job_to_request(job: &VerifyJob) -> Request {
+    Request {
+        cmd: job.rel.clone(),
+        param: vec![
+            json!(job.abs_path.to_string_lossy()),
+            json!(job.holder),
+            json!(job.storage_path.to_string_lossy()),
+        ],
+    }
+}
+
+/// Decode a [`Request`] produced by [`verify_job_to_request`] inside a worker.
+///
+/// Only the worker-side fields — `abs_path`, `holder`, and the storage-relative
+/// path used as the third primitive — are extracted; the other [`VerifyJob`]
+/// fields (`expected_sha`, `expected_size`) are kept on the main thread where
+/// [`VerifyProblem`] entries are built.
+fn request_to_verify_job(request: &Request) -> Result<(PathBuf, String, PathBuf), String> {
+    let abs_path = request
+        .param
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "verify job missing abs path".to_owned())?;
+    let holder = request
+        .param
+        .get(1)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "verify job missing holder".to_owned())?;
+    let storage_path = request
+        .param
+        .get(2)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "verify job missing storage path".to_owned())?;
+    Ok((PathBuf::from(abs_path), holder.to_owned(), PathBuf::from(storage_path)))
+}
+
+/// Run every [`VerifyJob`] across `process-max` workers via the in-process
+/// dispatcher, returning each job's [`VerifyResult`] keyed by its `rel` path.
+///
+/// When `repo.is_local()` is false (any remote/object backend) the parallel
+/// `std::fs` path is unsafe — `std::fs::read` would read from the wrong machine
+/// or simply find nothing at all — so the jobs run serially on the main thread
+/// through [`hash_repo_file_reversed`]. The result list is the identical
+/// `(rel, VerifyResult)` shape either way, so the caller is unaffected by
+/// which path ran.
+///
+/// On the local fast path the worker closure captures an
+/// `Arc<HashMap<String, RepoTransform>>` (one entry per distinct holder label
+/// seen in the backup's manifest, built once on the main thread before the
+/// pool is spawned). No [`Storage`] handle and no `&RepoTransform` cross the
+/// worker boundary — both would either be `!Send` or fail the
+/// `Fn(&Request) -> Result<Response, String> + Send + Sync + 'static` bound the
+/// dispatcher requires. The closure only sees primitives off the [`Request`]
+/// plus the `Arc<HashMap>` it cloned in.
+///
+/// `job_retry` wraps each per-file hash: a failed read / decompress is retried
+/// up to `job-retry` more times (with `job-retry-interval` between attempts)
+/// inside the worker before the job — and the whole verify pass — fails.
+//
+// `transform_map` is taken by value (rather than by reference) on purpose: the
+// parallel branch moves it into the `Fn + Send + Sync + 'static` worker closure
+// where the dispatcher will hand it to every thread; a `&Arc<_>` would force an
+// extra `Arc::clone` at the call site for the same effect. Clippy flags the
+// signature as "not consumed" because the serial branch does not `move` the
+// `Arc` anywhere — but the by-value signature is the contract callers see.
+#[allow(clippy::needless_pass_by_value)]
+fn run_verify_jobs(
+    jobs: &[VerifyJob],
+    config: &LoadedConfig,
+    transform_map: Arc<HashMap<String, RepoTransform>>,
+    job_retry: JobRetry,
+    repo: &dyn Storage,
+) -> Result<Vec<(String, VerifyResult)>, CommandError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Non-local repo: hash every file through the `Storage` trait, serially
+    // on this thread. The parallel `std::fs` path below would read from the
+    // local machine instead of the remote/object repo, finding either the
+    // wrong bytes or no file at all.
+    if !repo.is_local() {
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let transform = transform_map
+                .get(&job.holder)
+                .ok_or_else(|| CommandError::Other(format!("verify: unknown holder `{}` for `{}`", job.holder, job.rel)))?;
+            let (actual_sha, actual_size) = job_retry.run(|| hash_repo_file_reversed(repo, &job.storage_path, transform))?;
+            out.push((job.rel.clone(), VerifyResult { actual_sha, actual_size }));
+        }
+        return Ok(out);
+    }
+
+    let dispatcher_jobs: Vec<Job> = jobs
+        .iter()
+        .map(|job| Job {
+            key: job.rel.clone(),
+            request: verify_job_to_request(job),
+        })
+        .collect();
+
+    // The repo is local here (the serial branch above caught every non-local
+    // case), so the parallel `std::fs` fast path is safe. The dispatcher
+    // demands a `Send + Sync + 'static` worker, so the closure can only borrow
+    // owned data: an `Arc::clone` of the per-holder transform map (cheap,
+    // immutable, `Send + Sync`) and whatever rides in each `Request`. No
+    // `Storage` handle and no `&RepoTransform` cross the boundary; nothing
+    // borrowed from this stack frame escapes.
+    let worker_transforms = Arc::clone(&transform_map);
+    let results = ParallelExecutor::new(process_max(config)).run(dispatcher_jobs, move |request| {
+        let (abs_path, holder, _storage_path) = request_to_verify_job(request)?;
+        let transform = worker_transforms
+            .get(&holder)
+            .ok_or_else(|| format!("verify worker: unknown holder `{holder}`"))?;
+        // Retry the read+reverse per `job-retry`: re-read the on-disk file
+        // and re-apply the reverse chain on each attempt so a transient I/O
+        // blip can recover.
+        let (actual_sha, actual_size) = job_retry
+            .run(|| -> Result<(String, u64), CommandError> {
+                let raw =
+                    std::fs::read(&abs_path).map_err(|err| CommandError::Other(format!("read {}: {err}", abs_path.display())))?;
+                let plaintext = transform.apply_reverse_keyed(&raw).map_err(CommandError::Io)?;
+                Ok((sha1_hex(&plaintext), plaintext.len() as u64))
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(Response::Ok(OkResponse {
+            out: Some(json!({
+                "actual_sha": actual_sha,
+                "actual_size": actual_size,
+            })),
+        }))
+    });
+
+    let mut out = Vec::with_capacity(results.len());
+    for job_result in results {
+        match job_result.result {
+            Ok(Response::Ok(OkResponse { out: Some(value) })) => {
+                let actual_sha = value
+                    .get("actual_sha")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| CommandError::Other(format!("verify of {} returned no checksum", job_result.key)))?
+                    .to_owned();
+                let actual_size = value
+                    .get("actual_size")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| CommandError::Other(format!("verify of {} returned no size", job_result.key)))?;
+                out.push((job_result.key, VerifyResult { actual_sha, actual_size }));
+            }
+            Ok(_) => {
+                return Err(CommandError::Other(format!(
+                    "verify of {} produced an unexpected empty response",
+                    job_result.key
+                )));
+            }
+            Err(message) => return Err(CommandError::Other(message)),
+        }
+    }
+    Ok(out)
+}
+
 /// Verify a single backup's manifest, appending any problems found to `report`,
 /// counting every checksummed file inspected, and building the per-backup
 /// [`BackupVerify`] summary.
@@ -365,7 +590,14 @@ fn verify_backup(
 
     // One transform lookup per distinct holder label seen in this backup's
     // manifest (typically the backup itself plus one referenced full / diff).
+    // The same map is what the worker pool ultimately holds via `Arc`.
     let mut transforms: HashMap<String, RepoTransform> = HashMap::new();
+
+    // Files whose existence check passes get a `VerifyJob`. Missing files are
+    // reported immediately (the existence check is cheap, runs once per file,
+    // and lives on the main thread because it needs the `Storage` handle).
+    let mut jobs: Vec<VerifyJob> = Vec::new();
+    let local_repo = repo.is_local();
 
     for file in &manifest.files {
         // Zero-length files carry no checksum; nothing to re-read.
@@ -397,29 +629,65 @@ fn verify_backup(
             continue;
         }
 
-        let (actual, actual_size) = hash_repo_file_reversed(repo, &path, &transform)?;
+        // The parallel `std::fs` worker needs the *absolute* path; the serial
+        // `Storage::open_read` path needs only the storage-relative one. Skip
+        // the `info()` round-trip on a non-local repo where the result would
+        // be unused (and, for some backends, racy or expensive).
+        let abs_path = if local_repo { repo.info(&path)?.path } else { PathBuf::new() };
+
+        jobs.push(VerifyJob {
+            rel: file.path.clone(),
+            storage_path: path,
+            abs_path,
+            holder: holder.to_owned(),
+            expected_sha: expected.to_owned(),
+            expected_size: file.size,
+        });
+    }
+
+    // Side table: the original `VerifyJob` keyed by its `rel` path, so the
+    // main thread can rebuild a [`VerifyProblem`] (which is not `Serialize`)
+    // from the worker's primitive `(actual_sha, actual_size)` reply. The
+    // `manifest.files` loop already enforces one `rel` per backup, so this is
+    // a unique key.
+    let job_index: HashMap<&str, &VerifyJob> = jobs.iter().map(|j| (j.rel.as_str(), j)).collect();
+
+    // Wrap the per-holder transform map for the worker pool. `Arc<HashMap<_,_>>`
+    // is `Send + Sync` and `Clone` is O(1), so the closure captures it cheaply
+    // by move while the main thread keeps its own handle.
+    let transform_map = Arc::new(transforms);
+    let job_retry = JobRetry::from_options(config);
+    let results = run_verify_jobs(&jobs, config, transform_map, job_retry, repo)?;
+
+    // Workers reply with primitives; the main thread reconstructs
+    // [`VerifyProblem`] (not `Serialize`) from the (sha, size) pair plus the
+    // expected fields stashed on each `VerifyJob` before the pool ran.
+    for (rel, result) in results {
+        let job = job_index
+            .get(rel.as_str())
+            .ok_or_else(|| CommandError::Other(format!("verify result for unknown file `{rel}` in backup `{label}`")))?;
 
         let mut file_ok = true;
 
-        if actual_size != file.size {
+        if result.actual_size != job.expected_size {
             file_ok = false;
             let problem = VerifyProblem::SizeMismatch {
                 backup: label.to_owned(),
-                path: file.path.clone(),
-                expected: file.size,
-                actual: actual_size,
+                path: rel.clone(),
+                expected: job.expected_size,
+                actual: result.actual_size,
             };
             summary.errors.push(describe_problem(&problem));
             report.problems.push(problem);
         }
 
-        if actual != expected {
+        if result.actual_sha != job.expected_sha {
             file_ok = false;
             let problem = VerifyProblem::ChecksumMismatch {
                 backup: label.to_owned(),
-                path: file.path.clone(),
-                expected: expected.to_owned(),
-                actual,
+                path: rel.clone(),
+                expected: job.expected_sha.clone(),
+                actual: result.actual_sha,
             };
             summary.errors.push(describe_problem(&problem));
             report.problems.push(problem);
@@ -1449,5 +1717,259 @@ mod tests {
         );
         // Trailing token that is not 40 hex chars is not a checksum.
         assert!(split_segment_checksum("000000010000000000000001-notachecksum").is_none());
+    }
+
+    /// `LoadedConfig` with an explicit `process-max` value, so the parallel
+    /// branch can be exercised with a known worker count.
+    fn cfg_with_process_max(stanza: Option<&str>, process_max: i64) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(("process-max".to_owned(), None), OptionValue::Integer(process_max));
+        LoadedConfig {
+            command: "verify".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: stanza.map(str::to_owned),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verify_parallel_local_baseline() {
+        // Local repo + 3 valid files in one backup → empty problems,
+        // files_checked == 3. The parallel branch (process-max=4) must
+        // produce identical results to the serial path.
+        let (_dir, repo) = empty_repo();
+        let label = "20240101-120000F";
+
+        let a = b"PG_VERSION contents\n";
+        let b = b"some heap page bytes \x00\x01\x02";
+        let c = b"another relation byte stream";
+
+        seed_backup_info(&repo, "demo", &[label]);
+        seed_manifest(
+            &repo,
+            "demo",
+            label,
+            vec![
+                file_entry("pg_data/PG_VERSION", a, Some(sha1_hex(a))),
+                file_entry("pg_data/base/1/1259", b, Some(sha1_hex(b))),
+                file_entry("pg_data/base/1/1260", c, Some(sha1_hex(c))),
+            ],
+        );
+        write_backup_file(&repo, "demo", label, "pg_data/PG_VERSION", a);
+        write_backup_file(&repo, "demo", label, "pg_data/base/1/1259", b);
+        write_backup_file(&repo, "demo", label, "pg_data/base/1/1260", c);
+
+        // process-max=4 forces the parallel branch (4 workers, 3 jobs); the
+        // dispatcher caps the pool at the number of jobs.
+        let report = verify_inner(&cfg_with_process_max(Some("demo"), 4), &repo).expect("verify_inner");
+        assert!(
+            report.problems.is_empty(),
+            "clean parallel verify must report no problems: {:?}",
+            report.problems
+        );
+        assert_eq!(report.files_checked, 3);
+        assert_eq!(report.backups_checked, 1);
+        assert_eq!(report.backups.len(), 1);
+        assert_eq!(report.backups[0].valid, 3);
+        assert_eq!(report.backups[0].total, 3);
+        assert!(report.backups[0].errors.is_empty());
+    }
+
+    /// A [`Storage`] adapter that delegates every operation to a wrapped
+    /// `Posix` but reports `is_local() = false`, forcing the verify path to
+    /// take the serial `Storage::open_read` branch.
+    ///
+    /// The `Posix` is shared via `Arc` so the test can keep its own handle for
+    /// seeding while the verifier owns one too — the mock implements `Send +
+    /// Sync` (the `Storage` super-trait bound) and the seeding helpers below
+    /// take `&Posix`.
+    struct NonLocalMock {
+        inner: Posix,
+    }
+
+    impl Storage for NonLocalMock {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    #[test]
+    fn verify_remote_fallback_serial() {
+        // A non-local mock (`is_local() = false`) must route every file
+        // through the serial `Storage::open_read` branch — the parallel
+        // `std::fs` path would not even find the files (the mock's
+        // `info().path` is the Posix-resolved absolute path, but the contract
+        // for verify says non-local storage must NOT take the std::fs path).
+        // process-max=4 is set so the only way this can succeed without
+        // hitting the parallel branch is if `is_local()` actually gates it.
+        let dir = tempfile::tempdir().expect("repo tempdir");
+        let posix = Posix::new(dir.path());
+        let label = "20240101-120000F";
+
+        let a = b"PG_VERSION contents\n";
+        let b = b"some heap page bytes \x00\x01\x02";
+        let c = b"another relation byte stream";
+
+        seed_backup_info(&posix, "demo", &[label]);
+        seed_manifest(
+            &posix,
+            "demo",
+            label,
+            vec![
+                file_entry("pg_data/PG_VERSION", a, Some(sha1_hex(a))),
+                file_entry("pg_data/base/1/1259", b, Some(sha1_hex(b))),
+                file_entry("pg_data/base/1/1260", c, Some(sha1_hex(c))),
+            ],
+        );
+        write_backup_file(&posix, "demo", label, "pg_data/PG_VERSION", a);
+        write_backup_file(&posix, "demo", label, "pg_data/base/1/1259", b);
+        write_backup_file(&posix, "demo", label, "pg_data/base/1/1260", c);
+
+        let mock = NonLocalMock { inner: posix };
+        assert!(!mock.is_local(), "the mock must report itself non-local");
+
+        let report = verify_inner(&cfg_with_process_max(Some("demo"), 4), &mock).expect("verify_inner");
+        assert!(
+            report.problems.is_empty(),
+            "non-local serial verify must report no problems: {:?}",
+            report.problems
+        );
+        assert_eq!(report.files_checked, 3);
+        assert_eq!(report.backups_checked, 1);
+        assert_eq!(report.backups[0].valid, 3);
+        assert_eq!(report.backups[0].total, 3);
+    }
+
+    #[test]
+    fn verify_error_aggregation() {
+        // Local repo + 2 clean files + 1 size mismatch + 1 checksum mismatch.
+        // Both problems must be collected (the pass does NOT stop at the
+        // first), assigned to the right backup/path, and `summary.errors`
+        // must carry one entry per problem.
+        let (_dir, repo) = empty_repo();
+        let label = "20240101-120000F";
+
+        let clean1 = b"first clean file bytes";
+        let clean2 = b"second clean file bytes";
+
+        // The size-mismatch file: manifest records size=99, on-disk is 4 bytes.
+        let size_mismatch_bytes = b"SIZE";
+
+        // The checksum-mismatch file: manifest's checksum is all zeros, real
+        // sha1 differs. Size matches so only the checksum problem fires.
+        let csum_mismatch_bytes = b"the real bytes (wrong checksum recorded)";
+        let wrong_csum = "0000000000000000000000000000000000000000".to_owned();
+
+        let size_mismatch_entry = ManifestFile {
+            path: "pg_data/oversized".to_owned(),
+            size: 99, // lies — on-disk is 4 bytes
+            timestamp: 1_704_110_400,
+            checksum: Some(sha1_hex(size_mismatch_bytes)),
+            checksum_page: None,
+            reference: None,
+            mode: None,
+            user: None,
+            group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
+        };
+
+        seed_backup_info(&repo, "demo", &[label]);
+        seed_manifest(
+            &repo,
+            "demo",
+            label,
+            vec![
+                file_entry("pg_data/clean_a", clean1, Some(sha1_hex(clean1))),
+                file_entry("pg_data/clean_b", clean2, Some(sha1_hex(clean2))),
+                size_mismatch_entry,
+                file_entry("pg_data/bad_csum", csum_mismatch_bytes, Some(wrong_csum.clone())),
+            ],
+        );
+        write_backup_file(&repo, "demo", label, "pg_data/clean_a", clean1);
+        write_backup_file(&repo, "demo", label, "pg_data/clean_b", clean2);
+        write_backup_file(&repo, "demo", label, "pg_data/oversized", size_mismatch_bytes);
+        write_backup_file(&repo, "demo", label, "pg_data/bad_csum", csum_mismatch_bytes);
+
+        let report = verify_inner(&cfg_with_process_max(Some("demo"), 4), &repo).expect("verify_inner");
+
+        assert_eq!(report.files_checked, 4);
+        assert_eq!(report.problems.len(), 2, "must collect BOTH problems: {:?}", report.problems);
+        let summary = report.backups.iter().find(|b| b.label == label).expect("backup summary");
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.valid, 2, "2 clean files must be counted valid");
+        assert_eq!(summary.errors.len(), 2, "one entry per problem: {:?}", summary.errors);
+
+        let mut saw_size = false;
+        let mut saw_csum = false;
+        for problem in &report.problems {
+            match problem {
+                VerifyProblem::SizeMismatch {
+                    backup,
+                    path,
+                    expected,
+                    actual,
+                } => {
+                    assert_eq!(backup, label);
+                    assert_eq!(path, "pg_data/oversized");
+                    assert_eq!(*expected, 99);
+                    assert_eq!(*actual, size_mismatch_bytes.len() as u64);
+                    saw_size = true;
+                }
+                VerifyProblem::ChecksumMismatch {
+                    backup,
+                    path,
+                    expected,
+                    actual,
+                } => {
+                    assert_eq!(backup, label);
+                    assert_eq!(path, "pg_data/bad_csum");
+                    assert_eq!(expected, &wrong_csum);
+                    assert_eq!(actual, &sha1_hex(csum_mismatch_bytes));
+                    saw_csum = true;
+                }
+                other @ VerifyProblem::MissingFile { .. } => panic!("unexpected problem: {other:?}"),
+            }
+        }
+        assert!(saw_size, "size mismatch must be reported: {:?}", report.problems);
+        assert!(saw_csum, "checksum mismatch must be reported: {:?}", report.problems);
     }
 }
