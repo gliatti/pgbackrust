@@ -55,7 +55,10 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::{IoError, IoRead, IoWrite};
@@ -73,6 +76,97 @@ use crate::CommandError;
 /// Default bind / connect address used when the configured
 /// `tls-server-address` / `tls-server-port` options are absent.
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8432";
+
+/// Hard cap on the number of in-flight per-connection worker threads spawned
+/// by the `server` accept loops (TLS and plain TCP).
+///
+/// Stock pgBackRest's C `server.c` `fork()`s per accepted connection so a
+/// long-running backup transfer does not block PG's `archive_command`
+/// invocations of `archive-push`. The Rust port mirrors that with a
+/// `std::thread::spawn` per accepted connection (no Tokio: the protocol layer
+/// is synchronous and threading-based). An unbounded spawn is a footgun — a
+/// runaway or malicious peer could exhaust the host — so the loop refuses
+/// new connections (dropping the freshly accepted stream so the kernel
+/// resets the peer) once this many threads are in flight, logging a
+/// rate-limited warning. `32` is a generous ceiling: a typical pgBackRest
+/// deployment serves one to a handful of simultaneous workers (one backup
+/// stream + a small fan-out of `archive-push` calls), and the OS scheduler
+/// handles dozens of these effortlessly. Tests exercise a smaller cap via
+/// the `_caps` accept-loop variants.
+const MAX_WORKER_THREADS: usize = 32;
+
+/// Rate at which the accept loop logs a warning when an incoming connection
+/// is dropped because the worker-thread cap is full. Once per minute is the
+/// pgBackRest convention for "noisy but worth knowing".
+const CAP_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// RAII guard that decrements an `Arc<AtomicUsize>` worker counter when
+/// dropped — including on a per-connection thread panic. Each accept-loop
+/// spawn moves one of these into the spawned thread; the counter
+/// `fetch_sub`s on drop, so the accept loop's view of in-flight workers is
+/// always accurate.
+struct WorkerSlot {
+    counter: Arc<AtomicUsize>,
+}
+
+impl WorkerSlot {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Rate-limited "cap exceeded" warning state. The accept loops share an
+/// instance and only emit a log line once per [`CAP_WARN_INTERVAL`] to avoid
+/// flooding the log when an aggressive client hammers the listener.
+struct CapWarnState {
+    last: Mutex<Option<Instant>>,
+}
+
+impl CapWarnState {
+    const fn new() -> Self {
+        Self { last: Mutex::new(None) }
+    }
+
+    /// Log a warning if enough time has elapsed since the previous one.
+    fn maybe_warn(&self, in_flight: usize, cap: usize) {
+        let mut guard = match self.last.lock() {
+            Ok(g) => g,
+            // Lock poisoned by an earlier panic: treat as never-warned so the
+            // operator still sees the message once the next interval elapses.
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        let should_log = guard.is_none_or(|last| now.duration_since(last) >= CAP_WARN_INTERVAL);
+        if should_log {
+            *guard = Some(now);
+            drop(guard);
+            crate::control::log_warn(&format!(
+                "server: worker-thread cap reached ({in_flight}/{cap}); dropping incoming connection"
+            ));
+        }
+    }
+}
+
+/// Join every collected per-connection thread handle. Called on the
+/// graceful-shutdown path of both accept loops (when `should_continue`
+/// returns `false`) so any in-flight worker finishes before the listener
+/// teardown. A panicked worker thread surfaces as `Err` from `join`; the
+/// accept loop logs it and continues joining the rest — losing one panicked
+/// session must not strand the others.
+fn join_workers(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        if let Err(panic) = handle.join() {
+            crate::control::log_warn(&format!("server: worker thread panicked: {panic:?}"));
+        }
+    }
+}
 
 /// Resolved TCP keepalive settings for accepted `server` connections.
 ///
@@ -388,25 +482,56 @@ fn serve_listener_with(listener: &TcpListener, keepalive: KeepAlive, sck_block: 
 }
 
 /// Accept-loop core used by [`serve_listener_with`] and (via a shutdown flag)
-/// by the unit tests.
-///
-/// Per accepted connection: applies keepalive + `sck-block`, splits the
-/// socket into reader / writer halves, runs [`serve`], and closes the
-/// writer. A per-connection error is logged and the loop continues; only a
-/// non-retryable [`accept`](TcpListener::accept) error (i.e. anything other
-/// than `Interrupted` / `WouldBlock`) breaks out.
-///
-/// `should_continue` is polled before each accept (and after every
-/// `WouldBlock` retry); returning `false` ends the loop cleanly. Production
-/// passes `|| true`, so the loop runs until the listener is torn down.
+/// by the unit tests. Wraps [`serve_listener_with_continue_caps`] with the
+/// production worker-thread cap [`MAX_WORKER_THREADS`].
 fn serve_listener_with_continue(
     listener: &TcpListener,
     keepalive: KeepAlive,
     sck_block: bool,
+    should_continue: impl FnMut() -> bool,
+) -> Result<(), CommandError> {
+    serve_listener_with_continue_caps(listener, keepalive, sck_block, MAX_WORKER_THREADS, should_continue)
+}
+
+/// Accept-loop core for plain-TCP `server` connections, parameterized over
+/// the worker-thread cap so tests can drive it down to a small number and
+/// observe the cap-rejection path.
+///
+/// Per accepted connection: applies keepalive + `sck-block`, then **spawns a
+/// `std::thread`** that splits the socket into reader / writer halves, runs
+/// [`serve`], closes the writer, and exits. The accept loop returns to
+/// [`accept`](TcpListener::accept) immediately so a long-running connection
+/// does not block subsequent peers — this is the same isolation stock
+/// pgBackRest's C `server.c` gets from `fork()`.
+///
+/// Concurrency is bounded by `max_workers`: an
+/// `Arc<AtomicUsize>` counter is incremented before each spawn (via a
+/// [`WorkerSlot`] RAII guard inside the thread) and decremented when the
+/// thread exits, panic or otherwise. When the counter is at the cap the
+/// accept loop drops the freshly accepted stream so the kernel resets the
+/// peer (which will retry), and logs a rate-limited warning — the
+/// alternative (blocking on a join) would defeat the purpose of the spawn.
+///
+/// `should_continue` is polled before each accept (and after every
+/// `WouldBlock` retry); returning `false` ends the loop cleanly. On
+/// graceful shutdown every in-flight thread is `join`ed so the listener
+/// teardown waits for active sessions to finish. Production passes
+/// `|| true`, so the loop runs until the listener is torn down.
+fn serve_listener_with_continue_caps(
+    listener: &TcpListener,
+    keepalive: KeepAlive,
+    sck_block: bool,
+    max_workers: usize,
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<(), CommandError> {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let warn_state = Arc::new(CapWarnState::new());
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
     loop {
         if !should_continue() {
+            // Drop the listener-scoped handles so the spawned threads can
+            // finish; this is the cleanup symmetric to the spawn above.
+            join_workers(handles);
             return Ok(());
         }
         let (stream, _peer) = match listener.accept() {
@@ -420,22 +545,49 @@ fn serve_listener_with_continue(
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Err(e) => return Err(CommandError::Other(format!("tcp accept: {e}"))),
+            Err(e) => {
+                join_workers(handles);
+                return Err(CommandError::Other(format!("tcp accept: {e}")));
+            }
         };
         keepalive.apply(&stream);
         apply_sck_block(&stream, sck_block);
-        let (mut reader, mut writer) = match split(stream) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::control::log_info(&format!("tcp connection setup failed: {e}"));
-                continue;
-            }
-        };
-        if let Err(e) = serve(&mut reader, &mut writer) {
-            crate::control::log_info(&format!("tcp serve ended: {e}"));
+
+        // Periodically reap finished worker threads so the vector does not
+        // grow unboundedly across long-lived daemons. A panicked worker's
+        // counter is already decremented (via `WorkerSlot::drop`); the
+        // panic itself is logged by the shutdown-path `join_workers`.
+        handles.retain(|h| !h.is_finished());
+
+        // Refuse the connection if the cap is reached: drop the stream
+        // (closes the socket so the kernel sends RST/FIN), log once per
+        // minute, and continue accepting. Better to fail fast than to
+        // serialize behind a queue and re-introduce the head-of-line
+        // blocking this whole change is fixing.
+        let cur = in_flight.load(Ordering::Acquire);
+        if cur >= max_workers {
+            warn_state.maybe_warn(cur, max_workers);
+            drop(stream);
+            continue;
         }
-        // Signal a clean EOF to the peer; ignore an already-closed socket.
-        let _ = writer.close();
+
+        let slot_counter = Arc::clone(&in_flight);
+        let handle = std::thread::spawn(move || {
+            let _slot = WorkerSlot::new(slot_counter);
+            let (mut reader, mut writer) = match split(stream) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::control::log_info(&format!("tcp connection setup failed: {e}"));
+                    return;
+                }
+            };
+            if let Err(e) = serve(&mut reader, &mut writer) {
+                crate::control::log_info(&format!("tcp serve ended: {e}"));
+            }
+            // Signal a clean EOF to the peer; ignore an already-closed socket.
+            let _ = writer.close();
+        });
+        handles.push(handle);
     }
 }
 
@@ -1252,17 +1404,8 @@ fn serve_tls_storage_with(
 }
 
 /// Accept-loop core used by [`serve_tls_storage_with`] and (via a shutdown
-/// flag) by the unit tests.
-///
-/// Per accepted connection: completes the rustls handshake, reads the
-/// connection-greeting no-op to learn the client's stanza, runs
-/// [`authorize_client`] against that stanza, replies to the greeting, and
-/// serves the worker protocol for the rest of the connection's life. Any
-/// per-connection error is logged and the loop continues; only a
-/// non-retryable accept failure breaks out.
-///
-/// `should_continue` is polled before each accept (and after every
-/// `WouldBlock` retry); returning `false` ends the loop cleanly.
+/// flag) by the unit tests. Wraps [`serve_tls_storage_with_continue_caps`]
+/// with the production worker-thread cap [`MAX_WORKER_THREADS`].
 fn serve_tls_storage_with_continue(
     listener: &TcpListener,
     server_config: &Arc<ServerConfig>,
@@ -1270,10 +1413,66 @@ fn serve_tls_storage_with_continue(
     root: &std::path::Path,
     keepalive: KeepAlive,
     sck_block: bool,
+    should_continue: impl FnMut() -> bool,
+) -> Result<(), CommandError> {
+    serve_tls_storage_with_continue_caps(
+        listener,
+        server_config,
+        auth,
+        root,
+        keepalive,
+        sck_block,
+        MAX_WORKER_THREADS,
+        should_continue,
+    )
+}
+
+/// Accept-loop core for TLS `server` connections, parameterized over the
+/// worker-thread cap so tests can drive it down to a small number and
+/// observe the cap-rejection path.
+///
+/// Per accepted connection: applies keepalive + `sck-block`, then **spawns a
+/// `std::thread`** that runs [`handle_tls_connection`] — the TLS handshake,
+/// connection-greeting noOp, CN authorization, greeting ack, and worker
+/// serve loop are all on the spawned thread. The accept loop returns to
+/// [`accept`](TcpListener::accept) immediately so a long-running connection
+/// (e.g. a backup uploading hundreds of files over minutes) does not block
+/// concurrent `archive-push` calls from PG's `archive_command`. This
+/// mirrors stock pgBackRest's C `server.c`, which `fork()`s per accepted
+/// connection.
+///
+/// Concurrency is bounded by `max_workers`: an `Arc<AtomicUsize>` counter
+/// is incremented before each spawn (via a [`WorkerSlot`] RAII guard inside
+/// the thread) and decremented when the thread exits, panic or otherwise.
+/// When the counter is at the cap the accept loop drops the freshly
+/// accepted stream so the kernel resets the peer (which will retry), and
+/// logs a rate-limited warning — the alternative (blocking on a join) would
+/// defeat the purpose of the spawn.
+///
+/// A per-connection error is logged inside the spawned thread and that
+/// thread exits; the accept loop is unaffected. Only a non-retryable
+/// accept failure ends the loop.
+///
+/// `should_continue` is polled before each accept (and after every
+/// `WouldBlock` retry); returning `false` ends the loop cleanly. On
+/// graceful shutdown every in-flight thread is `join`ed so the listener
+/// teardown waits for active sessions to finish.
+fn serve_tls_storage_with_continue_caps(
+    listener: &TcpListener,
+    server_config: &Arc<ServerConfig>,
+    auth: &BTreeMap<String, Vec<String>>,
+    root: &std::path::Path,
+    keepalive: KeepAlive,
+    sck_block: bool,
+    max_workers: usize,
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<(), CommandError> {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let warn_state = Arc::new(CapWarnState::new());
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
     loop {
         if !should_continue() {
+            join_workers(handles);
             return Ok(());
         }
         let (stream, _peer) = match listener.accept() {
@@ -1283,14 +1482,44 @@ fn serve_tls_storage_with_continue(
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Err(e) => return Err(CommandError::Other(format!("tcp accept: {e}"))),
+            Err(e) => {
+                join_workers(handles);
+                return Err(CommandError::Other(format!("tcp accept: {e}")));
+            }
         };
         keepalive.apply(&stream);
         apply_sck_block(&stream, sck_block);
 
-        if let Err(e) = handle_tls_connection(server_config, auth, root, stream) {
-            crate::control::log_info(&format!("tls connection ended: {e}"));
+        // Periodically reap finished worker threads so the vector does not
+        // grow unboundedly across long-lived daemons.
+        handles.retain(|h| !h.is_finished());
+
+        // Refuse the connection if the cap is reached: drop the stream and
+        // log once per minute. See `serve_listener_with_continue_caps` for
+        // the rationale.
+        let cur = in_flight.load(Ordering::Acquire);
+        if cur >= max_workers {
+            warn_state.maybe_warn(cur, max_workers);
+            drop(stream);
+            continue;
         }
+
+        // Per-connection state cloned into the spawned thread: the
+        // `Arc<ServerConfig>` clone is cheap (rustls reuses one config
+        // across many sessions), the `BTreeMap` auth clone is small, and
+        // `PathBuf` is a heap allocation per spawn (negligible at the
+        // serve cadence we operate at).
+        let server_config = Arc::clone(server_config);
+        let auth = auth.clone();
+        let root = root.to_path_buf();
+        let slot_counter = Arc::clone(&in_flight);
+        let handle = std::thread::spawn(move || {
+            let _slot = WorkerSlot::new(slot_counter);
+            if let Err(e) = handle_tls_connection(&server_config, &auth, &root, stream) {
+                crate::control::log_info(&format!("tls connection ended: {e}"));
+            }
+        });
+        handles.push(handle);
     }
 }
 
@@ -1587,7 +1816,7 @@ mod tests {
     use pgbr_io::{MemRead, MemWrite};
     use pgbr_protocol::{ErrResponse, Message, OkResponse, Request, Response, read_message, write_message};
     use std::collections::BTreeMap;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Serialize a sequence of messages into a byte buffer suitable for
     /// feeding to a `MemRead`.
@@ -3016,5 +3245,302 @@ mod tests {
             2,
             "handle_tls_connection must close both the reader and the writer halves"
         );
+    }
+
+    // --- per-connection threading -----------------------------------------
+
+    /// The TLS accept loop must serve concurrent connections in parallel:
+    /// a long-running session must not block subsequent peers (the real-world
+    /// case being a backup transfer that would otherwise queue PG's
+    /// `archive_command` invocations of `archive-push` behind it). The
+    /// pre-fix loop served connections sequentially on the accept thread,
+    /// so three concurrent clients holding the connection open for `slow`
+    /// would take ~3 * `slow` wall-clock time. With per-connection thread
+    /// spawn they all complete in roughly `slow`.
+    #[test]
+    fn tls_serve_handles_concurrent_connections() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use pgbr_protocol::ProtocolClient;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+            shared_ca_pair("server.local", "principal");
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("principal".to_owned(), vec!["demo".to_owned()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_tls_storage_with_continue(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
+
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+
+        // Each client greets, sleeps `slow`, then closes. Pre-fix the
+        // sessions ran serially on the single accept thread, taking
+        // ~3 * `slow` total. Post-fix they run in parallel: total wall
+        // time should be close to `slow`. Picking 300ms for `slow` and
+        // asserting `< 2 * slow` keeps the test snappy and resistant to
+        // CI scheduler jitter while still rejecting the serial path
+        // (which would need ~900ms).
+        let slow = Duration::from_millis(300);
+        let addr = format!("127.0.0.1:{port}");
+        let started = Instant::now();
+        let mut workers = Vec::new();
+        for attempt in 1..=3 {
+            let client_config = Arc::clone(&client_config);
+            let addr = addr.clone();
+            workers.push(std::thread::spawn(move || {
+                let stream = connect_tls_stream(&addr, "localhost", client_config)
+                    .unwrap_or_else(|e| panic!("attempt {attempt}: connect: {e}"));
+                stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let io = SharedTlsIo::new(TlsClientIo::new(stream));
+                let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+                client
+                    .greet(Some("demo"))
+                    .unwrap_or_else(|e| panic!("attempt {attempt}: greet: {e}"));
+                std::thread::sleep(slow);
+                let _ = client.close();
+            }));
+        }
+        for w in workers {
+            w.join().expect("client thread panicked");
+        }
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
+
+        assert!(
+            elapsed < slow * 2,
+            "TLS accept loop must serve concurrent connections in parallel; \
+             3 clients each sleeping {slow:?} took {elapsed:?} (serial would be ~3x slow)"
+        );
+    }
+
+    /// Mirror of [`tls_serve_handles_concurrent_connections`] for the plain
+    /// TCP accept loop: three clients each hold a `noOp` ping connection open
+    /// for `slow` ms; the loop must serve them in parallel so the total wall
+    /// time is close to `slow`, not `3 * slow`.
+    #[test]
+    fn tcp_serve_handles_concurrent_connections() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_listener_with_continue(&listener, KeepAlive::default(), false, || {
+                !stop_for_server.load(Ordering::Acquire)
+            })
+        });
+
+        let slow = Duration::from_millis(300);
+        let started = Instant::now();
+        let mut workers = Vec::new();
+        for attempt in 1..=3 {
+            workers.push(std::thread::spawn(move || {
+                let stream = TcpStream::connect(addr).unwrap_or_else(|e| panic!("attempt {attempt}: connect: {e}"));
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let (mut reader, mut writer) = split(stream).unwrap();
+                ping_exchange(&mut reader, &mut writer).unwrap_or_else(|e| panic!("attempt {attempt}: ping: {e}"));
+                std::thread::sleep(slow);
+                let _ = writer.close();
+            }));
+        }
+        for w in workers {
+            w.join().expect("client thread panicked");
+        }
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
+
+        assert!(
+            elapsed < slow * 2,
+            "TCP accept loop must serve concurrent connections in parallel; \
+             3 clients each sleeping {slow:?} took {elapsed:?} (serial would be ~3x slow)"
+        );
+    }
+
+    /// The TLS accept loop's worker-thread cap is honoured: with a cap of 2,
+    /// two slow clients occupy both slots and a third client is rejected
+    /// quickly (the loop drops the stream so the kernel resets the peer).
+    /// Once the first two complete the cap frees up and a fourth client
+    /// succeeds. This exercises the same code path the production
+    /// `MAX_WORKER_THREADS` cap protects, just at a size the test can drive.
+    #[test]
+    fn tls_serve_caps_thread_pool() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use pgbr_protocol::ProtocolClient;
+
+        let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+            shared_ca_pair("server.local", "principal");
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let mut server_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            server_roots.add(c).unwrap();
+        }
+        let server_config = Arc::new(
+            build_server_config(
+                cert_chain_from_pem(&server_cert_pem),
+                private_key_from_pem(&server_key_pem),
+                Some(server_roots),
+                &[],
+            )
+            .unwrap(),
+        );
+        let mut auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        auth.insert("principal".to_owned(), vec!["demo".to_owned()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            // Cap = 2 so the third concurrent client must be rejected.
+            serve_tls_storage_with_continue_caps(
+                &listener,
+                &server_config,
+                &auth,
+                &root_path,
+                KeepAlive::default(),
+                false,
+                2,
+                || !stop_for_server.load(Ordering::Acquire),
+            )
+        });
+
+        let mut client_roots = RootCertStore::empty();
+        for c in cert_chain_from_pem(&ca_pem) {
+            client_roots.add(c).unwrap();
+        }
+        let client_config = Arc::new(
+            build_client_config(
+                client_roots,
+                Some((cert_chain_from_pem(&client_cert_pem), private_key_from_pem(&client_key_pem))),
+                &[],
+            )
+            .unwrap(),
+        );
+        let addr = format!("127.0.0.1:{port}");
+
+        // Connect two slow clients that each occupy a worker slot for the
+        // full `slow` duration. Spawn them on threads so the test can
+        // attempt the rejected third connection while both are in flight.
+        let slow = Duration::from_millis(500);
+        let mut slow_workers = Vec::new();
+        for attempt in 1..=2 {
+            let client_config = Arc::clone(&client_config);
+            let addr = addr.clone();
+            slow_workers.push(std::thread::spawn(move || {
+                let stream = connect_tls_stream(&addr, "localhost", client_config)
+                    .unwrap_or_else(|e| panic!("slow attempt {attempt}: connect: {e}"));
+                stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let io = SharedTlsIo::new(TlsClientIo::new(stream));
+                let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+                client
+                    .greet(Some("demo"))
+                    .unwrap_or_else(|e| panic!("slow attempt {attempt}: greet: {e}"));
+                std::thread::sleep(slow);
+                let _ = client.close();
+            }));
+        }
+
+        // Give the two slow clients time to complete their TLS handshakes
+        // and increment the in-flight counter. Without this brief settle the
+        // third attempt races the server's `in_flight.load`.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Attempt the third connection — the cap is full so the server
+        // drops the accepted stream. The TCP connect itself completes
+        // (the kernel accepts then RSTs/EOFs on its own), but the greeting
+        // round trip fails (handshake or read error) quickly. The key
+        // assertion is *fast*: in well under `slow` ms.
+        let started = Instant::now();
+        let rejected_result = (|| -> Result<(), CommandError> {
+            let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config))?;
+            stream.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let io = SharedTlsIo::new(TlsClientIo::new(stream));
+            let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+            client.greet(Some("demo")).map_err(|e| CommandError::Other(format!("{e}")))
+        })();
+        let rejected_elapsed = started.elapsed();
+        assert!(
+            rejected_result.is_err(),
+            "third client should be rejected when cap=2 and two slow clients are in flight"
+        );
+        assert!(
+            rejected_elapsed < slow,
+            "rejected client must fail quickly (well under the slow duration {slow:?}); took {rejected_elapsed:?}"
+        );
+
+        // Wait for the two slow workers to finish, freeing both slots.
+        for w in slow_workers {
+            w.join().expect("slow client thread panicked");
+        }
+
+        // After both slots free, a fresh connection must succeed.
+        let stream = connect_tls_stream(&addr, "localhost", Arc::clone(&client_config)).expect("post-drain connect must succeed");
+        stream.sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let io = SharedTlsIo::new(TlsClientIo::new(stream));
+        let mut client = ProtocolClient::new(io.clone_handle(), io.clone_handle());
+        client.greet(Some("demo")).expect("post-drain greet must succeed");
+        let _ = client.close();
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("loop end");
     }
 }
