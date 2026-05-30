@@ -939,6 +939,7 @@ name = "pgbr-cli"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "os_pipe",
  "pgbr-build",
  "pgbr-command",
  "pgbr-config",

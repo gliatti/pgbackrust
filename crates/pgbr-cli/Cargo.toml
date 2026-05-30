@@ -48,6 +48,12 @@ libc = "0.2"
 pgbr-info = { path = "../pgbr-info" }
 pgbr-postgres = { path = "../pgbr-postgres" }
 tempfile = "3"
+# The `RemoteTlsStorage` drop / round-trip tests in `remote_storage.rs` wire a
+# `RemoteStorage` against a `StorageRequestHandler<Posix>` running on a thread
+# over two `os_pipe` channels — mirroring the pattern in
+# `crates/pgbr-storage/src/remote.rs` tests — so the assertion runs without
+# bringing up a real TLS endpoint.
+os_pipe = "1"
 
 [lints]
 workspace = true
