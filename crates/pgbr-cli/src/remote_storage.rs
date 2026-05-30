@@ -613,5 +613,4 @@ mod tests {
         drop(tls);
         server.join().unwrap();
     }
-
 }
