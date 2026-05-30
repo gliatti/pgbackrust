@@ -873,6 +873,38 @@ if printf '%s' "$out" | grep -qiE '(invalid|mismatch).*(page checksum|page heade
 else printf '%s\n' "$out" | tail -6 >&2; fail "no invalid-page warning emitted"; fi
 
 ############################################################################
+hd "Scenario 21 — verify command (repo-side integrity check, clean + corruption)"
+# verify walks the repo and re-validates each backup file (reverse-chains then
+# SHA-1s the bytes, mirroring the writer's plaintext checksum) and each WAL
+# segment. A clean repo verifies cleanly; corrupting a backup file makes the
+# verify exit non-zero with a clear corruption hint (either a checksum-class
+# message or a decompress-class one — bytes mangled mid-stream fail the gz
+# inflate step before SHA-1 can be taken, which is itself a real corruption
+# detection signal). Companion to bfb275403 (verify: honour per-holder
+# compress suffix + reverse-hash to plaintext), which fixed the previously-
+# broken clean-repo path that flagged every compressed file as "missing".
+prepare_principal
+psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
+ok "full backup (for verify)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "verify on clean repo" principal "pgbackrest --stanza=demo verify"
+# Corrupt one of the backed-up files. Avoid backup.manifest* and backup.info*
+# (those have their own per-file checksums and would trip a different code
+# path); aim for a real bundled / compressed payload.
+LABEL_DIR=$(on principal "ls -d /var/lib/pgbackrest/backup/demo/*F | head -1")
+TARGET=$(on principal "find $LABEL_DIR -type f ! -name 'backup.manifest*' ! -name 'backup.info*' -size +1k | head -1")
+on principal "dd if=/dev/urandom of=$TARGET bs=128 count=4 seek=2 conv=notrunc 2>/dev/null"
+pass "corrupted 512 bytes of $TARGET"
+out=$(pg principal "pgbackrest --stanza=demo verify" 2>&1)
+rc=$?
+if [ "$rc" != "0" ]; then pass "verify exited non-zero on corruption (exit $rc)"
+else printf '%s\n' "$out" | tail -6 >&2; fail "verify did not detect corruption"; fi
+# Accept ANY corruption indicator: a checksum mismatch, an explicit "invalid"
+# wording, or a decompression-stage error (gz/zst/bz2/lz4 inflate failures
+# are themselves real corruption detections — the bytes were unreadable).
+if printf '%s' "$out" | grep -qiE 'checksum|invalid|mismatch|corrupt|inflate|decompress|zlib'; then pass "verify log surfaces a corruption signal"
+else printf '%s\n' "$out" | tail -8 >&2; fail "verify log surfaces no corruption signal"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
