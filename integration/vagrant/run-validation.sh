@@ -843,6 +843,36 @@ if [ "$in_rec2" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "pg
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "post-promote state (in_recovery=$in_rec2 rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+hd "Scenario 20 — checksum-page detects a corrupted relation page (page-validation)"
+# data_checksums=on (reset-cluster passes --data-checksums). pgbackrest's
+# default checksum-page now resolves dynamically from pg_control, so a corrupt
+# page IS detected even without --checksum-page on the CLI. Companion to
+# d57cc86b9 (default --checksum-page from pg_control and record invalid
+# blocks), which fixed the previously-silent corruption pass-through. Asserts
+# the backup completes (warning, not abort) AND logs an invalid-page warning.
+prepare_principal
+dch=$(psql_on principal 5433 "SHOW data_checksums" | grep -oE 'on|off' | head -1)
+assert_contains "$dch" "on" "cluster has data_checksums=on (reset-cluster default)"
+psql_on principal 5433 "CREATE TABLE t(i int, s text)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT g, repeat('x',1000) FROM generate_series(1,200) g" >/dev/null
+psql_on principal 5433 "CHECKPOINT" >/dev/null
+RELP=$(psql_on principal 5433 "SELECT pg_relation_filepath('t')" | grep -oE '^base/[0-9]+/[0-9]+' | head -1)
+ok "clean full backup (baseline)" principal "pgbackrest --stanza=demo --type=full backup"
+pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
+# Corrupt 100 bytes of page 0 of the relation (not touching the stored
+# checksum at offset 8 — the checksum is computed over the whole page so any
+# change in the data area invalidates it).
+on principal "dd if=/dev/urandom of=$PRI/$RELP bs=1 count=100 seek=100 conv=notrunc 2>/dev/null"
+pass "corrupted 100 bytes at offset 100 of \$PGDATA/$RELP"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 60 start" >/dev/null 2>&1
+out=$(pg principal "pgbackrest --stanza=demo --type=full backup" 2>&1)
+rc=$?
+if [ "$rc" = "0" ]; then pass "backup completed despite corruption (warn, not abort)"
+else printf '%s\n' "$out" | tail -6 >&2; fail "backup did not complete on corruption (exit $rc)"; fi
+if printf '%s' "$out" | grep -qiE '(invalid|mismatch).*(page checksum|page header)|page.*checksum.*(invalid|mismatch)'; then pass "backup log warns about invalid page checksum"
+else printf '%s\n' "$out" | tail -6 >&2; fail "no invalid-page warning emitted"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
