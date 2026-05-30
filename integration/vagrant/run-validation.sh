@@ -932,6 +932,38 @@ else fail "stop file still present after start ($nostf)"; fi
 ok "backup after start (resumed)" principal "pgbackrest --stanza=demo --type=full backup"
 
 ############################################################################
+hd "Scenario 23 — stanza-delete (gated on stop file, repo cleared)"
+# Stock pgBackRest requires `stop` before `stanza-delete` (the operator must
+# explicitly confirm the stanza is offline before any wipe). Companion to
+# af0f497ff (stanza: gate stanza-delete on stop file). Asserts (a) delete
+# without stop refuses with a clear error, (b) after stop the delete clears
+# archive/<stanza> + backup/<stanza>, (c) a clean stanza-create succeeds
+# afterwards proving no residue.
+LOCK=/tmp/pgbackrest
+prepare_principal
+on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
+psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,300)" >/dev/null
+ok "full backup (so the stanza has something to delete)" principal "pgbackrest --stanza=demo --type=full backup"
+exists=$(on principal "test -d /var/lib/pgbackrest/backup/demo && echo yes || echo no")
+assert_contains "$exists" "yes" "backup/demo present before delete"
+out=$(pg principal "pgbackrest --stanza=demo stanza-delete" 2>&1)
+rc=$?
+if [ "$rc" != "0" ]; then pass "stanza-delete refused without stop file (exit $rc)"
+else printf '%s\n' "$out" | tail -3 >&2; fail "stanza-delete ran without stop file"; fi
+if printf '%s' "$out" | grep -qiE 'stop file'; then pass "refusal message mentions 'stop file'"
+else printf '%s\n' "$out" | tail -3 >&2; fail "refusal message lacks 'stop file' hint"; fi
+ok "stop (to authorise the delete)" principal "pgbackrest --stanza=demo stop"
+ok "stanza-delete (after stop)" principal "pgbackrest --stanza=demo stanza-delete"
+gone_b=$(on principal "test -d /var/lib/pgbackrest/backup/demo && echo yes || echo no")
+gone_a=$(on principal "test -d /var/lib/pgbackrest/archive/demo && echo yes || echo no")
+if [ "$gone_b" = "no" ] && [ "$gone_a" = "no" ]; then pass "archive/demo + backup/demo both removed"
+else fail "stanza dirs remain after delete (backup=$gone_b archive=$gone_a)"; fi
+# Cleanup: start to remove stop file so the rest of the suite is unaffected.
+pg principal "pgbackrest --stanza=demo start" >/dev/null 2>&1 || true
+# Fresh stanza-create proves no residue prevents reuse of the name.
+ok "stanza-create after delete (no residue)" principal "pgbackrest --stanza=demo stanza-create"
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
