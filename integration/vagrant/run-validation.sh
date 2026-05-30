@@ -964,6 +964,25 @@ pg principal "pgbackrest --stanza=demo start" >/dev/null 2>&1 || true
 ok "stanza-create after delete (no residue)" principal "pgbackrest --stanza=demo stanza-create"
 
 ############################################################################
+hd "Scenario 24 — repo-put / repo-ls / repo-get / repo-rm (low-level repo cmds)"
+# The four low-level repository commands (command.html). repo-put behaves
+# like unix `tee` (does NOT create parent directories), so use a top-level
+# path. End-to-end: write, list, read-back, remove, verify gone.
+prepare_principal
+PAYLOAD="hello-pgbackrest-repo-put-$(date +%s)"
+ok "repo-put hello.txt (stdin -> repo)" principal "printf '%s' '$PAYLOAD' | pgbackrest repo-put hello.txt"
+ls_out=$(pg principal "pgbackrest repo-ls")
+if printf '%s' "$ls_out" | grep -qE '^hello\.txt$'; then pass "repo-ls lists hello.txt"
+else printf '%s\n' "$ls_out" | head -5 >&2; fail "repo-ls did not list hello.txt"; fi
+got=$(pg principal "pgbackrest repo-get hello.txt")
+if [ "$got" = "$PAYLOAD" ]; then pass "repo-get round-trips bytes byte-for-byte"
+else fail "repo-get bytes mismatch (want '$PAYLOAD' got '$got')"; fi
+ok "repo-rm hello.txt" principal "pgbackrest repo-rm hello.txt"
+ls_after=$(pg principal "pgbackrest repo-ls")
+if ! printf '%s' "$ls_after" | grep -qE '^hello\.txt$'; then pass "hello.txt absent after repo-rm"
+else fail "hello.txt still listed after repo-rm"; fi
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
