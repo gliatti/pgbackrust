@@ -36,6 +36,7 @@
 //! `--stanza`, an unreadable / malformed `backup.info`, or an unreadable
 //! `backup.manifest` — bubble up as a [`CommandError`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
@@ -44,6 +45,7 @@ use pgbr_io::{Filter, IoRead, Sha1};
 use pgbr_storage::{Storage, StorageError, StorageKind};
 
 use crate::CommandError;
+use crate::pipeline::RepoTransform;
 
 /// Length of a SHA-1 digest rendered as lowercase hexadecimal.
 const SHA1_HEX_LEN: usize = 40;
@@ -268,12 +270,48 @@ fn verify_info_consistency(repo: &dyn Storage, stanza: &str, backup: &InfoBackup
     }
 }
 
-/// Recompute the SHA-1 of a repository file by streaming it through the
-/// [`Sha1`] filter. Returns `(digest_hex, byte_count)`.
-fn hash_repo_file(repo: &dyn Storage, path: &Path) -> Result<(String, u64), CommandError> {
+/// Recompute the SHA-1 of a repository file, reversing the on-disk transform
+/// first so the digest matches the **plaintext** SHA-1 the manifest records.
+///
+/// The backup writer takes the SHA-1 over the plaintext before applying the
+/// compress / encrypt chain (see `backup::plaintext_sha1` and
+/// `RepoTransform::apply_forward_keyed`), so verify must reverse the chain
+/// before hashing — otherwise every compressed or encrypted clean file would
+/// flip from `MissingFile` to `ChecksumMismatch`. The returned size is the
+/// **plaintext** size, which is what the manifest's `size` field records too.
+fn hash_repo_file_reversed(repo: &dyn Storage, path: &Path, transform: &RepoTransform) -> Result<(String, u64), CommandError> {
     let mut reader: Box<dyn IoRead> = repo.open_read(path)?;
-    let bytes = reader.read_all()?;
-    Ok((sha1_hex(&bytes), bytes.len() as u64))
+    let raw = reader.read_all()?;
+    // The backup writer uses the keyed (SHA-1 KDF) chain, so reverse the same
+    // way. With an identity transform (no compression, no cipher) this is a
+    // pass-through and the digest matches what the legacy helper produced.
+    let plaintext = transform.apply_reverse_keyed(&raw)?;
+    Ok((sha1_hex(&plaintext), plaintext.len() as u64))
+}
+
+/// Resolve the [`RepoTransform`] a backup holder applied to its on-disk bytes,
+/// caching one lookup per holder label across a verify pass.
+///
+/// A manifest entry's `reference = Some(other_label)` means the bytes live in
+/// `other_label`'s directory and were written with **that** backup's transform,
+/// not the backup being verified. Stock pgBackRest's restore looks the holder's
+/// `compress-type` / `encrypted` flags up in `backup.info`'s `[backup:current]`
+/// entry for that label (see [`RepoTransform::from_metadata`]); verify mirrors
+/// the same lookup. When the holder is not listed (a stray reference that
+/// `backup.info` did not record) we fall back to the identity transform, which
+/// is the same conservative default `from_metadata` would yield with no
+/// recorded compress / encrypt flags.
+fn transform_for_holder<'a>(
+    holder: &str,
+    info: &InfoBackup,
+    config: &LoadedConfig,
+    cache: &'a mut HashMap<String, RepoTransform>,
+) -> &'a RepoTransform {
+    cache.entry(holder.to_owned()).or_insert_with(|| {
+        info.current
+            .get(holder)
+            .map_or_else(RepoTransform::identity, |entry| RepoTransform::from_metadata(entry, config))
+    })
 }
 
 /// SHA-1 of `bytes` as lowercase hex, computed exactly the way verify compares.
@@ -294,8 +332,21 @@ fn sha1_hex(bytes: &[u8]) -> String {
 ///
 /// A file whose manifest entry carries a `reference` is read from the backup
 /// that physically holds its bytes (`backup/<stanza>/<reference>/<path>`),
-/// mirroring restore's differential / incremental reference resolution.
-fn verify_backup(repo: &dyn Storage, stanza: &str, label: &str, report: &mut VerifyReport) -> Result<(), CommandError> {
+/// mirroring restore's differential / incremental reference resolution. The
+/// on-disk filename for each file carries the compression suffix the **holder**
+/// backup wrote it with (e.g. `.gz` / `.zst`), so the per-holder
+/// [`RepoTransform`] is looked up via [`transform_for_holder`] and its
+/// [`RepoTransform::repo_suffix`] is appended before the existence check and
+/// the hash. The hash itself reverses the same transform so the recomputed
+/// digest matches the plaintext SHA-1 the manifest records.
+fn verify_backup(
+    repo: &dyn Storage,
+    stanza: &str,
+    label: &str,
+    info: &InfoBackup,
+    config: &LoadedConfig,
+    report: &mut VerifyReport,
+) -> Result<(), CommandError> {
     let manifest = Manifest::load(repo, &manifest_path(stanza, label)).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
             path: manifest_path(stanza, label),
@@ -312,6 +363,10 @@ fn verify_backup(repo: &dyn Storage, stanza: &str, label: &str, report: &mut Ver
         errors: Vec::new(),
     };
 
+    // One transform lookup per distinct holder label seen in this backup's
+    // manifest (typically the backup itself plus one referenced full / diff).
+    let mut transforms: HashMap<String, RepoTransform> = HashMap::new();
+
     for file in &manifest.files {
         // Zero-length files carry no checksum; nothing to re-read.
         let Some(expected) = file.checksum.as_deref() else {
@@ -322,11 +377,17 @@ fn verify_backup(repo: &dyn Storage, stanza: &str, label: &str, report: &mut Ver
         summary.total += 1;
 
         // A referenced file's bytes live in the backup named by `reference`;
-        // otherwise they live in this backup's own directory.
+        // otherwise they live in this backup's own directory. The on-disk
+        // filename carries that backup's compression suffix.
         let holder = file.reference.as_deref().unwrap_or(label);
-        let path = backup_file_path(stanza, holder, &file.path);
+        let transform = transform_for_holder(holder, info, config, &mut transforms).clone();
+        let suffixed = format!("{}{}", file.path, transform.repo_suffix());
+        let path = backup_file_path(stanza, holder, &suffixed);
 
         if !repo.exists(&path)? {
+            // The user-visible path is the manifest-relative one (the source
+            // path), not the on-disk `.gz` variant — mirror stock pgBackRest's
+            // verify reporting, which names what users put into the cluster.
             let problem = VerifyProblem::MissingFile {
                 backup: label.to_owned(),
                 path: file.path.clone(),
@@ -336,7 +397,7 @@ fn verify_backup(repo: &dyn Storage, stanza: &str, label: &str, report: &mut Ver
             continue;
         }
 
-        let (actual, actual_size) = hash_repo_file(repo, &path)?;
+        let (actual, actual_size) = hash_repo_file_reversed(repo, &path, &transform)?;
 
         let mut file_ok = true;
 
@@ -521,7 +582,7 @@ pub fn verify_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<VerifyR
     // Stage 2: per-backup files (with reference resolution).
     let labels = select_backups(config, &info);
     for label in &labels {
-        verify_backup(repo, stanza, label, &mut report)?;
+        verify_backup(repo, stanza, label, &info, config, &mut report)?;
     }
 
     // Stage 3: WAL archive.
@@ -1157,6 +1218,216 @@ mod tests {
                 assert_eq!(actual, &sha1_hex(b"tampered wal bytes!!"));
             }
             other @ ArchiveProblem::Unreadable { .. } => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+    }
+
+    /// Seed `backup.info` where each `(label, compress_type)` pair records the
+    /// matching `backup-info-compress-type` flag in `[backup:current]`. This is
+    /// what verify reads back via `RepoTransform::from_metadata` so each backup
+    /// is checksummed against the transform it was actually written with.
+    fn seed_backup_info_with_compress(repo: &Posix, stanza: &str, entries: &[(&str, &str)]) {
+        let mut current = BTreeMap::new();
+        for (label, compress_type) in entries {
+            current.insert(
+                (*label).to_owned(),
+                json!({
+                    "backup-info-size": 100,
+                    "backup-label": *label,
+                    "backup-timestamp-stop": 1_704_110_410_i64,
+                    "backup-type": "full",
+                    "backup-info-compress-type": *compress_type,
+                    "backup-info-encrypted": false,
+                }),
+            );
+        }
+
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history,
+        };
+
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup/<stanza>");
+        info.save(repo, &super::backup_info_path(stanza)).expect("save backup.info");
+    }
+
+    /// Apply the keyed forward chain of a [`super::RepoTransform`] to `bytes`
+    /// (the exact path backup's writer uses) and return the repo-side bytes.
+    fn forward(transform: &crate::pipeline::RepoTransform, bytes: &[u8]) -> Vec<u8> {
+        transform.apply_forward_keyed(bytes).expect("apply_forward_keyed")
+    }
+
+    #[test]
+    fn verify_clean_compressed_backup_passes_when_suffix_matches() {
+        // The PRIMARY bug the live PG18 cluster surfaced: backup writes
+        // `<rel>.gz` under the label dir, but verify probed `<rel>` (no suffix)
+        // and reported every file MISSING. With the per-holder transform
+        // lookup the on-disk filename is reconstructed correctly, AND the
+        // hash is taken over the reversed (plaintext) bytes so the checksum
+        // recorded by the writer matches.
+        //
+        // The fixture mixes TWO compress types — one regular file under a
+        // gz-backup, one referenced file under a zst-backup — to prove the
+        // per-holder transform lookup is keyed on the *holder* label, not on
+        // the backup being verified.
+        let (_dir, repo) = empty_repo();
+        let full_gz = "20240101-120000F";
+        let full_zst = "20240102-120000F";
+
+        // Each label records its own compress-type in [backup:current]. The
+        // verify pass reads these via `RepoTransform::from_metadata`.
+        seed_backup_info_with_compress(&repo, "demo", &[(full_gz, "gz"), (full_zst, "zst")]);
+
+        // Build the transforms verify will reconstruct.
+        let tf_gz = crate::pipeline::RepoTransform {
+            compress_type: crate::pipeline::CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+        let tf_zst = crate::pipeline::RepoTransform {
+            compress_type: crate::pipeline::CompressType::Zst,
+            compress_level: 3,
+            cipher_pass: None,
+        };
+
+        // full_gz holds one file that REFERENCES a file from full_zst, AND
+        // its own file. Mixing the holders proves the suffix lookup is keyed
+        // on the holder, not the manifest's owner.
+        let own = b"PG_VERSION contents\n";
+        let referenced_bytes = b"shared heap page bytes that the zst backup physically holds";
+
+        seed_manifest(
+            &repo,
+            "demo",
+            full_gz,
+            vec![
+                file_entry("pg_data/PG_VERSION", own, Some(sha1_hex(own))),
+                referenced_entry("pg_data/base/1/1259", referenced_bytes, full_zst),
+            ],
+        );
+
+        // full_zst owns its file at <rel>.zst.
+        seed_manifest(
+            &repo,
+            "demo",
+            full_zst,
+            vec![file_entry(
+                "pg_data/base/1/1259",
+                referenced_bytes,
+                Some(sha1_hex(referenced_bytes)),
+            )],
+        );
+
+        // Write the on-disk bytes under each holder's directory with each
+        // holder's compression suffix.
+        write_backup_file(&repo, "demo", full_gz, "pg_data/PG_VERSION.gz", &forward(&tf_gz, own));
+        write_backup_file(
+            &repo,
+            "demo",
+            full_zst,
+            "pg_data/base/1/1259.zst",
+            &forward(&tf_zst, referenced_bytes),
+        );
+
+        let report = verify_inner(&cfg(Some("demo"), None), &repo).expect("verify_inner");
+        assert!(
+            report.problems.is_empty(),
+            "a clean compressed backup must report ZERO problems; got: {:?}",
+            report.problems
+        );
+        for backup in &report.backups {
+            assert!(
+                backup.errors.is_empty(),
+                "backup {}'s per-backup errors must be empty: {:?}",
+                backup.label,
+                backup.errors,
+            );
+            assert_eq!(
+                backup.valid, backup.total,
+                "every file in {} must be valid (got {}/{})",
+                backup.label, backup.valid, backup.total
+            );
+        }
+    }
+
+    #[test]
+    fn verify_corrupt_compressed_file_is_checksum_mismatch_not_missing() {
+        // NEGATIVE test for bug #2: if the .gz bytes are truncated, verify
+        // must detect the file as a ChecksumMismatch (the reversed bytes
+        // either decompress wrong or short), NOT as MissingFile.
+        let (_dir, repo) = empty_repo();
+        let label = "20240101-120000F";
+
+        seed_backup_info_with_compress(&repo, "demo", &[(label, "gz")]);
+
+        let tf = crate::pipeline::RepoTransform {
+            compress_type: crate::pipeline::CompressType::Gz,
+            compress_level: 6,
+            cipher_pass: None,
+        };
+
+        let plaintext = b"the relation bytes that compress and round-trip cleanly when intact";
+        let intended_sha = sha1_hex(plaintext);
+
+        seed_manifest(
+            &repo,
+            "demo",
+            label,
+            vec![file_entry("pg_data/base/1/1259", plaintext, Some(intended_sha))],
+        );
+
+        // Forward through gz, then TRUNCATE the last byte of the gz frame.
+        // The reverse will either fail to decompress or produce different
+        // plaintext — either way, NOT a MissingFile.
+        let mut gz = forward(&tf, plaintext);
+        assert!(gz.len() > 1, "gz output must be at least 2 bytes to truncate");
+        gz.pop();
+        write_backup_file(&repo, "demo", label, "pg_data/base/1/1259.gz", &gz);
+
+        let result = verify_inner(&cfg(Some("demo"), None), &repo);
+        match result {
+            // Two acceptable outcomes: the corruption is detected as a
+            // ChecksumMismatch in the report, OR the reverse chain errors
+            // out (a CommandError) — either way is NOT a silent
+            // "MissingFile" against a clean repo, which is the bug.
+            Ok(report) => {
+                assert!(
+                    !report.problems.iter().any(|p| matches!(p, VerifyProblem::MissingFile { .. })),
+                    "a corrupt .gz must NOT surface as MissingFile (the bug); problems: {:?}",
+                    report.problems,
+                );
+                assert!(
+                    report
+                        .problems
+                        .iter()
+                        .any(|p| matches!(p, VerifyProblem::ChecksumMismatch { .. } | VerifyProblem::SizeMismatch { .. })),
+                    "the corruption must be detected as a checksum or size mismatch: {:?}",
+                    report.problems,
+                );
+            }
+            Err(err) => {
+                // A decompression error surfacing as a CommandError is also
+                // acceptable: the corruption is detected, just through the
+                // reverse-chain failure rather than the digest comparison.
+                let msg = err.to_string();
+                assert!(!msg.is_empty(), "a decompression failure should carry a non-empty message");
+            }
         }
     }
 

@@ -186,6 +186,15 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "pg_snapshots",
     "pg_stat_tmp",
     "pg_subtrans",
+    // `log/` is where the postmaster writes its server log when
+    // `logging_collector = on` (the default `log_directory`). pgBackRest
+    // unconditionally excludes the postmaster log tree: the bytes are runtime
+    // diagnostic output that cannot help a restored cluster, and the file is
+    // actively being written / rotated while the backup runs, so capturing it
+    // would mid-stream a partial line at best (and disappear from the manifest
+    // when log rotation removes it at worst). C ref: `manifestBuildInfo`
+    // (`src/info/manifest/manifest.c`) skips `MANIFEST_TARGET_PGDATA/log`.
+    "log",
 ];
 
 /// Exact PG-data **root-level** file names pgBackRest always excludes.
@@ -218,6 +227,17 @@ const EXCLUDE_ROOT_FILES: &[&str] = &[
     "backup_label.old",
     "backup_manifest",
     "backup_manifest.tmp",
+    // A root-level postmaster server log: written by `pg_ctl -l <pgdata>/server.log`
+    // and by `logging_collector` when configured to write at the data root.
+    // pgBackRest unconditionally excludes it (transient runtime output, actively
+    // rotated, no value to a restored cluster). C ref: `manifestBuildInfo`'s
+    // PGDATA-root file skips (`src/info/manifest/manifest.c`).
+    "server.log",
+    // The pointer file `logging_collector` rewrites every rotation to name the
+    // current log file. It is regenerated on startup, so capturing it under a
+    // backup would only embed a stale pointer that contradicts the restored
+    // cluster's actual log path.
+    "current_logfiles",
 ];
 
 /// Basename pgBackRest excludes wherever it appears in a db path.
@@ -4305,6 +4325,29 @@ mod tests {
     }
 
     #[test]
+    fn is_excluded_covers_postmaster_log_paths() {
+        // The `log/` directory holds the postmaster server log (when
+        // `logging_collector` writes under PGDATA). The directory itself and
+        // every file beneath it must be excluded.
+        assert!(is_excluded("log"));
+        assert!(is_excluded("log/server.log"));
+        assert!(is_excluded("log/foo.log"));
+        assert!(is_excluded("log/postgresql-2026-05-30.log"));
+        // A sibling that merely shares the `log` prefix must NOT be excluded.
+        assert!(!is_excluded("login"));
+        assert!(!is_excluded("logical"));
+
+        // Root-level postmaster server log + the `current_logfiles` pointer.
+        assert!(is_excluded("server.log"));
+        assert!(is_excluded("current_logfiles"));
+        // Nested copies under a relation directory are NOT root files, so the
+        // root-file rule does not exclude them (the gating mirrors pgBackRest's
+        // PGDATA-root check; a real cluster would never put these there).
+        assert!(!is_excluded("base/1/server.log"));
+        assert!(!is_excluded("base/1/current_logfiles"));
+    }
+
+    #[test]
     fn is_excluded_covers_root_files_and_pg_internal_init() {
         // Root-level recovery / backup-label / postmaster files are excluded only
         // when they sit directly in the data root.
@@ -4489,6 +4532,52 @@ mod tests {
             let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
             assert!(!backup_root.join(excluded).exists(), "{excluded} must not be copied");
         }
+        // The real relation survives.
+        assert!(manifest.file("base/1/1259").is_some(), "real relation must be backed up");
+    }
+
+    #[test]
+    fn backup_excludes_postmaster_log_tree() {
+        // The `log/` tree and the root-level `server.log` / `current_logfiles`
+        // pointer file (postmaster server log + logging_collector state) must
+        // be excluded from the manifest and never copied. Without this exclude
+        // `verify` later reports them as missing on a clean repo because the
+        // postmaster rotates / removes them between backup and verify.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"keep this relation");
+        // Default `logging_collector = on` layout: PGDATA/log/*.log.
+        seed_file(&pg_s, "log/server.log", b"2026-05-30 12:00:00 ... LOG ...");
+        seed_file(&pg_s, "log/foo.log", b"older rotation");
+        // Root-level postmaster log used by `pg_ctl -l <pgdata>/server.log`.
+        seed_file(&pg_s, "server.log", b"root-level postmaster log");
+        // The `logging_collector` pointer file (rotation state).
+        seed_file(&pg_s, "current_logfiles", b"log/postgresql.log");
+
+        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+
+        let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
+        let (label, _) = info.current.iter().next().expect("one backup");
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{label}/backup.manifest"))).expect("manifest");
+
+        for excluded in ["log/server.log", "log/foo.log", "server.log", "current_logfiles"] {
+            assert!(
+                manifest.file(excluded).is_none(),
+                "{excluded} must be excluded from the manifest"
+            );
+            let backup_root = repo_dir.path().join(format!("backup/demo/{label}"));
+            assert!(!backup_root.join(excluded).exists(), "{excluded} must not be copied");
+        }
+        // The `log` directory follows the same convention as other excluded
+        // runtime dirs (`pg_notify`, `pg_wal`, ...): the directory entry is
+        // recorded as an empty path so a fresh-PGDATA restore recreates the
+        // dir, while its contents are excluded. (PostgreSQL would recreate
+        // `log/` on startup with `logging_collector = on` anyway, but matching
+        // the existing convention keeps the manifest shape consistent.)
+        assert!(
+            manifest.paths.iter().any(|p| p.path == "log"),
+            "log/ directory must be recorded as an empty manifest path"
+        );
         // The real relation survives.
         assert!(manifest.file("base/1/1259").is_some(), "real relation must be backed up");
     }
