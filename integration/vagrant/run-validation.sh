@@ -905,6 +905,33 @@ if printf '%s' "$out" | grep -qiE 'checksum|invalid|mismatch|corrupt|inflate|dec
 else printf '%s\n' "$out" | tail -8 >&2; fail "verify log surfaces no corruption signal"; fi
 
 ############################################################################
+hd "Scenario 22 — start / stop commands (pause/resume archiving + backups)"
+# `stop` creates <lock-path>/<stanza>.stop locally; backup + archive-push then
+# refuse with "stop file exists for stanza <name>" until `start` removes it.
+# Companion to 44dd361c4 (control: write stop file locally + gate backup +
+# archive on stop file), which fixed the previously-noop pair.
+LOCK=/tmp/pgbackrest
+prepare_principal
+# Ensure no stale stop file from a prior run / scenario.
+on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
+psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
+ok "baseline backup (before stop)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "stop command" principal "pgbackrest --stanza=demo stop"
+sf=$(on principal "ls $LOCK/demo.stop 2>/dev/null")
+assert_contains "$sf" "demo.stop" "stop file created at $LOCK/demo.stop"
+out=$(pg principal "pgbackrest --stanza=demo --type=full backup" 2>&1)
+rc=$?
+if [ "$rc" != "0" ]; then pass "backup is blocked while stopped (exit $rc)"
+else printf '%s\n' "$out" | tail -4 >&2; fail "backup ran despite stop file"; fi
+if printf '%s' "$out" | grep -qiE 'stop file exists'; then pass "refusal message names the stop file"
+else printf '%s\n' "$out" | tail -4 >&2; fail "refusal message lacks 'stop file exists'"; fi
+ok "start command" principal "pgbackrest --stanza=demo start"
+nostf=$(on principal "ls $LOCK/demo.stop 2>/dev/null; true")
+if [ -z "$nostf" ]; then pass "stop file removed by start"
+else fail "stop file still present after start ($nostf)"; fi
+ok "backup after start (resumed)" principal "pgbackrest --stanza=demo --type=full backup"
+
+############################################################################
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'
