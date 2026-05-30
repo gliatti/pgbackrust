@@ -1470,23 +1470,24 @@ fn option_path(config: &LoadedConfig, name: &str) -> Option<String> {
 }
 
 /// Resolve the filesystem root the `server` should serve the storage protocol
-/// from, preferring `pg-path` / `pg1-path` then `repo-path` / `repo1-path`,
-/// defaulting to the current directory when none is set.
+/// from, preferring `pg1-path` then `repo1-path`, defaulting to the current
+/// directory when none is set.
 ///
 /// A connecting `repo-host-type=tls` / `pg-host-type=tls` worker reaches the
 /// repository or PG data directory through this root, mirroring the SSH worker's
 /// [`worker_root`](crate::worker) selection.
+///
+/// Grouped options (`pgN-path`, `repoN-path`) are stored under the canonical
+/// `("pg-path", Some(N))` / `("repo-path", Some(N))` key (see
+/// `pgbr_config::cli::decode_option_key`); the literal `"pgN-path"` /
+/// `"repoN-path"` strings are never canonical names, so a lookup keyed by those
+/// strings always misses. The configured value lives under `Some(1)`.
 fn server_root(config: &LoadedConfig) -> std::path::PathBuf {
-    for name in ["pg-path", "pg1-path", "repo-path", "repo1-path"] {
-        if let Some(p) = config
-            .options
-            .get(&(name.to_owned(), None))
-            .or_else(|| config.options.get(&(name.to_owned(), Some(1))))
-            .and_then(|v| match v {
-                OptionValue::Path(p) | OptionValue::String(p) if !p.is_empty() => Some(p.clone()),
-                _ => None,
-            })
-        {
+    for name in ["pg-path", "repo-path"] {
+        if let Some(p) = config.options.get(&((*name).to_owned(), Some(1))).and_then(|v| match v {
+            OptionValue::Path(p) | OptionValue::String(p) if !p.is_empty() => Some(p.clone()),
+            _ => None,
+        }) {
             return std::path::PathBuf::from(p);
         }
     }
@@ -1743,6 +1744,48 @@ mod tests {
             (("tls-server-port", None), OptionValue::Integer(9999)),
         ]);
         assert_eq!(server_address(&config), "10.0.0.1:9999");
+    }
+
+    // --- server_root: canonical grouped key lookup ---------------------------
+
+    #[test]
+    fn server_root_picks_repo1_path_from_grouped_key() {
+        // The raw `repo1-path` from [global] decodes to the canonical
+        // `("repo-path", Some(1))` key. A prior bug looked up
+        // `("repo1-path", None)` / `("repo1-path", Some(1))` and missed the
+        // value, defaulting the TLS server to "." and failing at runtime.
+        let cfg = config_with(vec![(
+            ("repo-path", Some(1)),
+            OptionValue::Path("/var/lib/pgbackrest".to_owned()),
+        )]);
+        assert_eq!(server_root(&cfg), std::path::PathBuf::from("/var/lib/pgbackrest"));
+    }
+
+    #[test]
+    fn server_root_prefers_pg_path_over_repo_path() {
+        // When both are set, `pg-path` wins (the worker is more often spawned
+        // for a PG host than a repo host).
+        let cfg = config_with(vec![
+            (("pg-path", Some(1)), OptionValue::Path("/srv/pg".to_owned())),
+            (("repo-path", Some(1)), OptionValue::Path("/srv/repo".to_owned())),
+        ]);
+        assert_eq!(server_root(&cfg), std::path::PathBuf::from("/srv/pg"));
+    }
+
+    #[test]
+    fn server_root_defaults_to_dot_when_neither_set() {
+        assert_eq!(server_root(&config_with(vec![])), std::path::PathBuf::from("."));
+    }
+
+    #[test]
+    fn server_root_ignores_ungrouped_or_empty_values() {
+        // Ungrouped `("pg-path", None)` is NOT where the merged value lives —
+        // it must not be picked up. Empty grouped value is also ignored.
+        let cfg_ungrouped = config_with(vec![(("pg-path", None), OptionValue::Path("/ungrouped".to_owned()))]);
+        assert_eq!(server_root(&cfg_ungrouped), std::path::PathBuf::from("."));
+
+        let cfg_empty = config_with(vec![(("repo-path", Some(1)), OptionValue::Path(String::new()))]);
+        assert_eq!(server_root(&cfg_empty), std::path::PathBuf::from("."));
     }
 
     #[test]

@@ -268,12 +268,13 @@ where
 /// argv, so the heavier [`load_config_with_context`] merge (which would re-apply
 /// — and validate — every default) is neither needed nor wanted here.
 ///
-/// One normalisation is applied: the parent passes the worker's root as the
-/// grouped `--repo1-path` / `--pg1-path`, which `resolve_cli` keys as
-/// `("repo-path", Some(1))` / `("pg-path", Some(1))`. The worker side
-/// (`pgbr_command::worker::run_worker_stdio`) looks the root up under the
-/// *ungrouped* `("repo-path", None)` / `("pg-path", None)` keys, so mirror the
-/// grouped value into the ungrouped key it reads.
+/// One normalisation is applied (belt-and-suspenders): the parent passes the
+/// worker's root as the grouped `--repo1-path` / `--pg1-path`, which
+/// `resolve_cli` keys as `("repo-path", Some(1))` / `("pg-path", Some(1))`.
+/// `pgbr_command::worker::worker_root` reads that grouped key directly, but we
+/// also mirror the value into the ungrouped `("repo-path", None)` /
+/// `("pg-path", None)` key so any other consumer that looks up the ungrouped
+/// form still sees it.
 fn worker_loaded_config(resolved: &ResolvedCli) -> LoadedConfig {
     let stanza = resolved.options.get(&("stanza".to_owned(), None)).and_then(|v| match v {
         OptionValue::String(s) => Some(s.clone()),

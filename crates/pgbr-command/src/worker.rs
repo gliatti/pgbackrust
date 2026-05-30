@@ -185,9 +185,15 @@ pub fn serve_worker<R: IoRead, W: IoWrite>(root: &Path, reader: &mut R, writer: 
 /// back to `repo1-path` (the repository) — matching the two roots a worker is
 /// ever spawned for. Returns [`CommandError::MissingOption`] when neither is
 /// configured.
+///
+/// Grouped options (`pgN-path`, `repoN-path`) are stored under the canonical
+/// `("pg-path", Some(N))` / `("repo-path", Some(N))` key (see
+/// `pgbr_config::cli::decode_option_key`); the literal `"pgN-path"` /
+/// `"repoN-path"` strings are never canonical names, so a lookup keyed by those
+/// strings always misses. The configured value lives under `Some(1)`.
 fn worker_root(config: &LoadedConfig) -> Result<PathBuf, CommandError> {
-    for name in ["pg1-path", "pg-path", "repo1-path", "repo-path"] {
-        if let Some(OptionValue::Path(p) | OptionValue::String(p)) = config.options.get(&(name.to_owned(), None))
+    for name in ["pg-path", "repo-path"] {
+        if let Some(OptionValue::Path(p) | OptionValue::String(p)) = config.options.get(&((*name).to_owned(), Some(1)))
             && !p.is_empty()
         {
             return Ok(PathBuf::from(p));
@@ -229,7 +235,7 @@ pub fn run_worker_stdio(config: &LoadedConfig) -> Result<(), CommandError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread;
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig, OptionValue};
@@ -239,13 +245,14 @@ mod tests {
     use pgbr_storage::remote::RemoteStorage;
     use tempfile::TempDir;
 
-    use super::{is_worker, run_worker_stdio, serve_worker};
+    use super::{is_worker, run_worker_stdio, serve_worker, worker_root};
     use crate::CommandError;
 
     fn worker_config(command: &str, role: ConfigCommandRole, root: Option<&Path>) -> LoadedConfig {
         let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
         if let Some(p) = root {
-            options.insert(("pg1-path".to_owned(), None), OptionValue::Path(p.display().to_string()));
+            // Grouped option: raw `pg1-path` decodes to `("pg-path", Some(1))`.
+            options.insert(("pg-path".to_owned(), Some(1)), OptionValue::Path(p.display().to_string()));
         }
         LoadedConfig {
             command: command.to_owned(),
@@ -489,5 +496,67 @@ mod tests {
             super::WorkerHandler::parse_stanza_param(&[Value::Number(42.into()), Value::String("stanza=after-skip".to_owned()),]),
             Some("after-skip".to_owned())
         );
+    }
+
+    // --- worker_root: canonical grouped key lookup ---------------------------
+
+    fn config_with(opts: Vec<((&str, Option<u32>), OptionValue)>) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        for ((name, group), value) in opts {
+            options.insert((name.to_owned(), group), value);
+        }
+        LoadedConfig {
+            command: "remote".to_owned(),
+            command_role: ConfigCommandRole::Remote,
+            stanza: None,
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_root_picks_repo1_path_from_grouped_key() {
+        // The raw `repo1-path` from [global] decodes to the canonical
+        // `("repo-path", Some(1))` key. A prior bug looked up
+        // `("repo1-path", None)` and missed the value, causing the worker to
+        // fail with "permission denied: ./archive/<stanza>" at runtime.
+        let cfg = config_with(vec![(
+            ("repo-path", Some(1)),
+            OptionValue::Path("/var/lib/pgbackrest".to_owned()),
+        )]);
+        assert_eq!(worker_root(&cfg).unwrap(), PathBuf::from("/var/lib/pgbackrest"));
+    }
+
+    #[test]
+    fn worker_root_prefers_pg_path_over_repo_path() {
+        // When both are set, `pg-path` wins — the worker is more often spawned
+        // for a PG host than a repo host.
+        let cfg = config_with(vec![
+            (("pg-path", Some(1)), OptionValue::Path("/srv/pg".to_owned())),
+            (("repo-path", Some(1)), OptionValue::Path("/srv/repo".to_owned())),
+        ]);
+        assert_eq!(worker_root(&cfg).unwrap(), PathBuf::from("/srv/pg"));
+    }
+
+    #[test]
+    fn worker_root_errors_when_neither_pg_nor_repo_path_set() {
+        let err = worker_root(&config_with(vec![])).expect_err("empty options must error");
+        match err {
+            CommandError::MissingOption { option } => {
+                assert!(option.contains("path"), "option was {option:?}");
+            }
+            other => panic!("expected MissingOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_root_ignores_ungrouped_or_empty_values() {
+        // Ungrouped `("pg-path", None)` is NOT the canonical key — must miss.
+        let cfg_ungrouped = config_with(vec![(("pg-path", None), OptionValue::Path("/ungrouped".to_owned()))]);
+        assert!(matches!(worker_root(&cfg_ungrouped), Err(CommandError::MissingOption { .. })));
+
+        // Empty grouped value is ignored.
+        let cfg_empty = config_with(vec![(("repo-path", Some(1)), OptionValue::Path(String::new()))]);
+        assert!(matches!(worker_root(&cfg_empty), Err(CommandError::MissingOption { .. })));
     }
 }
