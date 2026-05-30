@@ -385,23 +385,33 @@ pub fn buffer_ptr() -> *mut c_char {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Lock and `fresh_state` helper shared between this module's tests and
-    //! `log::format`'s tests.
+    //! Lock and `fresh_state` helper shared between this module's tests,
+    //! `log::format`'s tests, and `log::capture`'s tests.
     //!
-    //! Both test sets touch the same process-global `LogState`. A single lock here
-    //! serialises them; if each module defined its own lock, parallel `cargo test`
-    //! could interleave a `log::tests::*` write with a `log::format::tests::*` read.
+    //! All three test sets touch the same process-global `LogState` and/or
+    //! `CaptureState` (which `format::log_post` reads at every dispatch). A single
+    //! lock here serialises them; if any module defined its own lock, parallel
+    //! `cargo test` could interleave e.g. a `capture::tests::*` flip of `installed`
+    //! with a `format::tests::*` banner-write decision (observed flake in
+    //! `log_internal_writes_banner_then_message_to_file`).
     use std::sync::Mutex;
 
     pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquire `TEST_LOCK`, reset `STATE` to a fresh `LogState`, and hand back the
-    /// guard so the caller's test run holds the lock for its lifetime.
+    /// Acquire `TEST_LOCK`, reset `STATE` to a fresh `LogState` *and* reset the
+    /// `log::capture` state to its default (installed = false, empty buffer), and
+    /// hand back the guard so the caller's test run holds the lock for its
+    /// lifetime. Resetting capture state here matters because `format::log_post`
+    /// reads `capture::is_installed` to choose between the file fd and the capture
+    /// buffer; a previous `capture::tests::*` test that left `installed = true`
+    /// would otherwise route a subsequent `format::tests::*` file-sink write into
+    /// the capture buffer instead of the temp-file fd.
     pub fn fresh_state() -> std::sync::MutexGuard<'static, ()> {
         let guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: TEST_LOCK serialises tests so no other reference is alive.
         let state = unsafe { super::state_mut() };
         *state = super::LogState::new();
+        super::capture::reset_state();
         guard
     }
 }

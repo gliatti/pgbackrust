@@ -113,16 +113,30 @@ pub fn contains(needle: &str) -> bool {
     captured.contains(needle)
 }
 
+/// Reset capture state to its default (installed = false, empty buffer). Called by
+/// `log::test_support::fresh_state` so a previous `capture::tests::*` test that left
+/// `installed = true` cannot route a later `log::format::tests::*` file-sink write
+/// into the capture buffer instead of the temp-file fd. The shared `TEST_LOCK`
+/// already serialises tests, so the caller upholds the single-threaded contract.
+#[cfg(test)]
+pub(super) fn reset_state() {
+    // SAFETY: see `state_mut`. The caller (`fresh_state`) holds `TEST_LOCK`.
+    let s = unsafe { state_mut() };
+    *s = CaptureState::new();
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// Acquire the workspace-wide log test lock (also used by `log::tests::*` and
+    /// `log::format::tests::*`) and reset capture state. See `log::test_support`
+    /// for why a single lock is required across this whole module.
     fn fresh() -> std::sync::MutexGuard<'static, ()> {
-        let g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let g = super::super::test_support::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: TEST_LOCK serialises tests so no other reference is alive.
         let s = unsafe { state_mut() };
         *s = CaptureState::new();
