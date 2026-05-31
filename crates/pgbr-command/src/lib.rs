@@ -181,7 +181,7 @@ pub fn dispatch_multi(
         "archive-push" => archive::push(config, &archive_repos, pg_storage),
         "expire" => expire::expire(config, repo_storage),
         "verify" => verify::verify(config, repo_storage),
-        "check" => check::check(config, repo_storage, pg_storage),
+        "check" => check::check(config, repo_storages, pg_storage),
         "annotate" => annotate::annotate(config, repo_storage),
         "manifest" => manifest::manifest(config, repo_storage),
         "server" => server::server(config, repo_storage),

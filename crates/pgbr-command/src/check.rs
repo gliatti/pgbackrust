@@ -935,32 +935,75 @@ fn archive_mode_check(config: &LoadedConfig) -> bool {
     )
 }
 
-/// `check` — verify the configured repository is reachable, the stanza is
-/// initialized, and (when a cluster is configured) the live WAL archive path
-/// works, then print the resulting [`CheckReport`].
+/// `check` — verify every configured repository.
+///
+/// Confirms each repository is reachable, the stanza is initialized, and (when
+/// a cluster is configured) the live WAL archive path works. Iterates
+/// `repo_storages` and runs the existing [`run_check`] logic on each. All
+/// repositories are verified even if an earlier one fails — failures are
+/// aggregated into a single error mentioning every offending repository, so a
+/// multi-repo `check` reports the full picture in one pass. Mirrors the
+/// `repoIdxList` iteration the C `cmdCheck` performs.
 ///
 /// `pg_storage` is accepted for dispatch-signature compatibility.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`run_check`].
-pub fn check(config: &LoadedConfig, repo_storage: &dyn Storage, _pg_storage: &dyn Storage) -> Result<(), CommandError> {
-    let report = run_check(config, repo_storage)?;
-    // `check` emits no machine-readable result on stdout; the summary is
-    // human-facing progress, so it is routed through the `pgbr_core::log`
-    // formatter (INFO) via `log_info`, leaving stdout free for commands that
-    // produce structured data.
-    log_info(&format!(
-        "stanza '{}' check ok: db-version={} db-system-id={} repo-writable={} archive-id={} archive-ok={}",
-        report.stanza, report.db_version, report.db_system_id, report.repo_writable, report.archive_id, report.archive_ok
-    ));
-    if let Some(pg) = &report.pg {
-        log_info(&format!(
-            "  pg check ok: server-version-num={} system-id={} in-recovery={} wal-segment={} archive-wait-ok={}",
-            pg.server_version_num, pg.system_id, pg.in_recovery, pg.wal_segment, pg.archive_wait_ok
-        ));
+/// [`CommandError::Other`] when one or more repositories fail their check; the
+/// message lists the failing repository group indexes. Otherwise propagates
+/// nothing — per-repo errors are caught and aggregated rather than
+/// short-circuiting.
+pub fn check(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)], _pg_storage: &dyn Storage) -> Result<(), CommandError> {
+    if repo_storages.is_empty() {
+        return Err(CommandError::Other("check requires at least one repository".to_owned()));
     }
-    Ok(())
+
+    let mut failures: Vec<(u32, CommandError)> = Vec::new();
+    let stanza_label = config.stanza.clone().unwrap_or_else(|| "<no stanza>".to_owned());
+
+    for (group_index, repo_storage) in repo_storages {
+        match run_check(config, *repo_storage) {
+            Ok(report) => {
+                // `check` emits no machine-readable result on stdout; the summary is
+                // human-facing progress, so it is routed through the `pgbr_core::log`
+                // formatter (INFO) via `log_info`, leaving stdout free for commands that
+                // produce structured data. Each repo is prefixed with its group index so
+                // a multi-repo run is unambiguous.
+                log_info(&format!(
+                    "stanza '{}' check ok: repo={} db-version={} db-system-id={} repo-writable={} archive-id={} archive-ok={}",
+                    report.stanza,
+                    group_index,
+                    report.db_version,
+                    report.db_system_id,
+                    report.repo_writable,
+                    report.archive_id,
+                    report.archive_ok,
+                ));
+                if let Some(pg) = &report.pg {
+                    log_info(&format!(
+                        "  pg check ok: repo={} server-version-num={} system-id={} in-recovery={} wal-segment={} archive-wait-ok={}",
+                        group_index, pg.server_version_num, pg.system_id, pg.in_recovery, pg.wal_segment, pg.archive_wait_ok
+                    ));
+                }
+            }
+            Err(err) => {
+                log_info(&format!("stanza '{stanza_label}' check FAILED: repo={group_index}: {err}"));
+                failures.push((*group_index, err));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        log_info(&format!(
+            "stanza '{stanza_label}' check ok on all {} configured repositor{}",
+            repo_storages.len(),
+            if repo_storages.len() == 1 { "y" } else { "ies" },
+        ));
+        Ok(())
+    } else {
+        let indexes = failures.iter().map(|(idx, _)| idx.to_string()).collect::<Vec<_>>().join(", ");
+        Err(CommandError::Other(format!("check failed on repo(s): {indexes}")))
+    }
 }
 
 /// Emit a human-facing progress line at `INFO` through the `pgbr_core::log`
@@ -1669,6 +1712,111 @@ mod tests {
         let report = super::run_check(&cfg, &storage).expect("repo-side check should pass");
         assert!(report.pg.is_none(), "no DB configured -> pg checks skipped");
         assert!(report.archive_ok);
+    }
+
+    // ---- multi-repo entry point: iterates every configured repository -------
+
+    #[test]
+    fn check_single_repo_baseline() {
+        // Single-repo configuration: the entry point still goes through the
+        // same iteration, exercising the one-entry slice path. The check must
+        // pass and return Ok.
+        if std::env::var("DATABASE_URL").is_ok() {
+            return;
+        }
+        let (_dir, storage) = posix();
+        let (_pg_dir, pg_storage) = posix();
+        let system_id = 6_873_049_345_984_568_091;
+        seed_stanza(
+            &storage,
+            "demo",
+            &archive_info(system_id, "16"),
+            &backup_info(system_id, "16"),
+        );
+        let cfg = config_for(Some("demo"));
+        let repos: Vec<(u32, &dyn Storage)> = vec![(1, &storage)];
+        super::check(&cfg, &repos, &pg_storage).expect("single-repo check should succeed");
+    }
+
+    #[test]
+    fn check_multi_repo_all_valid() {
+        // Three repos all seeded with valid info files. The entry point must
+        // iterate every repository (not just the active / first one) and
+        // return Ok once all three pass.
+        if std::env::var("DATABASE_URL").is_ok() {
+            return;
+        }
+        let (_d1, r1) = posix();
+        let (_d2, r2) = posix();
+        let (_d3, r3) = posix();
+        let (_pg_dir, pg_storage) = posix();
+        let system_id = 6_873_049_345_984_568_091;
+        for storage in [&r1, &r2, &r3] {
+            seed_stanza(
+                storage as &dyn Storage,
+                "demo",
+                &archive_info(system_id, "16"),
+                &backup_info(system_id, "16"),
+            );
+        }
+        let cfg = config_for(Some("demo"));
+        let repos: Vec<(u32, &dyn Storage)> = vec![(1, &r1), (2, &r2), (3, &r3)];
+        super::check(&cfg, &repos, &pg_storage).expect("multi-repo check should succeed");
+    }
+
+    #[test]
+    fn check_multi_repo_partial_failure() {
+        // Three repos: repo 1 and repo 3 are valid; repo 2 is broken
+        // (archive.info corrupted into unparseable bytes). The entry point
+        // must still attempt every repository and aggregate the failure into
+        // an error that names repo 2 specifically.
+        if std::env::var("DATABASE_URL").is_ok() {
+            return;
+        }
+        let (_d1, r1) = posix();
+        let (_d2, r2) = posix();
+        let (_d3, r3) = posix();
+        let (_pg_dir, pg_storage) = posix();
+        let system_id = 6_873_049_345_984_568_091;
+        for storage in [&r1, &r3] {
+            seed_stanza(
+                storage as &dyn Storage,
+                "demo",
+                &archive_info(system_id, "16"),
+                &backup_info(system_id, "16"),
+            );
+        }
+        // Seed r2 so backup.info loads fine but archive.info is garbage —
+        // archive.info will fail to parse, surfacing the per-repo failure.
+        r2.create_path(Path::new("archive/demo"), true).expect("mkdir archive/demo");
+        r2.create_path(Path::new("backup/demo"), true).expect("mkdir backup/demo");
+        backup_info(system_id, "16")
+            .save(&r2, Path::new("backup/demo/backup.info"))
+            .expect("save backup.info");
+        {
+            let mut w = r2
+                .open_write(Path::new("archive/demo/archive.info"))
+                .expect("open archive.info");
+            w.write(b"not a valid archive.info file").expect("write garbage");
+            w.flush().expect("flush");
+            w.close().expect("close");
+        }
+
+        let cfg = config_for(Some("demo"));
+        let repos: Vec<(u32, &dyn Storage)> = vec![(1, &r1), (2, &r2), (3, &r3)];
+        let err = super::check(&cfg, &repos, &pg_storage).expect_err("repo 2 broken -> check fails");
+        match err {
+            CommandError::Other(msg) => {
+                assert!(
+                    msg.contains("check failed on repo(s)"),
+                    "expected aggregate failure message, got {msg:?}"
+                );
+                // The failing repo index appears in the post-colon list, while
+                // the valid ones (1 and 3) do not.
+                assert_eq!(msg, "check failed on repo(s): 2", "only repo 2 should be listed: {msg:?}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 
     // Live-PostgreSQL end-to-end check through the real ConnCheckDb path.
