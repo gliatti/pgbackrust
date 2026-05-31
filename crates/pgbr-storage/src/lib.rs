@@ -148,6 +148,38 @@ pub trait Storage: Send + Sync {
     /// Returns [`StorageError`] for permission / backend failures.
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError>;
 
+    /// Write `bytes` to `path` as a single all-or-nothing operation.
+    ///
+    /// On local filesystem backends (see [`Storage::is_local`]) this is a
+    /// crash-safe write: the bytes go to a sibling temporary path that is
+    /// fsync'd and then atomically renamed onto `path`, so a concurrent
+    /// reader (or a crash mid-write) never observes a half-written or
+    /// truncated primary. On remote/object-store backends the default
+    /// implementation falls back to a plain [`Storage::open_write`] +
+    /// `write_all` + `close`, which is not atomic from the local POSIX point
+    /// of view but is the strongest single-call guarantee the backend
+    /// offers.
+    ///
+    /// pgBackRest uses this for the small "info" files
+    /// (`archive.info`, `backup.info`, and their `.copy` mirrors) so a
+    /// process crash in the middle of `save_keyed` cannot leave the primary
+    /// truncated; the `.copy` mirror written first acts as a recoverable
+    /// fallback on the load side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] for permission / backend / I/O failures. On
+    /// backends that override this with a temp+rename, a failure during the
+    /// rename leaves the temp file in place; callers should treat the write
+    /// as failed and not assume any partial state.
+    fn write_atomic_path(&self, path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+        let mut writer = self.open_write(path)?;
+        writer.write(bytes)?;
+        writer.flush()?;
+        writer.close()?;
+        Ok(())
+    }
+
     /// Remove a file. When `error_on_missing` is `false`, a missing file is treated as success.
     ///
     /// # Errors

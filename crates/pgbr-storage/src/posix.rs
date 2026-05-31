@@ -74,6 +74,47 @@ fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
     }
 }
 
+/// Crash-safe local write: stream `bytes` to `<path>.tmp`, `fsync(2)` the
+/// data, then `rename(2)` onto `path`. `rename(2)` is atomic on POSIX, so a
+/// concurrent reader (or a crash before the rename completes) never observes
+/// a half-written or truncated primary file.
+///
+/// `path` must be the fully-resolved (root-joined) target path — this helper
+/// does no path resolution.
+///
+/// # Errors
+///
+/// Surfaces any backend / I/O failure from `create`, `write_all`, `sync_all`,
+/// or `rename` as a [`StorageError`]. On a rename failure the temp file is
+/// left in place (it carries the would-be-new content); callers should treat
+/// the write as failed and ignore the stale temp file (a subsequent
+/// successful write will replace it).
+pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    // Sibling temp path. We append `.tmp` to the file name (not a directory of
+    // its own) so it lives in the same directory as `path` and the rename
+    // crosses no filesystem boundary — `rename(2)` is only atomic within a
+    // single filesystem.
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+
+    // Best-effort cleanup of any leftover temp from a previous crashed write;
+    // a missing file is fine. We don't surface this error: if the create
+    // below fails for the same reason, we'll report that.
+    let _ = fs::remove_file(&tmp_path);
+
+    // Create + write + fsync.
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| map_io(&err, &tmp_path))?;
+        Write::write_all(&mut file, bytes).map_err(|err| map_io(&err, &tmp_path))?;
+        file.sync_all().map_err(|err| map_io(&err, &tmp_path))?;
+        // `file` is dropped here — closes the fd before the rename.
+    }
+
+    // Atomic publish.
+    fs::rename(&tmp_path, path).map_err(|err| map_io(&err, path))
+}
+
 fn info_from_metadata(path: PathBuf, meta: &fs::Metadata) -> StorageInfo {
     let kind = if meta.is_file() {
         StorageKind::File
@@ -144,6 +185,16 @@ impl Storage for Posix {
             file: Some(file),
             path: resolved,
         }))
+    }
+
+    /// Crash-safe write for the local filesystem: bytes are streamed to a
+    /// sibling `<path>.tmp` file, fsync'd to disk, and `std::fs::rename`d
+    /// onto `path`. On POSIX `rename(2)` is atomic across power loss within
+    /// the same directory, so a concurrent reader (or a crash mid-write)
+    /// never observes a half-written primary.
+    fn write_atomic_path(&self, path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+        let resolved = self.resolve(path);
+        write_atomic_local(&resolved, bytes)
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {

@@ -15,13 +15,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use pgbr_io::{IoRead, IoWrite};
+use pgbr_io::IoWrite;
 use pgbr_storage::Storage;
 
 use crate::InfoError;
 use crate::archive::{
-    DbHistoryEntry, bytes_to_text, decode_maybe_encrypted, encode_maybe_encrypted, json_string, parse_required_string,
-    parse_required_u32, parse_required_u64, strip_json_quotes, write_with_copy,
+    DbHistoryEntry, bytes_to_text, copy_path, decode_maybe_encrypted, encode_maybe_encrypted, json_string, log_copy_recovery,
+    parse_required_string, parse_required_u32, parse_required_u64, read_and_decode, strip_json_quotes, write_with_copy,
 };
 use crate::format::{self, BACKREST_SECTION, CIPHER_PASS_KEY, CIPHER_SECTION, InfoFile};
 
@@ -146,13 +146,30 @@ impl InfoBackup {
     /// repository is encrypted. Returns the wrapper and the recovered repo
     /// sub-key.
     ///
+    /// Crash-recovery fallback: if the primary fails to load (storage error,
+    /// parse error, or checksum mismatch), the sibling `<path>.copy` mirror
+    /// (written first by [`InfoBackup::save_keyed`]) is tried next. When the
+    /// `.copy` succeeds it is returned and a `WARN`-level line is logged
+    /// noting crash recovery was needed. When both fail, the primary's error
+    /// is propagated.
+    ///
     /// # Errors
     ///
     /// Storage / I/O / format failures as for [`InfoBackup::load`].
     pub fn load_keyed(storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<(Self, Option<String>), InfoError> {
-        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
-        let bytes = reader.read_all()?;
-        Self::from_bytes_keyed(&bytes, passphrase)
+        match read_and_decode(storage, path, passphrase, Self::from_bytes_keyed) {
+            Ok(value) => Ok(value),
+            Err(primary_err) => {
+                let copy = copy_path(path);
+                match read_and_decode(storage, &copy, passphrase, Self::from_bytes_keyed) {
+                    Ok(value) => {
+                        log_copy_recovery(path, &primary_err);
+                        Ok(value)
+                    }
+                    Err(_copy_err) => Err(primary_err),
+                }
+            }
+        }
     }
 
     /// Write `backup.info` (and its `.copy` mirror) to `path`, storing

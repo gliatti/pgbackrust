@@ -145,13 +145,31 @@ impl InfoArchive {
     /// repository is encrypted. Returns the wrapper and the recovered repo
     /// sub-key.
     ///
+    /// Crash-recovery fallback: if the primary fails to load (storage error,
+    /// parse error, or checksum mismatch — exactly the surface a half-written
+    /// or torn primary would present), the sibling `<path>.copy` mirror
+    /// (written first by [`InfoArchive::save_keyed`]) is tried next. When the
+    /// `.copy` succeeds it is returned and a `WARN`-level line is logged
+    /// noting that crash recovery was needed. When both fail, the primary's
+    /// error is propagated (so the user sees the actual root cause).
+    ///
     /// # Errors
     ///
     /// Storage / I/O / format failures as for [`InfoArchive::load`].
     pub fn load_keyed(storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<(Self, Option<String>), InfoError> {
-        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
-        let bytes = reader.read_all()?;
-        Self::from_bytes_keyed(&bytes, passphrase)
+        match read_and_decode(storage, path, passphrase, Self::from_bytes_keyed) {
+            Ok(value) => Ok(value),
+            Err(primary_err) => {
+                let copy = copy_path(path);
+                match read_and_decode(storage, &copy, passphrase, Self::from_bytes_keyed) {
+                    Ok(value) => {
+                        log_copy_recovery(path, &primary_err);
+                        Ok(value)
+                    }
+                    Err(_copy_err) => Err(primary_err),
+                }
+            }
+        }
     }
 
     /// Write `archive.info` (and its `.copy` mirror) to `path` via `storage`,
@@ -274,27 +292,76 @@ pub(crate) fn bytes_to_text(bytes: Vec<u8>) -> Result<String, InfoError> {
 /// Write `bytes` to `path` and to its `.copy` mirror, matching pgBackRest's
 /// `infoArchiveSaveFile` / `infoBackupSaveFile` (both files are written from
 /// the same buffer so they stay in lock-step).
+///
+/// Crash-safety ordering: the `.copy` mirror is written **first** and the
+/// primary **second**. Each write goes through
+/// [`Storage::write_atomic_path`], so on a local filesystem each individual
+/// file lands via a temp+rename and is never observed half-written. The
+/// "copy first" order guarantees that a crash between the two writes leaves
+/// a fresh `.copy` (whatever the new state is) and a stale primary — and the
+/// load-side fallback in [`InfoArchive::load_keyed`] /
+/// [`crate::InfoBackup::load_keyed`] picks up the `.copy` when the primary
+/// fails to parse / checksum, so the new state is still recoverable.
 pub(crate) fn write_with_copy(storage: &dyn Storage, path: &Path, bytes: &[u8]) -> Result<(), InfoError> {
-    write_one(storage, path, bytes)?;
-    let copy_path = copy_path(path);
-    write_one(storage, &copy_path, bytes)?;
+    let copy = copy_path(path);
+    storage.write_atomic_path(&copy, bytes)?;
+    storage.write_atomic_path(path, bytes)?;
     Ok(())
 }
 
 /// The `<name>.copy` sibling path for an info file.
-fn copy_path(path: &Path) -> std::path::PathBuf {
+pub(crate) fn copy_path(path: &Path) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".copy");
     std::path::PathBuf::from(s)
 }
 
-/// Write a single info file's bytes via `storage`.
-fn write_one(storage: &dyn Storage, path: &Path, bytes: &[u8]) -> Result<(), InfoError> {
-    let mut writer: Box<dyn IoWrite> = storage.open_write(path)?;
-    writer.write(bytes)?;
-    writer.flush()?;
-    writer.close()?;
-    Ok(())
+/// Open `path` for reading, slurp the whole file, and hand the bytes to
+/// `decode`. Shared between [`InfoArchive::load_keyed`] and
+/// [`crate::InfoBackup::load_keyed`] (and their primary-then-`.copy`
+/// fallback) so the same I/O + parse failure surface gates both attempts.
+pub(crate) fn read_and_decode<T>(
+    storage: &dyn Storage,
+    path: &Path,
+    passphrase: Option<&str>,
+    decode: impl FnOnce(&[u8], Option<&str>) -> Result<T, InfoError>,
+) -> Result<T, InfoError> {
+    let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
+    let bytes = reader.read_all()?;
+    decode(&bytes, passphrase)
+}
+
+/// Process-global counter incremented every time [`log_copy_recovery`] fires.
+/// Test-only: the production code uses it as a side-channel observation point
+/// so the crash-recovery tests can confirm the warning fired without having
+/// to capture `stderr` (which is awkward to do portably from within a
+/// `cargo test` harness).
+#[cfg(test)]
+pub(crate) static COPY_RECOVERY_WARNINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Emit a `WARN` line stating that the `.copy` mirror was used because the
+/// primary failed. Best-effort: a formatter / write failure is intentionally
+/// swallowed so a successful crash-recovery load is never downgraded to an
+/// error just because the log pipe is gone.
+///
+/// `pgbr-info` does not pull in `pgbr-core` for logging, so this writes
+/// directly to `stderr` — pgBackRest's `LOG_WARN` lines surface the same way
+/// (the in-process logger fans out to whichever sinks `logInit` has open,
+/// stderr being one).
+pub(crate) fn log_copy_recovery(path: &Path, err: &InfoError) {
+    // `clippy::print_stderr` would flag a bare `eprintln!`; this helper is the
+    // single chokepoint for the warning so the allow is local to it.
+    #[allow(clippy::print_stderr)]
+    {
+        eprintln!(
+            "WARN: {} could not be loaded ({err}); using the .copy fallback (crash-recovery)",
+            path.display()
+        );
+    }
+    #[cfg(test)]
+    {
+        COPY_RECOVERY_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Strip surrounding double quotes from a JSON-string-encoded value. Returns the input
@@ -454,5 +521,177 @@ mod tests {
         let (reloaded, sub) = InfoArchive::load_keyed(&storage, path, None).unwrap();
         assert_eq!(reloaded, archive);
         assert_eq!(sub, None);
+    }
+
+    /// Tracing wrapper that records every [`Storage`] method invocation,
+    /// delegating the work to a wrapped [`Posix`] backend. Lets the crash-
+    /// safety tests assert that `write_with_copy` reaches the atomic path
+    /// rather than `open_write` (which would not be crash-safe).
+    struct TracingStorage {
+        inner: pgbr_storage::Posix,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TracingStorage {
+        fn new(root: impl Into<std::path::PathBuf>) -> Self {
+            Self {
+                inner: pgbr_storage::Posix::new(root),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl pgbr_storage::Storage for TracingStorage {
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, pgbr_storage::StorageError> {
+            self.record(format!("open_read:{}", path.display()));
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, pgbr_storage::StorageError> {
+            self.record(format!("open_write:{}", path.display()));
+            self.inner.open_write(path)
+        }
+
+        fn write_atomic_path(&self, path: &Path, bytes: &[u8]) -> Result<(), pgbr_storage::StorageError> {
+            self.record(format!("write_atomic_path:{}", path.display()));
+            self.inner.write_atomic_path(path, bytes)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    #[test]
+    fn write_with_copy_uses_atomic_rename() {
+        // The trait-level guarantee: `write_with_copy` routes both the `.copy`
+        // and the primary through `Storage::write_atomic_path`, never through
+        // the non-atomic `open_write` truncating fast path. The `.copy` is
+        // written first so a crash between the two leaves a recoverable copy
+        // (asserted in `load_keyed_falls_back_to_copy_on_primary_corruption`).
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TracingStorage::new(dir.path());
+        storage.create_path(Path::new("archive/demo"), true).unwrap();
+
+        let archive = sample();
+        let path = Path::new("archive/demo/archive.info");
+        archive.save_keyed(&storage, path, None, None).unwrap();
+
+        let calls = storage.calls();
+        let writes: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.starts_with("write_atomic_path:") || c.starts_with("open_write:"))
+            .collect();
+
+        // Exactly two writes, both atomic, with the .copy first.
+        assert_eq!(writes.len(), 2, "two info writes expected, got {writes:?}");
+        assert!(
+            writes[0].starts_with("write_atomic_path:") && writes[0].ends_with("archive.info.copy"),
+            ".copy mirror must be written first via the atomic path; got {writes:?}"
+        );
+        assert!(
+            writes[1].starts_with("write_atomic_path:") && writes[1].ends_with("archive.info"),
+            "primary must be written second via the atomic path; got {writes:?}"
+        );
+
+        // The Posix backend's atomic path uses a temp+rename, so no .tmp
+        // stragglers must be left after a clean save.
+        assert!(
+            !dir.path().join("archive/demo/archive.info.tmp").exists(),
+            "primary temp file must be renamed away"
+        );
+        assert!(
+            !dir.path().join("archive/demo/archive.info.copy.tmp").exists(),
+            ".copy temp file must be renamed away"
+        );
+    }
+
+    #[test]
+    fn load_keyed_falls_back_to_copy_on_primary_corruption() {
+        // Simulate the "crash between the .copy write and the primary write"
+        // outcome: the .copy carries the new, valid bytes, and the primary
+        // carries garbage left over from a half-finished write. `load_keyed`
+        // must transparently recover via the .copy and warn the operator.
+        use pgbr_storage::Posix;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Posix::new(dir.path());
+
+        let archive = sample();
+        let path = Path::new("archive/demo/archive.info");
+        storage.create_path(Path::new("archive/demo"), true).unwrap();
+
+        // Lay down a healthy pair, then corrupt only the primary.
+        archive.save_keyed(&storage, path, None, None).unwrap();
+        std::fs::write(dir.path().join("archive/demo/archive.info"), b"NOT A VALID INFO FILE\n").unwrap();
+
+        // Snapshot the warning counter to observe a `log_copy_recovery` call
+        // without trying to capture stderr (which is awkward to do portably
+        // from a `cargo test` harness; the stderr text itself remains the
+        // operator-facing signal in production).
+        let before = COPY_RECOVERY_WARNINGS.load(std::sync::atomic::Ordering::Relaxed);
+        let (reloaded, sub) = InfoArchive::load_keyed(&storage, path, None).unwrap();
+        let after = COPY_RECOVERY_WARNINGS.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(reloaded, archive, "value recovered from .copy fallback");
+        assert_eq!(sub, None);
+        assert!(after > before, "crash-recovery warning must have fired");
+    }
+
+    #[test]
+    fn load_keyed_propagates_when_both_fail() {
+        // When both the primary and the .copy fail to load, the primary's
+        // error is the one surfaced (it's the file the operator originally
+        // asked for). The .copy failure is intentionally swallowed — the
+        // operator doesn't need a noisy multi-error report; the primary's
+        // diagnostic is what they'll act on.
+        use pgbr_storage::Posix;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Posix::new(dir.path());
+
+        let path = Path::new("archive/demo/archive.info");
+        storage.create_path(Path::new("archive/demo"), true).unwrap();
+        std::fs::write(dir.path().join("archive/demo/archive.info"), b"NOT VALID 1\n").unwrap();
+        std::fs::write(dir.path().join("archive/demo/archive.info.copy"), b"NOT VALID 2\n").unwrap();
+
+        let err = InfoArchive::load_keyed(&storage, path, None).unwrap_err();
+        // The primary's error is what gets propagated; the exact variant
+        // depends on the parse stage but it MUST be the primary one (the
+        // checksum on "NOT VALID 1" can never match the format-required line).
+        assert!(
+            matches!(err, InfoError::Format(_)),
+            "expected primary's format error, got {err:?}"
+        );
     }
 }
