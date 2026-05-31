@@ -110,10 +110,6 @@ repo1-path=/var/lib/pgbackrest
 log-level-console=info
 log-level-file=detail
 log-path=/var/log/pgbackrest
-# archive-async hits a pre-existing async-worker hang in this Rust port:
-# sync mode drives the same TLS server transport without that hand-off so
-# the TLS scenario stays focused on the transport here.
-archive-async=n
 
 [demo]
 pg1-path=$PRI
@@ -123,18 +119,37 @@ sudo chmod 0644 /etc/pgbackrest/pgbackrest.conf
 sudo install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest
 " 2>&1 | grep -vE 'Connection to' | tail -3
 
-echo "=== start pgbackrest server daemon on depot (host-side background ssh) ==="
-# Detaching a daemon via setsid/nohup through `vagrant ssh -c` proved fragile
-# (ssh tty interaction kills it / swallows output). Instead, keep an ssh session
-# alive on the host for the daemon's lifetime: foreground pgbackrest server on
-# depot, but background the entire ssh on the host. Capture its PID so we can
-# kill the ssh (which kills the daemon) at scenario end.
-vagrant ssh depot -c "sudo fuser -k -TERM -n tcp 8432 2>/dev/null; sleep 1; sudo fuser -k -KILL -n tcp 8432 2>/dev/null; true" >/dev/null 2>&1
-nohup vagrant ssh depot -c "sudo -u postgres /usr/bin/pgbackrest server" >/tmp/pgbr-srv-host.log 2>&1 &
-SRV_SSH_PID=$!
-sleep 6
-echo "  host ssh pid: $SRV_SSH_PID"
-timeout 30 vagrant ssh depot -c "ps -eo pid,cmd | grep '[p]gbackrest server' | head; sudo ss -ltnp 2>/dev/null | grep 8432 | head" 2>&1 | grep -vE 'Connection to' | head -5
+echo "=== start pgbackrest server daemon on depot (systemd transient unit) ==="
+# Daemon lifecycle delegated to systemd as a transient unit. `systemctl stop`
+# is reliable + idempotent + kills the full cgroup, so we never end up with
+# a stale daemon holding stale certs across test cycles (which was the
+# BadSignature root cause). We also verify the port is actually free before
+# starting and after stopping, failing loudly if not.
+timeout 30 vagrant ssh depot -c "sudo systemctl stop pgbr-tls-test.service 2>/dev/null; sudo systemctl reset-failed pgbr-tls-test.service 2>/dev/null; true" >/dev/null 2>&1
+timeout 30 vagrant ssh depot -c "
+  for _ in \$(seq 1 30); do
+    sudo ss -ltnp 2>/dev/null | grep -q ':8432 ' || { echo 'port 8432 free'; exit 0; }
+    sleep 0.5
+  done
+  echo 'ERROR: port 8432 still bound after stop' >&2
+  sudo ss -ltnp | grep 8432 >&2
+  exit 1
+" 2>&1 | grep -vE 'Connection to'
+# systemd-run with --unit creates a transient service unit running as postgres.
+# StandardOutput=append:<file> captures logs to a known location on depot. The
+# wait pattern below confirms the daemon is actually listening before tests run.
+timeout 30 vagrant ssh depot -c "sudo systemd-run --unit=pgbr-tls-test --uid=postgres --gid=postgres \
+  --property=StandardOutput=append:/tmp/pgbr-srv-host.log \
+  --property=StandardError=append:/tmp/pgbr-srv-host.log \
+  /usr/bin/pgbackrest server" 2>&1 | grep -vE 'Connection to'
+timeout 30 vagrant ssh depot -c "
+  for _ in \$(seq 1 30); do
+    sudo ss -ltnp 2>/dev/null | grep -q ':8432 ' && break
+    sleep 0.5
+  done
+  sudo ss -ltnp 2>/dev/null | grep ':8432' | head
+  ps -eo pid,cmd | grep '[p]gbackrest server' | head
+" 2>&1 | grep -vE 'Connection to' | head -5
 
 echo "=== from principal: stanza-create over TLS ==="
 out=$(timeout 60 vagrant ssh principal -c "sudo -u postgres pgbackrest --stanza=demo stanza-create 2>&1")
@@ -159,11 +174,19 @@ printf '%s\n' "$out" | grep -vE 'Connection to' | tail -5
 [ "$rc" = "0" ] || fails=$((fails+1))
 
 echo "=== stop daemon + cleanup ==="
-# Kill the host-side ssh that's keeping the daemon alive, then clean up any
-# stray daemon on depot.
-kill "$SRV_SSH_PID" 2>/dev/null || true
-sleep 1
-timeout 30 vagrant ssh depot -c "sudo fuser -k -TERM -n tcp 8432 2>/dev/null; sleep 1; sudo fuser -k -KILL -n tcp 8432 2>/dev/null; true" 2>&1 | grep -vE 'Connection to'
+# Stop the transient unit. systemctl tears down the full cgroup so no
+# pgbackrest worker children survive. Verify the port is actually free.
+timeout 30 vagrant ssh depot -c "
+  sudo systemctl stop pgbr-tls-test.service 2>/dev/null || true
+  sudo systemctl reset-failed pgbr-tls-test.service 2>/dev/null || true
+  for _ in \$(seq 1 20); do
+    sudo ss -ltnp 2>/dev/null | grep -q ':8432 ' || { echo 'port 8432 released'; exit 0; }
+    sleep 0.5
+  done
+  echo 'ERROR: port 8432 still bound after systemctl stop' >&2
+  sudo ss -ltnp | grep 8432 >&2
+  exit 1
+" 2>&1 | grep -vE 'Connection to'
 rm -rf "$TMPD"
 
 echo "TLS_SERVER_FAILS=$fails"
