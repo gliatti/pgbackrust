@@ -63,14 +63,136 @@
 //!   differs (we always remove leaf files, never whole prefix dirs, except
 //!   for a fully-unreferenced archive-id which is dropped wholesale).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::{InfoArchive, InfoBackup, InfoError};
+use pgbr_protocol::message::{OkResponse, Request, Response};
+use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageError, StorageKind};
+use serde_json::json;
 
 use crate::CommandError;
 use crate::backup::acquire_command_lock;
+
+/// Number of parallel delete workers, from the resolved `process-max` option.
+///
+/// Mirrors [`crate::verify::process_max`] / [`crate::backup::process_max`]:
+/// `process-max` is an `Integer` (default 1). Values `<= 0` clamp to one worker
+/// so the expire pass always makes progress; the dispatcher additionally caps the
+/// thread count at the number of pending deletes.
+fn process_max(config: &LoadedConfig) -> usize {
+    match config.options.get(&("process-max".to_owned(), None)) {
+        Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// Resolve the local repository filesystem root for the active repo group, when
+/// the resolved `repo-path` option is present. Returns `None` if the option is
+/// missing or empty (which would force the caller back onto the serial
+/// `Storage::remove*` path). Mirrors how grouped `repo-path` is stored under
+/// `(name, Some(repo_index))` by [`pgbr_config::merge`].
+fn local_repo_root(config: &LoadedConfig, repo_index: u32) -> Option<PathBuf> {
+    let opt = config
+        .options
+        .get(&("repo-path".to_owned(), Some(repo_index)))
+        .or_else(|| config.options.get(&("repo-path".to_owned(), None)))?;
+    match opt {
+        OptionValue::Path(s) | OptionValue::String(s) if !s.is_empty() => Some(PathBuf::from(s)),
+        _ => None,
+    }
+}
+
+/// Dispatch every absolute path in `abs_paths` to the parallel executor and
+/// `std::fs::remove_dir_all` it in a worker thread. A `NotFound` error from
+/// `remove_dir_all` is treated as success so the pass remains idempotent across
+/// concurrent / repeated invocations. `key_of` builds the dispatcher key (used
+/// only to identify which job failed in the error path); the parent
+/// surfaces the first failure as a [`CommandError::Other`].
+fn parallel_remove_dirs(worker_count: usize, jobs: Vec<(String, PathBuf)>) -> Result<(), CommandError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let dispatcher_jobs: Vec<Job> = jobs
+        .into_iter()
+        .map(|(key, abs)| Job {
+            key,
+            request: Request {
+                cmd: "remove_dir_all".to_owned(),
+                param: vec![json!(abs.to_string_lossy())],
+            },
+        })
+        .collect();
+    let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
+        let abs = request
+            .param
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "remove_dir_all: missing path".to_owned())?;
+        match std::fs::remove_dir_all(abs) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove_dir_all {abs}: {err}")),
+        }
+        Ok(Response::Ok(OkResponse { out: None }))
+    });
+    for jr in results {
+        if let Err(message) = jr.result {
+            return Err(CommandError::Other(format!("remove {} failed: {message}", jr.key)));
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch every absolute path in `jobs` to the parallel executor and
+/// `std::fs::remove_file` it in a worker thread. Like
+/// [`parallel_remove_dirs`], `NotFound` is treated as success and the first
+/// failure surfaces as a [`CommandError::Other`].
+fn parallel_remove_files(worker_count: usize, jobs: Vec<(String, PathBuf)>) -> Result<(), CommandError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let dispatcher_jobs: Vec<Job> = jobs
+        .into_iter()
+        .map(|(key, abs)| Job {
+            key,
+            request: Request {
+                cmd: "remove_file".to_owned(),
+                param: vec![json!(abs.to_string_lossy())],
+            },
+        })
+        .collect();
+    let results = ParallelExecutor::new(worker_count).run(dispatcher_jobs, move |request| {
+        let abs = request
+            .param
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "remove_file: missing path".to_owned())?;
+        match std::fs::remove_file(abs) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove_file {abs}: {err}")),
+        }
+        Ok(Response::Ok(OkResponse { out: None }))
+    });
+    for jr in results {
+        if let Err(message) = jr.result {
+            return Err(CommandError::Other(format!("remove {} failed: {message}", jr.key)));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a storage-relative path against `local_root`. Absolute paths are
+/// returned verbatim (mirroring [`pgbr_storage::Posix::resolve`]).
+fn resolve_under_root(local_root: &Path, rel: &Path) -> PathBuf {
+    if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        local_root.join(rel)
+    }
+}
 
 /// An archive-id paired with whether it is the *current* cluster.
 type ArchiveIdMarked = (String, bool);
@@ -285,7 +407,22 @@ fn remaining_full_count(current: &std::collections::BTreeMap<String, serde_json:
 /// not rewritten — the labels are still dropped from the in-memory `info` so the
 /// downstream archive-retention plan is computed against the would-be-surviving
 /// set, but nothing is persisted. Each would-be removal is logged.
+///
+/// When the repository is local (`Storage::is_local()`), `process-max > 1`, and
+/// this is not a dry-run, the per-label `std::fs::remove_dir_all` calls run in
+/// parallel through [`ParallelExecutor`] — recursively deleting a backup tree is
+/// dominated by inode I/O, so fanning the work across worker threads gives a
+/// near-linear speed-up on local filesystems. The serial `Storage::remove_path`
+/// path is kept for remote backends (S3, Azure, GCS, SFTP), where the
+/// `std::fs` fast path would either touch the wrong machine entirely or simply
+/// find nothing; the dispatcher cannot route a `&dyn Storage` across the worker
+/// boundary because the worker closure must be `Send + Sync + 'static` (a raw
+/// `&dyn Storage` borrow leaks the stack frame), so the parallel branch is
+/// inherently `Posix`-only. Dry-run also stays serial: it never touches the
+/// filesystem, so parallelisation would buy nothing but jumbled log lines.
+#[allow(clippy::too_many_arguments)]
 fn remove_backups(
+    config: &LoadedConfig,
     repo: &dyn Storage,
     stanza: &str,
     info: &mut InfoBackup,
@@ -294,21 +431,53 @@ fn remove_backups(
     user_pass: Option<&str>,
     recorded_sub: Option<&str>,
 ) -> Result<(), CommandError> {
-    for label in labels {
-        if dry_run {
+    let workers = process_max(config);
+    let repo_index = crate::cipher::active_repo_index(config);
+
+    if dry_run {
+        for label in labels {
             log_info(&format!("[DRY-RUN] would remove backup {label}"));
-        } else {
+            info.current.remove(label);
+        }
+        return Ok(());
+    }
+
+    // Local + parallel fast path: build absolute paths once and fan the
+    // `remove_dir_all` calls across worker threads. The `repo-path` lookup
+    // produces the same root the `Posix` backend was constructed with, so the
+    // composed absolute paths line up with what the serial branch would have
+    // hit through `Storage::remove_path`.
+    if labels.is_empty() {
+        return Ok(());
+    }
+
+    if repo.is_local()
+        && workers > 1
+        && let Some(local_root) = local_repo_root(config, repo_index)
+    {
+        let jobs: Vec<(String, PathBuf)> = labels
+            .iter()
+            .map(|label| {
+                let rel = PathBuf::from(format!("backup/{stanza}/{label}"));
+                (label.clone(), resolve_under_root(&local_root, &rel))
+            })
+            .collect();
+        parallel_remove_dirs(workers, jobs)?;
+        for label in labels {
+            info.current.remove(label);
+        }
+    } else {
+        for label in labels {
             let path = PathBuf::from(format!("backup/{stanza}/{label}"));
             match repo.remove_path(&path, true, false) {
                 Ok(()) | Err(StorageError::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
+            info.current.remove(label);
         }
-        info.current.remove(label);
     }
-    if !labels.is_empty() && !dry_run {
-        save_backup_info(repo, stanza, info, user_pass, recorded_sub)?;
-    }
+
+    save_backup_info(repo, stanza, info, user_pass, recorded_sub)?;
     Ok(())
 }
 
@@ -331,6 +500,7 @@ fn archive_expire_tail(
         || Ok(Vec::new()),
         |keep_archive| {
             expire_archive(
+                config,
                 repo,
                 stanza,
                 keep_archive,
@@ -381,7 +551,7 @@ fn expire_adhoc_set(
     }
 
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
+    remove_backups(config, repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
     let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run, user_pass)?;
     Ok(ExpireSummary {
         expired_labels: expire,
@@ -427,7 +597,7 @@ fn expire_adhoc_oldest(
 
     let expire = dependent_closure(&info.current, std::slice::from_ref(&oldest_full));
     let kept_labels: Vec<String> = info.current.keys().filter(|l| !expire.contains(*l)).cloned().collect();
-    remove_backups(repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
+    remove_backups(config, repo, stanza, info, &expire, dry_run, user_pass, recorded_sub)?;
     let expired_archive_segments = archive_expire_tail(config, repo, stanza, info, dry_run, user_pass)?;
     Ok(ExpireSummary {
         expired_labels: expire,
@@ -998,8 +1168,15 @@ fn load_archive_ids(
 /// layout, falling back to a flat-layout cutoff for loose WAL files that
 /// sit directly under `archive/<stanza>/` (the current [`crate::archive`]
 /// push layout). Returns the removed base segment names in ascending order.
+///
+/// On a local repository with `process-max > 1`, leaf-file deletions are
+/// fanned across worker threads via [`ParallelExecutor`] (see
+/// [`remove_wal_under`] and the flat-layout branch below); remote backends
+/// continue through the serial `Storage::remove` path because the worker
+/// closure cannot capture a `&dyn Storage` without leaking the stack frame.
 #[allow(clippy::too_many_arguments)]
 fn expire_archive(
+    config: &LoadedConfig,
     repo: &dyn Storage,
     stanza: &str,
     keep_archive: u32,
@@ -1009,6 +1186,13 @@ fn expire_archive(
     dry_run: bool,
     user_pass: Option<&str>,
 ) -> Result<Vec<String>, CommandError> {
+    let workers = process_max(config);
+    let repo_index = crate::cipher::active_repo_index(config);
+    let local_root = if repo.is_local() && workers > 1 {
+        local_repo_root(config, repo_index)
+    } else {
+        None
+    };
     let archive_root = PathBuf::from(format!("archive/{stanza}"));
 
     // List the archive root. A missing directory means no WAL pushed yet.
@@ -1081,34 +1265,99 @@ fn expire_archive(
             if plan.skip_expiry {
                 continue;
             }
-            remove_wal_under(repo, &id_dir, plan, &mut removed, dry_run)?;
+            remove_wal_under(repo, &id_dir, plan, &mut removed, dry_run, workers, local_root.as_deref())?;
         }
     }
 
     // (B) Legacy flat layout — loose WAL files directly under the root.
-    if !loose_files.is_empty()
-        && let Some(cutoff) = flat_cutoff(keep_archive, kept_anchor_oldest_first)
-    {
-        for file_name in loose_files {
-            let base = strip_compress_suffix(&file_name);
-            if base < cutoff.as_str() {
-                if dry_run {
-                    log_info(&format!("[DRY-RUN] would remove WAL segment {base}"));
-                } else {
-                    let path = archive_root.join(&file_name);
-                    match repo.remove(&path, false) {
-                        Ok(()) | Err(StorageError::NotFound { .. }) => {}
-                        Err(err) => return Err(err.into()),
-                    }
-                }
-                removed.push(base.to_owned());
-            }
-        }
-    }
+    expire_flat_layout(
+        repo,
+        &archive_root,
+        &loose_files,
+        keep_archive,
+        kept_anchor_oldest_first,
+        dry_run,
+        workers,
+        local_root.as_deref(),
+        &mut removed,
+    )?;
 
     removed.sort();
     removed.dedup();
     Ok(removed)
+}
+
+/// Flat-layout (legacy) WAL expiry: walk `loose_files`, drop everything whose
+/// base name sorts before the global flat cutoff, and append the removed base
+/// names to `removed`. The parallel branch (`local_root = Some`, `workers > 1`)
+/// fans the `std::fs::remove_file` calls across worker threads via
+/// [`parallel_remove_files`]; the dry-run and remote branches stay on the
+/// existing single-threaded paths. Mirrors the per-archive-id parallelisation
+/// in [`remove_wal_under`].
+#[allow(clippy::too_many_arguments)]
+fn expire_flat_layout(
+    repo: &dyn Storage,
+    archive_root: &Path,
+    loose_files: &[String],
+    keep_archive: u32,
+    kept_anchor_oldest_first: &[serde_json::Value],
+    dry_run: bool,
+    workers: usize,
+    local_root: Option<&Path>,
+    removed: &mut Vec<String>,
+) -> Result<(), CommandError> {
+    if loose_files.is_empty() {
+        return Ok(());
+    }
+    let Some(cutoff) = flat_cutoff(keep_archive, kept_anchor_oldest_first) else {
+        return Ok(());
+    };
+
+    let to_remove: Vec<&String> = loose_files
+        .iter()
+        .filter(|file_name| strip_compress_suffix(file_name) < cutoff.as_str())
+        .collect();
+
+    if to_remove.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for file_name in &to_remove {
+            let base = strip_compress_suffix(file_name);
+            log_info(&format!("[DRY-RUN] would remove WAL segment {base}"));
+            removed.push(base.to_owned());
+        }
+        return Ok(());
+    }
+
+    if let Some(root) = local_root
+        && workers > 1
+    {
+        let jobs: Vec<(String, PathBuf)> = to_remove
+            .iter()
+            .map(|file_name| {
+                let base = strip_compress_suffix(file_name).to_owned();
+                let abs = resolve_under_root(root, &archive_root.join(file_name));
+                (base, abs)
+            })
+            .collect();
+        parallel_remove_files(workers, jobs)?;
+        for file_name in &to_remove {
+            removed.push(strip_compress_suffix(file_name).to_owned());
+        }
+    } else {
+        for file_name in &to_remove {
+            let base = strip_compress_suffix(file_name);
+            let path = archive_root.join(file_name);
+            match repo.remove(&path, false) {
+                Ok(()) | Err(StorageError::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+            removed.push(base.to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// The flat-layout cutoff: the `backup-archive-start` of the Nth-most-recent
@@ -1127,43 +1376,81 @@ fn flat_cutoff(keep_archive: u32, kept_anchor_oldest_first: &[serde_json::Value]
 /// every segment not covered by `plan.ranges`. History (`.history`) files
 /// are expired by timeline against `plan.history_timeline`. Appends removed
 /// base segment names to `removed`.
+///
+/// On a local repository (`local_root = Some(_)`, set by [`expire_archive`]
+/// when `repo.is_local() && process-max > 1`) the per-leaf deletes are
+/// dispatched to [`ParallelExecutor`] for a parallel `std::fs::remove_file`
+/// sweep. Dry-run and remote-backend passes stay on the serial
+/// [`remove_leaf`] path so they keep their existing semantics
+/// (`Storage::remove` round-trips, single-threaded log ordering).
 fn remove_wal_under(
     repo: &dyn Storage,
     id_dir: &std::path::Path,
     plan: &ArchiveIdPlan,
     removed: &mut Vec<String>,
     dry_run: bool,
+    workers: usize,
+    local_root: Option<&Path>,
 ) -> Result<(), CommandError> {
     let mut leaves: Vec<PathBuf> = Vec::new();
     collect_files(repo, id_dir, &mut leaves)?;
 
+    // Filter the listed leaves into the actual delete set, mirroring the serial
+    // logic verbatim: history files below the retention timeline plus WAL
+    // segments outside any kept range.
+    let mut victims: Vec<(PathBuf, String)> = Vec::new();
     for leaf in leaves {
         let Some(name) = leaf.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         let base = strip_compress_suffix(name);
 
-        // History files: expire those below the retention timeline.
         if let Some(timeline) = base.strip_suffix(".history") {
             if let Some(keep_below) = plan.history_timeline.as_deref()
                 && timeline.len() >= 8
                 && &timeline[0..8] < keep_below
             {
-                remove_leaf(repo, &leaf, base, dry_run)?;
-                removed.push(base.to_owned());
+                victims.push((leaf.clone(), base.to_owned()));
             }
             continue;
         }
 
-        // Only WAL-segment-shaped names participate in range filtering;
-        // anything else (e.g. backup-history sidecar files) is left alone.
         if !looks_like_wal_segment(base) {
             continue;
         }
 
         if !segment_in_ranges(base, &plan.ranges) {
-            remove_leaf(repo, &leaf, base, dry_run)?;
-            removed.push(base.to_owned());
+            victims.push((leaf.clone(), base.to_owned()));
+        }
+    }
+
+    if victims.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for (_, base) in &victims {
+            log_info(&format!("[DRY-RUN] would remove WAL segment {base}"));
+            removed.push(base.clone());
+        }
+        return Ok(());
+    }
+
+    if let Some(root) = local_root
+        && workers > 1
+    {
+        let jobs: Vec<(String, PathBuf)> = victims
+            .iter()
+            .map(|(leaf, base)| (base.clone(), resolve_under_root(root, leaf)))
+            .collect();
+        parallel_remove_files(workers, jobs)?;
+        for (_, base) in &victims {
+            removed.push(base.clone());
+        }
+    } else {
+        for (leaf, base) in &victims {
+            remove_leaf(repo, leaf, base, dry_run)?;
+            removed.push(base.clone());
         }
     }
     Ok(())
@@ -1336,13 +1623,23 @@ pub fn expire_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<ExpireS
     // the rewritten backup.info (both skipped in --dry-run, which only logs the
     // plan and drops the labels from the in-memory `info` so archive retention is
     // computed against the would-be-surviving set).
-    remove_backups(repo, stanza, &mut info, &expired_labels, dry_run, user_pass, recorded_sub)?;
+    remove_backups(
+        config,
+        repo,
+        stanza,
+        &mut info,
+        &expired_labels,
+        dry_run,
+        user_pass,
+        recorded_sub,
+    )?;
 
     // Archive retention runs after backups are expired, counted against
     // the anchor backups that survived (in `kept_labels`, oldest first).
     let kept_anchor_oldest_first = anchor_backups_oldest_first(&info, &kept_labels, archive_type);
     let expired_archive_segments = match retention_archive(config, repo_index)? {
         Some(keep_archive) => expire_archive(
+            config,
             repo,
             stanza,
             keep_archive,
@@ -1453,6 +1750,7 @@ fn expire_keep_all_backups(
     let kept_anchor_oldest_first = anchor_backups_oldest_first(info, &kept_labels, archive_type);
     let expired_archive_segments = match retention_archive(config, repo_index)? {
         Some(keep_archive) => expire_archive(
+            config,
             repo,
             stanza,
             keep_archive,
@@ -3180,5 +3478,259 @@ mod tests {
         assert_eq!(plan.archive_id, "14-1");
         assert!(!plan.drop_all);
         assert_eq!(plan.ranges.len(), 1);
+    }
+
+    /// Build a `LoadedConfig` for the parallel-deletion tests: carries the
+    /// `repo-retention-full` / `repo-retention-archive` options used by
+    /// `expire_inner` plus a `process-max` setting that flips the
+    /// `remove_backups` / `remove_wal_under` parallel branch on, and a
+    /// `repo-path` so [`local_repo_root`] resolves to the test repo's root
+    /// (otherwise the parallel branch falls back to the serial
+    /// `Storage::remove*` path even when the storage is local).
+    fn cfg_parallel(stanza: Option<&str>, retention_full: Option<i64>, repo_path: &Path, process_max: i64) -> LoadedConfig {
+        let mut cfg = cfg(stanza, retention_full);
+        cfg.options
+            .insert(("process-max".to_owned(), None), OptionValue::Integer(process_max));
+        cfg.options.insert(
+            ("repo-path".to_owned(), Some(1)),
+            OptionValue::Path(repo_path.to_string_lossy().into_owned()),
+        );
+        cfg
+    }
+
+    /// A [`Storage`] adapter that delegates to a wrapped [`Posix`] but reports
+    /// `is_local() = false`, forcing the expire parallel branch back onto the
+    /// serial `Storage::remove*` path. Mirrors the `NonLocalMock` in
+    /// `verify.rs`.
+    struct NonLocalMock {
+        inner: Posix,
+    }
+
+    impl Storage for NonLocalMock {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    /// Local + `process-max > 1`: every backup directory in `labels` is
+    /// removed in parallel via `std::fs::remove_dir_all`, and the labels are
+    /// dropped from `backup.info`.
+    #[test]
+    fn remove_backups_parallel_local() {
+        let (dir, repo) = empty_repo();
+        let stanza = "demo";
+
+        seed_backup_info(
+            &repo,
+            stanza,
+            &[
+                ("20240101-120000F", 1000, "full"),
+                ("20240102-120000F", 2000, "full"),
+                ("20240103-120000F", 3000, "full"),
+            ],
+        );
+        for label in ["20240101-120000F", "20240102-120000F", "20240103-120000F"] {
+            seed_backup_dir(&repo, stanza, label);
+            assert!(backup_dir_exists(&repo, stanza, label), "seed dir for {label}");
+        }
+
+        let cfg = cfg_parallel(Some(stanza), None, dir.path(), 4);
+        let mut info = pgbr_info::InfoBackup::load(&repo, &super::backup_info_path(stanza)).expect("reload");
+        let labels: Vec<String> = vec![
+            "20240101-120000F".to_owned(),
+            "20240102-120000F".to_owned(),
+            "20240103-120000F".to_owned(),
+        ];
+
+        super::remove_backups(&cfg, &repo, stanza, &mut info, &labels, false, None, None).expect("parallel remove");
+
+        for label in &labels {
+            assert!(!backup_dir_exists(&repo, stanza, label), "{label} should be gone");
+            assert!(!info.current.contains_key(label), "{label} should be dropped from info");
+        }
+    }
+
+    /// Non-local storage: the parallel branch is skipped (it would route
+    /// `std::fs` calls to the wrong machine) and the serial
+    /// `Storage::remove_path` path is taken. The wrapped `Posix` still backs
+    /// the deletes, so the dirs disappear; the assertion that matters is that
+    /// the run completes successfully — the parallel branch demands
+    /// `is_local()`, so a non-local mock with `process-max=4` must NOT fall
+    /// into it (a `&dyn Storage` cannot ride a worker thread).
+    #[test]
+    fn remove_backups_serial_on_remote() {
+        let dir = tempfile::tempdir().expect("repo tempdir");
+        let posix = Posix::new(dir.path());
+        let stanza = "demo";
+
+        seed_backup_info(
+            &posix,
+            stanza,
+            &[("20240101-120000F", 1000, "full"), ("20240102-120000F", 2000, "full")],
+        );
+        for label in ["20240101-120000F", "20240102-120000F"] {
+            seed_backup_dir(&posix, stanza, label);
+        }
+
+        // process-max=4 is set so the only way this can succeed without
+        // taking the parallel branch is if `is_local()` actually gates it.
+        let cfg = cfg_parallel(Some(stanza), None, dir.path(), 4);
+        let remote = NonLocalMock {
+            inner: Posix::new(dir.path()),
+        };
+        assert!(!remote.is_local(), "mock must report non-local");
+
+        let mut info = pgbr_info::InfoBackup::load(&posix, &super::backup_info_path(stanza)).expect("reload");
+        let labels: Vec<String> = vec!["20240101-120000F".to_owned(), "20240102-120000F".to_owned()];
+        super::remove_backups(&cfg, &remote, stanza, &mut info, &labels, false, None, None).expect("serial remove");
+
+        for label in &labels {
+            assert!(!backup_dir_exists(&posix, stanza, label), "{label} should be gone");
+            assert!(!info.current.contains_key(label), "{label} should be dropped");
+        }
+    }
+
+    /// Local + `process-max > 1`: 10 WAL leaves under an archive-id directory
+    /// are removed via the parallel `std::fs::remove_file` path. Drives
+    /// [`remove_wal_under`] through `expire_inner` so the full pipeline is
+    /// exercised end-to-end (filter the leaves by retention range, then fan
+    /// the deletes across workers). Uses the existing
+    /// [`seed_backup_info_full`] / [`seed_archive_id_segment`] helpers so the
+    /// archive-id (`14-1`) matches what `compute_archive_plan` resolves from
+    /// `backup.info.history`.
+    #[test]
+    fn remove_wal_under_parallel_local() {
+        let (dir, repo) = empty_repo();
+        let stanza = "demo";
+
+        // Two fulls on archive-id 14-1; keep both backups, archive-retain
+        // only the newest (`keep_archive = 1`). The retention backup is the
+        // newer one (range starts at ...0020). The 10 WAL segments at
+        // ...0010..0019 sit strictly between the older backup's range
+        // (...0001..0001) and the retained range (...0020..0020), so they
+        // all expire — every leaf is removed via the parallel branch.
+        seed_backup_info_full(
+            &repo,
+            stanza,
+            &[
+                (
+                    "20260101-100000F",
+                    100,
+                    "full",
+                    "000000010000000000000001",
+                    "000000010000000000000001",
+                    1,
+                ),
+                (
+                    "20260101-120000F",
+                    300,
+                    "full",
+                    "000000010000000000000020",
+                    "000000010000000000000020",
+                    1,
+                ),
+            ],
+            &[(1, "14")],
+            1,
+        );
+
+        for i in 0x10u32..=0x19u32 {
+            let seg = format!("00000001000000000000{i:04X}");
+            seed_archive_id_segment(&repo, stanza, "14-1", &seg, "");
+        }
+
+        let mut cfg = cfg_parallel(Some(stanza), Some(2), dir.path(), 4);
+        cfg.options
+            .insert(("repo-retention-archive".to_owned(), None), OptionValue::Integer(1));
+
+        let summary = super::expire_inner(&cfg, &repo).expect("expire");
+        assert_eq!(
+            summary.expired_archive_segments.len(),
+            10,
+            "expected 10 expired WAL segments, got {:?}",
+            summary.expired_archive_segments
+        );
+
+        for i in 0x10u32..=0x19u32 {
+            let seg = format!("00000001000000000000{i:04X}");
+            assert!(
+                !archive_id_segment_exists(dir.path(), stanza, "14-1", &seg, ""),
+                "{seg} should be gone"
+            );
+        }
+    }
+
+    /// `remove_backups` must be idempotent on a missing target dir: a label
+    /// whose on-disk directory was already removed (or never created) is
+    /// silently treated as success on both the parallel and serial branches.
+    /// The in-memory `info.current` entry is still dropped.
+    #[test]
+    fn remove_backups_idempotent_missing_target() {
+        let (dir, repo) = empty_repo();
+        let stanza = "demo";
+
+        // Seed `backup.info` recording two labels, but only materialise one
+        // directory on disk — the second label's `backup/demo/<label>` will
+        // be missing when `remove_backups` runs.
+        seed_backup_info(
+            &repo,
+            stanza,
+            &[("20240101-120000F", 1000, "full"), ("20240102-120000F", 2000, "full")],
+        );
+        seed_backup_dir(&repo, stanza, "20240101-120000F");
+        // Note: do not seed 20240102-120000F directory.
+        assert!(!backup_dir_exists(&repo, stanza, "20240102-120000F"));
+
+        let cfg = cfg_parallel(Some(stanza), None, dir.path(), 4);
+        let mut info = pgbr_info::InfoBackup::load(&repo, &super::backup_info_path(stanza)).expect("reload");
+        let labels: Vec<String> = vec!["20240101-120000F".to_owned(), "20240102-120000F".to_owned()];
+
+        // Parallel branch must not error on the missing target dir.
+        super::remove_backups(&cfg, &repo, stanza, &mut info, &labels, false, None, None).expect("idempotent remove");
+
+        for label in &labels {
+            assert!(!backup_dir_exists(&repo, stanza, label), "{label} should be gone");
+            assert!(!info.current.contains_key(label), "{label} should be dropped");
+        }
+
+        // And calling again with the same labels (now all missing) is still a
+        // no-op success — defending the "NotFound is success" contract.
+        super::remove_backups(&cfg, &repo, stanza, &mut info, &labels, false, None, None).expect("idempotent re-remove");
     }
 }
