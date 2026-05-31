@@ -4137,11 +4137,27 @@ fn run_backup(
     // repository writes at all, so the directory is not created; the copy jobs it
     // plans are never executed, so their (placeholder) absolute destinations are
     // never touched.
+    //
+    // The absolute path is resolved (via `info()`) **only** for a local repo,
+    // where it anchors the parallel `std::fs` copy workers' destinations (see
+    // `copy_file` / the parallel branch of `run_bundled_copy`). For a NON-local
+    // repo (S3 / Azure / GCS / SSH / SFTP) the copy path writes through the
+    // `Storage` trait at each job's repo-relative `rel_dest`, never the absolute
+    // `abs_dest`, so an absolute filesystem path is meaningless there — and worse,
+    // `create_path` is a no-op on an object store (no empty directories), so the
+    // freshly-"created" label dir has no object yet and an `info()` HEAD would
+    // 404 (`StorageError::NotFound`) and abort the backup before it writes a byte.
+    // So on the non-local branch we pass the repo-relative `backup_root` through
+    // unchanged (matching the dry-run branch and the `is_local()` guard pattern in
+    // `run_copy_jobs`); the subsequent trait writes create the keys.
     let abs_repo_backup_root = if policy.dry_run {
         PathBuf::from(&backup_root)
-    } else {
+    } else if repo_storage.is_local() {
         repo_storage.create_path(Path::new(&backup_root), true)?;
         absolute_path(repo_storage, Path::new(&backup_root))?
+    } else {
+        repo_storage.create_path(Path::new(&backup_root), true)?;
+        PathBuf::from(&backup_root)
     };
 
     // Begin the online backup (if a control connection is present). The start
@@ -8422,6 +8438,188 @@ mod tests {
         let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
         let pg_control = manifest.file("global/pg_control").expect("pg_control in manifest");
         assert_eq!(pg_control.checksum.as_deref(), Some(sha1_hex(b"\x01\x02\x03\x04").as_str()));
+    }
+
+    /// A `Storage` wrapper that faithfully models an **object store** (S3 / Azure /
+    /// GCS): it reports itself non-local, `create_path` is a **no-op** (object
+    /// stores have no empty directories), and `info()` does a HEAD on the key — so
+    /// `info()` on a path that was never written as an object returns
+    /// [`StorageError::NotFound`], exactly like S3's HEAD-404. Real bytes land in
+    /// an inner [`Posix`] so the manifest stays loadable, and every `info()` path
+    /// is recorded so a test can prove the backup setup never does a HEAD on the
+    /// label dir.
+    ///
+    /// This is the precise shape that triggered the `fix(backup-s3)` bug: the old
+    /// setup did `create_path(backup/<stanza>/<label>)` (a no-op here) and then
+    /// `info()` on that same dir key (a 404 here), aborting the backup before any
+    /// file was written.
+    struct ObjectStore {
+        inner: Posix,
+        /// Every path passed to `info()`, in call order.
+        info_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// Every path passed to `create_path()` (which is otherwise a no-op).
+        create_path_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ObjectStore {
+        fn new(inner: Posix) -> Self {
+            Self {
+                inner,
+                info_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                create_path_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn info_calls(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+            std::sync::Arc::clone(&self.info_calls)
+        }
+    }
+
+    impl Storage for ObjectStore {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.info_calls.lock().unwrap().push(path.to_string_lossy().into_owned());
+            // HEAD semantics: only a key with a real backing object resolves (200).
+            // A directory prefix (which an object store never materialises) or a
+            // missing key 404s — exactly like S3's HEAD. So consult the inner
+            // Posix, and treat anything that is not a concrete file as NotFound.
+            match self.inner.info(path) {
+                Ok(info) if info.kind == StorageKind::File => Ok(info),
+                Ok(_) | Err(pgbr_storage::StorageError::NotFound { .. }) => Err(pgbr_storage::StorageError::NotFound {
+                    path: path.to_path_buf(),
+                }),
+                Err(other) => Err(other),
+            }
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            // An object store has no directories: writing a key auto-creates its
+            // prefix, so the inner Posix needs the parent dir made first (the real
+            // S3 backend has nothing to do here).
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                self.inner.create_path(parent, true)?;
+            }
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, _recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            // No-op, exactly like the S3 backend (`s3.rs` create_path ~879): an
+            // object store has no empty directories, so there is nothing to make.
+            self.create_path_calls
+                .lock()
+                .unwrap()
+                .push(path.to_string_lossy().into_owned());
+            Ok(())
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    /// Regression test for `fix(backup-s3)`: a full backup against a non-local
+    /// (object-store) repo must NOT abort by doing a HEAD on the freshly-"created"
+    /// label directory. The old code called `create_path(backup/<stanza>/<label>)`
+    /// (a no-op on an object store) and then `absolute_path()` → `info()` → a HEAD
+    /// on that dir key, which 404s on an object store and killed the backup
+    /// instantly with `not found: backup/<stanza>/<label>` before any file was
+    /// written.
+    ///
+    /// With the `is_local()` guard the setup skips the `info()` call entirely on a
+    /// non-local repo, so the `NotFound` is never triggered and the backup runs.
+    #[test]
+    fn backup_root_resolution_skips_info_on_non_local_repo() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo_inner = Posix::new(repo.path());
+        let pg_s = Posix::new(pg.path());
+
+        // The stanza's `backup.info` is a real object, so loading it succeeds even
+        // under the HEAD-404 directory semantics; the label dir below has no object.
+        init_stanza(&repo_inner, "demo");
+        seed_cluster(&pg_s);
+
+        let repo_s = ObjectStore::new(repo_inner);
+        let info_calls = repo_s.info_calls();
+
+        // With the bug this returns Err(NotFound { path: "backup/demo/<label>" })
+        // from the setup before any copy runs. With the fix it succeeds.
+        let outcome = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity())
+            .expect("backup must not HEAD the empty label dir");
+        assert_eq!(outcome.file_count, 4, "4 non-excluded files expected");
+
+        // The label directory key must never have been HEADed (no `info()` on it).
+        // That HEAD is exactly what 404'd and aborted the backup before the fix.
+        let label_dir = format!("backup/demo/{LABEL}");
+        let calls = info_calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|p| p == &label_dir),
+            "the non-local backup-root setup must not HEAD the label dir {label_dir}; info() calls: {calls:?}"
+        );
+
+        // And the backup actually produced a loadable manifest in the repo.
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let pg_control = manifest.file("global/pg_control").expect("pg_control in manifest");
+        assert_eq!(pg_control.checksum.as_deref(), Some(sha1_hex(b"\x01\x02\x03\x04").as_str()));
+    }
+
+    /// Companion to the non-local regression test: on a LOCAL (Posix) repo the
+    /// backup-root setup must still resolve to the real absolute on-disk directory
+    /// (the `absolute_path()` fast path the parallel `std::fs` workers anchor on),
+    /// proving the `is_local()` guard did not regress the POSIX path.
+    #[test]
+    fn backup_root_resolution_uses_absolute_path_on_local() {
+        let (repo, pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        // The local fast path computes the absolute label dir via `info()` and the
+        // parallel workers write their data files there via `std::fs`. If the guard
+        // had wrongly taken the non-local branch, the data files would still be at
+        // the repo-relative path under the temp dir (Posix anchors at its root), so
+        // we assert the real absolute directory exists and holds the copied bytes.
+        let outcome = backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("local backup");
+        assert_eq!(outcome.file_count, 4, "4 non-excluded files expected");
+
+        let abs_backup_root = repo.path().join(format!("backup/demo/{LABEL}"));
+        assert!(
+            abs_backup_root.is_dir(),
+            "local backup root must resolve to the real absolute dir {}",
+            abs_backup_root.display()
+        );
+        // The copied data files landed at the absolute path (the `std::fs` write
+        // target derived from `absolute_path`), byte-for-byte.
+        assert_eq!(std::fs::read(abs_backup_root.join("PG_VERSION")).unwrap(), b"14\n");
+        assert_eq!(
+            std::fs::read(abs_backup_root.join("global/pg_control")).unwrap(),
+            b"\x01\x02\x03\x04"
+        );
+        drop(pg);
     }
 
     /// A `Storage` wrapper that counts every `open_read` while delegating all
