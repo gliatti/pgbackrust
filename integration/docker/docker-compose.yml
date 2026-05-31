@@ -1,5 +1,5 @@
 # Runnable 3-node integration topology (principal / secondaire / depot) for the
-# pgBackRest KB scenario matrix. Unlike the Vagrant/VirtualBox setup, this runs
+# pgBackRust KB scenario matrix. Unlike the Vagrant/VirtualBox setup, this runs
 # directly on a Docker host and is what CI / local validation uses.
 #
 # Usage:
@@ -11,6 +11,12 @@
 # Each node shares a key from integration/artifacts/ssh (created by run-all.sh)
 # so the postgres user can SSH between nodes for the pull/remote scenarios.
 
+# The prebuilt binary is bind-mounted at runtime rather than relied upon from
+# the image's COPY layer: under Docker Desktop's WSL2 / containerd image store
+# the COPYed /usr/bin/pgbackrest layer is intermittently not materialised at
+# run time (ls shows it, open() returns ENOENT), so the archive_command fails
+# with exit 127 and WAL never reaches the repo. Bind-mounting the host artifact
+# (a glibc-matching ELF built by integration/build-binary.sh) is deterministic.
 x-node: &node
   build:
     context: ../..
@@ -18,6 +24,7 @@ x-node: &node
   image: pgbr-node:latest
   volumes:
     - ../artifacts/ssh:/shared-ssh:ro
+    - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
   networks:
     - pgbr
 
@@ -30,7 +37,8 @@ services:
       PGBR_ROLE: repo
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
-      - depot-repo:/srv/depot/pgbackrest
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
+      - depot-repo:/srv/depot/pgbackrust
 
   principal:
     <<: *node
@@ -41,6 +49,7 @@ services:
       POSTGRES_PASSWORD: postgres
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
       - principal-data:/var/lib/postgresql/16/principal
 
   secondaire:
@@ -51,6 +60,7 @@ services:
       PGBR_ROLE: standby
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
       - secondaire-data:/var/lib/postgresql/16/secondaire
 
   # S3-compatible object store for the KB "Sauvegarde vers un dépôt S3"
@@ -61,8 +71,8 @@ services:
     container_name: pgbr-minio
     command: server /data
     environment:
-      MINIO_ROOT_USER: pgbackrest
-      MINIO_ROOT_PASSWORD: pgbackrest-secret
+      MINIO_ROOT_USER: pgbackrust
+      MINIO_ROOT_PASSWORD: pgbackrust-secret
     networks:
       - pgbr
     volumes:
