@@ -1,0 +1,67 @@
+[package]
+name = "pgbr-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+# Cross-platform advisory file locking (flock / LockFileEx) for lock-type
+# acquisition in `lock.rs`. Keeps the crate unsafe-free (the crate root has
+# `forbid(unsafe_code)`), unlike a raw `libc::flock` call.
+fs2 = "0.4"
+pgbr-build = { path = "../pgbr-build" }
+pgbr-compress = { path = "../pgbr-compress" }
+pgbr-config = { path = "../pgbr-config" }
+# Logger: human-facing progress / warning output is rerouted through
+# `pgbr_core::log` (the migrated `src/common/log.c` formatter) so machine-readable
+# command results stay on stdout while status lines honour the configured log
+# level / file sink. The `capture` submodule backs the unit-test assertions.
+pgbr-core = { path = "../pgbr-core" }
+# libpq wrapper: lets stanza-create/upgrade learn the cluster identity from a
+# live PostgreSQL connection (server_version_num + pg_control_system()) instead
+# of only reading global/pg_control off disk.
+pgbr-db = { path = "../pgbr-db" }
+# Binary <-> printable string encoders. Bundled-copy worker responses base64-encode
+# the transformed repo bytes so a JSON-shaped dispatcher response can carry them
+# across the worker boundary (the main thread base64-decodes and appends to the
+# in-memory bundle in deterministic skeleton order).
+pgbr-encode = { path = "../pgbr-encode" }
+pgbr-error = { path = "../pgbr-error" }
+pgbr-info = { path = "../pgbr-info" }
+pgbr-io = { path = "../pgbr-io" }
+pgbr-postgres = { path = "../pgbr-postgres" }
+pgbr-protocol = { path = "../pgbr-protocol" }
+# Regex wrapper: backs the `repo-ls --filter` option (a regular expression
+# matched against entry names), matching the C `cfgOptFilter` behaviour.
+pgbr-regex = { path = "../pgbr-regex" }
+pgbr-storage = { path = "../pgbr-storage" }
+# Pure-Rust TLS. Disable the default `aws_lc_rs` provider (which links the
+# aws-lc C library via bindgen/clang) and use the `ring` provider instead, so
+# no OpenSSL / C crypto build is needed. `install_default()` selects it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+serde_json = "1"
+# TCP keepalive on accepted `server` sockets: std's `TcpStream` exposes only
+# `set_nodelay`, not the keepalive idle / interval / count knobs the
+# `tcp-keep-alive-*` options map to. `socket2` borrows the socket fd via
+# `SockRef::from` (no ownership transfer, no `unsafe` in this crate) and sets
+# `SO_KEEPALIVE` plus the per-socket timers. Pure Rust, links no C library. The
+# `all` feature unlocks `TcpKeepalive::with_retries` (the probe-count knob).
+socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+# `rcgen` generates the self-signed cert used by the TLS round-trip tests.
+# Match rustls: use the `ring`-backed crypto so no aws-lc C build is pulled in.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# Cross-platform pipe pair backing the in-process worker protocol round-trip
+# tests (server on a thread, client in the test), so no child process is spawned.
+os_pipe = "1"
+serde_json = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

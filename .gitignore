@@ -2,3 +2,13 @@
 *~
 *.swp
 .DS_Store
+
+# Rust
+/target
+/crates/**/target
+
+# Local dev artefacts (not part of the migration deliverable)
+/graphify-out
+/TODO.md
+/backlog.md
+/.claude

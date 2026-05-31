@@ -1,0 +1,21 @@
+[package]
+name = "pgbr-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+pgbr-error = { path = "../pgbr-error" }
+pgbr-protocol = { path = "../pgbr-protocol" }
+# Direct libpq bindings — used to call PQconnectdb / PQexec / PQfinish so
+# behaviour matches the legacy C client byte-for-byte.
+libpq-sys = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

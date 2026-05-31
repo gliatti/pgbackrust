@@ -1,0 +1,25 @@
+# Builder image for the Vagrant/VirtualBox integration harness.
+#
+# The Vagrant boxes are Debian 12 "bookworm" (glibc 2.36). The main dev image
+# (Dockerfile.dev) is Debian 13 "trixie" and links against a newer glibc, so a
+# binary built there fails on the VMs with `GLIBC_2.39 not found`. This image
+# pins the bookworm toolchain + native -dev libs the crates link
+# (libpq-sys → libpq-dev + libclang for bindgen, openssl-sys → libssl-dev,
+# pgbr-compress → zlib/bz2/lz4/zstd, ssh2 → libssh2) so the produced ELF runs
+# on the VMs unmodified.
+FROM rust:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        pkg-config \
+        libpq-dev \
+        libssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblz4-dev \
+        libzstd-dev \
+        libssh2-1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work/pgbackrust

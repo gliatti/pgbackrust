@@ -1,0 +1,24 @@
+[package]
+name = "pgbr-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# YAML parser: serde_yml is the actively maintained fork of the (archived) serde_yaml crate.
+serde_yml = "0.0.12"
+# XML parser for src/build/help/help.xml. Used with the serde feature for typed parsing.
+quick-xml = { version = "0.38", features = ["serialize"] }
+# Lookup tables for typed enum values (option type, default-type, section, group, lock-type).
+# A simple match on &str avoids an extra dep here.
+
+[dev-dependencies]
+# Tests parse the actual files in src/build/ to verify schema coverage stays in sync.
+
+[lints]
+workspace = true

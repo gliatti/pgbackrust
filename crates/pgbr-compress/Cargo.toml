@@ -1,0 +1,38 @@
+[package]
+name = "pgbr-compress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+# Direct libz bindings — needed by `gz::compress` to call `deflateInit2_` / `deflate` /
+# `deflateEnd` with the legacy parameters (memLevel=9, default strategy) byte-for-byte. flate2
+# does not expose memLevel, so going through `libz-sys` is the only way to keep compressed
+# output byte-identical to the legacy C path.
+libz-sys = "1.1"
+# Direct LZ4-frame bindings — `lz4::error::classify` calls `LZ4F_isError` /
+# `LZ4F_getErrorName` from the system liblz4 so error names match the legacy C path
+# byte-for-byte. The higher-level `lz4_flex` crate replicates LZ4 in pure Rust but does
+# not expose the exact error-name strings the legacy `lz4Error` formatter emits.
+lz4-sys = "1.11"
+# Direct libbzip2 bindings — `bz2::compress` / `bz2::decompress` call
+# `BZ2_bzCompressInit` / `BZ2_bzCompress` / `BZ2_bzDecompress` / `BZ2_bzCompressEnd` /
+# `BZ2_bzDecompressEnd` so the streaming behaviour and byte output match the legacy C
+# path exactly (libbz2 is deterministic given fixed level + workFactor).
+bzip2-sys = "0.1"
+# Direct libzstd bindings — `zst::error::classify` calls `ZSTD_isError` /
+# `ZSTD_getErrorName` from the system libzstd so error names match the legacy C path
+# byte-for-byte. The streaming compress / decompress wrappers in `zst::compress` /
+# `zst::decompress` call `ZSTD_compressStream2` / `ZSTD_decompressStream`.
+zstd-sys = "2"
+# The `filter` module bridges each codec into `pgbr_io::Filter` so they compose in a
+# `pgbr_io::FilterChain`. pgbr-compress depends on pgbr-io (not the reverse) to keep
+# pgbr-io free of a compression dependency.
+pgbr-io = { path = "../pgbr-io" }
+
+[lints]
+workspace = true

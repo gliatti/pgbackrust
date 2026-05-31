@@ -1,0 +1,79 @@
+# Runnable 3-node integration topology (principal / secondaire / depot) for the
+# pgBackRest KB scenario matrix. Unlike the Vagrant/VirtualBox setup, this runs
+# directly on a Docker host and is what CI / local validation uses.
+#
+# Usage:
+#   ./integration/build-binary.sh                         # produce the binary
+#   docker compose -f integration/docker/docker-compose.yml build
+#   docker compose -f integration/docker/docker-compose.yml up -d
+#   ./integration/scenarios/run-all.sh
+#
+# Each node shares a key from integration/artifacts/ssh (created by run-all.sh)
+# so the postgres user can SSH between nodes for the pull/remote scenarios.
+
+x-node: &node
+  build:
+    context: ../..
+    dockerfile: integration/docker/Dockerfile.node
+  image: pgbr-node:latest
+  volumes:
+    - ../artifacts/ssh:/shared-ssh:ro
+  networks:
+    - pgbr
+
+services:
+  depot:
+    <<: *node
+    hostname: depot
+    container_name: pgbr-depot
+    environment:
+      PGBR_ROLE: repo
+    volumes:
+      - ../artifacts/ssh:/shared-ssh:ro
+      - depot-repo:/srv/depot/pgbackrest
+
+  principal:
+    <<: *node
+    hostname: principal
+    container_name: pgbr-principal
+    environment:
+      PGBR_ROLE: primary
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ../artifacts/ssh:/shared-ssh:ro
+      - principal-data:/var/lib/postgresql/16/principal
+
+  secondaire:
+    <<: *node
+    hostname: secondaire
+    container_name: pgbr-secondaire
+    environment:
+      PGBR_ROLE: standby
+    volumes:
+      - ../artifacts/ssh:/shared-ssh:ro
+      - secondaire-data:/var/lib/postgresql/16/secondaire
+
+  # S3-compatible object store for the KB "Sauvegarde vers un dépôt S3"
+  # scenario (repo1-type=s3). Bucket is created by scenario 11.
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    container_name: pgbr-minio
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: pgbackrest
+      MINIO_ROOT_PASSWORD: pgbackrest-secret
+    networks:
+      - pgbr
+    volumes:
+      - minio-data:/data
+
+networks:
+  pgbr:
+    name: pgbr-net
+
+volumes:
+  depot-repo:
+  principal-data:
+  secondaire-data:
+  minio-data:

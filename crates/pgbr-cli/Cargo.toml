@@ -1,0 +1,59 @@
+[package]
+name = "pgbr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pgbackrest"
+path = "src/main.rs"
+
+[lib]
+
+[dependencies]
+pgbr-build = { path = "../pgbr-build" }
+pgbr-command = { path = "../pgbr-command" }
+pgbr-config = { path = "../pgbr-config" }
+# Process logger (`pgbr_core::log`): the CLI initialises it from the resolved
+# log-level / log-path / log-timestamp / exec-id options at startup.
+pgbr-core = { path = "../pgbr-core" }
+# The RemoteProcessStorage wrapper delegates the IoRead / IoWrite of the
+# RemoteStorage proxy, so pgbr-io's traits are part of the lib's public surface.
+pgbr-io = { path = "../pgbr-io" }
+# The remote-host storage path spawns a worker via ProcessClient and proxies
+# storage over its pipes with RemoteStorage; both come from pgbr-protocol.
+pgbr-protocol = { path = "../pgbr-protocol" }
+pgbr-storage = { path = "../pgbr-storage" }
+# The `repo-host-type=tls` / `pg-host-type=tls` worker transport opens a TLS
+# connection (built by `pgbr_command::server`) to the peer's running
+# `pgbackrest server` and runs the storage protocol over it. The `StreamOwned`
+# the connector returns and the `Send`-able shared adapter built around it both
+# need rustls types. Match pgbr-command: ring provider, no aws-lc C build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# Re-exported as the error type for `pgbr_build::parse_config` failures.
+serde_yml = "0.0.12"
+
+# Process-control syscalls for the startup options: `umask(0)` (neutral-umask)
+# and `setpriority` (priority). Unix-only — Windows has no POSIX equivalent, so
+# those options degrade to a logged no-op there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Used by the cargo-native e2e test (tests/e2e.rs) to seed a synthetic PG data
+# dir with a real pg_control header and to read back the on-disk info/manifest
+# files the command stack writes.
+pgbr-info = { path = "../pgbr-info" }
+pgbr-postgres = { path = "../pgbr-postgres" }
+tempfile = "3"
+# The `RemoteTlsStorage` drop / round-trip tests in `remote_storage.rs` wire a
+# `RemoteStorage` against a `StorageRequestHandler<Posix>` running on a thread
+# over two `os_pipe` channels — mirroring the pattern in
+# `crates/pgbr-storage/src/remote.rs` tests — so the assertion runs without
+# bringing up a real TLS endpoint.
+os_pipe = "1"
+
+[lints]
+workspace = true

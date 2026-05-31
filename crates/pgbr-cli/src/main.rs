@@ -1,0 +1,22 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+//! `pgbackrest` binary entry point. Forwards argv (sans program name) to
+//! `pgbr_cli::run` and exits with the returned status code. Diagnostics
+//! are printed to stderr by the run path; this entry point only translates
+//! errors into exit codes.
+
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
+#[allow(clippy::print_stderr)] // CLI binary writes to stderr by design.
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let exit = match pgbr_cli::run(args) {
+        Ok(code) => code,
+        Err(err) => {
+            // Diagnostic to stderr before translating the error category into
+            // its exit code (centralised in `CliRunError::exit_code`).
+            eprintln!("pgbackrest: {err}");
+            err.exit_code()
+        }
+    };
+    std::process::exit(exit);
+}

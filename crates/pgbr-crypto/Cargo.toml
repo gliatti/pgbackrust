@@ -1,0 +1,18 @@
+[package]
+name = "pgbr-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+openssl = "0.10"
+openssl-sys = "0.9"
+md-5 = "0.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+.git
+target
+build
+graphify-out
+TODO.md
+backlog.md
+.claude
+doc/output
+**/*.log
