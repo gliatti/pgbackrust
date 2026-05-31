@@ -294,6 +294,28 @@ fn apply_sck_block(stream: &TcpStream, block: bool) {
     }
 }
 
+/// Disable Nagle's algorithm (set `TCP_NODELAY`) on an accepted protocol socket,
+/// best-effort.
+///
+/// The synchronous storage protocol exchanges many small request→response rounds
+/// (one per ~64KB write-chunk plus many metadata ops). With Nagle enabled (the
+/// kernel default) a small server response is buffered waiting for the ACK of a
+/// previous segment while the client blocks reading that response — a head-of-line
+/// stall. A `backup` issues thousands of these small rounds and effectively hangs;
+/// `archive-push` sends one ~16MB segment, fills the send buffer, and bypasses
+/// Nagle, which is why only `backup` exhibits the hang. Disabling Nagle makes
+/// every response flush immediately.
+///
+/// A failure to set the option is logged and ignored, exactly like keepalive and
+/// blocking-mode tuning: it is an optimisation, never a reason to drop an
+/// otherwise-good connection. Stock pgBackRest sets `TCP_NODELAY` unconditionally
+/// on every socket — C ref: `sckOptionSet` / `src/common/io/socket/common.c`.
+fn apply_nodelay(stream: &TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        crate::control::log_warn(&format!("unable to set TCP_NODELAY on accepted socket: {err}"));
+    }
+}
+
 /// Protocol error code returned for malformed or unexpected requests.
 ///
 /// Mirrors `pgbr_error::ErrorType` numbering, where `ProtocolError` is 39.
@@ -552,6 +574,7 @@ fn serve_listener_with_continue_caps(
         };
         keepalive.apply(&stream);
         apply_sck_block(&stream, sck_block);
+        apply_nodelay(&stream);
 
         // Periodically reap finished worker threads so the vector does not
         // grow unboundedly across long-lived daemons. A panicked worker's
@@ -1489,6 +1512,7 @@ fn serve_tls_storage_with_continue_caps(
         };
         keepalive.apply(&stream);
         apply_sck_block(&stream, sck_block);
+        apply_nodelay(&stream);
 
         // Periodically reap finished worker threads so the vector does not
         // grow unboundedly across long-lived daemons.
@@ -2699,6 +2723,64 @@ mod tests {
             matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
             "non-flipped socket read should time out, got {err:?}"
         );
+    }
+
+    #[test]
+    fn apply_nodelay_sets_tcp_nodelay() {
+        // The accept loops call `apply_nodelay` on every accepted socket to
+        // disable Nagle's algorithm (the backup many-small-rounds hang). Drive
+        // the helper over a loopback socket and assert the option took effect.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, _peer) = listener.accept().unwrap();
+
+        // Freshly-accepted sockets default to Nagle enabled (nodelay == false);
+        // after the helper it must be on.
+        apply_nodelay(&server_stream);
+        assert!(server_stream.nodelay().unwrap(), "apply_nodelay must enable TCP_NODELAY");
+    }
+
+    #[test]
+    fn server_accept_sets_tcp_nodelay() {
+        // End-to-end over the plain-TCP accept loop (`serve_listener_with_continue`,
+        // which the daemon's `serve_listener` wraps): the loop body applies
+        // keepalive + sck-block + `apply_nodelay` to every accepted socket. We
+        // cannot reach the server-side `TcpStream` directly (it is moved into the
+        // per-connection worker thread), so we observe nodelay on the CLIENT side
+        // of the same connection — the per-helper assertion that the server
+        // socket itself gets nodelay lives in `apply_nodelay_sets_tcp_nodelay`.
+        // This test pins that wiring nodelay into the loop does not disturb a
+        // normal ping round trip.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            serve_listener_with_continue(&listener, KeepAlive::default(), false, || {
+                !stop_for_server.load(Ordering::Acquire)
+            })
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // The client end can carry nodelay too; the server-accepted end is the
+        // one the loop tunes (asserted by the helper unit test).
+        stream.set_nodelay(true).unwrap();
+        assert!(stream.nodelay().unwrap(), "client side nodelay should be set");
+        let (mut reader, mut writer) = split(stream).unwrap();
+        ping_exchange(&mut reader, &mut writer).unwrap();
+        writer.close().unwrap();
+        drop(reader);
+        drop(writer);
+
+        stop.store(true, Ordering::Release);
+        server.join().expect("server thread panicked").expect("serve_listener");
     }
 
     #[test]

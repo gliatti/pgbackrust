@@ -292,6 +292,23 @@ pub struct RemoteTlsStorage<R: IoRead + Send + 'static = SyncTlsIo, W: IoWrite +
     inner: Option<RemoteStorage<R, W>>,
 }
 
+/// Disable Nagle's algorithm (`TCP_NODELAY`) on a protocol socket.
+///
+/// Factored out so it can be unit-tested over a loopback socket. The synchronous
+/// storage protocol does many small request→response rounds; with Nagle enabled
+/// small responses are buffered awaiting an ACK, stalling `backup` (many small
+/// rounds) while `archive-push` (one ~16MB segment) bypasses Nagle. Mirrors stock
+/// pgBackRest, which sets `TCP_NODELAY` unconditionally on all sockets
+/// (`src/common/io/socket/common.c`).
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] if `setsockopt(TCP_NODELAY)` fails;
+/// the caller maps it to [`ProtocolError::Spawn`].
+fn apply_nodelay(socket: &TcpStream) -> std::io::Result<()> {
+    socket.set_nodelay(true)
+}
+
 impl RemoteTlsStorage<SyncTlsIo, SyncTlsIo> {
     /// Open a TLS connection to `addr` (validating the server cert against
     /// `server_name` and presenting the client cert in `client_config`),
@@ -329,6 +346,16 @@ impl RemoteTlsStorage<SyncTlsIo, SyncTlsIo> {
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| ProtocolError::Spawn(format!("invalid tls server name `{server_name}`: {e}")))?;
         let socket = TcpStream::connect(addr).map_err(|e| ProtocolError::Spawn(format!("tls connect {addr}: {e}")))?;
+        // Disable Nagle's algorithm on the protocol socket. The synchronous
+        // storage protocol does many small request→response rounds (one per
+        // ~64KB write-chunk plus metadata ops); with Nagle enabled (the kernel
+        // default) a small response is buffered awaiting an ACK while the peer
+        // blocks reading it, stalling `backup` (many small rounds) while
+        // `archive-push` (one ~16MB segment) bypasses Nagle and works. Stock
+        // pgBackRest sets TCP_NODELAY unconditionally on all sockets
+        // (src/common/io/socket/common.c). Mirror the connect-failure mapping
+        // to `ProtocolError::Spawn`.
+        apply_nodelay(&socket).map_err(|e| ProtocolError::Spawn(format!("tls set nodelay {addr}: {e}")))?;
         // We intentionally do NOT apply SO_RCVTIMEO / SO_SNDTIMEO here. On
         // Linux those make the underlying TCP read/write return EAGAIN
         // (errno 11) once the timer elapses, but rustls' synchronous I/O
@@ -612,5 +639,27 @@ mod tests {
         // verb the new `Drop` impl sends.
         drop(tls);
         server.join().unwrap();
+    }
+
+    /// `RemoteTlsStorage::connect` disables Nagle's algorithm on the protocol
+    /// socket via `apply_nodelay`. A full mTLS connect needs certs and a peer, so
+    /// drive the factored-out `apply_nodelay` helper over a real loopback socket
+    /// (the exact call `connect` makes right after `TcpStream::connect`) and
+    /// assert `TCP_NODELAY` took effect — the synchronous storage protocol's
+    /// many-small-rounds backup would otherwise stall behind Nagle.
+    #[test]
+    fn remote_tls_connect_sets_tcp_nodelay() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connect just like `RemoteTlsStorage::connect` does.
+        let socket = TcpStream::connect(addr).unwrap();
+        let (_accepted, _peer) = listener.accept().unwrap();
+
+        // Fresh sockets default to Nagle enabled (nodelay == false); after the
+        // helper the connect path uses, it must be on.
+        apply_nodelay(&socket).expect("apply_nodelay should succeed on a connected loopback socket");
+        assert!(socket.nodelay().unwrap(), "RemoteTlsStorage::connect must set TCP_NODELAY");
     }
 }
