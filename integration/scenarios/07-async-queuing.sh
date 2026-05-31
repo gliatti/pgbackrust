@@ -9,17 +9,17 @@ set -euo pipefail
 
 STANZA=demo
 DATADIR=/var/lib/postgresql/$PGV/principal
-REPO=/srv/depot/pgbackrest
+REPO=/srv/depot/pgbackrust
 BIN=/usr/lib/postgresql/$PGV/bin
 
 info "07 async: enable asynchronous archiving on principal"
-node principal bash -c "install -d -o postgres -g postgres -m 0750 /var/spool/pgbackrest $REPO"
-node principal bash -c "cat > /etc/pgbackrest.conf <<EOF
+node principal bash -c "install -d -o postgres -g postgres -m 0750 /var/spool/pgbackrust $REPO"
+node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
 archive-async=y
-spool-path=/var/spool/pgbackrest
+spool-path=/var/spool/pgbackrust
 archive-push-queue-max=1GiB
 archive-get-queue-max=256MiB
 log-level-console=info
@@ -32,20 +32,10 @@ process-max=2
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust.conf"
 
-info "ensure cluster up + stanza initialized"
-pg_as principal bash -c "[ -s $DATADIR/PG_VERSION ] || $BIN/initdb -D $DATADIR --data-checksums >/dev/null"
-pg_as principal bash -c "
-  grep -q pgbackrest $DATADIR/postgresql.conf || cat >> $DATADIR/postgresql.conf <<EOF
-port = 5433
-archive_mode = on
-archive_command = '/usr/bin/pgbackrest --stanza=$STANZA archive-push %p'
-wal_level = replica
-EOF
-  $BIN/pg_ctl -D $DATADIR -l $DATADIR/server.log -w restart >/dev/null 2>&1 || \
-  $BIN/pg_ctl -D $DATADIR -l $DATADIR/server.log -w start"
-pg_as principal pgbackrest --stanza=$STANZA stanza-create || true
+reset_principal "$DATADIR" "$BIN" "$STANZA"
+pg_as principal pgbackrust --stanza=$STANZA stanza-create
 
 info "burst WAL to exercise the async push queue"
 psql_on principal 5433 -c "CREATE TABLE IF NOT EXISTS burst(i int);"
@@ -59,7 +49,7 @@ wait_for "archived WAL segments present" 40 1 \
   bash -c "$COMPOSE exec -T principal bash -c 'ls $REPO/archive/$STANZA/*/0000* 2>/dev/null | head -1 | grep -q .'"
 
 info "spool out dir should drain (no stuck .ok backlog growth)"
-out=$(pg_as principal pgbackrest --stanza=$STANZA check 2>&1) || true
+out=$(pg_as principal pgbackrust --stanza=$STANZA check 2>&1) || true
 assert_contains "$out" "" "check ran"
 
 pass "07 async-queuing complete"

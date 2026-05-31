@@ -10,12 +10,12 @@ set -euo pipefail
 
 STANZA=demo
 DATADIR=/var/lib/postgresql/$PGV/principal
-REPO=/srv/depot/pgbackrest
+REPO=/srv/depot/pgbackrust
 BIN=/usr/lib/postgresql/$PGV/bin
 
 info "02 remote-pull: depot config reaches principal over SSH"
 node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
-node depot bash -c "cat > /etc/pgbackrest.conf <<EOF
+node depot bash -c "cat > /etc/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -29,10 +29,10 @@ pg1-path=$DATADIR
 pg1-port=5433
 pg1-user=postgres
 EOF
-chown postgres:postgres /etc/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust.conf"
 
 info "principal config: archive WAL to depot over SSH (repo1-host)"
-node principal bash -c "cat > /etc/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -43,34 +43,24 @@ compress-level=1
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust.conf"
 
-info "ensure principal cluster is up with archiving"
-pg_as principal bash -c "[ -s $DATADIR/PG_VERSION ] || $BIN/initdb -D $DATADIR --data-checksums >/dev/null"
-pg_as principal bash -c "
-  grep -q pgbackrest $DATADIR/postgresql.conf || cat >> $DATADIR/postgresql.conf <<EOF
-port = 5433
-archive_mode = on
-archive_command = '/usr/bin/pgbackrest --stanza=$STANZA archive-push %p'
-wal_level = replica
-EOF
-  $BIN/pg_ctl -D $DATADIR -l $DATADIR/server.log -w restart >/dev/null 2>&1 || \
-  $BIN/pg_ctl -D $DATADIR -l $DATADIR/server.log -w start"
+reset_principal "$DATADIR" "$BIN" "$STANZA"
 
 info "verify SSH reachability postgres@principal <-> postgres@depot"
 pg_as depot ssh -o BatchMode=yes principal true && pass "depot->principal ssh"
 pg_as principal ssh -o BatchMode=yes depot true && pass "principal->depot ssh"
 
 info "stanza-create from depot (over SSH to principal)"
-pg_as depot pgbackrest --stanza=$STANZA stanza-create
+pg_as depot pgbackrust --stanza=$STANZA stanza-create
 
 info "check from depot"
-pg_as depot pgbackrest --stanza=$STANZA check
+pg_as depot pgbackrust --stanza=$STANZA check
 
 info "full backup launched from depot (pull)"
-pg_as depot pgbackrest --stanza=$STANZA --type=full backup
+pg_as depot pgbackrust --stanza=$STANZA --type=full backup
 
-out=$(pg_as depot pgbackrest --stanza=$STANZA info)
+out=$(pg_as depot pgbackrust --stanza=$STANZA info)
 assert_contains "$out" "status: ok" "info from depot"
 assert_contains "$out" "full backup" "info from depot"
 
