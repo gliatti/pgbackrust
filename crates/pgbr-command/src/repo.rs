@@ -16,10 +16,74 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_io::{IoError, IoRead, IoWrite, copy as io_copy};
 use pgbr_storage::{Storage, StorageError, StorageInfo, StorageKind};
 
 use crate::CommandError;
 use crate::pipeline::RepoTransform;
+
+/// Adapter: expose `&mut R: std::io::Read` as an [`IoRead`] so a process stdin
+/// handle (or any `std::io::Read` source like `Cursor<Vec<u8>>`) can feed
+/// [`pgbr_io::copy`] into a storage [`IoWrite`].
+struct StdReadToIo<'a, R: Read> {
+    inner: &'a mut R,
+    eof: bool,
+}
+
+impl<'a, R: Read> StdReadToIo<'a, R> {
+    const fn new(inner: &'a mut R) -> Self {
+        Self { inner, eof: false }
+    }
+}
+
+impl<R: Read> IoRead for StdReadToIo<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let n = self
+            .inner
+            .read(buf)
+            .map_err(|err| IoError::Backend(format!("read input: {err}")))?;
+        if n == 0 {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+
+    fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
+/// Adapter: expose `&mut W: std::io::Write` as an [`IoWrite`] so process
+/// stdout (or any `std::io::Write` sink like `Vec<u8>`) can be the target of
+/// [`pgbr_io::copy`] from a storage [`IoRead`]. `close` is a no-op — the
+/// caller owns the underlying writer's lifecycle.
+struct StdWriteToIo<'a, W: Write> {
+    inner: &'a mut W,
+}
+
+impl<'a, W: Write> StdWriteToIo<'a, W> {
+    const fn new(inner: &'a mut W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write> IoWrite for StdWriteToIo<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.inner
+            .write_all(buf)
+            .map_err(|err| IoError::Backend(format!("write output: {err}")))
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.inner
+            .flush()
+            .map_err(|err| IoError::Backend(format!("flush output: {err}")))
+    }
+
+    fn close(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+}
 
 /// Output format for `repo-ls` (the `--output` option, `text` by default).
 ///
@@ -316,43 +380,50 @@ pub fn get_to<W: Write>(config: &LoadedConfig, repo_storage: &dyn Storage, out: 
     let raw = boolean_opt(config, "raw").unwrap_or(false);
     let ignore_missing = boolean_opt(config, "ignore-missing").unwrap_or(false);
 
-    // `--raw` short-circuits the transform: read the exact path verbatim with
-    // no suffix fallback and no reverse chain.
+    // `--raw` short-circuits the transform: stream the exact path verbatim
+    // with no suffix fallback and no reverse chain. Streaming via
+    // `pgbr_io::copy` keeps memory bounded to one `buffer-size` chunk
+    // regardless of the file size (no full-file `Vec<u8>` allocation).
     if raw {
-        let Some(bytes) = read_exact_bytes(repo_storage, path, ignore_missing)? else {
-            return Ok(());
-        };
-        out.write_all(&bytes)
-            .map_err(|err| CommandError::Other(format!("write output: {err}")))?;
-        return Ok(());
+        return stream_exact(repo_storage, path, ignore_missing, out);
     }
 
     let transform = RepoTransform::from_options(config);
 
+    // Identity transform: no compression, no cipher, no internal filter
+    // buffering. Stream straight from storage to `out` so a multi-GB
+    // unencrypted/uncompressed file does not OOM.
+    if transform == RepoTransform::identity() {
+        return stream_exact(repo_storage, path, ignore_missing, out);
+    }
+
+    // Non-identity transform: compression / cipher filters consume their
+    // input as a contiguous slice and emit a `Vec<u8>` so we must still
+    // buffer the file end-to-end. The size limit is whatever the process can
+    // allocate; once a streaming filter trait lands this branch can also
+    // become a `pgbr_io::copy` pipeline.
     let Some(stored) = read_repo_bytes(repo_storage, path, &transform, ignore_missing)? else {
         return Ok(());
     };
-
-    let plaintext = if transform == RepoTransform::identity() {
-        stored
-    } else {
-        transform.apply_reverse(&stored)?
-    };
-
+    let plaintext = transform.apply_reverse(&stored)?;
     out.write_all(&plaintext)
         .map_err(|err| CommandError::Other(format!("write output: {err}")))?;
     Ok(())
 }
 
-/// Read the exact `<path>` with no suffix fallback. `Ok(None)` when the file is
-/// missing and `ignore_missing` is set; otherwise a missing file surfaces as
-/// [`StorageError::NotFound`].
-fn read_exact_bytes(repo_storage: &dyn Storage, path: &str, ignore_missing: bool) -> Result<Option<Vec<u8>>, CommandError> {
-    match repo_storage.open_read(Path::new(path)) {
-        Ok(mut reader) => Ok(Some(reader.read_all()?)),
-        Err(StorageError::NotFound { .. }) if ignore_missing => Ok(None),
-        Err(err) => Err(err.into()),
-    }
+/// Stream the exact `<path>` from `repo_storage` to `out` via
+/// [`pgbr_io::copy`] — bounded memory, no full-file buffering. Honours
+/// `--ignore-missing`: returns `Ok(())` having written nothing when the file
+/// is absent and the flag is set.
+fn stream_exact<W: Write>(repo_storage: &dyn Storage, path: &str, ignore_missing: bool, out: &mut W) -> Result<(), CommandError> {
+    let mut reader = match repo_storage.open_read(Path::new(path)) {
+        Ok(r) => r,
+        Err(StorageError::NotFound { .. }) if ignore_missing => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut sink = StdWriteToIo::new(out);
+    io_copy(&mut reader, &mut sink)?;
+    Ok(())
 }
 
 /// Read the repo-side bytes for `repo-get`: prefer the exact `<path>`; when the
@@ -433,29 +504,45 @@ pub fn put_from<R: Read>(config: &LoadedConfig, repo_storage: &dyn Storage, inpu
     })?;
     let raw = boolean_opt(config, "raw").unwrap_or(false);
 
-    // Slurp stdin: the compress / encrypt filters buffer their whole input
-    // before emitting, so there is nothing to gain from streaming here.
+    // `--raw` short-circuits the transform: stream input verbatim to the
+    // bare path via `pgbr_io::copy` (bounded memory).
+    if raw {
+        return stream_to(repo_storage, path, input);
+    }
+
+    let transform = RepoTransform::from_options(config);
+    let target = format!("{path}{}", transform.repo_suffix());
+
+    // Identity transform: no compress / cipher filter so there is nothing to
+    // buffer for. Stream input → storage chunk-by-chunk via `pgbr_io::copy`
+    // so a multi-GB plaintext input does not OOM the worker.
+    if transform == RepoTransform::identity() {
+        return stream_to(repo_storage, &target, input);
+    }
+
+    // Non-identity transform: compression / cipher filters require their
+    // input as a contiguous slice, so we still have to slurp the input and
+    // emit a `Vec<u8>`. Same per-file size limit as the buffered get path.
     let mut plaintext = Vec::new();
     input
         .read_to_end(&mut plaintext)
         .map_err(|err| CommandError::Other(format!("read input: {err}")))?;
-
-    // `--raw` short-circuits the transform: verbatim bytes at the bare path.
-    let (repo_bytes, target) = if raw {
-        (plaintext, path.clone())
-    } else {
-        let transform = RepoTransform::from_options(config);
-        let target = format!("{path}{}", transform.repo_suffix());
-        let bytes = if transform == RepoTransform::identity() {
-            plaintext
-        } else {
-            transform.apply_forward(&plaintext)?
-        };
-        (bytes, target)
-    };
+    let repo_bytes = transform.apply_forward(&plaintext)?;
 
     let mut writer = repo_storage.open_write(Path::new(&target))?;
     writer.write(&repo_bytes)?;
+    writer.flush()?;
+    writer.close()?;
+    Ok(())
+}
+
+/// Stream `input` into `repo_storage` at `target` via [`pgbr_io::copy`] —
+/// bounded memory, no full-input buffering. Flushes and closes the storage
+/// writer so the file is durable.
+fn stream_to<R: Read>(repo_storage: &dyn Storage, target: &str, input: &mut R) -> Result<(), CommandError> {
+    let mut writer = repo_storage.open_write(Path::new(target))?;
+    let mut source = StdReadToIo::new(input);
+    io_copy(&mut source, &mut writer)?;
     writer.flush()?;
     writer.close()?;
     Ok(())
@@ -1112,5 +1199,97 @@ mod tests {
         );
         rm(&cfg, &storage).expect("rm of a non-empty dir with --recurse must succeed");
         assert!(!repo.path().join("full").exists());
+    }
+
+    // ----- repo-get / repo-put: streaming for the identity-transform path ---
+    //
+    // `get_to` / `put_from` now route the identity-transform (and `--raw`)
+    // case through `pgbr_io::copy` instead of `read_all` + `write_all`, so a
+    // multi-GB plain file does not OOM the worker. These tests exercise the
+    // streaming path with a 4 MiB payload (well above the 64 KiB copy
+    // buffer) and assert byte-equality round trips.
+
+    /// Build a deterministic ~4 MiB byte payload so the assertion does not
+    /// depend on a fragile RNG seed but still defeats any accidental
+    /// "buffer is just the first 64 KiB" bug.
+    fn streaming_payload(size: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size);
+        let mut state: u32 = 0x9E37_79B9;
+        while bytes.len() < size {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(size);
+        bytes
+    }
+
+    #[test]
+    fn repo_get_streams_large_identity_file() {
+        // 4 MiB: 64x the default 64 KiB pgbr_io::copy buffer, so the
+        // streaming loop must iterate many times. With the prior buffered
+        // path this would still pass — the point is that the bytes survive
+        // the new pgbr_io::copy pipeline byte-for-byte.
+        let (repo, storage) = posix_repo();
+        let payload = streaming_payload(4 * 1024 * 1024);
+        std::fs::write(repo.path().join("big.bin"), &payload).expect("seed big file");
+
+        let cfg = fake_config("repo-get", vec!["big.bin".to_owned()]);
+        let mut buf: Vec<u8> = Vec::new();
+        get_to(&cfg, &storage, &mut buf).expect("identity streaming get_to should succeed");
+
+        assert_eq!(buf.len(), payload.len(), "streamed length must match");
+        assert_eq!(buf, payload, "streamed bytes must match the source verbatim");
+    }
+
+    #[test]
+    fn repo_put_streams_large_identity_input() {
+        // Mirror image of the get test: 4 MiB of stdin → identity put_from
+        // → on-disk file → read back via Posix. The whole round trip must
+        // be byte-equal regardless of file size.
+        let (repo, storage) = posix_repo();
+        let payload = streaming_payload(4 * 1024 * 1024);
+
+        let cfg = fake_config("repo-put", vec!["big.bin".to_owned()]);
+        let mut input = Cursor::new(payload.clone());
+        put_from(&cfg, &storage, &mut input).expect("identity streaming put_from should succeed");
+
+        // Bare path, not suffixed: identity transform => empty suffix.
+        let written = std::fs::read(repo.path().join("big.bin")).expect("read back");
+        assert_eq!(written.len(), payload.len(), "stored length must match");
+        assert_eq!(written, payload, "stored bytes must match the input verbatim");
+        assert!(!repo.path().join("big.bin.gz").exists(), "identity put must not suffix");
+    }
+
+    #[test]
+    fn repo_get_compressed_still_uses_buffered_path() {
+        // No regression: the gz round trip (a non-identity transform) still
+        // succeeds. This codifies that the streaming branch only fires for
+        // the identity / --raw case and the buffered transform pipeline is
+        // untouched.
+        let (repo, storage) = posix_repo();
+        let payload = b"compressed payload round-trips through the buffered transform path";
+
+        let put_cfg = fake_config_with(
+            "repo-put",
+            vec!["doc.txt".to_owned()],
+            vec![("compress-type", OptionValue::StringId("gz".to_owned()))],
+        );
+        let mut input = Cursor::new(payload.to_vec());
+        put_from(&put_cfg, &storage, &mut input).expect("gz put_from should still succeed");
+
+        // The on-disk artifact is suffixed and compressed (not plaintext).
+        let stored = std::fs::read(repo.path().join("doc.txt.gz")).expect("read back .gz");
+        assert_ne!(stored.as_slice(), payload.as_slice(), "gz put must still compress");
+        assert!(!repo.path().join("doc.txt").exists(), "gz put must not write the bare path");
+
+        // The reverse path still recovers the plaintext.
+        let get_cfg = fake_config_with(
+            "repo-get",
+            vec!["doc.txt".to_owned()],
+            vec![("compress-type", OptionValue::StringId("gz".to_owned()))],
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        get_to(&get_cfg, &storage, &mut buf).expect("gz get_to should still succeed");
+        assert_eq!(buf, payload, "buffered transform round trip must still work");
     }
 }
