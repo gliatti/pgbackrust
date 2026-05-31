@@ -55,12 +55,17 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::InfoArchive;
 use pgbr_io::Filter;
 use pgbr_postgres::lsn::parse_wal_segment;
+use pgbr_protocol::message::{OkResponse, Request, Response};
+use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Posix, Storage};
+use serde_json::json;
 
 use crate::CommandError;
 use crate::backup::acquire_command_lock;
@@ -321,6 +326,19 @@ const STATUS_EXT_OK: &str = ".ok";
 /// Status-file extension written for a segment whose drain failed; the file's
 /// body carries the failure message. Matches `STATUS_EXT_ERROR`.
 const STATUS_EXT_ERROR: &str = ".error";
+
+/// Resolve `process-max` (worker-pool size) from the loaded configuration.
+///
+/// Mirrors [`crate::verify`]'s and [`crate::backup`]'s private `process_max`:
+/// `process-max` is an `Integer` (default 1). Values `<= 0` clamp to one worker
+/// so any drain/prefetch always makes progress; the [`ParallelExecutor`]
+/// additionally caps the thread count at the number of queued jobs.
+fn process_max(config: &LoadedConfig) -> usize {
+    match config.options.get(&("process-max".to_owned(), None)) {
+        Some(OptionValue::Integer(value)) if *value >= 1 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
+    }
+}
 
 /// Whether `--archive-async` is enabled in the resolved configuration.
 /// Defaults to `false` (synchronous) when unset.
@@ -787,7 +805,7 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
         // stanza-level and identical across every repo, and the redundant load
         // doubles the TLS round-trip count on the very first async push (which
         // was observed to hang against a fresh TLS daemon).
-        drain_push_spool_multi(&spool, repo_storages, stanza, &archive_id, &transforms)?;
+        drain_push_spool_multi(&spool, repo_storages, stanza, &archive_id, &transforms, process_max(config))?;
 
         // Confirm the requested segment actually reached the repo(s). The drain
         // just wrote `<segment>.ok` (success) or `<segment>.error` (failure);
@@ -1038,7 +1056,7 @@ pub fn drain_push_spool_keyed(
         transform,
         archive_id: &archive_id,
     }];
-    drain_out_spool(spool, stanza, &targets)
+    drain_out_spool(spool, stanza, &targets, process_max(config))
 }
 
 /// Drain the spool *out* directory into **every** configured repository.
@@ -1073,6 +1091,7 @@ pub fn drain_push_spool_multi(
     stanza: &str,
     archive_id: &str,
     transforms: &[RepoTransform],
+    process_max: usize,
 ) -> Result<usize, CommandError> {
     // Reuse the foreground-resolved archive-id for every repo: the archive-id
     // (`<db-version>-<db-id>`) is stanza-level metadata, identical across all
@@ -1090,7 +1109,7 @@ pub fn drain_push_spool_multi(
         })
         .collect();
 
-    drain_out_spool(spool, stanza, &targets)
+    drain_out_spool(spool, stanza, &targets, process_max)
 }
 
 /// One repository the spool drain fans a staged segment out to: its storage,
@@ -1109,25 +1128,51 @@ struct DrainTarget<'a> {
 /// `<segment>.ok` written. On the first per-target failure a `<segment>.error`
 /// carrying the message is written and the staged copy is left for a retry. The
 /// count returned is the number of segments drained into all targets.
-fn drain_out_spool(spool: &dyn Storage, stanza: &str, targets: &[DrainTarget]) -> Result<usize, CommandError> {
+///
+/// When `process_max > 1` AND every target repo is local AND there is more than
+/// one staged segment, the per-segment fan-out is run across a [`ParallelExecutor`]
+/// pool — each worker reads the staged bytes via `std::fs`, applies every
+/// target's [`RepoTransform`], and writes to each target's local destination via
+/// `std::fs`. The main thread then writes the per-segment `.ok` / `.error`
+/// markers (and removes the staged copy on success) from the collected results,
+/// preserving the existing handshake. Otherwise the original serial loop runs.
+fn drain_out_spool(spool: &dyn Storage, stanza: &str, targets: &[DrainTarget], process_max: usize) -> Result<usize, CommandError> {
     let out_dir = push_out_dir(stanza);
     if !spool.exists(&out_dir)? {
         return Ok(0);
     }
 
-    let mut drained = 0;
+    // Collect every staged segment under out/ once (skipping status files).
+    // The list is materialised so both the serial and parallel branches walk
+    // the same set deterministically.
+    let mut segments: Vec<String> = Vec::new();
     for entry in spool.list(&out_dir)? {
         let Some(segment) = entry.path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // Skip status files left by earlier drains.
         if segment.ends_with(STATUS_EXT_OK) || segment.ends_with(STATUS_EXT_ERROR) {
             continue;
         }
-        let segment = segment.to_owned();
+        segments.push(segment.to_owned());
+    }
+
+    // Parallel guard: every target repo must be local (we write through
+    // `std::fs` in workers — that path against a remote/object backend would
+    // either fail or silently write to the wrong machine), and there must be
+    // more than one segment to make pool spawn-up worthwhile (a single segment
+    // gets the existing serial loop, which itself may parallelize per-target
+    // via [`drain_one_to_targets`]). The spool itself is always a local
+    // `Posix`, so it never needs guarding.
+    let all_local = targets.iter().all(|t| t.repo.is_local());
+    if process_max > 1 && all_local && segments.len() > 1 && !targets.is_empty() {
+        return drain_out_spool_parallel(spool, stanza, targets, &out_dir, &segments, process_max);
+    }
+
+    let mut drained = 0;
+    for segment in segments {
         let staged = out_dir.join(&segment);
 
-        match drain_one_to_targets(spool, stanza, &segment, &staged, targets) {
+        match drain_one_to_targets(spool, stanza, &segment, &staged, targets, process_max) {
             Ok(()) => {
                 spool.remove(&staged, false)?;
                 write_segment(b"", spool, &status_ok_path(stanza, &segment))?;
@@ -1142,20 +1187,145 @@ fn drain_out_spool(spool: &dyn Storage, stanza: &str, targets: &[DrainTarget]) -
     Ok(drained)
 }
 
+/// Parallel per-segment fan-out used by [`drain_out_spool`] when every target
+/// is local and more than one segment is queued. Each worker handles one staged
+/// segment: it reads the staged bytes, applies every target's [`RepoTransform`],
+/// and writes to each target's destination via `std::fs`. All file I/O is local
+/// `std::fs` (against absolute paths captured in the [`Job::request`]); no
+/// [`Storage`] handle or borrowed `&RepoTransform` crosses the worker boundary
+/// — the closure captures only owned data (`Arc<Vec<RepoTransform>>` of every
+/// target's transform, an `Arc<Vec<PathBuf>>` of every target's absolute repo
+/// archive-id directory, and the stanza). After all jobs complete the main
+/// thread writes the per-segment `.ok` / `.error` markers and removes the
+/// staged copy on success — so the handshake matches the serial path.
+fn drain_out_spool_parallel(
+    spool: &dyn Storage,
+    stanza: &str,
+    targets: &[DrainTarget],
+    out_dir: &Path,
+    segments: &[String],
+    process_max: usize,
+) -> Result<usize, CommandError> {
+    // Pre-compute the absolute (host-resolved) staged path and absolute
+    // per-target destination directory once on the main thread. Workers can
+    // then call `std::fs::write` directly with these paths — no `Storage`
+    // round-trip in the hot loop. The staged dir, like the rest of the spool,
+    // is always local `Posix`.
+    let staged_dir_abs = spool.info(out_dir)?.path;
+
+    // For each target: ensure the destination dir exists (so `info()` resolves)
+    // and capture its absolute path. The transform is cloned (it's `Clone +
+    // Send + Sync`); the per-target suffix piggybacks on each cloned transform.
+    let mut target_dirs_abs: Vec<PathBuf> = Vec::with_capacity(targets.len());
+    let mut worker_transforms: Vec<RepoTransform> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let dir = PathBuf::from(format!("archive/{stanza}/{}", target.archive_id));
+        target.repo.create_path(&dir, true)?;
+        target_dirs_abs.push(target.repo.info(&dir)?.path);
+        worker_transforms.push(target.transform.clone());
+    }
+
+    let worker_transforms: Arc<Vec<RepoTransform>> = Arc::new(worker_transforms);
+    let target_dirs_abs: Arc<Vec<PathBuf>> = Arc::new(target_dirs_abs);
+
+    // Build one job per segment. The request carries only JSON primitives: the
+    // staged file's absolute path (string) and the segment name (string).
+    let dispatcher_jobs: Vec<Job> = segments
+        .iter()
+        .map(|segment| {
+            let staged_abs = staged_dir_abs.join(segment);
+            Job {
+                key: segment.clone(),
+                request: Request {
+                    cmd: "drain-segment".to_owned(),
+                    param: vec![json!(staged_abs.to_string_lossy()), json!(segment.clone())],
+                },
+            }
+        })
+        .collect();
+
+    let executor = ParallelExecutor::new(process_max);
+    let closure_transforms = Arc::clone(&worker_transforms);
+    let closure_target_dirs = Arc::clone(&target_dirs_abs);
+    let results = executor.run(dispatcher_jobs, move |request| {
+        let staged_abs = request
+            .param
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "drain-segment: missing staged path".to_owned())?;
+        let segment = request
+            .param
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "drain-segment: missing segment name".to_owned())?;
+        let bytes = std::fs::read(staged_abs).map_err(|err| format!("read {staged_abs}: {err}"))?;
+        for (transform, dir) in closure_transforms.iter().zip(closure_target_dirs.iter()) {
+            let stored = transform.apply_forward_keyed(&bytes).map_err(|err| err.to_string())?;
+            let dest = dir.join(format!("{segment}{}", transform.repo_suffix()));
+            std::fs::write(&dest, &stored).map_err(|err| format!("write {}: {err}", dest.display()))?;
+        }
+        Ok(Response::Ok(OkResponse { out: None }))
+    });
+
+    // Apply each job's outcome on the main thread: on success remove the
+    // staged copy and write the `.ok` marker; on failure write the `.error`
+    // marker (the staged copy stays in place for a retry). Status writes
+    // continue even after a per-segment failure — the same fail-collect
+    // behaviour the serial loop has.
+    let mut drained = 0;
+    for jr in results {
+        let staged = out_dir.join(&jr.key);
+        match jr.result {
+            Ok(_) => {
+                spool.remove(&staged, false)?;
+                write_segment(b"", spool, &status_ok_path(stanza, &jr.key))?;
+                drained += 1;
+            }
+            Err(message) => {
+                write_segment(message.as_bytes(), spool, &status_error_path(stanza, &jr.key))?;
+            }
+        }
+    }
+    Ok(drained)
+}
+
 /// Transfer one staged segment to every target repository, applying each
 /// target's own [`RepoTransform`] (compress + per-repo cipher) and writing to
 /// that repository's archive-id directory. Used by [`drain_out_spool`]; a
 /// returned error becomes a `.error` status and the staged copy is kept. The
 /// staged bytes are read once and re-transformed per repository so each repo's
 /// cipher sub-key is honoured.
+///
+/// When the fan-out reaches more than one target AND every target repo is
+/// local AND `process_max > 1`, the per-target writes are dispatched across a
+/// [`ParallelExecutor`] pool: one [`Job`] per target, each worker applies that
+/// target's [`RepoTransform`] to a shared `Arc<Vec<u8>>` of the plaintext bytes
+/// and writes to that target's destination via `std::fs::write`. The shared
+/// bytes are computed exactly once (the spool read happens before the pool
+/// spawns), and the function only returns `Ok(())` after every target succeeded
+/// — any per-target failure surfaces as a `CommandError`, which the caller turns
+/// into a `<segment>.error` marker (so the `.ok` marker is only ever written
+/// after every repo holds the segment, exactly like the serial path).
 fn drain_one_to_targets(
     spool: &dyn Storage,
     stanza: &str,
     segment: &str,
     staged: &Path,
     targets: &[DrainTarget],
+    process_max: usize,
 ) -> Result<(), CommandError> {
     let bytes = read_segment(spool, staged)?;
+
+    // Parallel guard: more than one repo, every repo local, and a real pool
+    // size (`process_max > 1`). Otherwise the serial loop runs — which is the
+    // single-repo case, every non-local backend, and the explicit `process-max=1`
+    // case. The `is_local()` guard is critical: a `RemoteStorage` write inside
+    // a worker would either fail at compile/runtime (the storage handle is
+    // `!Send` for some backends) or write to the wrong place.
+    if process_max > 1 && targets.len() > 1 && targets.iter().all(|t| t.repo.is_local()) {
+        return drain_one_to_targets_parallel(stanza, segment, bytes, targets, process_max);
+    }
+
     for target in targets {
         let stored = transform_segment(target.transform, &bytes)?;
         let dest = repo_segment_path(
@@ -1164,6 +1334,85 @@ fn drain_one_to_targets(
             &format!("{segment}{}", target.transform.repo_suffix()),
         );
         write_segment(&stored, target.repo, &dest)?;
+    }
+    Ok(())
+}
+
+/// Parallel per-target fan-out used by [`drain_one_to_targets`] when more than
+/// one target is configured and every target repo is local. Dispatches one
+/// [`Job`] per target across a [`ParallelExecutor`] pool. Each worker captures
+/// only owned data — an `Arc<Vec<u8>>` clone of the plaintext segment bytes, a
+/// cloned `RepoTransform` for its target, and the absolute destination path
+/// (computed once on the main thread). It applies the transform and writes via
+/// `std::fs::write`. Returns `Ok(())` only when every per-target job
+/// succeeded; on any failure the first error message is returned as a
+/// [`CommandError::Other`], so the caller's `.error` status path triggers and
+/// no `.ok` marker is ever written for a segment that did not reach every
+/// repo.
+fn drain_one_to_targets_parallel(
+    stanza: &str,
+    segment: &str,
+    bytes: Vec<u8>,
+    targets: &[DrainTarget],
+    process_max: usize,
+) -> Result<(), CommandError> {
+    // Resolve every target's absolute destination directory once on the main
+    // thread (using the `Storage` handle, which the worker pool cannot touch).
+    // `create_path(.., true)` is idempotent on missing-but-needed dirs.
+    let mut dispatcher_jobs: Vec<Job> = Vec::with_capacity(targets.len());
+    let mut worker_transforms: Vec<RepoTransform> = Vec::with_capacity(targets.len());
+    for (idx, target) in targets.iter().enumerate() {
+        let dir = PathBuf::from(format!("archive/{stanza}/{}", target.archive_id));
+        target.repo.create_path(&dir, true)?;
+        let dir_abs = target.repo.info(&dir)?.path;
+        let dest_abs = dir_abs.join(format!("{segment}{}", target.transform.repo_suffix()));
+        worker_transforms.push(target.transform.clone());
+        dispatcher_jobs.push(Job {
+            key: format!("{segment}#target={idx}"),
+            request: Request {
+                cmd: "drain-target".to_owned(),
+                param: vec![json!(idx), json!(dest_abs.to_string_lossy())],
+            },
+        });
+    }
+
+    // The plaintext bytes are wrapped once in an `Arc<Vec<u8>>` so every worker
+    // closure clones the handle (O(1) refcount bump), not the bytes themselves.
+    // The transform list is wrapped likewise: indexing into it by the job's
+    // target position keeps lookups primitive across the JSON boundary.
+    let shared_bytes: Arc<Vec<u8>> = Arc::new(bytes);
+    let shared_transforms: Arc<Vec<RepoTransform>> = Arc::new(worker_transforms);
+
+    let closure_bytes = Arc::clone(&shared_bytes);
+    let closure_transforms = Arc::clone(&shared_transforms);
+    let results = ParallelExecutor::new(process_max).run(dispatcher_jobs, move |request| {
+        let idx = request
+            .param
+            .first()
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "drain-target: missing target index".to_owned())?;
+        let dest_abs = request
+            .param
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "drain-target: missing destination path".to_owned())?;
+        let idx_usize = usize::try_from(idx).map_err(|err| format!("drain-target: index {idx} out of range: {err}"))?;
+        let transform = closure_transforms
+            .get(idx_usize)
+            .ok_or_else(|| format!("drain-target: no transform for index {idx_usize}"))?;
+        let stored = transform.apply_forward_keyed(&closure_bytes).map_err(|err| err.to_string())?;
+        std::fs::write(dest_abs, &stored).map_err(|err| format!("write {dest_abs}: {err}"))?;
+        Ok(Response::Ok(OkResponse { out: None }))
+    });
+
+    // Every target must succeed before the caller writes the `.ok` marker —
+    // the segment is only "archived" when every repo holds it. Return the
+    // first failure encountered (results may arrive in any order; we sort
+    // implicitly by surfacing any one error).
+    for jr in results {
+        if let Err(message) = jr.result {
+            return Err(CommandError::Other(format!("drain target {} failed: {message}", jr.key)));
+        }
     }
     Ok(())
 }
@@ -1480,7 +1729,29 @@ pub fn prefetch_get_spool(
 
     // Account for whatever is already staged so a partially-filled spool is not
     // overrun on the next prefetch round.
-    let mut staged_bytes = spool_in_backlog_bytes(spool, stanza);
+    let staged_bytes_now = spool_in_backlog_bytes(spool, stanza);
+    let workers = process_max(config);
+
+    // Parallel guard: the repo must be local (workers will `std::fs::read` from
+    // it directly — that would either fail or read the wrong file against a
+    // remote/object backend), and there must be a real pool size and at least
+    // two segments to prefetch. The spool is always local `Posix`, so it never
+    // needs guarding.
+    if workers > 1 && repo_storage.is_local() && segments.len() > 1 {
+        return prefetch_get_spool_parallel(
+            spool,
+            repo_storage,
+            stanza,
+            &archive_id,
+            segments,
+            queue_max,
+            staged_bytes_now,
+            sub_key.as_deref(),
+            workers,
+        );
+    }
+
+    let mut staged_bytes = staged_bytes_now;
     let mut prefetched = 0;
     for segment in segments {
         // Stop once the in/ spool has reached the configured byte cap.
@@ -1512,6 +1783,177 @@ pub fn prefetch_get_spool(
         staged_bytes += bytes.len() as u64;
         write_segment(&bytes, spool, &get_in_dir(stanza).join(segment))?;
         prefetched += 1;
+    }
+
+    Ok(prefetched)
+}
+
+/// Parallel per-segment prefetch used by [`prefetch_get_spool`] when the repo
+/// is local and more than one segment is queued. Each worker probes the
+/// repository for its segment's stored form (plaintext or compressed),
+/// reverses the per-repo transform (decrypt then decompress) and writes the
+/// plaintext bytes into the spool *in* directory — all via `std::fs`, so no
+/// [`Storage`] handle crosses the worker boundary.
+///
+/// The `archive-get-queue-max` cap is enforced cooperatively across workers via
+/// an `Arc<AtomicU64>`: each worker bumps the counter by the *intended* segment
+/// size before doing real work, then bails out (writing nothing) if the bump
+/// overshot the limit. The bump is post-decrement-on-bail so a serialised
+/// retry would re-attempt the segment cleanly. The pre-existing `staged_bytes`
+/// (the in/ dir's backlog before this call) seeds the counter. The on-the-wire
+/// per-segment size used for the gate is the *plaintext* size — matching what
+/// the serial path accounts.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn prefetch_get_spool_parallel(
+    spool: &dyn Storage,
+    repo_storage: &dyn Storage,
+    stanza: &str,
+    archive_id: &str,
+    segments: &[String],
+    queue_max: Option<u64>,
+    staged_bytes: u64,
+    sub_key: Option<&str>,
+    process_max: usize,
+) -> Result<usize, CommandError> {
+    // Resolve absolute directories for the repo's archive-id and the spool's
+    // in/ on the main thread. The repo's archive-id dir is the one workers
+    // probe + read from (via `std::fs`), the spool's in/ dir is where they
+    // write (also via `std::fs`).
+    let repo_archive_dir = PathBuf::from(format!("archive/{stanza}/{archive_id}"));
+    // The archive-id dir may not yet exist on a fresh repo: `info()` would
+    // surface NotFound. Fall back gracefully: with no dir there is nothing
+    // to prefetch.
+    let repo_archive_abs = if repo_storage.exists(&repo_archive_dir)? {
+        repo_storage.info(&repo_archive_dir)?.path
+    } else {
+        return Ok(0);
+    };
+
+    let in_dir = get_in_dir(stanza);
+    spool.create_path(&in_dir, true)?;
+    let in_dir_abs = spool.info(&in_dir)?.path;
+
+    // The byte cap counter starts at the pre-existing backlog so a partially
+    // filled spool is not overrun. `Arc<AtomicU64>` is `Send + Sync`, cheap
+    // to clone, and lets every worker check + bump atomically before reading.
+    let counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(staged_bytes));
+    let limit_owned: Option<u64> = queue_max;
+
+    let suffixes_owned: Vec<&'static str> = COMPRESS_SUFFIXES.to_vec();
+    let sub_key_owned: Option<String> = sub_key.map(str::to_owned);
+
+    let dispatcher_jobs: Vec<Job> = segments
+        .iter()
+        .map(|segment| Job {
+            key: segment.clone(),
+            request: Request {
+                cmd: "prefetch-segment".to_owned(),
+                param: vec![
+                    json!(segment.clone()),
+                    json!(repo_archive_abs.to_string_lossy()),
+                    json!(in_dir_abs.to_string_lossy()),
+                ],
+            },
+        })
+        .collect();
+
+    let counter_for_workers = Arc::clone(&counter);
+    let results = ParallelExecutor::new(process_max).run(dispatcher_jobs, move |request| {
+        let segment = request
+            .param
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "prefetch-segment: missing segment".to_owned())?;
+        let repo_dir = request
+            .param
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "prefetch-segment: missing repo dir".to_owned())?;
+        let spool_dir = request
+            .param
+            .get(2)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "prefetch-segment: missing spool dir".to_owned())?;
+        let repo_dir = Path::new(repo_dir);
+        let spool_dir = Path::new(spool_dir);
+
+        // Probe the stored form: plaintext first, then every compression
+        // suffix. Workers do this via `std::fs::metadata` (cheaper than
+        // `exists` everywhere). A segment with no stored form yet is skipped
+        // (the caller's serial path also `continue`s here — a future segment
+        // may not be archived yet).
+        let plaintext_path = repo_dir.join(segment);
+        let (source, suffix) = if std::fs::metadata(&plaintext_path).is_ok() {
+            (plaintext_path, "")
+        } else {
+            let mut found: Option<(PathBuf, &'static str)> = None;
+            for suffix in &suffixes_owned {
+                let candidate = repo_dir.join(format!("{segment}{suffix}"));
+                if std::fs::metadata(&candidate).is_ok() {
+                    found = Some((candidate, *suffix));
+                    break;
+                }
+            }
+            match found {
+                Some(pair) => pair,
+                None => {
+                    return Ok(Response::Ok(OkResponse {
+                        out: Some(json!({ "skipped": true })),
+                    }));
+                }
+            }
+        };
+
+        let stored = std::fs::read(&source).map_err(|err| format!("read {}: {err}", source.display()))?;
+        let bytes = decode_stored_segment(&stored, suffix, sub_key_owned.as_deref()).map_err(|err| err.to_string())?;
+        let segment_len = bytes.len() as u64;
+
+        // Cooperative queue-max enforcement. Bump first, then check: if the
+        // bump overshot the limit, roll back (subtract the same delta) and
+        // report this segment as skipped — workers in flight that already
+        // wrote earlier still count, but no new write happens once the cap
+        // is reached.
+        if let Some(limit) = limit_owned {
+            let prev = counter_for_workers.fetch_add(segment_len, Ordering::SeqCst);
+            if prev.saturating_add(segment_len) > limit {
+                counter_for_workers.fetch_sub(segment_len, Ordering::SeqCst);
+                return Ok(Response::Ok(OkResponse {
+                    out: Some(json!({ "skipped": true })),
+                }));
+            }
+        }
+
+        // Write the plaintext bytes into the in/ dir. The parent already
+        // exists (the main thread `create_path`d it) so `std::fs::write` is
+        // safe with no further mkdir.
+        let dest = spool_dir.join(segment);
+        std::fs::write(&dest, &bytes).map_err(|err| format!("write {}: {err}", dest.display()))?;
+
+        Ok(Response::Ok(OkResponse {
+            out: Some(json!({ "prefetched": true })),
+        }))
+    });
+
+    let mut prefetched = 0;
+    for jr in results {
+        match jr.result {
+            Ok(Response::Ok(OkResponse { out: Some(value) })) => {
+                if value.get("prefetched").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                    prefetched += 1;
+                }
+                // `skipped` (segment not in repo, or queue cap reached) is
+                // a no-op — the serial path also silently skips both.
+            }
+            Ok(_) => {
+                return Err(CommandError::Other(format!(
+                    "prefetch of {} produced an unexpected empty response",
+                    jr.key
+                )));
+            }
+            Err(message) => {
+                return Err(CommandError::Other(format!("prefetch of {} failed: {message}", jr.key)));
+            }
+        }
     }
 
     Ok(prefetched)
@@ -3308,6 +3750,7 @@ mod tests {
             "demo",
             "18-1",
             &transforms,
+            1,
         )
         .expect("multi drain should succeed without loading archive.info");
         assert_eq!(drained, 1, "exactly one segment should drain");
@@ -3419,8 +3862,355 @@ mod tests {
             "demo",
             "16-1",
             &transforms,
+            1,
         )
         .expect("drain must not touch archive.info");
         assert_eq!(drained, 1, "exactly one segment should drain");
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel-drain / parallel-prefetch coverage. Each Fix has a parallel-on
+    // test (process_max > 1, every backend local) and a serial-fallback test
+    // (process_max > 1 but the backend reports `is_local() == false`, so the
+    // parallel `std::fs` path is unsafe and the function must transparently
+    // fall back to the `Storage`-trait serial loop).
+    // -----------------------------------------------------------------------
+
+    /// `Posix`-backed storage that overrides `is_local()` to `false`, used to
+    /// prove the parallel branches gate on `is_local()` and fall back to the
+    /// serial `Storage`-trait loop on a remote/object backend. All real I/O
+    /// still hits the wrapped `Posix` so the test can assert end-to-end
+    /// behaviour, but the parallel `std::fs` path is forbidden by the gate.
+    struct RemotePosix {
+        inner: Posix,
+    }
+
+    impl Storage for RemotePosix {
+        fn is_local(&self) -> bool {
+            false
+        }
+
+        fn exists(&self, path: &Path) -> Result<bool, pgbr_storage::StorageError> {
+            self.inner.exists(path)
+        }
+
+        fn info(&self, path: &Path) -> Result<pgbr_storage::StorageInfo, pgbr_storage::StorageError> {
+            self.inner.info(path)
+        }
+
+        fn list(&self, path: &Path) -> Result<Vec<pgbr_storage::StorageInfo>, pgbr_storage::StorageError> {
+            self.inner.list(path)
+        }
+
+        fn open_read(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoRead>, pgbr_storage::StorageError> {
+            self.inner.open_read(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<Box<dyn pgbr_io::IoWrite>, pgbr_storage::StorageError> {
+            self.inner.open_write(path)
+        }
+
+        fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove(path, error_on_missing)
+        }
+
+        fn rename(&self, source: &Path, target: &Path) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.rename(source, target)
+        }
+
+        fn create_path(&self, path: &Path, recursive: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.create_path(path, recursive)
+        }
+
+        fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), pgbr_storage::StorageError> {
+            self.inner.remove_path(path, recursive, error_on_missing)
+        }
+    }
+
+    /// `fake_config` plus a `process-max` integer option, mirroring how the
+    /// CLI option is resolved at runtime. Drives the parallel-on branches.
+    fn fake_config_with_process_max(stanza: Option<&str>, process_max: i64) -> LoadedConfig {
+        let mut cfg = fake_config(stanza, Vec::new());
+        cfg.options
+            .insert(("process-max".to_owned(), None), OptionValue::Integer(process_max));
+        cfg
+    }
+
+    /// Fix A — parallel multi-repo drain. With three local repos, a single
+    /// staged segment, and `process_max=4`, `drain_push_spool_multi` must
+    /// land that segment in EVERY repo (the per-target writes are
+    /// parallelised, but the `.ok` handshake still requires all targets to
+    /// succeed before the staged copy is removed and the marker is written).
+    #[test]
+    fn drain_one_to_targets_parallel_multi_repo_local() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo3 = tempfile::tempdir().expect("repo3 tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let repo3_s = Posix::new(repo3.path());
+        let (_spool, spool_s) = spool_storage();
+
+        // Single staged segment; the parallelism is across the three repos
+        // (Fix A's inner per-target pool), not across segments. Only one
+        // staged file means the per-segment outer pool (Fix B) is skipped
+        // and `drain_one_to_targets` is invoked — exercising Fix A.
+        put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
+
+        let transforms = vec![
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+        ];
+
+        let drained = drain_push_spool_multi(
+            &spool_s,
+            &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage, &repo3_s as &dyn Storage],
+            "demo",
+            "16-1",
+            &transforms,
+            4,
+        )
+        .expect("parallel multi-repo drain should succeed");
+        assert_eq!(drained, 1, "exactly one segment should drain");
+
+        for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s), ("repo3", &repo3_s)] {
+            let dest = format!("archive/demo/16-1/{SEGMENT}");
+            assert!(
+                repo.exists(Path::new(&dest)).expect("exists"),
+                "{label}: segment must land at {dest}",
+            );
+            assert_eq!(read(repo, &dest), WAL_BODY, "{label}: round-trip bytes");
+        }
+
+        // `.ok` was written, staged copy removed.
+        assert!(
+            spool_s.exists(&status_ok_path("demo", SEGMENT)).expect("status_ok exists"),
+            ".ok marker must be written after every repo succeeded"
+        );
+        assert!(
+            !spool_s.exists(&push_out_dir("demo").join(SEGMENT)).expect("staged exists"),
+            "staged copy must be removed once every repo holds the segment"
+        );
+    }
+
+    /// Fix A — serial fallback when any repo reports `is_local() == false`.
+    /// `RemotePosix` writes through `std::fs` underneath but the gate must
+    /// block the parallel `std::fs` path and route through the serial
+    /// `Storage::open_write` trait loop. End-to-end the segment must still
+    /// land in both repos.
+    #[test]
+    fn drain_one_to_targets_falls_back_to_serial_on_remote() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = RemotePosix {
+            inner: Posix::new(repo1.path()),
+        };
+        let repo2_s = Posix::new(repo2.path());
+        let (_spool, spool_s) = spool_storage();
+
+        put(&spool_s, &format!("archive/demo/out/{SEGMENT}"), WAL_BODY);
+
+        let transforms = vec![
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+        ];
+
+        let drained = drain_push_spool_multi(
+            &spool_s,
+            &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage],
+            "demo",
+            "16-1",
+            &transforms,
+            4,
+        )
+        .expect("serial fallback should still drain");
+        assert_eq!(drained, 1);
+
+        let dest = format!("archive/demo/16-1/{SEGMENT}");
+        assert!(repo1_s.exists(Path::new(&dest)).expect("remote exists"));
+        assert!(repo2_s.exists(Path::new(&dest)).expect("local exists"));
+    }
+
+    /// Fix B — parallel per-segment drain across multiple staged segments
+    /// and multiple local repos. With four staged segments and two local
+    /// repos and `process_max=4`, every segment must land in every repo and
+    /// every `.ok` marker must be written.
+    #[test]
+    fn drain_out_spool_parallel_local() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let (_spool, spool_s) = spool_storage();
+
+        let segments = [
+            "000000010000000000000001",
+            "000000010000000000000002",
+            "000000010000000000000003",
+            "000000010000000000000004",
+        ];
+        for (idx, seg) in segments.iter().enumerate() {
+            // Distinguishable per-segment bytes so a swap in routing would
+            // be detected (and not masked by an identical body).
+            let mut body = WAL_BODY.to_vec();
+            body.extend_from_slice(format!("-seg-{idx}").as_bytes());
+            put(&spool_s, &format!("archive/demo/out/{seg}"), &body);
+        }
+
+        let transforms = vec![
+            RepoTransform::with_key(CompressType::None, 0, None),
+            RepoTransform::with_key(CompressType::None, 0, None),
+        ];
+
+        let drained = drain_push_spool_multi(
+            &spool_s,
+            &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage],
+            "demo",
+            "16-1",
+            &transforms,
+            4,
+        )
+        .expect("parallel per-segment drain should succeed");
+        assert_eq!(drained, 4, "every staged segment should drain");
+
+        for (idx, seg) in segments.iter().enumerate() {
+            let mut expected = WAL_BODY.to_vec();
+            expected.extend_from_slice(format!("-seg-{idx}").as_bytes());
+            for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s)] {
+                let dest = format!("archive/demo/16-1/{seg}");
+                assert!(
+                    repo.exists(Path::new(&dest)).expect("exists"),
+                    "{label}: segment {seg} must land at {dest}",
+                );
+                assert_eq!(read(repo, &dest), expected, "{label}: segment {seg} bytes round-trip");
+            }
+            assert!(
+                spool_s.exists(&status_ok_path("demo", seg)).expect("status_ok exists"),
+                "{seg}: .ok marker must be written"
+            );
+            assert!(
+                !spool_s.exists(&push_out_dir("demo").join(seg)).expect("staged exists"),
+                "{seg}: staged copy must be removed"
+            );
+        }
+    }
+
+    /// Fix B — serial fallback when any repo is non-local. Multi-segment
+    /// backlog plus a `RemotePosix` repo gates the parallel branch off and
+    /// the serial loop drains everything via the `Storage` trait. The
+    /// end-to-end result is identical to the parallel case.
+    #[test]
+    fn drain_out_spool_serial_on_remote() {
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo1_s = RemotePosix {
+            inner: Posix::new(repo1.path()),
+        };
+        let (_spool, spool_s) = spool_storage();
+
+        let segments = ["000000010000000000000001", "000000010000000000000002"];
+        for seg in &segments {
+            put(&spool_s, &format!("archive/demo/out/{seg}"), WAL_BODY);
+        }
+
+        let transforms = vec![RepoTransform::with_key(CompressType::None, 0, None)];
+
+        let drained = drain_push_spool_multi(&spool_s, &[&repo1_s as &dyn Storage], "demo", "16-1", &transforms, 4)
+            .expect("serial fallback should still drain a non-local repo");
+        assert_eq!(drained, 2);
+
+        for seg in &segments {
+            let dest = format!("archive/demo/16-1/{seg}");
+            assert!(repo1_s.exists(Path::new(&dest)).expect("dest exists"));
+            assert!(
+                spool_s.exists(&status_ok_path("demo", seg)).expect("status_ok exists"),
+                "{seg}: .ok marker must be written",
+            );
+        }
+    }
+
+    /// Fix C — parallel prefetch across multiple segments against a local
+    /// repo. Five segments seeded in the repo's archive-id directory and
+    /// `process-max=4`. Every segment must end up in the in/ spool with
+    /// its plaintext bytes intact, and the function reports five
+    /// pre-fetched.
+    #[test]
+    fn prefetch_get_spool_parallel_local() {
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let (_spool, spool_s) = spool_storage();
+        seed_archive_info_generic(&repo_s, "demo");
+
+        let segments = [
+            "000000010000000000000001",
+            "000000010000000000000002",
+            "000000010000000000000003",
+            "000000010000000000000004",
+            "000000010000000000000005",
+        ];
+        for (idx, seg) in segments.iter().enumerate() {
+            let mut body = WAL_BODY.to_vec();
+            body.extend_from_slice(format!("-seg-{idx}").as_bytes());
+            put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{seg}"), &body);
+        }
+
+        let requested: Vec<String> = segments.iter().map(|s| (*s).to_owned()).collect();
+
+        let prefetched = prefetch_get_spool(
+            &fake_config_with_process_max(Some("demo"), 4),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &requested,
+            None,
+        )
+        .expect("parallel prefetch should succeed");
+        assert_eq!(prefetched, 5, "every requested segment must be prefetched");
+
+        for (idx, seg) in segments.iter().enumerate() {
+            let mut expected = WAL_BODY.to_vec();
+            expected.extend_from_slice(format!("-seg-{idx}").as_bytes());
+            let staged = format!("archive/demo/in/{seg}");
+            assert!(spool_s.exists(Path::new(&staged)).expect("exists"), "{seg}: staged in spool");
+            assert_eq!(read(&spool_s, &staged), expected, "{seg}: round-trip plaintext");
+        }
+    }
+
+    /// Fix C — serial fallback when the repo reports `is_local() == false`.
+    /// The parallel `std::fs` probe + read would target the wrong machine
+    /// on a remote backend, so the gate must keep the function on the
+    /// existing serial `Storage`-trait loop. Behaviour is identical to the
+    /// parallel branch end-to-end.
+    #[test]
+    fn prefetch_get_spool_serial_on_remote() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let repo_inner = Posix::new(repo.path());
+        seed_archive_info_generic(&repo_inner, "demo");
+        let segments = ["000000010000000000000001", "000000010000000000000002"];
+        for seg in &segments {
+            put(&repo_inner, &format!("archive/demo/{ARCHIVE_ID}/{seg}"), WAL_BODY);
+        }
+        let repo_s = RemotePosix { inner: repo_inner };
+        let (_spool, spool_s) = spool_storage();
+
+        let requested: Vec<String> = segments.iter().map(|s| (*s).to_owned()).collect();
+
+        let prefetched = prefetch_get_spool(
+            &fake_config_with_process_max(Some("demo"), 4),
+            &spool_s,
+            &repo_s,
+            1,
+            "demo",
+            &requested,
+            None,
+        )
+        .expect("serial fallback should prefetch from a non-local repo");
+        assert_eq!(prefetched, 2);
+
+        for seg in &segments {
+            let staged = format!("archive/demo/in/{seg}");
+            assert!(spool_s.exists(Path::new(&staged)).expect("exists"), "{seg}: staged");
+            assert_eq!(read(&spool_s, &staged), WAL_BODY, "{seg}: plaintext");
+        }
     }
 }
