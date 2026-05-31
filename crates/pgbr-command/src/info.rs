@@ -166,6 +166,17 @@ pub struct StanzaSummary {
     /// Backups discovered in `[backup:current]`. Empty when `backup.info`
     /// did not load or the section was empty.
     pub backups: Vec<BackupSummary>,
+    /// Lowest WAL segment present under `archive/<stanza>/<archive-id>/`.
+    /// `None` when the archive directory is missing/empty or the archive
+    /// identity could not be resolved.
+    pub wal_min: Option<String>,
+    /// Highest WAL segment present under `archive/<stanza>/<archive-id>/`.
+    /// `None` when the archive directory is missing/empty or the archive
+    /// identity could not be resolved.
+    pub wal_max: Option<String>,
+    /// Repository cipher type. `"none"` for an unencrypted repository,
+    /// otherwise the configured cipher's `string-id` (e.g. `"aes-256-cbc"`).
+    pub cipher: String,
 }
 
 /// Alias for [`StanzaSummary`] — the task's "`StanzaInfo` model" name. Both
@@ -273,6 +284,73 @@ fn decode_backup(label: &str, value: &Value) -> BackupSummary {
     }
 }
 
+/// Scan `archive/<stanza>/<archive-id>/` for WAL segment files and return the
+/// lexicographically lowest / highest segment names, with any compression
+/// suffix (`.gz`, `.zst`, `.bz2`, `.lz4`) stripped.
+///
+/// Returns `(None, None)` when the directory is missing (typical for a stanza
+/// that has been initialised but has never archived a WAL) or empty.
+///
+/// Pure listing — does **not** scan the per-WAL `0000000A` subdirectories. This
+/// fork's `archive-push` writes segments directly under the archive-id path, so
+/// a flat listing is sufficient.
+///
+/// # Errors
+///
+/// Returns [`CommandError::Storage`] for any storage failure other than
+/// `NotFound`, which is the expected "no WAL yet" case and is mapped to
+/// `(None, None)`.
+fn scan_archive_wal_range(
+    repo: &dyn Storage,
+    stanza: &str,
+    archive_id: &str,
+) -> Result<(Option<String>, Option<String>), CommandError> {
+    let dir = PathBuf::from(format!("archive/{stanza}/{archive_id}"));
+    let entries = match repo.list(&dir) {
+        Ok(entries) => entries,
+        Err(StorageError::NotFound { .. }) => return Ok((None, None)),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut segments: Vec<String> = Vec::new();
+    for info in entries {
+        if !matches!(info.kind, StorageKind::File) {
+            continue;
+        }
+        let Some(file_name) = info.path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Strip any single recognised compression suffix; non-WAL files (history
+        // / backup labels) that don't match a suffix still pass through and are
+        // sorted alongside, mirroring `archive-get`'s segment listing.
+        let stripped = file_name
+            .strip_suffix(".gz")
+            .or_else(|| file_name.strip_suffix(".zst"))
+            .or_else(|| file_name.strip_suffix(".bz2"))
+            .or_else(|| file_name.strip_suffix(".lz4"))
+            .unwrap_or(file_name);
+        segments.push(stripped.to_owned());
+    }
+
+    if segments.is_empty() {
+        return Ok((None, None));
+    }
+    segments.sort();
+    let min = segments.first().cloned();
+    let max = segments.last().cloned();
+    Ok((min, max))
+}
+
+/// Read `repo<index>-cipher-type` from the active repo's config and return
+/// either `"aes-256-cbc"` (when set to an aes flavour) or `"none"`.
+fn detect_cipher_type(config: &LoadedConfig) -> &'static str {
+    let index = crate::cipher::active_repo_index(config);
+    match config.options.get(&("repo-cipher-type".to_owned(), Some(index))) {
+        Some(OptionValue::StringId(value) | OptionValue::String(value)) if value == "aes-256-cbc" => "aes-256-cbc",
+        _ => "none",
+    }
+}
+
 /// Build a `StanzaSummary` for `name` by attempting to load both info files.
 /// Each is tried independently — a missing file degrades to `NotInitialized`
 /// or `Error(...)` rather than propagating.
@@ -280,7 +358,7 @@ fn decode_backup(label: &str, value: &Value) -> BackupSummary {
 /// `user_pass` is the active repository's user passphrase (`repo-cipher-pass`),
 /// or `None` for an unencrypted repository; the info files are encrypted under
 /// it on an encrypted repo, so they are loaded keyed.
-fn summarize_stanza(repo_storage: &dyn Storage, name: &str, user_pass: Option<&str>) -> StanzaSummary {
+fn summarize_stanza(config: &LoadedConfig, repo_storage: &dyn Storage, name: &str, user_pass: Option<&str>) -> StanzaSummary {
     let archive_path = PathBuf::from(format!("archive/{name}/archive.info"));
     let backup_path = PathBuf::from(format!("backup/{name}/backup.info"));
 
@@ -323,6 +401,20 @@ fn summarize_stanza(repo_storage: &dyn Storage, name: &str, user_pass: Option<&s
         |b| b.current.iter().map(|(label, value)| decode_backup(label, value)).collect(),
     );
 
+    // Resolve the archive-id (`<db-version>-<db-id>`, e.g. `14-1`) from
+    // whichever info file loaded and scan `archive/<stanza>/<archive-id>/` for
+    // the WAL range. Errors from the scan degrade to (None, None) so a single
+    // storage glitch does not block the rest of the per-stanza summary.
+    let archive_id = pg_version
+        .as_deref()
+        .zip(pg_id)
+        .map(|(version, id)| format!("{version}-{id}"));
+    let (wal_min, wal_max) = archive_id.as_deref().map_or((None, None), |id| {
+        scan_archive_wal_range(repo_storage, name, id).unwrap_or((None, None))
+    });
+
+    let cipher = detect_cipher_type(config).to_owned();
+
     StanzaSummary {
         name: name.to_owned(),
         status,
@@ -332,6 +424,9 @@ fn summarize_stanza(repo_storage: &dyn Storage, name: &str, user_pass: Option<&s
         backrest_format,
         backrest_version,
         backups,
+        wal_min,
+        wal_max,
+        cipher,
     }
 }
 
@@ -358,7 +453,7 @@ pub fn info_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<V
     let user_pass = crate::cipher::active_user_pass(config)?;
     let summaries = stanzas
         .iter()
-        .map(|name| summarize_stanza(repo_storage, name, user_pass.as_deref()))
+        .map(|name| summarize_stanza(config, repo_storage, name, user_pass.as_deref()))
         .collect();
     Ok(summaries)
 }
@@ -461,15 +556,17 @@ fn render_backup_text(out: &mut String, b: &BackupSummary) {
 
 /// Render the full per-stanza database/backup text block, grouping backups by
 /// their `(db-id)`. Mirrors `formatTextDb`: a `wal archive min/max` header per
-/// database followed by each backup. WAL min/max are not derived here (this
-/// fork does not scan the archive directory in `info`), so they show
-/// `none present`.
+/// database followed by each backup. The WAL range comes from a flat listing
+/// of `archive/<stanza>/<archive-id>/` performed by
+/// [`scan_archive_wal_range`] during `summarize_stanza`.
 fn render_db_text(out: &mut String, summary: &StanzaSummary) {
     let version = summary.pg_version.as_deref().unwrap_or("?");
     let _ = writeln!(out, "\n        db ({version})");
-    // WAL archive min/max would require scanning archive/<stanza>/<id>/; not
-    // performed by this fork's `info`, so report none present.
-    let _ = writeln!(out, "        wal archive min/max ({version}): {}", wal_range(None, None));
+    let _ = writeln!(
+        out,
+        "        wal archive min/max ({version}): {}",
+        wal_range(summary.wal_min.as_deref(), summary.wal_max.as_deref())
+    );
 
     for b in &summary.backups {
         render_backup_text(out, b);
@@ -482,11 +579,11 @@ fn render_stanza_text(summary: &StanzaSummary) -> String {
     let _ = writeln!(out, "stanza: {}", summary.name);
     let _ = writeln!(out, "    status: {}", status_line(&summary.status));
 
-    // cipher is reported when the stanza exists on at least one repo. This
-    // fork does not yet thread the repo cipher type into `info`, so report the
-    // common case (`none`); documented placeholder.
+    // cipher is reported when the stanza exists on at least one repo. The
+    // value comes from `summary.cipher` which is populated from the active
+    // repo's `repo-cipher-type` config option ("none" for an unencrypted repo).
     if !matches!(summary.status, StanzaStatus::NotInitialized) {
-        out.push_str("    cipher: none\n");
+        let _ = writeln!(out, "    cipher: {}", summary.cipher);
         render_db_text(&mut out, summary);
     }
     out
@@ -600,18 +697,19 @@ fn stanza_json(summary: &StanzaSummary) -> Value {
         _ => Vec::new(),
     };
 
-    // archive[] would carry per-db WAL min/max; this fork does not scan the
-    // archive directory in `info`, so each db with identity gets a row with
-    // null min/max (documented placeholder). The `id` here is the db-id as a
-    // string stand-in for the C side's archive id (e.g. "14-1").
-    let archive = summary.pg_id.map_or_else(Vec::new, |id| {
-        vec![json!({
-            "id": id.to_string(),
-            "min": Value::Null,
-            "max": Value::Null,
+    // archive[] carries per-db WAL min/max from a flat listing of
+    // `archive/<stanza>/<archive-id>/`. The `id` here is the archive id
+    // (`<db-version>-<db-id>`, e.g. `"14-1"`), matching the C side. `min`/`max`
+    // are `null` when the archive directory is empty or missing.
+    let archive = match (summary.pg_id, summary.pg_version.as_deref()) {
+        (Some(id), Some(version)) => vec![json!({
+            "id": format!("{version}-{id}"),
+            "min": summary.wal_min,
+            "max": summary.wal_max,
             "database": { "id": id, "repo-key": 1 },
-        })]
-    });
+        })],
+        _ => Vec::new(),
+    };
 
     let format = summary.backrest_format.unwrap_or(0);
     let version = summary.backrest_version.as_deref().unwrap_or("");
@@ -623,8 +721,7 @@ fn stanza_json(summary: &StanzaSummary) -> Value {
             "code": summary.status.code(),
             "message": summary.status.message(),
         },
-        // Single-repo fork: cipher always none.
-        "cipher": "none",
+        "cipher": summary.cipher,
         "db": db,
         "archive": archive,
         "backup": backup,
@@ -843,7 +940,7 @@ fn render_set(config: &LoadedConfig, repo_storage: &dyn Storage, label: &str) ->
     // On an encrypted repository the info files are encrypted under the user
     // passphrase; resolve it for the info-file load.
     let user_pass = crate::cipher::active_user_pass(config)?;
-    let summary = summarize_stanza(repo_storage, stanza, user_pass.as_deref());
+    let summary = summarize_stanza(config, repo_storage, stanza, user_pass.as_deref());
     let backup = find_backup(&summary, label)
         .ok_or_else(|| CommandError::Other(format!("backup '{label}' does not exist in stanza '{stanza}'")))?;
 
@@ -898,6 +995,7 @@ mod tests {
 
     use pgbr_config::{ConfigCommandRole, LoadedConfig};
     use pgbr_info::{DbHistoryEntry, InfoArchive, InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
+    use pgbr_io::IoWrite;
     use pgbr_storage::{Posix, Storage};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1726,5 +1824,166 @@ mod tests {
             !out.contains("backup annotation(s):"),
             "empty annotation map must not produce a header:\n{out}"
         );
+    }
+
+    /// Seed `archive/demo/<archive-id>/` with the given filenames as empty
+    /// files. Used by the WAL min/max scan tests.
+    fn seed_archive_segments(storage: &Posix, archive_id: &str, files: &[&str]) {
+        let dir = format!("archive/demo/{archive_id}");
+        storage
+            .create_path(std::path::Path::new(&dir), true)
+            .expect("create archive id dir");
+        for name in files {
+            let path = format!("{dir}/{name}");
+            let mut w = storage.open_write(std::path::Path::new(&path)).expect("open_write segment");
+            w.write(b"").expect("write segment");
+            w.close().expect("close segment");
+        }
+    }
+
+    #[test]
+    fn wal_min_max_discovers_segments() {
+        // archive.info + backup.info present (so archive-id is resolvable) and
+        // `archive/demo/14-1/` carries two segments. The compressed segment's
+        // `.gz` suffix must be stripped before comparison so the lexical sort
+        // produces the right min/max.
+        let (_dir, storage) = posix_repo();
+        storage
+            .create_path(std::path::Path::new("archive/demo"), true)
+            .expect("create archive/demo");
+        storage
+            .create_path(std::path::Path::new("backup/demo"), true)
+            .expect("create backup/demo");
+
+        sample_archive()
+            .save(&storage, std::path::Path::new("archive/demo/archive.info"))
+            .expect("save archive.info");
+        sample_backup_with(BTreeMap::new())
+            .save(&storage, std::path::Path::new("backup/demo/backup.info"))
+            .expect("save backup.info");
+
+        seed_archive_segments(&storage, "14-1", &["000000010000000000000001.gz", "000000010000000000000005"]);
+
+        let cfg = fake_config(Some("demo"));
+        let summaries = info_inner(&cfg, &storage).expect("info_inner");
+        let s = &summaries[0];
+        assert_eq!(s.wal_min.as_deref(), Some("000000010000000000000001"));
+        assert_eq!(s.wal_max.as_deref(), Some("000000010000000000000005"));
+
+        // And the text rendering reflects the scanned range, not the
+        // placeholder.
+        let text = render_text(&summaries);
+        assert!(
+            text.contains("wal archive min/max (14): 000000010000000000000001/000000010000000000000005"),
+            "expected scanned range in text:\n{text}"
+        );
+
+        // JSON: the archive entry carries the same min/max and the new
+        // `<db-version>-<db-id>` archive id.
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&summaries)).expect("valid json");
+        let archive = parsed.as_array().unwrap()[0]["archive"].as_array().unwrap();
+        assert_eq!(archive[0]["id"], json!("14-1"));
+        assert_eq!(archive[0]["min"], json!("000000010000000000000001"));
+        assert_eq!(archive[0]["max"], json!("000000010000000000000005"));
+    }
+
+    #[test]
+    fn wal_min_max_empty_archive_dir() {
+        // archive.info present but the `archive/demo/14-1/` directory is empty
+        // (or missing): WAL range is (None, None) and text rendering falls back
+        // to "none present".
+        let (_dir, storage) = posix_repo();
+        storage
+            .create_path(std::path::Path::new("archive/demo"), true)
+            .expect("create archive/demo");
+        storage
+            .create_path(std::path::Path::new("backup/demo"), true)
+            .expect("create backup/demo");
+
+        sample_archive()
+            .save(&storage, std::path::Path::new("archive/demo/archive.info"))
+            .expect("save archive.info");
+        sample_backup_with(BTreeMap::new())
+            .save(&storage, std::path::Path::new("backup/demo/backup.info"))
+            .expect("save backup.info");
+
+        let cfg = fake_config(Some("demo"));
+        let summaries = info_inner(&cfg, &storage).expect("info_inner");
+        let s = &summaries[0];
+        assert!(s.wal_min.is_none(), "expected None for missing archive dir");
+        assert!(s.wal_max.is_none(), "expected None for missing archive dir");
+
+        let text = render_text(&summaries);
+        assert!(
+            text.contains("wal archive min/max (14): none present"),
+            "expected 'none present' fallback in text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cipher_type_aes_when_configured() {
+        // `repo1-cipher-type=aes-256-cbc` => `summary.cipher == "aes-256-cbc"`
+        // and the rendered cipher line + JSON `cipher` key reflect that. Use
+        // the encrypted info-file seed flow so the stanza actually loads.
+        let (_dir, storage) = posix_repo();
+        let user_pass = "user-passphrase";
+        let arc_sub = pgbr_info::cipher_pass_gen();
+        let bak_sub = pgbr_info::cipher_pass_gen();
+
+        storage
+            .create_path(std::path::Path::new("archive/enc"), true)
+            .expect("create archive/enc");
+        storage
+            .create_path(std::path::Path::new("backup/enc"), true)
+            .expect("create backup/enc");
+
+        sample_archive()
+            .save_keyed(
+                &storage,
+                std::path::Path::new("archive/enc/archive.info"),
+                Some(user_pass),
+                Some(&arc_sub),
+            )
+            .expect("save encrypted archive.info");
+        sample_backup_with(BTreeMap::new())
+            .save_keyed(
+                &storage,
+                std::path::Path::new("backup/enc/backup.info"),
+                Some(user_pass),
+                Some(&bak_sub),
+            )
+            .expect("save encrypted backup.info");
+
+        let mut cfg = fake_config(Some("enc"));
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-cipher-pass".to_owned(), Some(1)),
+            OptionValue::String(user_pass.to_owned()),
+        );
+
+        let summaries = info_inner(&cfg, &storage).expect("info_inner");
+        let s = &summaries[0];
+        assert_eq!(s.cipher, "aes-256-cbc");
+
+        let text = render_text(&summaries);
+        assert!(text.contains("    cipher: aes-256-cbc\n"), "{text}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&summaries)).expect("valid json");
+        assert_eq!(parsed.as_array().unwrap()[0]["cipher"], json!("aes-256-cbc"));
+    }
+
+    #[test]
+    fn cipher_type_none_default() {
+        // No `repo1-cipher-type` set => `summary.cipher == "none"` and the
+        // text/JSON rendering match.
+        let (_dir, summary) = initialized_demo();
+        assert_eq!(summary.cipher, "none");
+        let text = render_text(std::slice::from_ref(&summary));
+        assert!(text.contains("    cipher: none\n"), "{text}");
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(std::slice::from_ref(&summary))).expect("valid json");
+        assert_eq!(parsed.as_array().unwrap()[0]["cipher"], json!("none"));
     }
 }
