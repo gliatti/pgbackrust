@@ -19,12 +19,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use pgbr_config::{LoadedConfig, OptionValue};
+use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::InfoBackup;
 use pgbr_storage::Storage;
 use serde_json::{Map, Value};
 
 use crate::CommandError;
+use crate::backup::acquire_command_lock;
 
 /// JSON key under which a backup entry stores its annotations.
 const ANNOTATION_KEY: &str = "backup-annotation";
@@ -185,10 +186,32 @@ pub fn annotate_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<Annot
 /// written to stdout — `annotate` produces no machine-readable result, and the
 /// C command likewise reports success with `LOG_INFO`, not a `printf`.
 ///
+/// Holds the **backup** advisory lock for the whole command: `annotate` does a
+/// read-modify-write of `backup.info`, the same file `backup` / `expire`
+/// mutate, so a concurrent `annotate` (or a concurrent `backup` / `expire`)
+/// would lose updates. The lock matches the type those commands take. Before
+/// acquiring the lock we also honour the `stop` sentinel, so a stopped stanza
+/// is refused without creating a lock file. C ref: `cmdLockAcquire` +
+/// `lockStopTest`.
+///
 /// # Errors
 ///
-/// Surfaces whatever [`annotate_inner`] returns; see its docs.
+/// Returns [`CommandError::Other`] when the stanza is stopped, or when
+/// another `backup` / `expire` / `annotate` already holds the backup lock.
+/// Otherwise surfaces whatever [`annotate_inner`] returns; see its docs.
 pub fn annotate(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
+    let stanza = require_stanza(config)?;
+    // Refuse to run when the operator has called `stop` for this stanza (or
+    // `stop --force` which writes `all.stop` and blocks every stanza). The
+    // gate runs BEFORE acquiring the backup lock so a stopped stanza doesn't
+    // even create a lock file. C ref: cmdLockAcquire's lockStopTest check.
+    if crate::lock::is_stopped(config)? {
+        return Err(CommandError::Other(format!("stop file exists for stanza {stanza}")));
+    }
+    // Hold the backup lock for the whole command — annotate rewrites the same
+    // `backup.info` that backup / expire mutate. C ref: lockAcquire(lockTypeBackup).
+    let _locks = acquire_command_lock(config, LockType::Backup)?;
+
     let result = annotate_inner(config, repo_storage)?;
 
     crate::control::log_info(&format!(
@@ -405,6 +428,88 @@ mod tests {
             CommandError::MissingOption { option } => assert_eq!(option, "set"),
             other => panic!("expected MissingOption, got {other:?}"),
         }
+    }
+
+    /// Build an annotate config that ALSO carries `lock-path`, so the lock
+    /// helpers in `annotate` actually take the backup lock under a tempdir.
+    fn fake_config_with_lock_path(stanza: &str, set: Option<&str>, annotations: &[(&str, &str)], lock_path: &Path) -> LoadedConfig {
+        let mut cfg = fake_config(stanza, set, annotations);
+        cfg.options.insert(
+            ("lock-path".to_owned(), None),
+            OptionValue::Path(lock_path.to_string_lossy().into_owned()),
+        );
+        cfg
+    }
+
+    #[test]
+    fn annotate_acquires_backup_lock() {
+        // The `annotate` public entry point must take `LockType::Backup` so a
+        // concurrent `backup` / `expire` / `annotate` can't race on the
+        // read-modify-write of `backup.info`. With `lock-path` pointing at an
+        // isolated tempdir, calling `annotate` creates the expected lock
+        // file, and a concurrent `lock_acquire` on the same stanza+type then
+        // fails with "another backup is running".
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let lock_path = lock_dir.path();
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+        let label = "20240101-120000F";
+        let _seed = seed_backup_info(&repo, "demo", label, json!({ "backup-label": label }));
+
+        let expected_lock = lock_path.join("demo-backup.lock");
+        assert!(!expected_lock.exists(), "precondition: lock file must not exist yet");
+
+        // Hold a parallel backup lock for the duration of the call so we can
+        // observe the conflict deterministically. With the parallel handle
+        // held, `annotate` must fail to acquire and surface the friendly
+        // "another backup is running" message.
+        let parallel = crate::lock::lock_acquire(lock_path, "demo", pgbr_config::LockType::Backup).expect("seed: parallel acquire");
+        assert!(expected_lock.exists(), "parallel acquire must have created the lock file");
+
+        let cfg = fake_config_with_lock_path("demo", Some(label), &[("k", "v")], lock_path);
+        let err = annotate(&cfg, &repo).expect_err("annotate must fail while backup lock is held");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("another backup is running"),
+            "unexpected annotate error message: {msg}"
+        );
+
+        // After releasing the parallel lock, annotate succeeds and the lock
+        // file is created (and cleaned up on Drop).
+        drop(parallel);
+        assert!(!expected_lock.exists(), "drop must remove the stale lock file");
+        let cfg2 = fake_config_with_lock_path("demo", Some(label), &[("k", "v")], lock_path);
+        annotate(&cfg2, &repo).expect("annotate must succeed once lock is free");
+        assert!(!expected_lock.exists(), "annotate must release & clean up its lock file");
+    }
+
+    #[test]
+    fn annotate_refuses_when_stopped() {
+        // A `<lock-path>/<stanza>.stop` sentinel must short-circuit `annotate`
+        // BEFORE it touches `backup.info` or creates a lock file. The error
+        // message mentions the stop condition and the stanza.
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let lock_path = lock_dir.path();
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let repo = Posix::new(repo_dir.path());
+        let label = "20240101-120000F";
+        let _seed = seed_backup_info(&repo, "demo", label, json!({ "backup-label": label }));
+
+        // Touch the stop file.
+        let stop_path = lock_path.join("demo.stop");
+        std::fs::write(&stop_path, b"").expect("seed stop file");
+
+        let cfg = fake_config_with_lock_path("demo", Some(label), &[("k", "v")], lock_path);
+        let err = annotate(&cfg, &repo).expect_err("annotate must refuse while stopped");
+        let msg = err.to_string();
+        assert!(msg.contains("stop file"), "expected stop-file mention, got: {msg}");
+        assert!(msg.contains("demo"), "expected stanza name in error, got: {msg}");
+
+        // No lock file should have been created (the stop check runs first).
+        assert!(
+            !lock_path.join("demo-backup.lock").exists(),
+            "stop gate must run before lock acquisition"
+        );
     }
 
     /// Serializes the process-global `pgbr_core::log` state across the capture
