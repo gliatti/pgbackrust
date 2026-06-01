@@ -1,2 +1,2 @@
-artifacts/pgbackrust
-artifacts/ssh/
+/pgbackrust
+/ssh/
