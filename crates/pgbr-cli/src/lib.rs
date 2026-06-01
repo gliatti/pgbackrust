@@ -33,6 +33,17 @@ const CONFIG_YAML: &str = pgbr_build::inputs::CONFIG_YAML;
 /// Default path to `pgbackrest.conf` if `--config` is not supplied.
 const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrest/pgbackrest.conf";
 
+/// Legacy default path checked when `--config` is not supplied and the modern
+/// [`DEFAULT_CONFIG_PATH`] does not exist on disk.
+///
+/// Mirrors stock pgBackRest's `PGBACKREST_CONFIG_ORIG_PATH_FILE` fallback in
+/// `cfgFileLoad` (`src/config/parse.c`): "The default location for the
+/// configuration file is `/etc/pgbackrest/pgbackrest.conf`. If no file exists in
+/// that location then the old default of `/etc/pgbackrest.conf` will be checked"
+/// (see `help.xml`). The fallback only applies when the user did **not** supply
+/// an explicit `--config` (i.e. the path is still the default).
+const LEGACY_CONFIG_PATH: &str = "/etc/pgbackrest.conf";
+
 /// Default base config directory (the `config-path` option's default), used to
 /// derive the include-path default `<config-path>/conf.d` when neither
 /// `--config-include-path` nor `--config-path` is supplied. Mirrors
@@ -423,24 +434,29 @@ fn load_static_cfg() -> Result<Cfg, CliRunError> {
 /// include files are loaded *after* the main file, so a value they set wins for
 /// the same key (pgBackRest's documented load order).
 fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError> {
-    // Determine the config file path. `--config=<path>` lives in
-    // `resolved.options[("config", None)]`. Fall back to the default.
-    let config_path = config_file_path(&resolved);
+    // Determine the config file to read. `--config=<path>` lives in
+    // `resolved.options[("config", None)]`; `--no-config` disables the file
+    // entirely. With neither, the default `/etc/pgbackrest/pgbackrest.conf` is
+    // used, falling back to the legacy `/etc/pgbackrest.conf` when the modern
+    // default is absent.
+    let main_ini = match config_file_choice(&resolved) {
+        // `--no-config`: read no config file at all (stock parity).
+        ConfigFileChoice::Disabled => None,
+        // `--config=<path>`: read exactly that file. A missing explicit file is
+        // tolerated (empty INI), matching the no-config-present default path.
+        ConfigFileChoice::Explicit(path) => read_optional_ini(&path)?,
+        // No `--config`: read the default, falling back to the legacy default
+        // when the modern one does not exist (stock `cfgFileLoad`).
+        ConfigFileChoice::Default => match read_optional_ini(&PathBuf::from(DEFAULT_CONFIG_PATH))? {
+            modern @ Some(_) => modern,
+            None => read_optional_ini(&PathBuf::from(LEGACY_CONFIG_PATH))?,
+        },
+    }
+    .unwrap_or_default();
 
     // Config sources in load order: the main config file first, then the
     // include files. A later source's value wins for the same key.
     let mut inis: Vec<IniFile> = Vec::new();
-
-    let main_ini = match std::fs::read_to_string(&config_path) {
-        Ok(text) => parse_ini(&text).map_err(CliRunError::Ini)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => IniFile::default(),
-        Err(error) => {
-            return Err(CliRunError::ReadConfigFile {
-                path: config_path,
-                error,
-            });
-        }
-    };
     inis.push(main_ini);
 
     // Scan the config-include-path for `*.conf` files and append each parsed
@@ -553,10 +569,47 @@ where
     load_resolved(resolved, &cfg, ctx)
 }
 
-fn config_file_path(resolved: &ResolvedCli) -> PathBuf {
+/// Which config file (if any) the main load should read, derived from the
+/// resolved `config` option.
+#[derive(Debug)]
+enum ConfigFileChoice {
+    /// `--no-config` was given: read no config file at all.
+    Disabled,
+    /// `--config=<path>` was given: read exactly this file (no legacy fallback).
+    Explicit(PathBuf),
+    /// No `--config`: read [`DEFAULT_CONFIG_PATH`], falling back to
+    /// [`LEGACY_CONFIG_PATH`] when the modern default is absent.
+    Default,
+}
+
+/// Classify the resolved `config` option into a [`ConfigFileChoice`].
+///
+/// `--config=<path>` resolves to a `String`/`Path` value (an explicit file);
+/// `--no-config` resolves to `Boolean(false)` (the option's `negate: true`),
+/// which disables the config file. Anything else means no `--config` was
+/// supplied, so the default-with-legacy-fallback path is used.
+fn config_file_choice(resolved: &ResolvedCli) -> ConfigFileChoice {
     match resolved.options.get(&("config".to_owned(), None)) {
-        Some(OptionValue::Path(p) | OptionValue::String(p)) => PathBuf::from(p),
-        _ => PathBuf::from(DEFAULT_CONFIG_PATH),
+        Some(OptionValue::Path(p) | OptionValue::String(p)) => ConfigFileChoice::Explicit(PathBuf::from(p)),
+        Some(OptionValue::Boolean(false)) => ConfigFileChoice::Disabled,
+        _ => ConfigFileChoice::Default,
+    }
+}
+
+/// Read and parse an INI file, returning `None` when it does not exist.
+///
+/// A missing file is not an error (the caller treats it as "no config present"
+/// and either falls back or uses an empty INI). A malformed file surfaces as
+/// [`CliRunError::Ini`]; any other I/O error surfaces as
+/// [`CliRunError::ReadConfigFile`].
+fn read_optional_ini(path: &PathBuf) -> Result<Option<IniFile>, CliRunError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_ini(&text).map(Some).map_err(CliRunError::Ini),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CliRunError::ReadConfigFile {
+            path: path.clone(),
+            error,
+        }),
     }
 }
 
@@ -1150,6 +1203,76 @@ mod tests {
             super::config_include_path(&resolved),
             std::path::PathBuf::from("/somewhere/else"),
         );
+    }
+
+    #[test]
+    fn config_file_choice_classifies_the_config_option() {
+        use super::ConfigFileChoice;
+        let cfg = load_static_cfg().expect("config compiles");
+
+        // No `--config`: the default-with-legacy-fallback path is used.
+        let cli = pgbr_config::parse_cli(["info"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        assert!(matches!(super::config_file_choice(&resolved), ConfigFileChoice::Default));
+
+        // `--config=<path>`: read exactly that file (no legacy fallback).
+        let cli = pgbr_config::parse_cli(["info", "--config=/custom/pgbackrest.conf"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        match super::config_file_choice(&resolved) {
+            ConfigFileChoice::Explicit(p) => assert_eq!(p, std::path::PathBuf::from("/custom/pgbackrest.conf")),
+            other => panic!("expected Explicit, got {other:?}"),
+        }
+
+        // `--no-config`: read no config file at all.
+        let cli = pgbr_config::parse_cli(["info", "--no-config"]).unwrap();
+        let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
+        assert!(matches!(super::config_file_choice(&resolved), ConfigFileChoice::Disabled));
+    }
+
+    #[test]
+    fn read_optional_ini_returns_none_for_missing_file() {
+        // A nonexistent path is "no config present" (None), not an error.
+        let missing = std::path::PathBuf::from("/definitely/missing/pgbackrest.conf");
+        let ini = super::read_optional_ini(&missing).expect("missing file must not error");
+        assert!(ini.is_none(), "a missing config file yields None");
+    }
+
+    #[test]
+    fn read_optional_ini_parses_an_existing_file() {
+        // An existing, well-formed file parses to Some(IniFile).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pgbackrest.conf");
+        std::fs::write(&path, "[global]\nrepo1-path=/srv/repo\n").expect("write conf");
+        let ini = super::read_optional_ini(&path).expect("existing file parses");
+        assert!(ini.is_some(), "an existing config file yields Some");
+    }
+
+    #[test]
+    fn legacy_config_path_falls_back_when_modern_default_absent() {
+        // The legacy `/etc/pgbackrest.conf` default is consulted when the modern
+        // `/etc/pgbackrest/pgbackrest.conf` does not exist. We cannot write to
+        // `/etc` in tests, but we can prove the fallback *order* against two temp
+        // files standing in for the two defaults: when the "modern" temp path is
+        // absent, the "legacy" temp path is read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modern = dir.path().join("modern.conf"); // intentionally not created
+        let legacy = dir.path().join("legacy.conf");
+        std::fs::write(&legacy, "[global]\nrepo1-path=/srv/legacy\n").expect("write legacy conf");
+
+        // Mirror `load_resolved`'s default-branch fallback: read modern, else legacy.
+        let read_with_fallback = |a: &std::path::Path, b: &std::path::Path| {
+            super::read_optional_ini(&a.to_path_buf())
+                .expect("modern read")
+                .or_else(|| super::read_optional_ini(&b.to_path_buf()).expect("legacy read"))
+        };
+
+        let chosen = read_with_fallback(&modern, &legacy);
+        assert!(chosen.is_some(), "fallback must read the legacy file when modern is absent");
+
+        // When the modern file *does* exist, it is read (legacy not needed).
+        std::fs::write(&modern, "[global]\nrepo1-path=/srv/modern\n").expect("write modern conf");
+        let chosen = read_with_fallback(&modern, &legacy);
+        assert!(chosen.is_some(), "modern file is read when present");
     }
 
     /// Resolve the merged options for a `--config-include-path` scan
