@@ -13,7 +13,7 @@
 
 # The prebuilt binary is bind-mounted at runtime rather than relied upon from
 # the image's COPY layer: under Docker Desktop's WSL2 / containerd image store
-# the COPYed /usr/bin/pgbackrest layer is intermittently not materialised at
+# the COPYed /usr/bin/pgbackrust layer is intermittently not materialised at
 # run time (ls shows it, open() returns ENOENT), so the archive_command fails
 # with exit 127 and WAL never reaches the repo. Bind-mounting the host artifact
 # (a glibc-matching ELF built by integration/build-binary.sh) is deterministic.
@@ -24,7 +24,7 @@ x-node: &node
   image: pgbr-node:latest
   volumes:
     - ../artifacts/ssh:/shared-ssh:ro
-    - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
+    - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
   networks:
     - pgbr
 
@@ -37,7 +37,7 @@ services:
       PGBR_ROLE: repo
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
-      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
       - depot-repo:/srv/depot/pgbackrust
 
   principal:
@@ -49,7 +49,7 @@ services:
       POSTGRES_PASSWORD: postgres
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
-      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
       - principal-data:/var/lib/postgresql/16/principal
 
   secondaire:
@@ -60,7 +60,7 @@ services:
       PGBR_ROLE: standby
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
-      - ../artifacts/pgbackrust:/usr/bin/pgbackrest:ro
+      - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
       - secondaire-data:/var/lib/postgresql/16/secondaire
 
   # S3-compatible object store for the KB "Sauvegarde vers un dépôt S3"

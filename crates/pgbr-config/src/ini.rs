@@ -1,4 +1,4 @@
-//! Parser for `pgbackrest.conf` (INI format).
+//! Parser for `pgbackrust.conf` (INI format).
 //!
 //! Section grammar:
 //!
@@ -57,7 +57,7 @@ impl IniSection {
     }
 }
 
-/// Parsed contents of one `pgbackrest.conf` file.
+/// Parsed contents of one `pgbackrust.conf` file.
 ///
 /// Value lookup uses raw textual keys (option name with optional `repoN-` /
 /// `pgN-` prefix); the typed mapping happens in the merge step.
@@ -66,7 +66,7 @@ impl IniSection {
 /// order. A single-valued option (the common case) yields a one-element vector
 /// and the merge step takes the last entry (last-write-wins). A multi-valued
 /// option — `type: hash` (e.g. `recovery-option`) or `type: list` — is written
-/// as one line per entry in pgBackRest's config grammar, and the merge step
+/// as one line per entry in pgBackRust's config grammar, and the merge step
 /// assembles every recorded line into the resulting `Hash`/`List`. Collapsing
 /// repeats to a single value (the prior behaviour) silently dropped all but the
 /// last `recovery-option=` line, so e.g. a standby restore lost
@@ -111,7 +111,7 @@ impl fmt::Display for IniError {
 
 impl std::error::Error for IniError {}
 
-/// Parse the textual content of a `pgbackrest.conf` file.
+/// Parse the textual content of a `pgbackrust.conf` file.
 ///
 /// # Errors
 ///
@@ -170,7 +170,7 @@ pub fn parse_ini(content: &str) -> Result<IniFile, IniError> {
 }
 
 /// Strip a `#`-prefixed comment from a line. Quotes are not interpreted —
-/// pgBackRest's INI grammar doesn't allow `#` inside values.
+/// pgBackRust's INI grammar doesn't allow `#` inside values.
 fn strip_comment(line: &str) -> &str {
     line.split_once('#').map_or(line, |(before, _)| before)
 }
@@ -182,12 +182,12 @@ mod tests {
     #[test]
     fn parses_global_and_stanza_sections() {
         let ini = parse_ini(
-            "[global]\nrepo1-path=/var/lib/pgbackrest\nlog-level-file=detail\n\n[demo]\npg1-path=/var/lib/postgresql/14/main\n",
+            "[global]\nrepo1-path=/var/lib/pgbackrust\nlog-level-file=detail\n\n[demo]\npg1-path=/var/lib/postgresql/14/main\n",
         )
         .unwrap();
 
         let global = &ini.sections[&IniSection::Global];
-        assert_eq!(global["repo1-path"], vec!["/var/lib/pgbackrest".to_owned()]);
+        assert_eq!(global["repo1-path"], vec!["/var/lib/pgbackrust".to_owned()]);
         assert_eq!(global["log-level-file"], vec!["detail".to_owned()]);
 
         let demo = &ini.sections[&IniSection::Stanza("demo".to_owned())];

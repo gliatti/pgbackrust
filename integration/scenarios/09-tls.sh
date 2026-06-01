@@ -70,7 +70,7 @@ info "depot: TLS server (bind 0.0.0.0) + reach principal's PG over SSH"
 # the literal '*', so use 0.0.0.0 (mirrors the vagrant scenario). depot reaches
 # principal's PG over SSH (pg1-host + pg1-host-user, host-type defaults to ssh)
 # since principal does not run its own TLS server.
-node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO; cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO; cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -87,11 +87,11 @@ pg1-host-user=postgres
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 info "principal: TLS client to depot's repo (repo1-host-type=tls)"
 # repo*-host-user is only valid with host-type=ssh, so it is omitted here.
-node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-type=tls
@@ -105,7 +105,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 info "launch the depot pgbackrust TLS server (detached so it survives the exec)"
 # Launch with `docker compose exec -d` and NO shell wrapper / redirect: a

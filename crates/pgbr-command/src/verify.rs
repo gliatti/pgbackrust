@@ -299,7 +299,7 @@ fn hash_repo_file_reversed(repo: &dyn Storage, path: &Path, transform: &RepoTran
 ///
 /// A manifest entry's `reference = Some(other_label)` means the bytes live in
 /// `other_label`'s directory and were written with **that** backup's transform,
-/// not the backup being verified. Stock pgBackRest's restore looks the holder's
+/// not the backup being verified. Stock pgBackRust's restore looks the holder's
 /// `compress-type` / `encrypted` flags up in `backup.info`'s `[backup:current]`
 /// entry for that label (see [`RepoTransform::from_metadata`]); verify mirrors
 /// the same lookup. When the holder is not listed (a stray reference that
@@ -618,7 +618,7 @@ fn verify_backup(
 
         if !repo.exists(&path)? {
             // The user-visible path is the manifest-relative one (the source
-            // path), not the on-disk `.gz` variant — mirror stock pgBackRest's
+            // path), not the on-disk `.gz` variant — mirror stock pgBackRust's
             // verify reporting, which names what users put into the cluster.
             let problem = VerifyProblem::MissingFile {
                 backup: label.to_owned(),

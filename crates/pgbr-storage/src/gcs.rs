@@ -6,7 +6,7 @@
 //!
 //! ## Authentication
 //!
-//! pgBackRest's gcs backend authenticates several ways: a service-account key
+//! pgBackRust's gcs backend authenticates several ways: a service-account key
 //! (JWT → `OAuth2` bearer token), an auto-discovered GCE instance token, and a
 //! pre-supplied bearer token. This backend implements two of them:
 //!
@@ -58,7 +58,7 @@ const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 pub const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
 /// `OAuth2` scope requested for the service-account access token: read/write to
-/// Cloud Storage, matching what pgBackRest's gcs driver requests.
+/// Cloud Storage, matching what pgBackRust's gcs driver requests.
 const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 
 /// Lifetime (seconds) of the signed JWT assertion. Google caps this at one hour.

@@ -1,5 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! Per-command implementations for the pgBackRest Rust rewrite.
+//! Per-command implementations for the pgBackRust Rust rewrite.
 //!
 //! This crate is the dispatcher layer: given a fully resolved
 //! [`pgbr_config::LoadedConfig`] plus the two `Storage` instances the
@@ -100,7 +100,7 @@ impl From<pgbr_io::IoError> for CommandError {
 /// Route a resolved configuration to the matching per-command function.
 ///
 /// `repo_storage` and `pg_storage` are the two `Storage` instances every
-/// pgBackRest command needs: the first points at the backup repository,
+/// pgBackRust command needs: the first points at the backup repository,
 /// the second at the `PostgreSQL` data directory of the active stanza. The
 /// caller wires up real backends (posix / s3 / azure / …); tests use
 /// `Posix` rooted at a `tempfile::TempDir`.

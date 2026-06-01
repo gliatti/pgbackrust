@@ -63,7 +63,7 @@ pub struct StorageInfo {
 pub enum StorageKind {
     /// A regular file.
     File,
-    /// A directory ("path" in pgBackRest C parlance).
+    /// A directory ("path" in pgBackRust C parlance).
     Path,
     /// A symbolic link.
     Link,
@@ -160,7 +160,7 @@ pub trait Storage: Send + Sync {
     /// of view but is the strongest single-call guarantee the backend
     /// offers.
     ///
-    /// pgBackRest uses this for the small "info" files
+    /// pgBackRust uses this for the small "info" files
     /// (`archive.info`, `backup.info`, and their `.copy` mirrors) so a
     /// process crash in the middle of `save_keyed` cannot leave the primary
     /// truncated; the `.copy` mirror written first acts as a recoverable

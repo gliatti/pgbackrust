@@ -76,7 +76,7 @@ timeout 30 vagrant ssh depot -c "
 # 0750 perms on the parent dir prevent the calling user from listing it.
 sudo bash -c 'rm -rf /var/lib/pgbackrust/* /var/lib/pgbackrust/.[!.]* /tmp/pgbackrust/*.stop 2>/dev/null; true'
 sudo install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust
-sudo tee /etc/pgbackrest/pgbackrest.conf >/dev/null <<EOF
+sudo tee /etc/pgbackrust/pgbackrust.conf >/dev/null <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 log-level-console=info
@@ -95,11 +95,11 @@ pg1-host-user=postgres
 pg1-path=$PRI
 pg1-port=5433
 EOF
-sudo chmod 0644 /etc/pgbackrest/pgbackrest.conf
+sudo chmod 0644 /etc/pgbackrust/pgbackrust.conf
 " 2>&1 | grep -vE 'Connection to' | tail -3
 # principal: client-side TLS config
 timeout 30 vagrant ssh principal -c "
-sudo tee /etc/pgbackrest/pgbackrest.conf >/dev/null <<EOF
+sudo tee /etc/pgbackrust/pgbackrust.conf >/dev/null <<EOF
 [global]
 repo1-host=depot
 repo1-host-type=tls
@@ -115,7 +115,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$PRI
 pg1-port=5433
 EOF
-sudo chmod 0644 /etc/pgbackrest/pgbackrest.conf
+sudo chmod 0644 /etc/pgbackrust/pgbackrust.conf
 sudo install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust
 " 2>&1 | grep -vE 'Connection to' | tail -3
 
@@ -141,7 +141,7 @@ timeout 30 vagrant ssh depot -c "
 timeout 30 vagrant ssh depot -c "sudo systemd-run --unit=pgbr-tls-test --uid=postgres --gid=postgres \
   --property=StandardOutput=append:/tmp/pgbr-srv-host.log \
   --property=StandardError=append:/tmp/pgbr-srv-host.log \
-  /usr/bin/pgbackrest server" 2>&1 | grep -vE 'Connection to'
+  /usr/bin/pgbackrust server" 2>&1 | grep -vE 'Connection to'
 timeout 30 vagrant ssh depot -c "
   for _ in \$(seq 1 30); do
     sudo ss -ltnp 2>/dev/null | grep -q ':8432 ' && break

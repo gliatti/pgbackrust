@@ -23,7 +23,7 @@ info "05 standby: depot reaches the primary (pg1) over SSH — phase 1, no pg2 y
 # backup fail trying to reach the not-yet-running secondaire on 5434. pg2 (and
 # backup-standby=prefer) are added in phase 2, once the standby is streaming.
 write_depot_primary_only() {
-  node depot bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+  node depot bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -35,12 +35,12 @@ pg1-host-user=postgres
 pg1-path=$PRI_DATA
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 }
 write_depot_primary_only
 
 info "secondaire restore config (ignore primary as pg1-host conflicts)"
-node secondaire bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node secondaire bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -54,10 +54,10 @@ recovery-option=primary_conninfo=host=principal port=5433 user=replicator
 recovery-option=primary_slot_name=secondaire
 recovery-option=recovery_target_timeline=latest
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 info "principal config: archive WAL to depot over SSH (repo1-host)"
-node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -67,7 +67,7 @@ log-level-console=info
 pg1-path=$PRI_DATA
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 info "depot: ensure repo dir exists"
 node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
@@ -129,7 +129,7 @@ repl=$(psql_on principal 5433 -c "SELECT count(*) FROM pg_stat_replication;" 2>/
 assert_contains "$repl" "1" "primary sees one streaming standby"
 
 info "depot phase 2: add the now-running standby (pg2) + backup-standby=prefer"
-node depot bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node depot bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -146,7 +146,7 @@ pg2-host-user=postgres
 pg2-path=$STB_DATA
 pg2-port=5434
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 info "backup with backup-standby=prefer (launched from depot)"
 # With the standby streaming, backup-standby coordination reaches the backup-start

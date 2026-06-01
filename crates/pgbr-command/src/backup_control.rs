@@ -1,6 +1,6 @@
 //! The `PostgreSQL` backup-control protocol abstraction.
 //!
-//! Real pgBackRest does not just copy the data directory: it brackets the file
+//! Real pgBackRust does not just copy the data directory: it brackets the file
 //! copy with `PostgreSQL`'s online-backup control functions so the copied files
 //! form a consistent, restorable image. C reference: `src/command/backup/backup.c`
 //! (`backupStart` / `backupStop`) and `src/db/db.c` (`dbBackupStart` /
@@ -232,7 +232,7 @@ pub fn backup_start_sql(info: &BackupServerInfo, label: &str, fast: bool) -> Str
     // function item in the FROM clause must be aliased (`… as lsn`) to give its
     // single output column the name `lsn` — otherwise the column is named after
     // the function and `select lsn` fails with `column "lsn" does not exist`.
-    // pgBackRest's `db/db.c` uses the same `as lsn` alias.
+    // pgBackRust's `db/db.c` uses the same `as lsn` alias.
     if info.uses_pg_backup_start() {
         // PG >= 15: keyword arguments, always non-exclusive.
         format!("select lsn::text as lsn from pg_catalog.pg_backup_start(label => {label_lit}, fast => {fast_lit}) as lsn")
@@ -374,7 +374,7 @@ impl BackupControl for LibpqBackupControl {
     fn wal_segment_size(&mut self) -> Result<u64, CommandError> {
         // `current_setting('wal_segment_size')` returns a unit-suffixed string
         // (e.g. "16MB"); read the raw byte count from pg_settings instead, where
-        // `setting * unit` is the size in the unit's base. pgBackRest derives the
+        // `setting * unit` is the size in the unit's base. pgBackRust derives the
         // byte size the same way (setting times the documented byte multiplier).
         let result = self
             .conn

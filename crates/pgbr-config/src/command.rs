@@ -15,7 +15,7 @@ use crate::types::{ConfigCommandRole, LockType};
 // parameter-allowed, internal). Bundling them into a state-machine enum
 // would be more boilerplate than insight, so suppress the lint.
 #[allow(clippy::struct_excessive_bools)]
-/// One pgBackRest command (e.g. `backup`, `restore`, `archive-push`) after
+/// One pgBackRust command (e.g. `backup`, `restore`, `archive-push`) after
 /// resolution from `config.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfgCommand {

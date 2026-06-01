@@ -190,7 +190,7 @@ pub fn page_lsn(page: &[u8]) -> Option<u64> {
 /// Whether a data page's *header* is structurally sane, independent of the
 /// checksum.
 ///
-/// pgBackRest validates a page's header before (and in addition to) its
+/// pgBackRust validates a page's header before (and in addition to) its
 /// checksum so a page whose checksum happens to collide can still be rejected
 /// when its bookkeeping fields are impossible. C reference: the
 /// `PageHeaderData` field checks `PostgreSQL` itself uses in `PageIsVerified`

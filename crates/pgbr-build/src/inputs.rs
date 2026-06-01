@@ -1,4 +1,4 @@
-//! The four hand-written pgBackRest definition files, embedded at compile time.
+//! The four hand-written pgBackRust definition files, embedded at compile time.
 //!
 //! These were historically read from `src/build/` by the C code generator.
 //! With the C tree removed, the canonical copies live under

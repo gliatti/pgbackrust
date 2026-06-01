@@ -346,7 +346,7 @@ fn dry_run_option(config: &LoadedConfig) -> bool {
 /// Emit a human-facing progress / plan line at `INFO` through the
 /// `pgbr_core::log` formatter.
 ///
-/// pgBackRest routes progress lines to its log (the console at
+/// pgBackRust routes progress lines to its log (the console at
 /// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
 /// free for machine-readable command output. This is the Rust analogue of the C
 /// `LOG_INFO` macro: the message lands on whichever sinks the logger has open, so
@@ -562,7 +562,7 @@ fn expire_adhoc_set(
 
 /// Adhoc `--oldest` expiry: remove the oldest full backup set (the full plus
 /// every backup that depends on it), bypassing the retention rules. Refused if
-/// only one full backup exists (pgBackRest always keeps at least one full).
+/// only one full backup exists (pgBackRust always keeps at least one full).
 fn expire_adhoc_oldest(
     config: &LoadedConfig,
     repo: &dyn Storage,
@@ -2403,7 +2403,7 @@ mod tests {
     /// Materialise a WAL segment in the per-archive-id layout at
     /// `archive/<stanza>/<archive-id>/<major-path>/<segment>`. The major
     /// path is the first 16 chars of the segment name, matching how
-    /// pgBackRest groups WAL on disk.
+    /// pgBackRust groups WAL on disk.
     fn seed_archive_id_segment(repo: &Posix, stanza: &str, archive_id: &str, segment: &str, suffix: &str) {
         let major = &segment[0..16.min(segment.len())];
         let dir = format!("archive/{stanza}/{archive_id}/{major}");

@@ -24,7 +24,7 @@
 //!
 //! ## Multiple repositories
 //!
-//! pgBackRest initialises (resp. removes / upgrades) the stanza on **every**
+//! pgBackRust initialises (resp. removes / upgrades) the stanza on **every**
 //! configured repository. [`create`] / [`delete`] / [`upgrade`] take a slice of
 //! `(group_index, repo_storage)` pairs — one per configured repository — and run
 //! the operation against each, reading that repository's own `repoN-cipher-*`
@@ -47,9 +47,9 @@ use pgbr_storage::{Storage, StorageError};
 use crate::CommandError;
 use crate::backup::acquire_command_lock;
 
-/// pgBackRest on-disk info-file format version written by this port.
+/// pgBackRust on-disk info-file format version written by this port.
 const BACKREST_FORMAT: u32 = 5;
-/// pgBackRest version string stamped into freshly written info files.
+/// pgBackRust version string stamped into freshly written info files.
 const BACKREST_VERSION: &str = "2.58";
 /// Path of the control file relative to the PG data directory.
 const PG_CONTROL_PATH: &str = "global/pg_control";
@@ -165,7 +165,7 @@ fn read_cluster_identity(pg_storage: &dyn Storage) -> Result<ClusterIdentity, Co
     Ok(ClusterIdentity { header, version })
 }
 
-/// The four raw values pgBackRest needs to identify a cluster, exactly as the
+/// The four raw values pgBackRust needs to identify a cluster, exactly as the
 /// libpq queries return them as text. Kept separate from [`ClusterIdentity`]
 /// so the mapping below ([`query_result_to_identity`]) is a pure function that
 /// needs no live `PostgreSQL` to exercise.
@@ -181,7 +181,7 @@ struct DbIdentityRow {
     pg_control_version: u32,
 }
 
-/// Map a `server_version_num` (e.g. `160004`, `90600`) to a pgBackRest major
+/// Map a `server_version_num` (e.g. `160004`, `90600`) to a pgBackRust major
 /// version label (`"9.6"`, `"10"`, …). Mirrors the C `pgVersionFromNum` /
 /// `(num / 100 * 100)` major-stripping in `src/postgres/interface.c`.
 ///
@@ -548,7 +548,7 @@ fn create_with_identity(
     );
 
     // For an encrypted repository, generate a fresh random sub-key per info
-    // file (archive + backup get *distinct* sub-keys, matching pgBackRest's
+    // file (archive + backup get *distinct* sub-keys, matching pgBackRust's
     // two `cipherPassGen` calls in `cmdStanzaCreate`). The sub-key is stored in
     // the file's [cipher] section and the whole file is then encrypted under
     // the user passphrase.
@@ -596,7 +596,7 @@ fn create_with_identity(
     })
 }
 
-/// `true` when the info file at `path` is encrypted, detected by pgBackRest's
+/// `true` when the info file at `path` is encrypted, detected by pgBackRust's
 /// `"Salted__"` cipher header at the start of the file.
 fn info_file_is_encrypted(storage: &dyn Storage, path: &Path) -> Result<bool, CommandError> {
     let mut reader = storage.open_read(path)?;
@@ -637,7 +637,7 @@ pub fn delete(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)]) -> R
     let stanza = require_stanza(config)?;
     // REQUIRE a stop file before wiping the stanza. This is the operator's
     // explicit "this stanza is offline, it's safe to remove" signal. Stock
-    // pgBackRest enforces the same guard in `src/command/stanza/delete.c`
+    // pgBackRust enforces the same guard in `src/command/stanza/delete.c`
     // (`lockStopTest(false)`). The semantics are INVERTED relative to
     // backup/archive: those commands refuse to run when stopped, this one
     // refuses to run when NOT stopped.
@@ -738,7 +738,7 @@ fn upgrade_with_identity(
 
     // The cipher type must not change between create and upgrade: encryption is
     // a stanza-create-time decision. Detect the *on-disk* encryption state up
-    // front (by the pgBackRest cipher header) and refuse to "add" encryption to
+    // front (by the pgBackRust cipher header) and refuse to "add" encryption to
     // an existing unencrypted repository, or "drop" it from an encrypted one,
     // before attempting a decrypt that would otherwise fail cryptically.
     let on_disk_encrypted = info_file_is_encrypted(repo_storage, &archive_info_path)?;
@@ -909,7 +909,7 @@ mod tests {
     /// stanza-delete must refuse to run unless the operator first ran
     /// `stop` (or `stop --force` to write `all.stop`). This is the safety
     /// guard that prevents accidentally wiping a live, actively-archived
-    /// stanza. Mirrors stock pgBackRest's `lockStopTest(false)` check in
+    /// stanza. Mirrors stock pgBackRust's `lockStopTest(false)` check in
     /// `src/command/stanza/delete.c`.
     #[test]
     fn stanza_delete_refuses_without_stop_file() {
@@ -999,12 +999,12 @@ mod tests {
         create(&cfg, &[(1, &repo_s as &dyn Storage)], &pg_s).expect("encrypted stanza-create should succeed");
 
         // The on-disk info files must NOT be plaintext (they start with the
-        // pgBackRest cipher header) and must NOT be loadable without the pass.
+        // pgBackRust cipher header) and must NOT be loadable without the pass.
         let raw = {
             let mut r = repo_s.open_read(&archive_info_path("enc")).unwrap();
             r.read_all().unwrap()
         };
-        assert_eq!(&raw[..8], b"Salted__", "encrypted info file uses pgBackRest framing");
+        assert_eq!(&raw[..8], b"Salted__", "encrypted info file uses pgBackRust framing");
         assert!(
             InfoArchive::load(&repo_s, &archive_info_path("enc")).is_err(),
             "plain load of an encrypted file must fail"
@@ -1494,7 +1494,7 @@ mod tests {
             "repo1 (unencrypted) info must load plainly"
         );
 
-        // repo2: encrypted (pgBackRest cipher header), not plainly loadable, but
+        // repo2: encrypted (pgBackRust cipher header), not plainly loadable, but
         // loadable with repo2's passphrase.
         let raw = {
             let mut r = repo2_s.open_read(&archive_info_path("demo")).unwrap();

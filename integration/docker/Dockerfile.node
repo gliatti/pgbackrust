@@ -12,7 +12,7 @@ RUN apt-get update \
       openssh-server openssh-client ca-certificates openssl procps less \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /var/run/sshd /var/log/pgbackrust /var/spool/pgbackrust \
-             /etc/pgbackrest/conf.d /etc/certs \
+             /etc/pgbackrust/conf.d /etc/certs \
  && chown -R postgres:postgres /var/log/pgbackrust /var/spool/pgbackrust
 
 # The prebuilt Linux binary produced by integration/build-binary.sh.

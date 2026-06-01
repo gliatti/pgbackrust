@@ -1,7 +1,7 @@
 //! Per-version `PostgreSQL` interface metadata.
 //!
 //! Each supported major version has a constant set of values that the
-//! pgBackRest control-file reader needs to recognise:
+//! pgBackRust control-file reader needs to recognise:
 //!
 //! - `catalog_version_no`: matched against the cluster's `pg_control` to
 //!   confirm the version detection (taken from `src/include/catalog/

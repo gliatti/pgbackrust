@@ -1,6 +1,6 @@
 //! Remote DB protocol: message-mapping layer.
 //!
-//! pgBackRest's main process drives a remote worker that owns a libpq
+//! pgBackRust's main process drives a remote worker that owns a libpq
 //! [`Connection`] and answers a small set of protocol commands on its
 //! behalf (C reference: `src/db/protocol.c`, `dbOpenProtocol` /
 //! `dbQueryProtocol`). This module provides the pieces, all decoupled

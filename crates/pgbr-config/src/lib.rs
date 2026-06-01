@@ -1,9 +1,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! Runtime configuration model for the pgBackRest Rust rewrite.
+//! Runtime configuration model for the pgBackRust Rust rewrite.
 //!
 //! This crate consumes the typed `pgbr_build::Config` produced from
 //! `src/build/config/config.yaml` and lowers it into a runtime configuration
-//! model — `Cfg` and friends — used at the start of every pgBackRest
+//! model — `Cfg` and friends — used at the start of every pgBackRust
 //! invocation to decide which command is being run, which options are valid
 //! for it, and what their resolved values are.
 //!

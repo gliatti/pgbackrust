@@ -1458,7 +1458,7 @@ pub struct MemContextStackEntry {
     pub try_depth: u32,
 }
 
-// SAFETY for every read/write below: pgBackRest's process model is single-threaded per fork so
+// SAFETY for every read/write below: pgBackRust's process model is single-threaded per fork so
 // concurrent access from the same process is impossible by construction.
 
 const ZERO_ENTRY: MemContextStackEntry = MemContextStackEntry {

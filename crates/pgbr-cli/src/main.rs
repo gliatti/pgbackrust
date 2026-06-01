@@ -1,5 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! `pgbackrest` binary entry point. Forwards argv (sans program name) to
+//! `pgbackrust` binary entry point. Forwards argv (sans program name) to
 //! `pgbr_cli::run` and exits with the returned status code. Diagnostics
 //! are printed to stderr by the run path; this entry point only translates
 //! errors into exit codes.
@@ -14,7 +14,7 @@ fn main() {
         Err(err) => {
             // Diagnostic to stderr before translating the error category into
             // its exit code (centralised in `CliRunError::exit_code`).
-            eprintln!("pgbackrest: {err}");
+            eprintln!("pgbackrust: {err}");
             err.exit_code()
         }
     };

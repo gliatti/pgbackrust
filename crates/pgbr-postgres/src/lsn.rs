@@ -5,7 +5,7 @@
 //! where the upper half is the high 32 bits and the lower half the low 32
 //! bits (e.g. `0/16B3E40`, `1/0`). `pg_backup_start` / `pg_backup_stop`
 //! (and their pre-15 `pg_start_backup` / `pg_stop_backup` predecessors)
-//! return such a string; pgBackRest records both the raw LSN and the name
+//! return such a string; pgBackRust records both the raw LSN and the name
 //! of the WAL segment that contains it.
 //!
 //! A WAL segment file is named with 24 hex digits: the 8-digit timeline id
@@ -43,7 +43,7 @@ pub fn parse_lsn(text: &str) -> Option<u64> {
 
 /// Render a 64-bit LSN back to its canonical `"XXXXXXXX/YYYYYYYY"` text form.
 ///
-/// pgBackRest renders the two halves with no leading zeroes and uppercase hex
+/// pgBackRust renders the two halves with no leading zeroes and uppercase hex
 /// (matching `PostgreSQL`'s `%X/%X` formatting), e.g. `0/16B3E40`, `1/0`.
 #[must_use]
 pub fn lsn_to_string(lsn: u64) -> String {
@@ -225,7 +225,7 @@ const WAL_MAGIC_VERSIONS: &[(u16, &str)] = &[
 
 /// Decoded long page header from the first page of a WAL segment.
 ///
-/// pgBackRest reads this on `archive-push` (`archive-header-check`) to confirm a
+/// pgBackRust reads this on `archive-push` (`archive-header-check`) to confirm a
 /// completed WAL segment belongs to the stanza's cluster before storing it. C
 /// reference: `pgWalFromBuffer()` in `src/postgres/interface.c`, which decodes a
 /// `PgWal { version, systemId, size }` from the same bytes.

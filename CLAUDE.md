@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-pgBackRest is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `eol`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
+pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbackrust`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `main`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbackrust/issues/238).
 
-The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrest` binary (from `crates/pgbr-cli`). There is no C left to build.
+The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrust` binary (from `crates/pgbr-cli`). There is no C left to build.
 
 What remains before the migration is fully "done":
 
@@ -30,7 +30,7 @@ docker compose run --rm cargo check --workspace                   # quick type-c
 docker compose run --rm cargo test --workspace                    # run all tests
 docker compose run --rm cargo fmt --check                         # rustfmt verify
 docker compose run --rm cargo clippy --workspace --all-targets -- -D warnings
-docker compose run --rm cargo run -p pgbr-cli -- info             # run the pgbackrest binary
+docker compose run --rm cargo run -p pgbr-cli -- info             # run the pgbackrust binary
 ```
 
 The first build of the image takes a few minutes. Cargo registry, git cache and `target/` live in named volumes (`cargo-registry`, `cargo-git`, `rust-target`) so subsequent `cargo` runs are fast. To wipe them: `docker compose down -v`. The `dev` service stays up (`sleep infinity`) so you can `docker compose exec dev bash` for an interactive shell.
@@ -47,7 +47,7 @@ docker compose run --rm dev cargo test --workspace
 
 ## Rust workspace
 
-`cargo build --workspace --release` builds everything; the `pgbackrest` binary comes from `crates/pgbr-cli`. Crates:
+`cargo build --workspace --release` builds everything; the `pgbackrust` binary comes from `crates/pgbr-cli`. Crates:
 
 - `pgbr-core` — string, blob, memory primitives, log formatting, debug, stack trace, object base
 - `pgbr-error` — typed `Error` / `ErrorType` (generated from `error.yaml` by `build.rs`), format, retry
@@ -55,7 +55,7 @@ docker compose run --rm dev cargo test --workspace
 - `pgbr-crypto` — xxhash
 - `pgbr-compress` — gz / bz2 / lz4 / zst compress + decompress, exposed as `pgbr_io::Filter` adapters (`filter` module)
 - `pgbr-regex` — regex wrapper
-- `pgbr-build` — typed parsers for the four pgBackRest definition files, which are embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files themselves live in `crates/pgbr-build/inputs/`
+- `pgbr-build` — typed parsers for the four pgBackRust definition files, which are embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files themselves live in `crates/pgbr-build/inputs/`
 - `pgbr-config` — full configuration pipeline: `types`, `command` (`CfgCommand`), `option` (`CfgOption`), `compile` (`Cfg`, inheritance + `+role`/`+inherit`/`-command` expansion), `value` (`OptionValue`, `parse_value`), `cli` (`parse_cli` + `resolve_cli`), `ini` (`parse_ini`), `merge` (`load_config` / `load_config_with_context` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range/depend validation + dynamic & per-flavor defaults)
 - `pgbr-io` — `IoRead`/`IoWrite` traits (with `Box<dyn>`/`&mut` blanket impls + `copy`), `MemRead`/`MemWrite`, `FileRead`/`FileWrite`, `FilterChain`, and the `filter` module (`Sha1`, `Sha256`, `Size`, `Cipher` AES-256-CBC)
 - `pgbr-storage` — `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2)
@@ -64,7 +64,7 @@ docker compose run --rm dev cargo test --workspace
 - `pgbr-postgres` — `crc32c_one`, `version` registry (PG 9.6 .. 18), `control` (`pg_control` header + per-version field offsets), `page` (`pg_checksum_page`)
 - `pgbr-info` — on-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 `format`
 - `pgbr-command` — every command + the `dispatch` entry: backup (full/diff/incr), restore (+ delta + reference resolution), archive-push/get, expire (backup + WAL retention), verify, check, info, stanza-create/delete/upgrade, repo-ls/get/put/rm, annotate, manifest, start/stop, server/server-ping (TCP + TLS), help, version; plus the shared `pipeline::RepoTransform` (compress + encrypt)
-- `pgbr-cli` — the `pgbackrest` binary: parse argv → load `config.yaml` + `pgbackrest.conf` → resolve → `pgbr_command::dispatch`
+- `pgbr-cli` — the `pgbackrust` binary: parse argv → load `config.yaml` + `pgbackrust.conf` → resolve → `pgbr_command::dispatch`
 
 ## Adding a configuration option
 
@@ -81,7 +81,7 @@ These are embedded into `pgbr-build` at compile time, so a plain `cargo build` p
 
 ## CI gating
 
-`.github/workflows/test.yml` runs the Rust gate (fmt check, clippy `--all-targets -D warnings`, `cargo test --workspace`) on pushes/PRs to `eol` and on `**-ci` / `**-cig` branches. Pull requests target **`eol`**.
+`.github/workflows/test.yml` runs the Rust gate (fmt check, clippy `--all-targets -D warnings`, `cargo test --workspace`) on pushes/PRs to `main` and on `**-ci` / `**-cig` branches. Pull requests target **`main`**.
 
 ## Tip: branches ending in `-cig` push to GitHub Actions
 
@@ -89,4 +89,4 @@ Renaming a branch to end in `-cig` (or `-ci`) and pushing it to your fork trigge
 
 ## History
 
-The C source this was ported from lived under `src/` (removed in the dismantling commits; recoverable from git history). The original plan was a 215-phase incremental port behind an FFI shim with C↔Rust differential tests; that was retired after ~50 phases in favour of a single big-bang rewrite (epic #238). If you need to consult the original C for behavioural reference, check out a pre-dismantling commit or pgBackRest 2.58.0 upstream.
+The C source this was ported from lived under `src/` (removed in the dismantling commits; recoverable from git history). The original plan was a 215-phase incremental port behind an FFI shim with C↔Rust differential tests; that was retired after ~50 phases in favour of a single big-bang rewrite (epic #238). If you need to consult the original C for behavioural reference, check out a pre-dismantling commit or pgBackRust 2.58.0 upstream.

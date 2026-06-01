@@ -1,8 +1,8 @@
-//! Process transport for the pgBackRest local/remote protocol.
+//! Process transport for the pgBackRust local/remote protocol.
 //!
-//! pgBackRest's main process drives helper workers (a `--local` worker for
+//! pgBackRust's main process drives helper workers (a `--local` worker for
 //! parallel work on the same host, a `--remote` worker reached over SSH) by
-//! spawning a child `pgbackrest` invocation and exchanging the JSON-line
+//! spawning a child `pgbackrust` invocation and exchanging the JSON-line
 //! protocol over the child's stdin/stdout pipes. C reference:
 //! `src/protocol/client.c`, `src/protocol/server.c`, `src/common/exec.c`.
 //!
@@ -237,7 +237,7 @@ impl<R: IoRead, W: IoWrite> ProtocolClient<R, W> {
     /// stanza to the server side.
     ///
     /// The first message on a freshly-opened mutual-TLS connection to a
-    /// `pgbackrest server` is a no-op whose `param` list optionally carries a
+    /// `pgbackrust server` is a no-op whose `param` list optionally carries a
     /// single `stanza=<name>` token. The server reads it before calling
     /// `authorize_client`, so the CN authorization runs against the *client's*
     /// requested stanza rather than whatever stanza (if any) the server
@@ -358,16 +358,16 @@ pub fn serve<R: IoRead, W: IoWrite, H: RequestHandler>(
     }
 }
 
-/// The SSH client program pgBackRest invokes to reach a remote worker.
-/// Matches the default of pgBackRest's `cmd-ssh` option.
+/// The SSH client program pgBackRust invokes to reach a remote worker.
+/// Matches the default of pgBackRust's `cmd-ssh` option.
 pub const SSH_PROGRAM: &str = "ssh";
 
 /// The default worker program name spawned on the local or remote side.
-pub const PGBACKREST_PROGRAM: &str = "pgbackrest";
+pub const PGBACKRUST_PROGRAM: &str = "pgbackrust";
 
 /// Build the argument vector for launching a remote worker over SSH.
 ///
-/// Models pgBackRest's `protocolRemoteParamSsh` (`src/protocol/helper.c`):
+/// Models pgBackRust's `protocolRemoteParamSsh` (`src/protocol/helper.c`):
 /// a fixed block of hardening `-o` options, an optional `-p <port>`, the
 /// `[<user>@]<host>` destination, then the remote program followed by its
 /// arguments. The returned tuple is `("ssh", args)` where the program name
@@ -426,8 +426,8 @@ pub fn build_ssh_command(
 
 /// Build the argument vector for launching a worker on the local host.
 ///
-/// Models pgBackRest's `protocolLocalParam`: there is no SSH wrapper, just
-/// the `pgbackrest` program itself plus the role / config arguments the
+/// Models pgBackRust's `protocolLocalParam`: there is no SSH wrapper, just
+/// the `pgbackrust` program itself plus the role / config arguments the
 /// caller supplies (e.g. `["--local", ...]`). Returns `(program, role_args)`
 /// ready for [`ProcessClient::spawn`].
 #[must_use]
@@ -435,7 +435,7 @@ pub fn build_local_command(program: &str, role_args: &[String]) -> (String, Vec<
     (program.to_owned(), role_args.to_vec())
 }
 
-/// Spawns a child worker (`pgbackrest --remote` / `--local`) with piped
+/// Spawns a child worker (`pgbackrust --remote` / `--local`) with piped
 /// stdin/stdout and exchanges protocol messages with it.
 ///
 /// The child's stdout is wrapped in a [`PipeRead`] and its stdin in a
@@ -478,12 +478,12 @@ impl ProcessClient {
     }
 
     /// Spawn a remote worker over SSH (`ssh [opts] [-p port] [user@]host
-    /// pgbackrest --remote ...`).
+    /// pgbackrust --remote ...`).
     ///
     /// Builds the SSH command line with [`build_ssh_command`] and delegates to
     /// [`ProcessClient::spawn`], so the protocol then runs over the local
     /// `ssh` process's piped stdin/stdout — the SSH client transparently
-    /// forwards them to the remote `pgbackrest` worker's stdin/stdout.
+    /// forwards them to the remote `pgbackrust` worker's stdin/stdout.
     ///
     /// # Errors
     ///
@@ -500,7 +500,7 @@ impl ProcessClient {
         Self::spawn(&command, &args)
     }
 
-    /// Spawn a local worker (`program role_args...`, e.g. `pgbackrest
+    /// Spawn a local worker (`program role_args...`, e.g. `pgbackrust
     /// --local ...`).
     ///
     /// Builds the command line with [`build_local_command`] and delegates to
@@ -806,7 +806,7 @@ mod tests {
             "repo1.example.com",
             None,
             None,
-            "pgbackrest",
+            "pgbackrust",
             &["--remote".to_owned(), "info".to_owned()],
         );
         assert_eq!(program, "ssh");
@@ -822,7 +822,7 @@ mod tests {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "repo1.example.com",
-                "pgbackrest",
+                "pgbackrust",
                 "--remote",
                 "info",
             ]
@@ -835,7 +835,7 @@ mod tests {
             "db1.example.com",
             Some(2222),
             Some("postgres"),
-            "pgbackrest",
+            "pgbackrust",
             &["--remote".to_owned()],
         );
         assert_eq!(program, "ssh");
@@ -853,7 +853,7 @@ mod tests {
                 "-p",
                 "2222",
                 "postgres@db1.example.com",
-                "pgbackrest",
+                "pgbackrust",
                 "--remote",
             ]
         );
@@ -861,13 +861,13 @@ mod tests {
 
     #[test]
     fn build_local_command_passes_args() {
-        let (program, args) = build_local_command("pgbackrest", &["--local".to_owned(), "--process=1".to_owned()]);
-        assert_eq!(program, "pgbackrest");
+        let (program, args) = build_local_command("pgbackrust", &["--local".to_owned(), "--process=1".to_owned()]);
+        assert_eq!(program, "pgbackrust");
         assert_eq!(args, vec!["--local", "--process=1"]);
 
         // No args still yields just the program with an empty arg vector.
-        let (program, args) = build_local_command("/usr/bin/pgbackrest", &[]);
-        assert_eq!(program, "/usr/bin/pgbackrest");
+        let (program, args) = build_local_command("/usr/bin/pgbackrust", &[]);
+        assert_eq!(program, "/usr/bin/pgbackrust");
         assert!(args.is_empty());
     }
 

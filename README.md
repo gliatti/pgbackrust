@@ -1,19 +1,19 @@
-# pgBackRest <br/> A Rust rewrite of the PostgreSQL backup & restore tool
+# pgBackRust <br/> A Rust rewrite of the PostgreSQL backup & restore tool
 
 ## About this fork
 
-[pgBackRest](https://github.com/pgbackrest/pgbackrest) is a reliable backup and
+[pgBackRust](https://github.com/pgbackrust/pgbackrust) is a reliable backup and
 restore solution for PostgreSQL. The upstream project is **no longer
-maintained** — [release 2.58.0](https://github.com/pgbackrest/pgbackrest/releases/tag/release/2.58.0)
+maintained** — [release 2.58.0](https://github.com/pgbackrust/pgbackrust/releases/tag/release/2.58.0)
 is the final C release (see the original notice below).
 
-This fork is a **from-scratch rewrite of pgBackRest in Rust**. The original C
+This fork is a **from-scratch rewrite of pgBackRust in Rust**. The original C
 sources (everything that lived under `src/`), the Meson build, and the
 transitional cbindgen/FFI scaffolding have been removed. The repository is now a
 **cargo-only Rust workspace**: `cargo build --workspace --release` produces the
-`pgbackrest` binary. There is no C left to build.
+`pgbackrust` binary. There is no C left to build.
 
-The rewrite preserves pgBackRest's on-disk formats, configuration model, and
+The rewrite preserves pgBackRust's on-disk formats, configuration model, and
 command set so that it can read existing repositories, while replacing the
 manual memory contexts and FFI ceremony of the C code with idiomatic Rust
 (`Result`, `Drop`, lifetimes, safe wrappers around the few C libraries that are
@@ -25,7 +25,7 @@ still linked).
 
 ## Workspace layout
 
-The build is driven entirely by Cargo. The `pgbackrest` binary is produced by
+The build is driven entirely by Cargo. The `pgbackrust` binary is produced by
 `crates/pgbr-cli`; everything else is a library crate under `crates/`.
 
 | Crate | Responsibility |
@@ -36,8 +36,8 @@ The build is driven entirely by Cargo. The `pgbackrest` binary is produced by
 | `pgbr-crypto` | xxhash. |
 | `pgbr-compress` | gz / bz2 / lz4 / zstd compress + decompress, exposed as `pgbr_io::Filter` adapters. |
 | `pgbr-regex` | Regex wrapper. |
-| `pgbr-build` | Typed parsers for the four pgBackRest definition files, embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files live in `crates/pgbr-build/inputs/`. |
-| `pgbr-config` | Full configuration pipeline: option model, compile/inheritance, value parsing, CLI tokenizer, `pgbackrest.conf` ini parsing, and `load_config` with the CLI > stanza:cmd > stanza > global:cmd > global > default precedence plus allow-list / allow-range / depend validation. |
+| `pgbr-build` | Typed parsers for the four pgBackRust definition files, embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files live in `crates/pgbr-build/inputs/`. |
+| `pgbr-config` | Full configuration pipeline: option model, compile/inheritance, value parsing, CLI tokenizer, `pgbackrust.conf` ini parsing, and `load_config` with the CLI > stanza:cmd > stanza > global:cmd > global > default precedence plus allow-list / allow-range / depend validation. |
 | `pgbr-io` | `IoRead` / `IoWrite` traits, in-memory and file-backed implementations, `FilterChain`, and built-in filters (`Sha1`, `Sha256`, `Size`, `Cipher` AES-256-CBC). |
 | `pgbr-storage` | `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2). |
 | `pgbr-db` | Safe libpq wrapper (`Connection`, `QueryResult`). |
@@ -45,7 +45,7 @@ The build is driven entirely by Cargo. The `pgbackrest` binary is produced by
 | `pgbr-postgres` | `crc32c_one`, version registry (PG 9.6 .. 18), `pg_control` header parsing, and `pg_checksum_page`. |
 | `pgbr-info` | On-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 format. |
 | `pgbr-command` | Every command implementation plus the `dispatch` entry point (see below). |
-| `pgbr-cli` | The `pgbackrest` binary: parse argv → load config → resolve → `pgbr_command::dispatch`. |
+| `pgbr-cli` | The `pgbackrust` binary: parse argv → load config → resolve → `pgbr_command::dispatch`. |
 
 `pgbr-command` implements: backup (full / differential / incremental), restore
 (with delta and reference resolution), archive-push / archive-get, expire
@@ -66,7 +66,7 @@ docker compose run --rm cargo build --workspace --release
 ```
 
 The release binary is written to the `rust-target` volume under
-`target/release/pgbackrest`. Run a command directly with:
+`target/release/pgbackrust`. Run a command directly with:
 
 ```
 docker compose run --rm cargo run -p pgbr-cli -- info
@@ -110,7 +110,7 @@ flow.
 
 ## License
 
-pgBackRest is released under the MIT license. See [`LICENSE`](LICENSE) for the
+pgBackRust is released under the MIT license. See [`LICENSE`](LICENSE) for the
 full text. The original copyright and attribution are preserved:
 
 > Portions Copyright (c) 2015-2026, The PostgreSQL Global Development Group
@@ -127,10 +127,10 @@ This rewrite builds on that work and remains under the same MIT license.
 
 ## Original notice of obsolescence
 
-> TL;DR: pgBackRest is no longer being maintained. If you fork pgBackRest, please select a new name for your project.
+> TL;DR: pgBackRust is no longer being maintained. If you fork pgBackRust, please select a new name for your project.
 >
-> After a lot of thought, I have decided to stop working on pgBackRest. I did not come to this decision lightly. pgBackRest has been my passion project for the last thirteen years, and I was fortunate to have corporate sponsorship for much of this time, but there were also many late nights and weekends as I worked to make pgBackRest the project it is today, aided by numerous contributors. Every open-source developer knows exactly what I mean and how much of your life gets devoted to a special project.
+> After a lot of thought, I have decided to stop working on pgBackRust. I did not come to this decision lightly. pgBackRust has been my passion project for the last thirteen years, and I was fortunate to have corporate sponsorship for much of this time, but there were also many late nights and weekends as I worked to make pgBackRust the project it is today, aided by numerous contributors. Every open-source developer knows exactly what I mean and how much of your life gets devoted to a special project.
 >
-> Since Crunchy Data was sold, I have been maintaining pgBackRest and looking for a position that would allow me to continue the work, but so far I have not been successful. Likewise, my efforts to secure sponsorship have also fallen far short of what I need to make the project viable.
+> Since Crunchy Data was sold, I have been maintaining pgBackRust and looking for a position that would allow me to continue the work, but so far I have not been successful. Likewise, my efforts to secure sponsorship have also fallen far short of what I need to make the project viable.
 >
-> Again, many thanks to all the pgBackRest contributors over the years. It was a pleasure working with you!
+> Again, many thanks to all the pgBackRust contributors over the years. It was a pleasure working with you!

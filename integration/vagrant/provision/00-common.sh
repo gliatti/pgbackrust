@@ -31,27 +31,27 @@ echo "[common] runtime directories"
 install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust 2>/dev/null || install -d -m 0750 /var/log/pgbackrust
 install -d -m 0750 /var/spool/pgbackrust
 # Config dir uses the 'e' spelling the current binary reads by default
-# (/etc/pgbackrest/pgbackrest.conf, conf.d at /etc/pgbackrest/conf.d).
-install -d -m 0755 /etc/pgbackrest /etc/pgbackrest/conf.d
+# (/etc/pgbackrust/pgbackrust.conf, conf.d at /etc/pgbackrust/conf.d).
+install -d -m 0755 /etc/pgbackrust /etc/pgbackrust/conf.d
 install -d -m 0750 /etc/certs
 
 # --- install the Rust pgbackrust binary (uploaded to /tmp by Vagrant) -------
 # The current binary reads its default config from the 'e' path
-# (/etc/pgbackrest/pgbackrest.conf) and resolves the worker spawn command from
+# (/etc/pgbackrust/pgbackrust.conf) and resolves the worker spawn command from
 # its own executable path (std::env::current_exe → cmd/pg-host-cmd/repo-host-cmd
 # defaults). The `check` command also requires the cluster's archive_command to
-# contain the substring "pgbackrest". So install the binary at the 'e' path
-# /usr/bin/pgbackrest and add a /usr/bin/pgbackrust symlink so the harness's
+# contain the substring "pgbackrust". So install the binary at the 'e' path
+# /usr/bin/pgbackrust and add a /usr/bin/pgbackrust symlink so the harness's
 # bare-name `pgbackrust ...` invocations still resolve on PATH.
 ARTIFACT=/tmp/pgbackrust.bin
 if [ -s "$ARTIFACT" ]; then
-  echo "[common] installing prebuilt pgbackrest binary"
-  install -m 0755 "$ARTIFACT" /usr/bin/pgbackrest
-  ln -sf /usr/bin/pgbackrest /usr/bin/pgbackrust
+  echo "[common] installing prebuilt pgbackrust binary"
+  install -m 0755 "$ARTIFACT" /usr/bin/pgbackrust
+  ln -sf /usr/bin/pgbackrust /usr/bin/pgbackrust
 else
   echo "[common] ERROR: prebuilt binary /tmp/pgbackrust.bin missing — run ../build-binary.sh on the host first" >&2
   exit 1
 fi
 
-pgbackrest version || true
+pgbackrust version || true
 echo "[common] done on role=${PGBR_ROLE}"

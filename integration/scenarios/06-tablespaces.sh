@@ -12,7 +12,7 @@ BIN=/usr/lib/postgresql/$PGV/bin
 
 info "06 tablespaces: self-provision principal as its own repo host"
 node principal bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
-node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -23,7 +23,7 @@ start-fast=y
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 reset_principal "$DATADIR" "$BIN" "$STANZA"
 pg_as principal pgbackrust --stanza=$STANZA stanza-create

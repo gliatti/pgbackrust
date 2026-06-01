@@ -5,7 +5,7 @@
 // from a YAML mapping. Suppress the lint at crate level.
 #![allow(clippy::zero_sized_map_values)]
 
-//! Build-time inputs for the pgBackRest Rust rewrite.
+//! Build-time inputs for the pgBackRust Rust rewrite.
 //!
 //! Parses the four hand-written definition files (`config.yaml`, `error.yaml`,
 //! `help.xml`, `postgres.yaml`) into typed Rust structures consumed by

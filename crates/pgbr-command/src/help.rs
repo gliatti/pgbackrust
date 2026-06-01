@@ -14,7 +14,7 @@ fn load_help() -> Result<pgbr_build::Help, CommandError> {
 }
 
 /// Print either the full command list (no params) or a one-command summary
-/// (`pgbackrest help <command>`).
+/// (`pgbackrust help <command>`).
 ///
 /// # Errors
 ///

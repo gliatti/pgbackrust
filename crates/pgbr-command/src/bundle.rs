@@ -43,7 +43,7 @@ pub struct BundleSlot {
 /// [`BundleSlot`] (bundle id + offset) the bytes belong at and advances its
 /// internal cursor.
 ///
-/// Sizing rule (mirrors pgBackRest): a file is appended to the current bundle
+/// Sizing rule (mirrors pgBackRust): a file is appended to the current bundle
 /// unless doing so would push the bundle past `bundle_size` **and** the current
 /// bundle already holds at least one file — in that case a new bundle is started
 /// first. A single file larger than `bundle_size` still gets its own bundle (it

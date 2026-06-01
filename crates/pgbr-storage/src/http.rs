@@ -1,7 +1,7 @@
 //! Shared HTTPS-client configuration for the object-store backends
 //! ([`crate::S3`], [`crate::Azure`], [`crate::Gcs`]).
 //!
-//! pgBackRest's cloud drivers all share a small family of transport options that
+//! pgBackRust's cloud drivers all share a small family of transport options that
 //! are independent of the storage protocol on top: the `repo-storage-verify-tls`
 //! toggle (skip certificate verification), `repo-storage-ca-file` /
 //! `repo-storage-ca-path` (extra CA roots to trust), `repo-storage-port`
@@ -26,7 +26,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use crate::StorageError;
 
 /// Transport-level (HTTPS-client) options shared by the cloud backends, mirroring
-/// pgBackRest's `repo-storage-*` family.
+/// pgBackRust's `repo-storage-*` family.
 ///
 /// The defaults reproduce a stock HTTPS client: certificate verification on, no
 /// extra CA roots, the protocol default port, and the backend's own default
@@ -35,7 +35,7 @@ use crate::StorageError;
 pub struct HttpOptions {
     /// Verify the server's TLS certificate against the trusted roots. When
     /// `false` (the `repo-storage-verify-tls=n` case) every certificate is
-    /// accepted — insecure, but pgBackRest supports it for self-signed
+    /// accepted — insecure, but pgBackRust supports it for self-signed
     /// endpoints. Defaults to `true`.
     pub verify_tls: bool,
     /// Path to a PEM file of additional CA certificates to trust

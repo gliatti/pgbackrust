@@ -28,9 +28,9 @@
 //!    identifier, and confirms they agree with the stanza's info-file db
 //!    history.
 //! 7. Confirms `archive_mode` is `on` and `archive_command` references
-//!    `pgbackrest`.
+//!    `pgbackrust`.
 //! 8. Forces a fresh WAL segment to be archived: on a primary it calls
-//!    `pg_create_restore_point('pgBackRest Archive Check')` then
+//!    `pg_create_restore_point('pgBackRust Archive Check')` then
 //!    `pg_switch_wal()` (`pg_switch_xlog()` pre-10) and records the switched
 //!    segment name. On a standby it cannot switch, so it instead inspects the
 //!    most recent segment already present in the repo.
@@ -484,7 +484,7 @@ fn positive_integer_opt(config: &LoadedConfig, name: &str) -> Option<i64> {
 }
 
 /// Resolve `--archive-timeout` (a [`OptionValue::Time`] in milliseconds) into a
-/// [`Duration`], defaulting to 60s (the pgBackRest default) when unset.
+/// [`Duration`], defaulting to 60s (the pgBackRust default) when unset.
 fn archive_timeout(config: &LoadedConfig) -> Duration {
     match config.options.get(&("archive-timeout".to_owned(), None)) {
         Some(OptionValue::Time(ms)) => Duration::from_millis(*ms),
@@ -608,7 +608,7 @@ fn check_pg<D: CheckDb>(
     let in_recovery = db.is_in_recovery()?;
 
     // 7. archive_mode must be enabled (archive-mode-check) and archive_command
-    //    must reference pgbackrest. `always` is expected only on a standby; a
+    //    must reference pgbackrust. `always` is expected only on a standby; a
     //    primary reporting `always` is unexpected and rejected. The archive_mode
     //    half is skipped when archive-mode-check is off.
     let (archive_mode, archive_command) = db.archive_settings()?;
@@ -626,9 +626,9 @@ fn check_pg<D: CheckDb>(
             }
         }
     }
-    if !archive_command.contains("pgbackrest") {
+    if !archive_command.contains("pgbackrust") {
         return Err(CommandError::Other(format!(
-            "archive_command '{archive_command}' does not reference pgbackrest"
+            "archive_command '{archive_command}' does not reference pgbackrust"
         )));
     }
 
@@ -637,7 +637,7 @@ fn check_pg<D: CheckDb>(
     let wal_segment = if in_recovery {
         db.last_wal_segment(server_version_num)?
     } else {
-        db.create_restore_point("pgBackRest Archive Check")?;
+        db.create_restore_point("pgBackRust Archive Check")?;
         db.switch_wal(server_version_num)?
     };
 
@@ -705,7 +705,7 @@ fn segment_present(repo_storage: &dyn Storage, archive_dir: &Path, segment: &str
     }))
 }
 
-/// Map a `server_version_num` (e.g. `160004`, `90600`) to a pgBackRest major
+/// Map a `server_version_num` (e.g. `160004`, `90600`) to a pgBackRust major
 /// version label (`"9.6"`, `"10"`, …), mirroring `stanza.rs`'s helper of the
 /// same name. PG < 10 keeps the `9.x` minor; PG >= 10 collapses to the bare
 /// major. Returns `None` for a version with no registry entry.
@@ -722,7 +722,7 @@ fn pg_version_label_from_num(server_version_num: u32) -> Option<&'static str> {
 /// remove it. Returns `Ok(true)` only when the round trip matched.
 fn probe_repo_writable(repo_storage: &dyn Storage, stanza: &str) -> Result<bool, CommandError> {
     let probe_path = PathBuf::from(format!("{stanza}/check-{}", std::process::id()));
-    let payload = format!("pgbackrest check probe for stanza '{stanza}'").into_bytes();
+    let payload = format!("pgbackrust check probe for stanza '{stanza}'").into_bytes();
 
     // Ensure the stanza directory exists so the probe write does not fail merely
     // because the repo has only the `archive/<stanza>` and `backup/<stanza>`
@@ -774,7 +774,7 @@ fn probe_archive_round_trip(repo_storage: &dyn Storage, stanza: &str, archive_id
     let archive_dir = format!("archive/{stanza}/{archive_id}");
     let test_name = format!("{archive_id}.check-{}", std::process::id());
     let test_path = PathBuf::from(format!("{archive_dir}/{test_name}"));
-    let payload = format!("pgbackrest archive check for stanza '{stanza}' archive-id '{archive_id}'").into_bytes();
+    let payload = format!("pgbackrust archive check for stanza '{stanza}' archive-id '{archive_id}'").into_bytes();
 
     // Ensure the archive-id directory exists. On a freshly-created stanza that
     // has never archived a segment the directory may be absent; `create_path`
@@ -810,7 +810,7 @@ fn probe_archive_round_trip(repo_storage: &dyn Storage, stanza: &str, archive_id
     }
 }
 
-/// The `pgN` index `check` uses for its single control connection. pgBackRest's
+/// The `pgN` index `check` uses for its single control connection. pgBackRust's
 /// `check` drives the cluster at the active `pg` index (1 by default).
 const CHECK_PG_INDEX: u32 = 1;
 
@@ -819,7 +819,7 @@ const CHECK_PG_INDEX: u32 = 1;
 /// The repo-side checks always run. For the live-PG half:
 ///
 /// - When `pg1-host` is set (the dedicated-repo-host "pull" topology), the
-///   control connection runs on the PG host: a `pgbackrest` worker is spawned
+///   control connection runs on the PG host: a `pgbackrust` worker is spawned
 ///   there over SSH, opened against the *local* cluster (no `host=<pghost>`, so
 ///   libpq uses the unix socket with peer / trust auth), and driven through a
 ///   [`RemoteCheckDb`].
@@ -1009,7 +1009,7 @@ pub fn check(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)], _pg_s
 /// Emit a human-facing progress line at `INFO` through the `pgbr_core::log`
 /// formatter.
 ///
-/// pgBackRest routes progress lines to its log (the console at
+/// pgBackRust routes progress lines to its log (the console at
 /// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
 /// free for machine-readable command output. This is the Rust analogue of the C
 /// `LOG_INFO` macro: the message lands on whichever sinks the logger has open, so
@@ -1069,7 +1069,7 @@ mod tests {
                 system_id: 6_873_049_345_984_568_091,
                 in_recovery: false,
                 archive_mode: "on".to_owned(),
-                archive_command: "pgbackrest --stanza=demo archive-push %p".to_owned(),
+                archive_command: "pgbackrust --stanza=demo archive-push %p".to_owned(),
                 switch_segment: "000000010000000000000003".to_owned(),
                 last_segment: "000000010000000000000002".to_owned(),
                 restore_point: None,
@@ -1520,7 +1520,7 @@ mod tests {
         assert!(report.archive_wait_ok);
         assert_eq!(report.server_version_num, 160_004);
         // A primary must have created the restore point and switched WAL.
-        assert_eq!(db.restore_point.as_deref(), Some("pgBackRest Archive Check"));
+        assert_eq!(db.restore_point.as_deref(), Some("pgBackRust Archive Check"));
         assert!(db.switched, "primary must force a WAL switch");
     }
 
@@ -1661,7 +1661,7 @@ mod tests {
             Duration::from_millis(1),
             true,
         )
-        .expect_err("archive_command not referencing pgbackrest must fail");
+        .expect_err("archive_command not referencing pgbackrust must fail");
         match err {
             CommandError::Other(msg) => assert!(msg.contains("archive_command"), "message was {msg:?}"),
             other => panic!("expected Other(archive_command), got {other:?}"),
@@ -1847,7 +1847,7 @@ mod tests {
         // On a primary, exercise the restore-point + switch path and confirm the
         // returned name is a 24-hex WAL segment.
         if !db.is_in_recovery().expect("recovery") {
-            db.create_restore_point("pgBackRest Archive Check")
+            db.create_restore_point("pgBackRust Archive Check")
                 .expect("create restore point");
             let segment = db.switch_wal(version).expect("switch wal");
             assert_eq!(segment.len(), 24, "WAL segment name should be 24 hex chars: {segment}");
@@ -1902,7 +1902,7 @@ mod tests {
                         } else if sql.contains("archive_mode") {
                             scalar_rows("on")
                         } else if sql.contains("archive_command") {
-                            scalar_rows("pgbackrest --stanza=demo archive-push %p")
+                            scalar_rows("pgbackrust --stanza=demo archive-push %p")
                         } else if sql.contains("pg_create_restore_point") {
                             scalar_rows("0/3000000")
                         } else if sql.contains("pg_walfile_name") {

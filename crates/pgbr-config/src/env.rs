@@ -1,13 +1,13 @@
-//! `PGBACKREST_<OPTION>` environment-variable option source.
+//! `PGBACKRUST_<OPTION>` environment-variable option source.
 //!
-//! pgBackRest lets any option be set through an environment variable whose
-//! name is `PGBACKREST_` followed by the option name uppercased with every
+//! pgBackRust lets any option be set through an environment variable whose
+//! name is `PGBACKRUST_` followed by the option name uppercased with every
 //! `-` turned into `_`. Indexed group options carry their index in the name,
 //! e.g.
 //!
-//! - `--repo1-path` ⇄ `PGBACKREST_REPO1_PATH`
-//! - `--compress-type` ⇄ `PGBACKREST_COMPRESS_TYPE`
-//! - `--pg2-host` ⇄ `PGBACKREST_PG2_HOST`
+//! - `--repo1-path` ⇄ `PGBACKRUST_REPO1_PATH`
+//! - `--compress-type` ⇄ `PGBACKRUST_COMPRESS_TYPE`
+//! - `--pg2-host` ⇄ `PGBACKRUST_PG2_HOST`
 //!
 //! In the merge precedence the env source sits **below the CLI but above the
 //! config file** (CLI > ENV > stanza:cmd > stanza > global:cmd > global >
@@ -26,11 +26,11 @@ use std::collections::BTreeMap;
 use crate::compile::Cfg;
 use crate::types::OptionGroup;
 
-/// The prefix every pgBackRest option environment variable carries.
-const ENV_PREFIX: &str = "PGBACKREST_";
+/// The prefix every pgBackRust option environment variable carries.
+const ENV_PREFIX: &str = "PGBACKRUST_";
 
 /// Highest group index probed when collecting env vars for indexed (`pg`/`repo`)
-/// options. pgBackRest's own ceiling is 256 (`CFG_OPTION_KEY_MAX`); probing that
+/// options. pgBackRust's own ceiling is 256 (`CFG_OPTION_KEY_MAX`); probing that
 /// many slots per grouped option is cheap (a string build + a closure call) and
 /// keeps parity with the C parser, which scans the whole environment.
 const GROUP_INDEX_MAX: u32 = 256;
@@ -38,8 +38,8 @@ const GROUP_INDEX_MAX: u32 = 256;
 /// Build the environment-variable name for an option key.
 ///
 /// `option_with_index` is the key as it would appear on the command line
-/// (group prefix included), e.g. `repo1-path` -> `PGBACKREST_REPO1_PATH`,
-/// `compress-type` -> `PGBACKREST_COMPRESS_TYPE`.
+/// (group prefix included), e.g. `repo1-path` -> `PGBACKRUST_REPO1_PATH`,
+/// `compress-type` -> `PGBACKRUST_COMPRESS_TYPE`.
 ///
 /// The transform is: prepend [`ENV_PREFIX`], uppercase, and replace every `-`
 /// with `_`. This is the inverse of the decode performed by [`collect_env`].
@@ -71,18 +71,18 @@ fn raw_key_for(option_name: &str, group: Option<OptionGroup>, index: Option<u32>
     }
 }
 
-/// Collect every `PGBACKREST_<OPTION>` value that `lookup` resolves, keyed by
+/// Collect every `PGBACKRUST_<OPTION>` value that `lookup` resolves, keyed by
 /// `(option_name, group_index)` — the same key shape the CLI/INI sources use.
 ///
 /// For each option declared in `cfg`:
-/// - **non-grouped** options probe a single env var (`PGBACKREST_<NAME>`),
+/// - **non-grouped** options probe a single env var (`PGBACKRUST_<NAME>`),
 ///   keyed `(name, None)`;
-/// - **grouped** (`pg`/`repo`) options probe `PGBACKREST_<PREFIX><N>_...` for
+/// - **grouped** (`pg`/`repo`) options probe `PGBACKRUST_<PREFIX><N>_...` for
 ///   `N` from 1 to [`GROUP_INDEX_MAX`] inclusive, keyed `(name, Some(N))`.
 ///
 /// `lookup` is the injected environment reader: given an env var *name* it
 /// returns its value (or `None`). An empty-string value is ignored (treated as
-/// unset), matching pgBackRest. The returned map holds the *raw* string values;
+/// unset), matching pgBackRust. The returned map holds the *raw* string values;
 /// the merge step parses them via [`crate::value::parse_value`], exactly as it
 /// does for INI values.
 pub fn collect_env<F>(cfg: &Cfg, lookup: F) -> BTreeMap<(String, Option<u32>), String>
@@ -125,7 +125,7 @@ where
 }
 
 /// Convenience wrapper over [`collect_env`] that reads the *real* process
-/// environment via [`std::env::var`]. Use this in the `pgbackrest` binary; the
+/// environment via [`std::env::var`]. Use this in the `pgbackrust` binary; the
 /// pure [`collect_env`] is preferred in tests.
 #[must_use]
 pub fn env_values_from_process(cfg: &Cfg) -> BTreeMap<(String, Option<u32>), String> {
@@ -183,16 +183,16 @@ option:
 
     #[test]
     fn env_name_uppercases_and_swaps_dash() {
-        assert_eq!(option_env_name("repo1-path"), "PGBACKREST_REPO1_PATH");
-        assert_eq!(option_env_name("compress-type"), "PGBACKREST_COMPRESS_TYPE");
-        assert_eq!(option_env_name("stanza"), "PGBACKREST_STANZA");
-        assert_eq!(option_env_name("pg2-host"), "PGBACKREST_PG2_HOST");
+        assert_eq!(option_env_name("repo1-path"), "PGBACKRUST_REPO1_PATH");
+        assert_eq!(option_env_name("compress-type"), "PGBACKRUST_COMPRESS_TYPE");
+        assert_eq!(option_env_name("stanza"), "PGBACKRUST_STANZA");
+        assert_eq!(option_env_name("pg2-host"), "PGBACKRUST_PG2_HOST");
     }
 
     #[test]
     fn collect_env_reads_non_grouped_option() {
         let cfg = small_cfg();
-        let collected = collect_env(&cfg, |name| (name == "PGBACKREST_COMPRESS_TYPE").then(|| "zst".to_owned()));
+        let collected = collect_env(&cfg, |name| (name == "PGBACKRUST_COMPRESS_TYPE").then(|| "zst".to_owned()));
         assert_eq!(
             collected.get(&("compress-type".to_owned(), None)).map(String::as_str),
             Some("zst")
@@ -205,9 +205,9 @@ option:
     fn collect_env_decodes_grouped_repo_index() {
         let cfg = small_cfg();
         let env: BTreeMap<&str, &str> = [
-            ("PGBACKREST_REPO1_PATH", "/var/lib/repo1"),
-            ("PGBACKREST_REPO3_PATH", "/var/lib/repo3"),
-            ("PGBACKREST_PG2_PATH", "/data/pg2"),
+            ("PGBACKRUST_REPO1_PATH", "/var/lib/repo1"),
+            ("PGBACKRUST_REPO3_PATH", "/var/lib/repo3"),
+            ("PGBACKRUST_PG2_PATH", "/data/pg2"),
         ]
         .into_iter()
         .collect();
@@ -230,7 +230,7 @@ option:
     #[test]
     fn collect_env_ignores_empty_string_value() {
         let cfg = small_cfg();
-        let collected = collect_env(&cfg, |name| (name == "PGBACKREST_STANZA").then(String::new));
+        let collected = collect_env(&cfg, |name| (name == "PGBACKRUST_STANZA").then(String::new));
         assert!(collected.is_empty(), "empty env value must be treated as unset");
     }
 
@@ -239,7 +239,7 @@ option:
         let cfg = small_cfg();
         // An env var that doesn't map to any declared option is never read,
         // because collect_env probes per-option, not the whole environment.
-        let env: BTreeMap<&str, &str> = [("PGBACKREST_NOT_AN_OPTION", "x"), ("UNRELATED", "y")].into_iter().collect();
+        let env: BTreeMap<&str, &str> = [("PGBACKRUST_NOT_AN_OPTION", "x"), ("UNRELATED", "y")].into_iter().collect();
         let collected = collect_env(&cfg, |name| env.get(name).map(|v| (*v).to_owned()));
         assert!(collected.is_empty());
     }

@@ -8,7 +8,7 @@
 //!   `"Salted__"`-framed AES-256-CBC ciphertext, or decrypts the same
 //!   format back to plaintext. The KDF digest is selectable via
 //!   [`CipherDigest`] (MD5 for the `openssl enc` CLI default, SHA-1 for
-//!   pgBackRest repository compatibility). See [`cipher`] for the on-disk
+//!   pgBackRust repository compatibility). See [`cipher`] for the on-disk
 //!   format and KDF details.
 
 pub mod cipher;
