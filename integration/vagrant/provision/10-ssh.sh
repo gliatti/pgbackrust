@@ -46,7 +46,7 @@ chmod 0600 "$SSHDIR/config"
 # pubkey auth; set a non-login usable password field so key auth is accepted.
 usermod -p '*' postgres 2>/dev/null || true
 
-# System-wide client config: pgbackrest spawns `ssh <host> pgbackrest ...` as
+# System-wide client config: pgbackrust spawns `ssh <host> pgbackrust ...` as
 # the postgres OS user, but sudo may not set HOME, so the per-user config above
 # can be missed. A drop-in applies regardless of HOME.
 install -d -m 0755 /etc/ssh/ssh_config.d

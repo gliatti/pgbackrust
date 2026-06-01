@@ -2,7 +2,7 @@
 # Diagnostic capture for the archive-async hang against the TLS server.
 # Captures: strace on the depot daemon (under systemd-run), strace on the
 # principal archive-push call, daemon log, and (if the push hangs) gdb bts
-# on every alive pgbackrest process on both VMs after a 30s wait.
+# on every alive pgbackrust process on both VMs after a 30s wait.
 #
 # Output artifacts on the HOST under integration/vagrant/diag-out/.
 set -uo pipefail
@@ -22,7 +22,7 @@ echo "=== stop any prior daemon ==="
 timeout 30 vagrant ssh depot -c "
   sudo systemctl stop pgbr-tls-test.service 2>/dev/null || true
   sudo systemctl reset-failed pgbr-tls-test.service 2>/dev/null || true
-  PIDS=\$(pgrep -f '/usr/bin/pgbackrest' 2>/dev/null)
+  PIDS=\$(pgrep -f '/usr/bin/pgbackrust' 2>/dev/null)
   [ -n \"\$PIDS\" ] && sudo kill -9 \$PIDS 2>/dev/null
   for _ in \$(seq 1 20); do
     sudo ss -ltnp 2>/dev/null | grep -q ':8432 ' || break
@@ -42,16 +42,16 @@ for vm in depot principal; do
 done
 
 echo "=== start daemon under strace (transient unit) ==="
-# systemd-run wraps strace which wraps pgbackrest. -f follows forks/clones,
+# systemd-run wraps strace which wraps pgbackrust. -f follows forks/clones,
 # -tt absolute timestamps, -y decodes fds → paths/sockets, -s 256 captures
 # enough of each buffer to read protocol traffic, -e trace=!nanosleep,clock_*
 # trims noise.
 timeout 30 vagrant ssh depot -c "sudo systemd-run --unit=pgbr-tls-test --uid=postgres --gid=postgres \
   --property=StandardOutput=append:/tmp/pgbr-srv-host.log \
   --property=StandardError=append:/tmp/pgbr-srv-host.log \
-  /usr/bin/strace -f -tt -y -s 256 -o /tmp/strace-srv.out /usr/bin/pgbackrest server" 2>&1 | grep -vE 'Connection to'
+  /usr/bin/strace -f -tt -y -s 256 -o /tmp/strace-srv.out /usr/bin/pgbackrust server" 2>&1 | grep -vE 'Connection to'
 sleep 3
-timeout 30 vagrant ssh depot -c "sudo ss -ltnp 2>/dev/null | grep ':8432' | head; pgrep -af pgbackrest" 2>&1 | grep -vE 'Connection to' | head -10
+timeout 30 vagrant ssh depot -c "sudo ss -ltnp 2>/dev/null | grep ':8432' | head; pgrep -af pgbackrust" 2>&1 | grep -vE 'Connection to' | head -10
 
 echo "=== resolve a WAL to push ==="
 WAL_PATH=$(timeout 15 vagrant ssh principal -c "sudo bash -c 'ls -1 ${PRI}/pg_wal/0000* 2>/dev/null | grep -v partial | head -1'" 2>&1 | grep -vE 'Connection to' | tr -d '\r' | tail -1)
@@ -66,21 +66,21 @@ timeout 45 vagrant ssh principal -c "
   sudo -u postgres bash -c '
     set +e
     timeout 30 /usr/bin/strace -f -tt -y -s 256 -o /tmp/strace-push.out \
-      /usr/bin/pgbackrest --stanza=demo --archive-async=y --log-level-console=detail \
+      /usr/bin/pgbackrust --stanza=demo --archive-async=y --log-level-console=detail \
       archive-push ${WAL_PATH} > /tmp/push.log 2>&1
     echo \"exit=\$?\"
     sleep 1
     echo --- pgrep snapshot ---
-    pgrep -af pgbackrest || echo none
+    pgrep -af pgbackrust || echo none
   '
 " 2>&1 | grep -vE 'Connection to' | head -20
 
-echo "=== gdb bt on any hung pgbackrest (depot then principal) ==="
+echo "=== gdb bt on any hung pgbackrust (depot then principal) ==="
 for vm in depot principal; do
   timeout 60 vagrant ssh "$vm" -c "
-    PIDS=\$(pgrep -f '/usr/bin/pgbackrest' 2>/dev/null)
+    PIDS=\$(pgrep -f '/usr/bin/pgbackrust' 2>/dev/null)
     if [ -z \"\$PIDS\" ]; then
-      echo \"$vm: no live pgbackrest processes\"
+      echo \"$vm: no live pgbackrust processes\"
     else
       for PID in \$PIDS; do
         echo --- $vm PID \$PID ---

@@ -1,8 +1,8 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 #
-# Multi-VM topology that reproduces the "pgBackRest - Base de connaissance"
-# (Dalibo) test matrix end to end against the Rust pgbackrest binary:
+# Multi-VM topology that reproduces the "pgBackRust - Base de connaissance"
+# (Dalibo) test matrix end to end against the Rust pgbackrust binary:
 #
 #   * principal  (192.168.56.11) — primary PostgreSQL cluster
 #   * secondaire (192.168.56.12) — streaming standby of `principal`
@@ -14,9 +14,9 @@
 # encryption, multiple repos, and the TLS (server / server-ping) path.
 #
 # Provisioning installs PostgreSQL from PGDG and drops the prebuilt Rust
-# `pgbackrest` binary into /usr/bin on every node. Build the binary first
-# with ../build-binary.sh (extracts target/release/pgbackrest from the
-# Docker dev image into ../artifacts/pgbackrest); provisioning falls back to
+# `pgbackrust` binary into /usr/bin on every node. Build the binary first
+# with ../build-binary.sh (extracts target/release/pgbackrust from the
+# Docker dev image into ../artifacts/pgbackrust); provisioning falls back to
 # an in-VM `cargo build --release` when the artifact is absent.
 
 NODES = {
@@ -66,7 +66,7 @@ Vagrant.configure("2") do |config|
       # Upload the prebuilt Linux binary + the shared SSH keypair to /tmp; the
       # shell provisioners below install them. (Built by ../build-binary.sh and
       # ../../ ... the key is minted by run-vagrant.sh before `vagrant up`.)
-      m.vm.provision "binary-file", type: "file", source: "../artifacts/pgbackrest", destination: "/tmp/pgbackrest.bin"
+      m.vm.provision "binary-file", type: "file", source: "../artifacts/pgbackrust", destination: "/tmp/pgbackrust.bin"
       m.vm.provision "sshkey-file", type: "file", source: "../artifacts/ssh/id_ed25519", destination: "/tmp/pgbr_ssh_key"
       m.vm.provision "sshpub-file", type: "file", source: "../artifacts/ssh/id_ed25519.pub", destination: "/tmp/pgbr_ssh_key.pub"
 

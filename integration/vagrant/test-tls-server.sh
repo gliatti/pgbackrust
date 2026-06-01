@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TLS server scenario (host-orchestrated). Generates a self-signed CA + server
 # cert (CN=depot) + client cert (CN=principal) on depot, propagates the CA +
-# client material to principal, runs `pgbackrest server` as a daemon on depot
+# client material to principal, runs `pgbackrust server` as a daemon on depot
 # listening on tls-server-port (8432), then drives stanza-create + check +
 # full backup from principal over the TLS transport (repo-host-type=tls).
 # Stops the daemon at end. Run from the integration/vagrant dir on the host.
@@ -11,7 +11,7 @@ export MSYS_NO_PATHCONV=1
 PGV=${PGBR_PG_VERSION:-18}
 PRI=/var/lib/postgresql/$PGV/principal
 BIN=/usr/lib/postgresql/$PGV/bin
-CD=/etc/pgbackrest/certs
+CD=/etc/pgbackrust/certs
 fails=0
 
 echo "=== TLS server: cert generation on depot (X.509 v3 + SAN, rustls compatible) ==="
@@ -74,14 +74,14 @@ timeout 90 vagrant ssh principal -c "sudo PGBR_PG_VERSION=$PGV bash /tmp/reset-c
 timeout 30 vagrant ssh depot -c "
 # Run rm via sudo bash -c so the glob is expanded by a privileged shell —
 # 0750 perms on the parent dir prevent the calling user from listing it.
-sudo bash -c 'rm -rf /var/lib/pgbackrest/* /var/lib/pgbackrest/.[!.]* /tmp/pgbackrest/*.stop 2>/dev/null; true'
-sudo install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest
+sudo bash -c 'rm -rf /var/lib/pgbackrust/* /var/lib/pgbackrust/.[!.]* /tmp/pgbackrust/*.stop 2>/dev/null; true'
+sudo install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust
 sudo tee /etc/pgbackrest/pgbackrest.conf >/dev/null <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
 log-level-file=detail
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 tls-server-address=0.0.0.0
 tls-server-cert-file=$CD/server.crt
@@ -106,20 +106,20 @@ repo1-host-type=tls
 repo1-host-ca-file=$CD/ca.crt
 repo1-host-cert-file=$CD/client.crt
 repo1-host-key-file=$CD/client.key
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
 log-level-file=detail
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 sudo chmod 0644 /etc/pgbackrest/pgbackrest.conf
-sudo install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest
+sudo install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust
 " 2>&1 | grep -vE 'Connection to' | tail -3
 
-echo "=== start pgbackrest server daemon on depot (systemd transient unit) ==="
+echo "=== start pgbackrust server daemon on depot (systemd transient unit) ==="
 # Daemon lifecycle delegated to systemd as a transient unit. `systemctl stop`
 # is reliable + idempotent + kills the full cgroup, so we never end up with
 # a stale daemon holding stale certs across test cycles (which was the
@@ -152,14 +152,14 @@ timeout 30 vagrant ssh depot -c "
 " 2>&1 | grep -vE 'Connection to' | head -5
 
 echo "=== from principal: stanza-create over TLS ==="
-out=$(timeout 60 vagrant ssh principal -c "sudo -u postgres pgbackrest --stanza=demo stanza-create 2>&1")
+out=$(timeout 60 vagrant ssh principal -c "sudo -u postgres pgbackrust --stanza=demo stanza-create 2>&1")
 rc=$?
 echo "  stanza-create exit=$rc"
 printf '%s\n' "$out" | grep -vE 'Connection to' | tail -6
 [ "$rc" = "0" ] || fails=$((fails+1))
 
 echo "=== from principal: check over TLS ==="
-out=$(timeout 120 vagrant ssh principal -c "sudo -u postgres pgbackrest --stanza=demo check 2>&1")
+out=$(timeout 120 vagrant ssh principal -c "sudo -u postgres pgbackrust --stanza=demo check 2>&1")
 rc=$?
 echo "  check exit=$rc"
 printf '%s\n' "$out" | grep -vE 'Connection to' | tail -3
@@ -167,7 +167,7 @@ printf '%s\n' "$out" | grep -vE 'Connection to' | tail -3
 
 echo "=== from principal: full backup over TLS ==="
 timeout 30 vagrant ssh principal -c "sudo -u postgres /usr/lib/postgresql/$PGV/bin/psql -p5433 -c 'CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)'" >/dev/null 2>&1
-out=$(timeout 600 vagrant ssh principal -c "sudo -u postgres pgbackrest --stanza=demo --type=full backup 2>&1")
+out=$(timeout 600 vagrant ssh principal -c "sudo -u postgres pgbackrust --stanza=demo --type=full backup 2>&1")
 rc=$?
 echo "  backup exit=$rc"
 printf '%s\n' "$out" | grep -vE 'Connection to' | tail -5
@@ -175,7 +175,7 @@ printf '%s\n' "$out" | grep -vE 'Connection to' | tail -5
 
 echo "=== stop daemon + cleanup ==="
 # Stop the transient unit. systemctl tears down the full cgroup so no
-# pgbackrest worker children survive. Verify the port is actually free.
+# pgbackrust worker children survive. Verify the port is actually free.
 timeout 30 vagrant ssh depot -c "
   sudo systemctl stop pgbr-tls-test.service 2>/dev/null || true
   sudo systemctl reset-failed pgbr-tls-test.service 2>/dev/null || true

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end validation of the Rust pgbackrest binary against the live
+# End-to-end validation of the Rust pgbackrust binary against the live
 # PostgreSQL clusters provisioned in the Vagrant/VirtualBox topology
 # (principal / secondaire / depot). Run AFTER `vagrant up` (and after
 # ../build-binary.sh has produced the binary). Drives the KB scenarios over
@@ -21,10 +21,16 @@ hd()   { printf '\n=== %s ===\n' "$*"; }
 # double quotes, $, or newlines passes through intact (a bash -lc '...' wrapper
 # would otherwise mangle embedded single quotes, e.g. pg_create_restore_point('x')).
 # The remote command's exit status propagates as the pipeline's status.
-on() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo bash -l" 2>&1; }
+# A host-side `timeout -k 20 660` backstops every `vagrant ssh`: the `ok` helper
+# already caps the REMOTE command at 600s, but if the ssh transport itself wedges
+# (handshake/network), no inner timeout ever starts — so the whole run hangs
+# indefinitely. The host backstop (SIGTERM at 660s, SIGKILL 20s later) guarantees
+# each remote call returns, turning a hang into a per-step failure instead of a
+# dead suite. 660 > 600 so `ok`'s inner timeout fires first for cleaner messages.
+on() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); timeout -k 20 660 vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo bash -l" 2>&1; }
 # As `on` but as the postgres user; `-H` sets HOME so ssh (~/.ssh/config) and
-# pgbackrest find their per-user state.
-pg() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo -u postgres -H bash -l" 2>&1; }
+# pgbackrust find their per-user state.
+pg() { local n="$1"; shift; local b64; b64=$(printf '%s' "$*" | base64 | tr -d '\n'); timeout -k 20 660 vagrant ssh "$n" -c "echo $b64 | base64 -d | sudo -u postgres -H bash -l" 2>&1; }
 # psql on a node/port as postgres.
 psql_on() { local n="$1" port="$2"; shift 2; pg "$n" "/usr/lib/postgresql/$PGV/bin/psql -p $port -X -A -t -c \"$*\""; }
 
@@ -33,7 +39,7 @@ assert_contains() {
   if printf '%s' "$out" | grep -qF -- "$needle"; then pass "$what"; else printf '%s\n' "$out" | tail -5 >&2; fail "$what (missing '$needle')"; fi
 }
 
-# Run a pgbackrest (or any) command as postgres on a node; PASS on exit 0.
+# Run a pgbackrust (or any) command as postgres on a node; PASS on exit 0.
 # Usage: ok "<description>" <node> "<command...>"
 ok() {
   local desc="$1" node="$2"; shift 2
@@ -64,54 +70,62 @@ reset_principal_cluster() {
 prepare_principal_cfg() {
   local extra="$1"
   reset_principal_cluster
-  on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; true"
+  on principal "rm -rf /var/lib/pgbackrust/* 2>/dev/null; true"
   on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 $extra
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf
-install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 
-  ok "stanza-create" principal "pgbackrest --stanza=demo stanza-create"
+  ok "stanza-create" principal "pgbackrust --stanza=demo stanza-create"
 }
 
 # The KB Exemple 1 minimal config (local repo, retention-full=2).
 prepare_principal() { prepare_principal_cfg "repo1-retention-full=2"; }
 
+# Optional scenario selector. Pass scenario numbers as args to run only those
+# (e.g. `./run-validation.sh 7 14` re-runs just the two standby scenarios);
+# no args runs every scenario. Each scenario block below is gated on `want N`.
+# The "Sanity" block is never gated (it is a cheap per-node version check).
+WANT="$*"
+want() { [ -z "$WANT" ] && return 0; case " $WANT " in *" $1 "*) return 0;; *) return 1;; esac; }
+
 ############################################################################
 hd "Sanity: binary runs on each node"
 for node in depot principal secondaire; do
-  out=$(pg "$node" "pgbackrest version")
-  assert_contains "$out" "pgBackRest" "$node: pgbackrest version"
+  out=$(pg "$node" "pgbackrust version")
+  assert_contains "$out" "pgBackRest" "$node: pgbackrust version"
 done
 
 ############################################################################
+if want 1; then
 hd "Scenario 1 — local minimal backup on principal (KB Exemple 1)"
 # Clean baseline (cluster + repo + fresh stanza), then the live WAL round-trip.
 prepare_principal
-ok "check (live WAL archive round-trip)" principal "pgbackrest --stanza=demo check"
+ok "check (live WAL archive round-trip)" principal "pgbackrust --stanza=demo check"
 
 # Seed data BEFORE the full backup so the restore can prove it survived.
 psql_on principal 5433 "CREATE TABLE IF NOT EXISTS t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 
-ok "full backup" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup" principal "pgbackrust --stanza=demo --type=full backup"
 
 # More WAL + an incremental backup.
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "incr backup" principal "pgbackrest --stanza=demo --type=incr backup"
+ok "incr backup" principal "pgbackrust --stanza=demo --type=incr backup"
 
 # info shows both.
-out=$(pg principal "pgbackrest --stanza=demo info")
+out=$(pg principal "pgbackrust --stanza=demo info")
 assert_contains "$out" "status: ok" "info status ok"
 assert_contains "$out" "full backup" "info shows full"
 assert_contains "$out" "incr backup" "info shows incr"
@@ -119,7 +133,7 @@ assert_contains "$out" "incr backup" "info shows incr"
 # Restore (KB style: options before the command): stop, --delta restore, start,
 # verify the rows survived (1000 + 500 = 1500).
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore (--delta restore, options before command)" principal "pgbackrest --stanza=demo --delta restore"
+ok "delta restore (--delta restore, options before command)" principal "pgbackrust --stanza=demo --delta restore"
 # `-w` waits for the cluster to finish recovery and accept connections; a
 # recovery failure makes pg_ctl return non-zero after its timeout.
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 60 start" >/dev/null 2>&1
@@ -134,6 +148,8 @@ else
 fi
 
 ############################################################################
+fi
+if want 2; then
 hd "Scenario 2 — PITR to a named restore point (pgstef PITR walkthrough)"
 # Self-contained: fresh promoted primary (archiving active), full backup, then a
 # named restore point as the PITR target with "future" rows after it that must
@@ -143,7 +159,7 @@ hd "Scenario 2 — PITR to a named restore point (pgstef PITR walkthrough)"
 # it the "latest" backup that --type=name restores, and recovery would start
 # after the target and never reach it — a classic PITR ordering mistake.)
 prepare_principal
-ok "PITR full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "PITR full backup (pre-target base)" principal "pgbackrust --stanza=demo --type=full backup"
 
 # Data AFTER the base backup: 1000 rows committed before the restore point (the
 # PITR target), then 500 "future" rows that must NOT survive the restore.
@@ -161,13 +177,13 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 # Poll directly via pg (not ok: ok prepends `timeout 600`, which cannot wrap a
 # `for` loop). The loop is self-bounded to ~60s.
 poll_rc=0
-pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrest/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
+pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrust/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
 if [ "$poll_rc" -eq 0 ]; then pass "restore-point WAL ($target_seg) archived to repo"
 else fail "restore-point WAL ($target_seg) not archived within 60s"; fi
 
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
 ok "PITR restore (--type=name --target=pitr_target --target-action=promote)" principal \
-  "pgbackrest --stanza=demo --delta --type=name --target=pitr_target --target-action=promote restore"
+  "pgbackrust --stanza=demo --delta --type=name --target=pitr_target --target-action=promote restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 120 start" >/dev/null 2>&1
 sleep 5
 after=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -182,23 +198,25 @@ else
 fi
 
 ############################################################################
+fi
+if want 3; then
 hd "Scenario 3 — backup to a dedicated remote repository over SSH (depot)"
-# pgBackRest topology: the backup runs ON the PG host (principal) and writes the
+# pgBackRust topology: the backup runs ON the PG host (principal) and writes the
 # repository to a dedicated host (depot) over SSH (repo1-host=depot). The DB
 # connection is local; only repository I/O + archive-push go over the SSH worker.
 reset_principal_cluster
-on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 # Also clear principal's LOCAL repo so the placement check reflects only this
 # scenario (the remote backup must put NOTHING in principal's local repo).
-on principal "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on principal "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-path=$PRI
@@ -206,30 +224,30 @@ pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
 
-ok "stanza-create (remote repo on depot)" principal "pgbackrest --stanza=demo stanza-create"
-ok "check (remote repo write + WAL archive over SSH)" principal "pgbackrest --stanza=demo check"
+ok "stanza-create (remote repo on depot)" principal "pgbackrust --stanza=demo stanza-create"
+ok "check (remote repo write + WAL archive over SSH)" principal "pgbackrust --stanza=demo check"
 
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup (files pushed to depot over SSH)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup (files pushed to depot over SSH)" principal "pgbackrust --stanza=demo --type=full backup"
 
 # The repository must live on depot, not principal.
-dep_has=$(on depot "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -c 'F\$'")
-pri_has=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -c 'F\$' || true")
+dep_has=$(on depot "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -c 'F\$'")
+pri_has=$(on principal "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -c 'F\$' || true")
 if printf '%s' "$dep_has" | grep -qE '[1-9]' && printf '%s' "${pri_has:-0}" | grep -qxE '0'; then
   pass "backup stored on depot (not principal)"
 else
   fail "backup placement (depot=$dep_has principal=$pri_has, want depot>=1 principal=0)"
 fi
 
-out=$(pg principal "pgbackrest --stanza=demo info")
+out=$(pg principal "pgbackrust --stanza=demo info")
 assert_contains "$out" "status: ok" "remote-repo info status ok"
 assert_contains "$out" "full backup" "remote-repo info shows full"
 
 # Restore reads the backup back FROM depot over SSH into principal's PGDATA.
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore (reads remote repo on depot over SSH)" principal "pgbackrest --stanza=demo --delta restore"
+ok "delta restore (reads remote repo on depot over SSH)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -237,20 +255,22 @@ if [ "$rows" = "1500" ]; then pass "remote-repo restored data (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "remote-repo restored data (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 4; then
 hd "Scenario 4 — encrypted repository (repo1-cipher-type=aes-256-cbc)"
 prepare_principal_cfg "repo1-retention-full=2
 repo1-cipher-type=aes-256-cbc
 repo1-cipher-pass=demo-cipher-passphrase"
-ok "check (encrypted repo)" principal "pgbackrest --stanza=demo check"
+ok "check (encrypted repo)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup (encrypted)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup (encrypted)" principal "pgbackrust --stanza=demo --type=full backup"
 # Stored repo files must be OpenSSL-encrypted (the "Salted__" magic), not plaintext.
-hdr=$(on principal "f=\$(find /var/lib/pgbackrest/backup/demo -name 'pg_control*' | head -1); head -c6 \"\$f\" 2>/dev/null")
+hdr=$(on principal "f=\$(find /var/lib/pgbackrust/backup/demo -name 'pg_control*' | head -1); head -c6 \"\$f\" 2>/dev/null")
 assert_contains "$hdr" "Salted" "backup files encrypted (OpenSSL Salted__ header)"
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore (encrypted repo)" principal "pgbackrest --stanza=demo --delta restore"
+ok "delta restore (encrypted repo)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -258,42 +278,46 @@ if [ "$rows" = "1500" ]; then pass "encrypted restore data (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "encrypted restore data (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 5; then
 hd "Scenario 5 — zstd compression + differential backup + retention/expire"
 prepare_principal_cfg "repo1-retention-full=2
 compress-type=zst
 compress-level=3"
-ok "check (zstd repo)" principal "pgbackrest --stanza=demo check"
+ok "check (zstd repo)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup #1 (zstd)" principal "pgbackrest --stanza=demo --type=full backup"
-zst=$(on principal "ls /var/lib/pgbackrest/backup/demo/*F/global/pg_control* 2>/dev/null")
+ok "full backup #1 (zstd)" principal "pgbackrust --stanza=demo --type=full backup"
+zst=$(on principal "ls /var/lib/pgbackrust/backup/demo/*F/global/pg_control* 2>/dev/null")
 assert_contains "$zst" ".zst" "backup files zstd-compressed (.zst suffix)"
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "differential backup (zstd)" principal "pgbackrest --stanza=demo --type=diff backup"
-ok "full backup #2 (zstd)" principal "pgbackrest --stanza=demo --type=full backup"
-fulls_before=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
-ok "expire (--repo1-retention-full=1)" principal "pgbackrest --stanza=demo expire --repo1-retention-full=1"
-fulls_after=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+ok "differential backup (zstd)" principal "pgbackrust --stanza=demo --type=diff backup"
+ok "full backup #2 (zstd)" principal "pgbackrust --stanza=demo --type=full backup"
+fulls_before=$(on principal "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+ok "expire (--repo1-retention-full=1)" principal "pgbackrust --stanza=demo expire --repo1-retention-full=1"
+fulls_after=$(on principal "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
 if [ "${fulls_before:-0}" = "2" ] && [ "${fulls_after:-0}" = "1" ]; then pass "expire kept newest full only ($fulls_before -> $fulls_after)"
 else fail "expire retention (full dirs before=$fulls_before after=$fulls_after, want 2 -> 1)"; fi
 
 ############################################################################
+fi
+if want 6; then
 hd "Scenario 6 — block-incremental + file bundling (repo-block, repo-bundle)"
 prepare_principal_cfg "repo1-retention-full=2
 repo1-block=y
 repo1-bundle=y"
-ok "check (block+bundle repo)" principal "pgbackrest --stanza=demo check"
+ok "check (block+bundle repo)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,2000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup (block+bundle)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup (block+bundle)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(2001,2500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "incr backup (block+bundle)" principal "pgbackrest --stanza=demo --type=incr backup"
+ok "incr backup (block+bundle)" principal "pgbackrust --stanza=demo --type=incr backup"
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore (block+bundle)" principal "pgbackrest --stanza=demo --delta restore"
+ok "delta restore (block+bundle)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -301,55 +325,57 @@ if [ "$rows" = "2500" ]; then pass "block+bundle restored data (2500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "block+bundle restored data (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 7; then
 hd "Scenario 7 — create a streaming standby on secondaire (restore --type=standby)"
 # Repo on depot (shared); principal is the primary backing up to depot. The
 # secondaire node restores that backup as a hot standby and streams from principal.
 # (KB Exemple 3 / Dalibo Ex.4: a backup-fed streaming replica.)
 SEC=/var/lib/postgresql/$PGV/secondaire
 reset_principal_cluster
-on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "stanza-create (standby scenario)" principal "pgbackrest --stanza=demo stanza-create"
-ok "check (standby scenario)" principal "pgbackrest --stanza=demo check"
+ok "stanza-create (standby scenario)" principal "pgbackrust --stanza=demo stanza-create"
+ok "check (standby scenario)" principal "pgbackrust --stanza=demo check"
 # Replication role the standby connects as (reset-cluster's pg_hba allows the
 # 192.168.56.0/24 subnet via scram-sha-256).
 psql_on principal 5433 "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator'" >/dev/null
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup (for standby)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup (for standby)" principal "pgbackrust --stanza=demo --type=full backup"
 
-# Configure pgbackrest on secondaire (same remote repo on depot, its own data dir).
+# Configure pgbackrust on secondaire (same remote repo on depot, its own data dir).
 on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 [demo]
 pg1-path=$SEC
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf
-install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest"
+install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust"
 # Stop any prior standby + wipe its data dir, then restore as a standby from depot.
 on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
 ok "restore --type=standby (on secondaire, from depot)" secondaire \
-  "pgbackrest --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
+  "pgbackrust --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
 sig=$(on secondaire "ls $SEC/standby.signal 2>&1")
 assert_contains "$sig" "standby.signal" "restore wrote standby.signal"
 
@@ -372,9 +398,11 @@ if [ "$srows2" = "1600" ]; then pass "streaming replication primary -> standby (
 else pg secondaire "tail -15 $SEC/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "streaming replication (standby rows=$srows2, want 1600)"; fi
 
 ############################################################################
+fi
+if want 8; then
 hd "Scenario 8 — PITR to a timestamp (--type=time)"
 prepare_principal
-ok "PITR(time) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "PITR(time) full backup (pre-target base)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 # Capture a recovery target time AFTER the 1000 base rows committed; the 500
@@ -385,11 +413,11 @@ psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/n
 target_seg=$(psql_on principal 5433 "SELECT pg_walfile_name(pg_current_wal_lsn())" | grep -oE '[0-9A-F]{24}' | head -1)
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 poll_rc=0
-pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrest/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
+pg principal "for i in \$(seq 1 60); do ls /var/lib/pgbackrust/archive/demo/18-1/ 2>/dev/null | grep -q \"^${target_seg}\" && exit 0; sleep 1; done; exit 1" >/dev/null 2>&1 || poll_rc=$?
 [ "$poll_rc" -eq 0 ] && pass "target WAL ($target_seg) archived" || fail "target WAL not archived in 60s"
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
 ok "PITR restore (--type=time --target='$target_time' --target-action=promote)" principal \
-  "pgbackrest --stanza=demo --delta --type=time --target='$target_time' --target-action=promote restore"
+  "pgbackrust --stanza=demo --delta --type=time --target='$target_time' --target-action=promote restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 120 start" >/dev/null 2>&1
 sleep 5
 after=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -398,39 +426,41 @@ if [ "$after" = "1000" ] && [ "$future" = "0" ]; then pass "PITR(time) recovered
 else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(time) (after=$after future=$future, want 1000/0)"; fi
 
 ############################################################################
+fi
+if want 9; then
 hd "Scenario 9 — multiple repositories (repo1 + repo2, both local on principal)"
 reset_principal_cluster
-on principal "rm -rf /var/lib/pgbackrest/* /var/lib/pgbackrest2/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/lib/pgbackrest2 /var/log/pgbackrest"
+on principal "rm -rf /var/lib/pgbackrust/* /var/lib/pgbackrust2/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/lib/pgbackrust2 /var/log/pgbackrust"
 on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
-repo2-path=/var/lib/pgbackrest2
+repo2-path=/var/lib/pgbackrust2
 repo2-retention-full=2
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "stanza-create (2 repos)" principal "pgbackrest --stanza=demo stanza-create"
-ok "check (2 repos)" principal "pgbackrest --stanza=demo check"
+ok "stanza-create (2 repos)" principal "pgbackrust --stanza=demo stanza-create"
+ok "check (2 repos)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup to repo1 (default)" principal "pgbackrest --stanza=demo --repo=1 --type=full backup"
-ok "full backup to repo2" principal "pgbackrest --stanza=demo --repo=2 --type=full backup"
-r1=$(on principal "ls /var/lib/pgbackrest/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
-r2=$(on principal "ls /var/lib/pgbackrest2/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+ok "full backup to repo1 (default)" principal "pgbackrust --stanza=demo --repo=1 --type=full backup"
+ok "full backup to repo2" principal "pgbackrust --stanza=demo --repo=2 --type=full backup"
+r1=$(on principal "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+r2=$(on principal "ls /var/lib/pgbackrust2/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
 if printf '%s' "$r1" | grep -qE '[1-9]' && printf '%s' "$r2" | grep -qE '[1-9]'; then pass "both repos hold a full backup (repo1=$r1 repo2=$r2)"
 else fail "multi-repo backup placement (repo1=$r1 repo2=$r2, want both >=1)"; fi
-out=$(pg principal "pgbackrest --stanza=demo --repo=2 info")
+out=$(pg principal "pgbackrust --stanza=demo --repo=2 info")
 assert_contains "$out" "full backup" "repo2 info shows full"
 # Restore explicitly from repo2.
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore from repo2" principal "pgbackrest --stanza=demo --repo=2 --delta restore"
+ok "delta restore from repo2" principal "pgbackrust --stanza=demo --repo=2 --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -438,19 +468,21 @@ if [ "$rows" = "1500" ]; then pass "restore from repo2 (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "restore from repo2 (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 10; then
 hd "Scenario 10 — pull backup from a dedicated repo host (KB Exemple 2: depot runs backup, pg1-host=principal)"
 # The backup/stanza/check commands run ON depot with the PG host remote
 # (pg1-host=principal): the control connection (pg_backup_start/stop, version,
 # WAL switch) runs on an SSH worker on principal (local libpq, peer/trust). The
 # repository is local to depot; principal archives WAL to depot.
 reset_principal_cluster
-on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-host=principal
@@ -463,25 +495,25 @@ on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "pull stanza-create (on depot, pg1-host=principal via SSH worker)" depot "pgbackrest --stanza=demo stanza-create"
-ok "pull check (on depot, control connection on principal worker)" depot "pgbackrest --stanza=demo check"
+ok "pull stanza-create (on depot, pg1-host=principal via SSH worker)" depot "pgbackrust --stanza=demo stanza-create"
+ok "pull check (on depot, control connection on principal worker)" depot "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "pull full backup (on depot, pg_backup_start/stop on worker; files pulled over SSH)" depot "pgbackrest --stanza=demo --type=full backup"
-out=$(pg depot "pgbackrest --stanza=demo info")
+ok "pull full backup (on depot, pg_backup_start/stop on worker; files pulled over SSH)" depot "pgbackrust --stanza=demo --type=full backup"
+out=$(pg depot "pgbackrust --stanza=demo info")
 assert_contains "$out" "full backup" "pull backup: info shows full"
 # Cross-validate the pull backup is restorable: principal (repo on depot) restores it.
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "restore the pull backup (on principal, repo on depot)" principal "pgbackrest --stanza=demo --delta restore"
+ok "restore the pull backup (on principal, repo on depot)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -489,6 +521,8 @@ if [ "$rows" = "1500" ]; then pass "pull backup restored (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "pull backup restore (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 11; then
 hd "Scenario 11 — compression variants bz2 + lz4 (configuration.html compress-type)"
 # Scenario 5 proved zstd; this proves the remaining real codecs are usable
 # end-to-end: each does a full backup whose repo files carry the codec's suffix
@@ -498,15 +532,15 @@ hd "Scenario 11 — compression variants bz2 + lz4 (configuration.html compress-
 # find dies on SIGPIPE, pipefail reports the pipeline as failed despite a match).
 for CT in bz2 lz4; do
   prepare_principal_cfg "compress-type=$CT"
-  ok "check ($CT repo)" principal "pgbackrest --stanza=demo check"
+  ok "check ($CT repo)" principal "pgbackrust --stanza=demo check"
   psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
   psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
   psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-  ok "full backup ($CT)" principal "pgbackrest --stanza=demo --type=full backup"
-  sfx=$(on principal "ls /var/lib/pgbackrest/backup/demo/*F/global/pg_control* 2>/dev/null")
+  ok "full backup ($CT)" principal "pgbackrust --stanza=demo --type=full backup"
+  sfx=$(on principal "ls /var/lib/pgbackrust/backup/demo/*F/global/pg_control* 2>/dev/null")
   assert_contains "$sfx" ".$CT" "backup files $CT-compressed (.$CT suffix)"
   pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-  ok "delta restore ($CT)" principal "pgbackrest --stanza=demo --delta restore"
+  ok "delta restore ($CT)" principal "pgbackrust --stanza=demo --delta restore"
   pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
   sleep 4
   rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -515,6 +549,8 @@ for CT in bz2 lz4; do
 done
 
 ############################################################################
+fi
+if want 12; then
 hd "Scenario 12 — asynchronous WAL archiving (archive-async=y + spool-path)"
 # Async mode stages each WAL into <spool>/archive/<stanza>/out/ and the foreground
 # call drains the spool into the repo before returning. A 'check' archive
@@ -522,19 +558,19 @@ hd "Scenario 12 — asynchronous WAL archiving (archive-async=y + spool-path)"
 # archive-check) are the deterministic proof that staged segments actually reach
 # the repo within archive-timeout, not pile up in the spool unread.
 prepare_principal_cfg "archive-async=y
-spool-path=/var/spool/pgbackrest
+spool-path=/var/spool/pgbackrust
 repo1-retention-full=2"
-on principal "install -d -o postgres -g postgres -m 0750 /var/spool/pgbackrest; rm -rf /var/spool/pgbackrest/* 2>/dev/null; true"
-ok "check (async archive round-trip)" principal "pgbackrest --stanza=demo check"
+on principal "install -d -o postgres -g postgres -m 0750 /var/spool/pgbackrust; rm -rf /var/spool/pgbackrust/* 2>/dev/null; true"
+ok "check (async archive round-trip)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 for _ in 1 2 3; do psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null; done
-ok "full backup (async; archive-check waits for stop WAL)" principal "pgbackrest --stanza=demo --type=full backup"
-arch=$(on principal "ls /var/lib/pgbackrest/archive/demo/*/0000* 2>/dev/null | wc -l" | tr -d ' ')
+ok "full backup (async; archive-check waits for stop WAL)" principal "pgbackrust --stanza=demo --type=full backup"
+arch=$(on principal "ls /var/lib/pgbackrust/archive/demo/*/0000* 2>/dev/null | wc -l" | tr -d ' ')
 if [ "${arch:-0}" -ge 1 ]; then pass "WAL segments reached the repo archive ($arch present)"
 else fail "no WAL in repo archive (got: $arch) — async drain regression"; fi
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "delta restore (async repo)" principal "pgbackrest --stanza=demo --delta restore"
+ok "delta restore (async repo)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -542,11 +578,13 @@ if [ "$rows" = "1500" ]; then pass "async repo restored data (1500 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "async repo restored data (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 13; then
 hd "Scenario 13 — restore to an alternate datadir (--pg1-path=<other>)"
-# pgBackRest's restore can target a different PGDATA directory via --pg1-path
+# pgBackRust's restore can target a different PGDATA directory via --pg1-path
 # (command.html). The restored cluster must start on its own port and serve
 # the backed-up data; recovery requires that PG's restore_command — which runs
-# `pgbackrest archive-get %f "%p"` with cwd=PGDATA — actually delivers the
+# `pgbackrust archive-get %f "%p"` with cwd=PGDATA — actually delivers the
 # fetched WAL to the cwd-relative %p (not under pg1-path). This scenario
 # regression-guards that contract, fixed in c4ef0bb30.
 ALT=/var/lib/postgresql/$PGV/alt-restore
@@ -554,11 +592,11 @@ prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "full backup (for alt restore)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup (for alt restore)" principal "pgbackrust --stanza=demo --type=full backup"
 pg principal "$BIN/pg_ctl -D $ALT -m fast -w stop" >/dev/null 2>&1 || true
 on principal "rm -rf $ALT; install -d -o postgres -g postgres -m 0700 $ALT"
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-ok "restore --pg1-path=$ALT (alternate datadir)" principal "pgbackrest --stanza=demo --pg1-path=$ALT --delta restore"
+ok "restore --pg1-path=$ALT (alternate datadir)" principal "pgbackrust --stanza=demo --pg1-path=$ALT --delta restore"
 pv=$(on principal "test -f $ALT/PG_VERSION && cat $ALT/PG_VERSION || echo MISSING")
 assert_contains "$pv" "$PGV" "alt-restore PG_VERSION present"
 pg principal "$BIN/pg_ctl -D $ALT -o '-p 5434' -l $ALT/server.log -w -t 90 start" >/dev/null 2>&1
@@ -570,6 +608,8 @@ pg principal "$BIN/pg_ctl -D $ALT -m fast -w stop" >/dev/null 2>&1
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w start" >/dev/null 2>&1
 
 ############################################################################
+fi
+if want 14; then
 hd "Scenario 14 — backup-standby=y (KB Exemple 8: backup runs on repo host, files pulled from standby)"
 # Topology: depot=repo host (orchestrator), principal=primary, secondaire=standby
 # streaming from principal. Config on depot has pg1=principal + pg2=secondaire +
@@ -579,15 +619,15 @@ hd "Scenario 14 — backup-standby=y (KB Exemple 8: backup runs on repo host, fi
 # pull-backup file-copy path (read source through a remote pg_storage worker).
 SEC=/var/lib/postgresql/$PGV/secondaire
 reset_principal_cluster
-on depot "rm -rf /var/lib/pgbackrest/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrest /var/log/pgbackrest"
+on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 # Step 1: initial config on depot (pg1 only) so we can take a base backup that
 # the standby will restore from. backup-standby is enabled later, once the
 # standby is up; turning it on now would make `check` fail (no pg2 yet).
 on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-host=principal
@@ -596,44 +636,44 @@ pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-# principal also needs a pgbackrest.conf so PG's archive_command (set by
+# principal also needs a pgbackrust.conf so PG's archive_command (set by
 # reset-cluster) actually pushes WAL to depot, mirroring Scenario 10's setup.
 on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "stanza-create (backup-standby setup, on depot)" depot "pgbackrest --stanza=demo stanza-create"
-ok "check (initial, no standby)" depot "pgbackrest --stanza=demo check"
+ok "stanza-create (backup-standby setup, on depot)" depot "pgbackrust --stanza=demo stanza-create"
+ok "check (initial, no standby)" depot "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator'" >/dev/null
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "initial full backup (primary, no standby yet)" depot "pgbackrest --stanza=demo --type=full backup"
+ok "initial full backup (primary, no standby yet)" depot "pgbackrust --stanza=demo --type=full backup"
 # Step 2: restore secondaire as a streaming standby from the depot repo.
 on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
 on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 [demo]
 pg1-path=$SEC
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf
-install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest"
+install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust"
 ok "restore --type=standby (on secondaire, from depot)" secondaire \
-  "pgbackrest --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
+  "pgbackrust --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
 pg secondaire "$BIN/pg_ctl -D $SEC -l $SEC/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 5
 in_rec=$(psql_on secondaire 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
@@ -650,10 +690,10 @@ else fail "replication mismatch (primary=$prows standby=$srows, want 2000/2000)"
 # Step 3: re-config depot with pg1+pg2 + backup-standby=y and take the standby backup.
 on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 backup-standby=y
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 start-fast=y
 [demo]
 pg1-host=principal
@@ -666,8 +706,8 @@ pg2-path=$SEC
 pg2-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "full backup --backup-standby=y (start/stop on pg1, files from pg2)" depot "pgbackrest --stanza=demo --type=full backup"
-out=$(pg depot "pgbackrest --stanza=demo info")
+ok "full backup --backup-standby=y (start/stop on pg1, files from pg2)" depot "pgbackrust --stanza=demo --type=full backup"
+out=$(pg depot "pgbackrust --stanza=demo info")
 fulls=$(printf '%s' "$out" | grep -cE 'full backup')
 if [ "$fulls" -ge 2 ]; then pass "info shows $fulls full backups (initial + standby)"
 else fail "info doesn't show >=2 full backups (got $fulls)"; fi
@@ -678,15 +718,15 @@ on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
-repo1-path=/var/lib/pgbackrest
+repo1-path=/var/lib/pgbackrust
 log-level-console=info
-log-path=/var/log/pgbackrest
+log-path=/var/log/pgbackrust
 [demo]
 pg1-path=$PRI
 pg1-port=5433
 EOF
 chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-ok "restore the standby backup (on principal, repo on depot)" principal "pgbackrest --stanza=demo --delta restore"
+ok "restore the standby backup (on principal, repo on depot)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
 rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
@@ -694,6 +734,8 @@ if [ "$rows" = "2000" ]; then pass "standby backup restored data (2000 rows)"
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "standby backup restore (got: $rows)"; fi
 
 ############################################################################
+fi
+if want 15; then
 hd "Scenario 15 — PITR to a transaction id (--type=xid + --target-action=promote)"
 # Scenarios 2 + 8 covered --type=name and --type=time; this covers --type=xid
 # (command.html). Backup with 1000 rows in place, capture an xid via
@@ -704,7 +746,7 @@ prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "PITR(xid) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "PITR(xid) full backup (pre-target base)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "CHECKPOINT" >/dev/null
 TGT_XID=$(psql_on principal 5433 "SELECT pg_current_xact_id()::text" | grep -oE '^[0-9]+$' | head -1)
 if [ -n "$TGT_XID" ]; then pass "captured target xid ($TGT_XID)"
@@ -714,7 +756,7 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 sleep 5
 pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
 ok "PITR restore (--type=xid --target=$TGT_XID --target-action=promote)" principal \
-  "pgbackrest --stanza=demo --type=xid --target=$TGT_XID --target-action=promote --delta restore"
+  "pgbackrust --stanza=demo --type=xid --target=$TGT_XID --target-action=promote --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 10
 in_rec=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
@@ -723,6 +765,8 @@ if [ "$in_rec" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "PIT
 else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(xid) outcome (in_recovery=$in_rec rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+fi
+if want 16; then
 hd "Scenario 16 — PITR to a WAL LSN (--type=lsn + --target-action=promote)"
 # Completes the PITR target-type matrix: --type=name (S2), --type=time (S8),
 # --type=xid (S15), --type=lsn here (command.html). Backup with 1000 rows,
@@ -732,7 +776,7 @@ prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "PITR(lsn) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "PITR(lsn) full backup (pre-target base)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "CHECKPOINT" >/dev/null
 TGT_LSN=$(psql_on principal 5433 "SELECT pg_current_wal_lsn()::text" | grep -oE '^[0-9A-Fa-f]+/[0-9A-Fa-f]+$' | head -1)
 if [ -n "$TGT_LSN" ]; then pass "captured target lsn ($TGT_LSN)"
@@ -742,7 +786,7 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 sleep 5
 pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
 ok "PITR restore (--type=lsn --target=$TGT_LSN --target-action=promote)" principal \
-  "pgbackrest --stanza=demo --type=lsn --target=$TGT_LSN --target-action=promote --delta restore"
+  "pgbackrust --stanza=demo --type=lsn --target=$TGT_LSN --target-action=promote --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 10
 in_rec=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
@@ -751,42 +795,46 @@ if [ "$in_rec" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "PIT
 else pg principal "tail -25 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "PITR(lsn) outcome (in_recovery=$in_rec rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+fi
+if want 17; then
 hd "Scenario 17 — info --output=json (machine-parsable) + expire --set=<label> (targeted)"
 # Two distinct documented features that combine naturally: the JSON output is
 # the canonical way for tooling to drive expire --set. Asserts (a) the JSON
 # output starts with `[` and ends with `]` (smoke-tests well-formed structure
 # without needing python on the MSYS host), (b) two backups appear as two
 # `"label" : "..."` entries in the JSON, (c) expire --set=<label1> removes
-# ONLY that backup. Labels are extracted with grep/sed (pgbackrest formats
+# ONLY that backup. Labels are extracted with grep/sed (pgbackrust formats
 # labels as <YYYYMMDD>-<HHMMSS>{F,D,I}), so the harness stays bash-only.
 extract_labels_from_json() {
   # echo each label in the JSON on its own line, in order. Empty if none.
   printf '%s' "$1" | grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/'
 }
 prepare_principal
-out=$(pg principal "pgbackrest --stanza=demo info --output=json")
+out=$(pg principal "pgbackrust --stanza=demo info --output=json")
 first_nonblank=$(printf '%s' "$out" | sed -n '/[^[:space:]]/{p;q}')
 last_nonblank=$(printf '%s' "$out" | awk 'NF{l=$0}END{print l}')
 if [ "$first_nonblank" = "[" ] && [ "$last_nonblank" = "]" ]; then pass "info --output=json (empty repo) is a well-formed JSON array"
 else printf '%s\n' "$out" | tail -4 >&2; fail "info --output=json (empty) not bracketed (first=$first_nonblank last=$last_nonblank)"; fi
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
-ok "full backup #1 (for expire --set)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "full backup #1 (for expire --set)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,1500)" >/dev/null
-ok "full backup #2 (for expire --set)" principal "pgbackrest --stanza=demo --type=full backup"
-json=$(pg principal "pgbackrest --stanza=demo info --output=json")
+ok "full backup #2 (for expire --set)" principal "pgbackrust --stanza=demo --type=full backup"
+json=$(pg principal "pgbackrust --stanza=demo info --output=json")
 mapfile -t LABELS < <(extract_labels_from_json "$json")
 if [ "${#LABELS[@]}" = "2" ]; then pass "info --output=json shows both backups (${LABELS[0]}, ${LABELS[1]})"
 else fail "info --output=json missed backups (got ${#LABELS[@]}: ${LABELS[*]})"; fi
 LABEL1="${LABELS[0]:-}"
 LABEL2="${LABELS[1]:-}"
-ok "expire --set=$LABEL1 (targeted deletion)" principal "pgbackrest --stanza=demo expire --set=$LABEL1"
-post=$(pg principal "pgbackrest --stanza=demo info --output=json")
+ok "expire --set=$LABEL1 (targeted deletion)" principal "pgbackrust --stanza=demo expire --set=$LABEL1"
+post=$(pg principal "pgbackrust --stanza=demo info --output=json")
 mapfile -t REMAINING < <(extract_labels_from_json "$post")
 if [ "${#REMAINING[@]}" = "1" ] && [ "${REMAINING[0]}" = "$LABEL2" ]; then pass "expire --set removed only the targeted backup ($LABEL1 gone, $LABEL2 kept)"
 else fail "expire --set wrong outcome (remaining ${#REMAINING[@]}: ${REMAINING[*]}, want only $LABEL2)"; fi
 
 ############################################################################
+fi
+if want 18; then
 hd "Scenario 18 — annotate command (set / update / delete key=value metadata)"
 # annotate attaches arbitrary user-supplied key/value labels to a backup's
 # metadata (command.html). The annotation is persisted in backup.info under
@@ -797,22 +845,24 @@ hd "Scenario 18 — annotate command (set / update / delete key=value metadata)"
 # value, and remove an annotation by setting it to an empty value.
 prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
-ok "full backup (for annotate)" principal "pgbackrest --stanza=demo --type=full backup"
-LABEL=$(pg principal "pgbackrest --stanza=demo info --output=json" | grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | head -1)
-ok "annotate --set=$LABEL --annotation=note=hello" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note=hello"
-js1=$(pg principal "pgbackrest --stanza=demo info --output=json")
+ok "full backup (for annotate)" principal "pgbackrust --stanza=demo --type=full backup"
+LABEL=$(pg principal "pgbackrust --stanza=demo info --output=json" | grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | head -1)
+ok "annotate --set=$LABEL --annotation=note=hello" principal "pgbackrust --stanza=demo annotate --set=$LABEL --annotation=note=hello"
+js1=$(pg principal "pgbackrust --stanza=demo info --output=json")
 if printf '%s' "$js1" | grep -qE '"note"[[:space:]]*:[[:space:]]*"hello"'; then pass "info --output=json renders annotation note=hello"
 else fail "annotation note=hello not visible in info json"; fi
-ok "annotate update (note=updated, same key)" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note=updated"
-js2=$(pg principal "pgbackrest --stanza=demo info --output=json")
+ok "annotate update (note=updated, same key)" principal "pgbackrust --stanza=demo annotate --set=$LABEL --annotation=note=updated"
+js2=$(pg principal "pgbackrust --stanza=demo info --output=json")
 if printf '%s' "$js2" | grep -qE '"note"[[:space:]]*:[[:space:]]*"updated"' && ! printf '%s' "$js2" | grep -qE '"note"[[:space:]]*:[[:space:]]*"hello"'; then pass "annotation value updated (hello -> updated)"
 else fail "annotation update failed"; fi
-ok "annotate delete (--annotation=note= empty)" principal "pgbackrest --stanza=demo annotate --set=$LABEL --annotation=note="
-js3=$(pg principal "pgbackrest --stanza=demo info --output=json")
+ok "annotate delete (--annotation=note= empty)" principal "pgbackrust --stanza=demo annotate --set=$LABEL --annotation=note="
+js3=$(pg principal "pgbackrust --stanza=demo info --output=json")
 if ! printf '%s' "$js3" | grep -qE '"note"[[:space:]]*:[[:space:]]*"'; then pass "annotation removed (empty value deletes the key)"
 else fail "annotation NOT removed"; fi
 
 ############################################################################
+fi
+if want 19; then
 hd "Scenario 19 — PITR --target-action=pause (cluster stays in recovery until promoted)"
 # Scenarios 2/8/15/16 covered --target-action=promote (the default). pause is
 # the alternative: when recovery reaches the target the cluster STAYS in
@@ -821,7 +871,7 @@ hd "Scenario 19 — PITR --target-action=pause (cluster stays in recovery until 
 prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,1000)" >/dev/null
 psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
-ok "PITR(pause) full backup (pre-target base)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "PITR(pause) full backup (pre-target base)" principal "pgbackrust --stanza=demo --type=full backup"
 psql_on principal 5433 "CHECKPOINT" >/dev/null
 TGT_LSN=$(psql_on principal 5433 "SELECT pg_current_wal_lsn()::text" | grep -oE '^[0-9A-Fa-f]+/[0-9A-Fa-f]+$' | head -1)
 psql_on principal 5433 "INSERT INTO t SELECT generate_series(1001,2000)" >/dev/null
@@ -829,7 +879,7 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 sleep 5
 pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
 ok "PITR restore --type=lsn --target-action=pause" principal \
-  "pgbackrest --stanza=demo --type=lsn --target=$TGT_LSN --target-action=pause --delta restore"
+  "pgbackrust --stanza=demo --type=lsn --target=$TGT_LSN --target-action=pause --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 8
 in_rec=$(psql_on principal 5433 "SELECT pg_is_in_recovery()" | grep -oE '^[tf]$' | head -1)
@@ -843,8 +893,10 @@ if [ "$in_rec2" = "f" ] && [ -n "$rows" ] && [ "$rows" -le 1000 ]; then pass "pg
 else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "post-promote state (in_recovery=$in_rec2 rows=$rows, want f / <=1000)"; fi
 
 ############################################################################
+fi
+if want 20; then
 hd "Scenario 20 — checksum-page detects a corrupted relation page (page-validation)"
-# data_checksums=on (reset-cluster passes --data-checksums). pgbackrest's
+# data_checksums=on (reset-cluster passes --data-checksums). pgbackrust's
 # default checksum-page now resolves dynamically from pg_control, so a corrupt
 # page IS detected even without --checksum-page on the CLI. Companion to
 # d57cc86b9 (default --checksum-page from pg_control and record invalid
@@ -857,7 +909,7 @@ psql_on principal 5433 "CREATE TABLE t(i int, s text)" >/dev/null
 psql_on principal 5433 "INSERT INTO t SELECT g, repeat('x',1000) FROM generate_series(1,200) g" >/dev/null
 psql_on principal 5433 "CHECKPOINT" >/dev/null
 RELP=$(psql_on principal 5433 "SELECT pg_relation_filepath('t')" | grep -oE '^base/[0-9]+/[0-9]+' | head -1)
-ok "clean full backup (baseline)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "clean full backup (baseline)" principal "pgbackrust --stanza=demo --type=full backup"
 pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
 # Corrupt 100 bytes of page 0 of the relation (not touching the stored
 # checksum at offset 8 — the checksum is computed over the whole page so any
@@ -865,7 +917,7 @@ pg principal "$BIN/pg_ctl -D $PRI -m fast -w stop" >/dev/null 2>&1
 on principal "dd if=/dev/urandom of=$PRI/$RELP bs=1 count=100 seek=100 conv=notrunc 2>/dev/null"
 pass "corrupted 100 bytes at offset 100 of \$PGDATA/$RELP"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 60 start" >/dev/null 2>&1
-out=$(pg principal "pgbackrest --stanza=demo --type=full backup" 2>&1)
+out=$(pg principal "pgbackrust --stanza=demo --type=full backup" 2>&1)
 rc=$?
 if [ "$rc" = "0" ]; then pass "backup completed despite corruption (warn, not abort)"
 else printf '%s\n' "$out" | tail -6 >&2; fail "backup did not complete on corruption (exit $rc)"; fi
@@ -873,6 +925,8 @@ if printf '%s' "$out" | grep -qiE '(invalid|mismatch).*(page checksum|page heade
 else printf '%s\n' "$out" | tail -6 >&2; fail "no invalid-page warning emitted"; fi
 
 ############################################################################
+fi
+if want 21; then
 hd "Scenario 21 — verify command (repo-side integrity check, clean + corruption)"
 # verify walks the repo and re-validates each backup file (reverse-chains then
 # SHA-1s the bytes, mirroring the writer's plaintext checksum) and each WAL
@@ -885,16 +939,16 @@ hd "Scenario 21 — verify command (repo-side integrity check, clean + corruptio
 # broken clean-repo path that flagged every compressed file as "missing".
 prepare_principal
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
-ok "full backup (for verify)" principal "pgbackrest --stanza=demo --type=full backup"
-ok "verify on clean repo" principal "pgbackrest --stanza=demo verify"
+ok "full backup (for verify)" principal "pgbackrust --stanza=demo --type=full backup"
+ok "verify on clean repo" principal "pgbackrust --stanza=demo verify"
 # Corrupt one of the backed-up files. Avoid backup.manifest* and backup.info*
 # (those have their own per-file checksums and would trip a different code
 # path); aim for a real bundled / compressed payload.
-LABEL_DIR=$(on principal "ls -d /var/lib/pgbackrest/backup/demo/*F | head -1")
+LABEL_DIR=$(on principal "ls -d /var/lib/pgbackrust/backup/demo/*F | head -1")
 TARGET=$(on principal "find $LABEL_DIR -type f ! -name 'backup.manifest*' ! -name 'backup.info*' -size +1k | head -1")
 on principal "dd if=/dev/urandom of=$TARGET bs=128 count=4 seek=2 conv=notrunc 2>/dev/null"
 pass "corrupted 512 bytes of $TARGET"
-out=$(pg principal "pgbackrest --stanza=demo verify" 2>&1)
+out=$(pg principal "pgbackrust --stanza=demo verify" 2>&1)
 rc=$?
 if [ "$rc" != "0" ]; then pass "verify exited non-zero on corruption (exit $rc)"
 else printf '%s\n' "$out" | tail -6 >&2; fail "verify did not detect corruption"; fi
@@ -905,6 +959,8 @@ if printf '%s' "$out" | grep -qiE 'checksum|invalid|mismatch|corrupt|inflate|dec
 else printf '%s\n' "$out" | tail -8 >&2; fail "verify log surfaces no corruption signal"; fi
 
 ############################################################################
+fi
+if want 22; then
 hd "Scenario 22 — start / stop commands (pause/resume archiving + backups)"
 # `stop` creates <lock-path>/<stanza>.stop locally; backup + archive-push then
 # refuse with "stop file exists for stanza <name>" until `start` removes it.
@@ -915,25 +971,27 @@ prepare_principal
 # Ensure no stale stop file from a prior run / scenario.
 on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,500)" >/dev/null
-ok "baseline backup (before stop)" principal "pgbackrest --stanza=demo --type=full backup"
-ok "stop command" principal "pgbackrest --stanza=demo stop"
+ok "baseline backup (before stop)" principal "pgbackrust --stanza=demo --type=full backup"
+ok "stop command" principal "pgbackrust --stanza=demo stop"
 sf=$(on principal "ls $LOCK/demo.stop 2>/dev/null")
 assert_contains "$sf" "demo.stop" "stop file created at $LOCK/demo.stop"
-out=$(pg principal "pgbackrest --stanza=demo --type=full backup" 2>&1)
+out=$(pg principal "pgbackrust --stanza=demo --type=full backup" 2>&1)
 rc=$?
 if [ "$rc" != "0" ]; then pass "backup is blocked while stopped (exit $rc)"
 else printf '%s\n' "$out" | tail -4 >&2; fail "backup ran despite stop file"; fi
 if printf '%s' "$out" | grep -qiE 'stop file exists'; then pass "refusal message names the stop file"
 else printf '%s\n' "$out" | tail -4 >&2; fail "refusal message lacks 'stop file exists'"; fi
-ok "start command" principal "pgbackrest --stanza=demo start"
+ok "start command" principal "pgbackrust --stanza=demo start"
 nostf=$(on principal "ls $LOCK/demo.stop 2>/dev/null; true")
 if [ -z "$nostf" ]; then pass "stop file removed by start"
 else fail "stop file still present after start ($nostf)"; fi
-ok "backup after start (resumed)" principal "pgbackrest --stanza=demo --type=full backup"
+ok "backup after start (resumed)" principal "pgbackrust --stanza=demo --type=full backup"
 
 ############################################################################
+fi
+if want 23; then
 hd "Scenario 23 — stanza-delete (gated on stop file, repo cleared)"
-# Stock pgBackRest requires `stop` before `stanza-delete` (the operator must
+# Stock pgBackRust requires `stop` before `stanza-delete` (the operator must
 # explicitly confirm the stanza is offline before any wipe). Companion to
 # af0f497ff (stanza: gate stanza-delete on stop file). Asserts (a) delete
 # without stop refuses with a clear error, (b) after stop the delete clears
@@ -943,46 +1001,49 @@ LOCK=/tmp/pgbackrest
 prepare_principal
 on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,300)" >/dev/null
-ok "full backup (so the stanza has something to delete)" principal "pgbackrest --stanza=demo --type=full backup"
-exists=$(on principal "test -d /var/lib/pgbackrest/backup/demo && echo yes || echo no")
+ok "full backup (so the stanza has something to delete)" principal "pgbackrust --stanza=demo --type=full backup"
+exists=$(on principal "test -d /var/lib/pgbackrust/backup/demo && echo yes || echo no")
 assert_contains "$exists" "yes" "backup/demo present before delete"
-out=$(pg principal "pgbackrest --stanza=demo stanza-delete" 2>&1)
+out=$(pg principal "pgbackrust --stanza=demo stanza-delete" 2>&1)
 rc=$?
 if [ "$rc" != "0" ]; then pass "stanza-delete refused without stop file (exit $rc)"
 else printf '%s\n' "$out" | tail -3 >&2; fail "stanza-delete ran without stop file"; fi
 if printf '%s' "$out" | grep -qiE 'stop file'; then pass "refusal message mentions 'stop file'"
 else printf '%s\n' "$out" | tail -3 >&2; fail "refusal message lacks 'stop file' hint"; fi
-ok "stop (to authorise the delete)" principal "pgbackrest --stanza=demo stop"
-ok "stanza-delete (after stop)" principal "pgbackrest --stanza=demo stanza-delete"
-gone_b=$(on principal "test -d /var/lib/pgbackrest/backup/demo && echo yes || echo no")
-gone_a=$(on principal "test -d /var/lib/pgbackrest/archive/demo && echo yes || echo no")
+ok "stop (to authorise the delete)" principal "pgbackrust --stanza=demo stop"
+ok "stanza-delete (after stop)" principal "pgbackrust --stanza=demo stanza-delete"
+gone_b=$(on principal "test -d /var/lib/pgbackrust/backup/demo && echo yes || echo no")
+gone_a=$(on principal "test -d /var/lib/pgbackrust/archive/demo && echo yes || echo no")
 if [ "$gone_b" = "no" ] && [ "$gone_a" = "no" ]; then pass "archive/demo + backup/demo both removed"
 else fail "stanza dirs remain after delete (backup=$gone_b archive=$gone_a)"; fi
 # Cleanup: start to remove stop file so the rest of the suite is unaffected.
-pg principal "pgbackrest --stanza=demo start" >/dev/null 2>&1 || true
+pg principal "pgbackrust --stanza=demo start" >/dev/null 2>&1 || true
 # Fresh stanza-create proves no residue prevents reuse of the name.
-ok "stanza-create after delete (no residue)" principal "pgbackrest --stanza=demo stanza-create"
+ok "stanza-create after delete (no residue)" principal "pgbackrust --stanza=demo stanza-create"
 
 ############################################################################
+fi
+if want 24; then
 hd "Scenario 24 — repo-put / repo-ls / repo-get / repo-rm (low-level repo cmds)"
 # The four low-level repository commands (command.html). repo-put behaves
 # like unix `tee` (does NOT create parent directories), so use a top-level
 # path. End-to-end: write, list, read-back, remove, verify gone.
 prepare_principal
-PAYLOAD="hello-pgbackrest-repo-put-$(date +%s)"
-ok "repo-put hello.txt (stdin -> repo)" principal "printf '%s' '$PAYLOAD' | pgbackrest repo-put hello.txt"
-ls_out=$(pg principal "pgbackrest repo-ls")
+PAYLOAD="hello-pgbackrust-repo-put-$(date +%s)"
+ok "repo-put hello.txt (stdin -> repo)" principal "printf '%s' '$PAYLOAD' | pgbackrust repo-put hello.txt"
+ls_out=$(pg principal "pgbackrust repo-ls")
 if printf '%s' "$ls_out" | grep -qE '^hello\.txt$'; then pass "repo-ls lists hello.txt"
 else printf '%s\n' "$ls_out" | head -5 >&2; fail "repo-ls did not list hello.txt"; fi
-got=$(pg principal "pgbackrest repo-get hello.txt")
+got=$(pg principal "pgbackrust repo-get hello.txt")
 if [ "$got" = "$PAYLOAD" ]; then pass "repo-get round-trips bytes byte-for-byte"
 else fail "repo-get bytes mismatch (want '$PAYLOAD' got '$got')"; fi
-ok "repo-rm hello.txt" principal "pgbackrest repo-rm hello.txt"
-ls_after=$(pg principal "pgbackrest repo-ls")
+ok "repo-rm hello.txt" principal "pgbackrust repo-rm hello.txt"
+ls_after=$(pg principal "pgbackrust repo-ls")
 if ! printf '%s' "$ls_after" | grep -qE '^hello\.txt$'; then pass "hello.txt absent after repo-rm"
 else fail "hello.txt still listed after repo-rm"; fi
 
 ############################################################################
+fi
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'

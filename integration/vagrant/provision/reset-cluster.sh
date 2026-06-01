@@ -6,7 +6,7 @@
 # the data dir in a half-restored, non-bootable state — which then breaks every
 # subsequent run because the harness assumes a live server. This script makes
 # the validation idempotent: it tears the cluster down, re-initdbs it, rewrites
-# the KB postgresql.conf knobs (port 5433, archiving wired to pgbackrest), and
+# the KB postgresql.conf knobs (port 5433, archiving wired to pgbackrust), and
 # starts it. Run as root (it uses `sudo -u postgres` internally).
 set -euo pipefail
 
@@ -23,7 +23,7 @@ PORT=5433
 # happens constantly as the harness opens/closes `sudo -u postgres` sessions. The
 # running postmaster then survives but every NEW backend dies with
 #   FATAL: could not open shared memory segment "/PostgreSQL.<id>": No such file
-# (seen as a pgbackrest "db-open" failure / hang on the pull-backup path). Enabling
+# (seen as a pgbackrust "db-open" failure / hang on the pull-backup path). Enabling
 # linger + RemoveIPC=no makes the segments persistent for the cluster's lifetime.
 sudo loginctl enable-linger postgres >/dev/null 2>&1 || true
 if grep -q '^RemoveIPC' /etc/systemd/logind.conf 2>/dev/null; then

@@ -6,7 +6,7 @@
 #   secondaire: empty data dir at /var/lib/postgresql/$PGV/secondaire on 5434
 #               (populated by the standby-restore scenario, not here)
 #
-# Archiving is wired to the Rust pgbackrest binary exactly as the KB shows.
+# Archiving is wired to the Rust pgbackrust binary exactly as the KB shows.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 

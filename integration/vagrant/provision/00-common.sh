@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Common provisioning for every node: base packages, PGDG repo, the Rust
-# pgbackrest binary, and the pgBackRest runtime directories from the KB
+# pgbackrust binary, and the pgBackRust runtime directories from the KB
 # (spool / log / config). Idempotent — safe to re-run with `vagrant provision`.
 set -euo pipefail
 
@@ -21,25 +21,35 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
   apt-get update -qq
 fi
 
-# Runtime shared libraries the pgbackrest binary links (readelf NEEDED):
+# Runtime shared libraries the pgbackrust binary links (readelf NEEDED):
 # libpq (pgbr-db), libbz2 (bz2 compress), libssl/libcrypto, libz (gz). All but
 # libpq are part of the Debian base, but install them explicitly to be safe.
 apt-get install -y -qq libpq5 libbz2-1.0 libssl3 zlib1g >/dev/null || true
 
-# --- pgBackRest runtime directories (KB layout) ----------------------------
+# --- pgBackRust runtime directories (KB layout) ----------------------------
 echo "[common] runtime directories"
-install -d -o postgres -g postgres -m 0750 /var/log/pgbackrest 2>/dev/null || install -d -m 0750 /var/log/pgbackrest
-install -d -m 0750 /var/spool/pgbackrest
+install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust 2>/dev/null || install -d -m 0750 /var/log/pgbackrust
+install -d -m 0750 /var/spool/pgbackrust
+# Config dir uses the 'e' spelling the current binary reads by default
+# (/etc/pgbackrest/pgbackrest.conf, conf.d at /etc/pgbackrest/conf.d).
 install -d -m 0755 /etc/pgbackrest /etc/pgbackrest/conf.d
 install -d -m 0750 /etc/certs
 
-# --- install the Rust pgbackrest binary (uploaded to /tmp by Vagrant) -------
-ARTIFACT=/tmp/pgbackrest.bin
+# --- install the Rust pgbackrust binary (uploaded to /tmp by Vagrant) -------
+# The current binary reads its default config from the 'e' path
+# (/etc/pgbackrest/pgbackrest.conf) and resolves the worker spawn command from
+# its own executable path (std::env::current_exe → cmd/pg-host-cmd/repo-host-cmd
+# defaults). The `check` command also requires the cluster's archive_command to
+# contain the substring "pgbackrest". So install the binary at the 'e' path
+# /usr/bin/pgbackrest and add a /usr/bin/pgbackrust symlink so the harness's
+# bare-name `pgbackrust ...` invocations still resolve on PATH.
+ARTIFACT=/tmp/pgbackrust.bin
 if [ -s "$ARTIFACT" ]; then
   echo "[common] installing prebuilt pgbackrest binary"
   install -m 0755 "$ARTIFACT" /usr/bin/pgbackrest
+  ln -sf /usr/bin/pgbackrest /usr/bin/pgbackrust
 else
-  echo "[common] ERROR: prebuilt binary /tmp/pgbackrest.bin missing — run ../build-binary.sh on the host first" >&2
+  echo "[common] ERROR: prebuilt binary /tmp/pgbackrust.bin missing — run ../build-binary.sh on the host first" >&2
   exit 1
 fi
 
