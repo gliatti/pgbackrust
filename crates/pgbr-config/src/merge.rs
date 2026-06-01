@@ -322,7 +322,10 @@ fn merge_ini_files(inis: &[IniFile]) -> IniFile {
         for (section, values) in &ini.sections {
             let entry = combined.sections.entry(section.clone()).or_default();
             for (key, value) in values {
-                // Later file wins for the same (section, key).
+                // Later file wins for the same (section, key): its full value
+                // list (one element for a scalar, N for a repeated hash/list
+                // option) replaces the earlier file's list wholesale, matching
+                // pgBackRest layering each config file's options independently.
                 entry.insert(key.clone(), value.clone());
             }
         }
@@ -612,9 +615,10 @@ fn lookup_ini(
 
     for section in &try_sections {
         if let Some(section_values) = ini.sections.get(section)
-            && let Some(raw) = section_values.get(&raw_key)
+            && let Some(raws) = section_values.get(&raw_key)
+            && !raws.is_empty()
         {
-            let value = parse_value(option_type, raw).map_err(|error| LoadError::ValueParse {
+            let value = parse_ini_values(option_type, raws).map_err(|error| LoadError::ValueParse {
                 option: option_name.to_owned(),
                 group_index,
                 error,
@@ -623,6 +627,44 @@ fn lookup_ini(
         }
     }
     Ok(None)
+}
+
+/// Build an [`OptionValue`] from every config-file line recorded for one key.
+///
+/// pgBackRest writes a multi-valued option as one entry per line — `type: hash`
+/// (e.g. `recovery-option=primary_conninfo=…` then
+/// `recovery-option=primary_slot_name=…`) and `type: list` accumulate across
+/// lines. Each line is parsed in its own right and the per-line maps/vectors
+/// are unioned (later lines win on a duplicate hash key, mirroring last-write
+/// semantics within the section). Every other option type is scalar: only the
+/// last recorded line is significant (last-write-wins), so it alone is parsed.
+///
+/// `raws` is guaranteed non-empty by the caller.
+fn parse_ini_values(option_type: OptionType, raws: &[String]) -> Result<OptionValue, ValueError> {
+    match option_type {
+        OptionType::Hash => {
+            let mut map = std::collections::BTreeMap::new();
+            for raw in raws {
+                if let OptionValue::Hash(entries) = parse_value(OptionType::Hash, raw)? {
+                    map.extend(entries);
+                }
+            }
+            Ok(OptionValue::Hash(map))
+        }
+        OptionType::List => {
+            let mut items = Vec::new();
+            for raw in raws {
+                if let OptionValue::List(entries) = parse_value(OptionType::List, raw)? {
+                    items.extend(entries);
+                }
+            }
+            Ok(OptionValue::List(items))
+        }
+        // Scalar: last line written for the key wins. `raws` is non-empty (the
+        // caller checks), so `last()` always yields a value; fall back to the
+        // empty string defensively rather than panicking.
+        _ => parse_value(option_type, raws.last().map_or("", String::as_str)),
+    }
 }
 
 fn validate_value(
@@ -1636,6 +1678,47 @@ option:
             Some(&OptionValue::Path("/var/lib/pgbackrest".into())),
             "repo-path must be present in the resolved options for command `server`",
         );
+    }
+
+    #[test]
+    fn repeated_recovery_option_lines_accumulate_into_one_hash() {
+        // Regression for the standby-streaming gap: pgBackRest writes a
+        // `type: hash` option (`recovery-option`) as one line per entry. The
+        // INI parser used to collapse repeated keys (last-write-wins), so a
+        // standby restore config with
+        //   recovery-option=primary_conninfo=host=principal port=5433 user=replicator
+        //   recovery-option=primary_slot_name=secondaire
+        //   recovery-option=recovery_target_timeline=latest
+        // kept only the LAST line. The generated recovery config then lacked
+        // primary_conninfo / primary_slot_name and the standby never streamed.
+        // All three entries must now survive into a single resolved Hash.
+        let parsed = pgbr_build::parse_config(pgbr_build::inputs::CONFIG_YAML).unwrap();
+        let cfg = crate::compile::compile(&parsed).unwrap();
+        let cli = parse_cli(["restore", "--stanza=demo", "--type=standby"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ini = crate::ini::parse_ini(concat!(
+            "[demo]\n",
+            "pg1-path=/var/lib/postgresql/16/secondaire\n",
+            "recovery-option=primary_conninfo=host=principal port=5433 user=replicator\n",
+            "recovery-option=primary_slot_name=secondaire\n",
+            "recovery-option=recovery_target_timeline=latest\n",
+        ))
+        .unwrap();
+        let loaded = load_config(resolved, &ini, &cfg).expect("standby restore config must resolve");
+        let OptionValue::Hash(map) = loaded
+            .options
+            .get(&("recovery-option".to_owned(), None))
+            .expect("recovery-option must resolve")
+        else {
+            panic!("recovery-option must be a Hash");
+        };
+        assert_eq!(
+            map.get("primary_conninfo").map(String::as_str),
+            Some("host=principal port=5433 user=replicator"),
+            "primary_conninfo (first line) must survive — it was being dropped",
+        );
+        assert_eq!(map.get("primary_slot_name").map(String::as_str), Some("secondaire"));
+        assert_eq!(map.get("recovery_target_timeline").map(String::as_str), Some("latest"));
     }
 
     // ---- dynamic and per-flavor defaults -----------------------------------

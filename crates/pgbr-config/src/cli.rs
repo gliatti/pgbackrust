@@ -17,6 +17,7 @@
 //! is even loaded), and lets tests exercise the tokenizer without building a
 //! full Cfg.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -314,7 +315,21 @@ pub fn resolve_cli(input: CliInput, cfg: &Cfg) -> Result<ResolvedCli, CliResolve
                         option: option_name.clone(),
                         error,
                     })?;
-                    options.insert((option_name, group_index), value);
+                    // A multi-valued option (`type: hash`/`list`, e.g.
+                    // `--recovery-option`) may be repeated on the command line,
+                    // each flag contributing one entry; accumulate into the
+                    // existing value rather than overwriting (which would keep
+                    // only the last flag). Scalars stay last-write-wins.
+                    match options.entry((option_name, group_index)) {
+                        Entry::Occupied(mut e) => match (e.get_mut(), value) {
+                            (OptionValue::Hash(existing), OptionValue::Hash(add)) => existing.extend(add),
+                            (OptionValue::List(existing), OptionValue::List(add)) => existing.extend(add),
+                            (slot, value) => *slot = value,
+                        },
+                        Entry::Vacant(e) => {
+                            e.insert(value);
+                        }
+                    }
                 }
             },
         }
@@ -426,6 +441,10 @@ option:
     command:
       backup: {}
       archive-push: {}
+  recovery-option:
+    type: hash
+    command:
+      backup: {}
   stanza:
     type: string
     command:
@@ -533,6 +552,26 @@ option:
         let input = parse_cli(["backup", "--online"]).unwrap();
         let r = resolve_cli(input, &cfg).unwrap();
         assert_eq!(r.options[&("online".to_owned(), None)], OptionValue::Boolean(true));
+    }
+
+    #[test]
+    fn repeated_hash_flags_accumulate() {
+        // A `type: hash` option (e.g. `--recovery-option`) may be repeated, each
+        // flag contributing one entry. They must accumulate into one Hash rather
+        // than the last flag overwriting the earlier ones.
+        let cfg = small_cfg();
+        let input = parse_cli([
+            "backup",
+            "--recovery-option=primary_conninfo=host=principal",
+            "--recovery-option=primary_slot_name=secondaire",
+        ])
+        .unwrap();
+        let r = resolve_cli(input, &cfg).unwrap();
+        let OptionValue::Hash(map) = &r.options[&("recovery-option".to_owned(), None)] else {
+            panic!("recovery-option must be a Hash");
+        };
+        assert_eq!(map.get("primary_conninfo").map(String::as_str), Some("host=principal"));
+        assert_eq!(map.get("primary_slot_name").map(String::as_str), Some("secondaire"));
     }
 
     #[test]

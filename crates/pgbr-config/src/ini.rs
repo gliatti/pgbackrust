@@ -61,11 +61,22 @@ impl IniSection {
 ///
 /// Value lookup uses raw textual keys (option name with optional `repoN-` /
 /// `pgN-` prefix); the typed mapping happens in the merge step.
+///
+/// Each key maps to **all** values written for it within the section, in file
+/// order. A single-valued option (the common case) yields a one-element vector
+/// and the merge step takes the last entry (last-write-wins). A multi-valued
+/// option — `type: hash` (e.g. `recovery-option`) or `type: list` — is written
+/// as one line per entry in pgBackRest's config grammar, and the merge step
+/// assembles every recorded line into the resulting `Hash`/`List`. Collapsing
+/// repeats to a single value (the prior behaviour) silently dropped all but the
+/// last `recovery-option=` line, so e.g. a standby restore lost
+/// `primary_conninfo` / `primary_slot_name` and never streamed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IniFile {
     /// Sections in order of first appearance, each carrying its key/value
-    /// pairs (last write wins on duplicate keys within the same section).
-    pub sections: BTreeMap<IniSection, BTreeMap<String, String>>,
+    /// pairs. Every value written for a key is retained in file order (see the
+    /// type-level note); merging decides single- vs multi-valued semantics.
+    pub sections: BTreeMap<IniSection, BTreeMap<String, Vec<String>>>,
 }
 
 /// Errors raised by [`parse_ini`].
@@ -143,10 +154,16 @@ pub fn parse_ini(content: &str) -> Result<IniFile, IniError> {
         if key.is_empty() {
             return Err(IniError::EmptyKey { line: line_no });
         }
+        // Accumulate every value written for this key (in file order) rather
+        // than overwriting. Single-valued options take the last entry at merge
+        // time (last-write-wins); multi-valued (hash/list) options consume all
+        // of them.
         out.sections
             .entry(section.clone())
             .or_default()
-            .insert(key.to_owned(), v.trim().to_owned());
+            .entry(key.to_owned())
+            .or_default()
+            .push(v.trim().to_owned());
     }
 
     Ok(out)
@@ -170,11 +187,11 @@ mod tests {
         .unwrap();
 
         let global = &ini.sections[&IniSection::Global];
-        assert_eq!(global["repo1-path"], "/var/lib/pgbackrest");
-        assert_eq!(global["log-level-file"], "detail");
+        assert_eq!(global["repo1-path"], vec!["/var/lib/pgbackrest".to_owned()]);
+        assert_eq!(global["log-level-file"], vec!["detail".to_owned()]);
 
         let demo = &ini.sections[&IniSection::Stanza("demo".to_owned())];
-        assert_eq!(demo["pg1-path"], "/var/lib/postgresql/14/main");
+        assert_eq!(demo["pg1-path"], vec!["/var/lib/postgresql/14/main".to_owned()]);
     }
 
     #[test]
@@ -182,31 +199,39 @@ mod tests {
         let ini = parse_ini("[global:archive-push]\nbuffer-size=2MiB\n\n[demo:backup]\nstart-fast=y\n").unwrap();
 
         let g_arch = &ini.sections[&IniSection::GlobalCommand("archive-push".to_owned())];
-        assert_eq!(g_arch["buffer-size"], "2MiB");
+        assert_eq!(g_arch["buffer-size"], vec!["2MiB".to_owned()]);
 
         let s_backup = &ini.sections[&IniSection::StanzaCommand {
             stanza: "demo".to_owned(),
             command: "backup".to_owned(),
         }];
-        assert_eq!(s_backup["start-fast"], "y");
+        assert_eq!(s_backup["start-fast"], vec!["y".to_owned()]);
     }
 
     #[test]
     fn comments_and_blank_lines_ignored() {
         let ini = parse_ini("# a comment\n\n[global]\n# another\nrepo1-path=/foo  # trailing\n").unwrap();
-        assert_eq!(ini.sections[&IniSection::Global]["repo1-path"], "/foo");
+        assert_eq!(ini.sections[&IniSection::Global]["repo1-path"], vec!["/foo".to_owned()]);
     }
 
     #[test]
     fn whitespace_around_equals_is_trimmed() {
         let ini = parse_ini("[global]\n  log-level-file =   detail   \n").unwrap();
-        assert_eq!(ini.sections[&IniSection::Global]["log-level-file"], "detail");
+        assert_eq!(ini.sections[&IniSection::Global]["log-level-file"], vec!["detail".to_owned()]);
     }
 
     #[test]
-    fn duplicate_key_in_same_section_last_wins() {
+    fn duplicate_key_in_same_section_accumulates_in_order() {
+        // The parser retains every value for a repeated key, in file order; the
+        // merge step decides single- (last-wins) vs multi-valued (hash/list,
+        // all values) semantics. A repeated `recovery-option=` relies on this
+        // so a standby restore keeps every recovery setting (e.g. both
+        // `primary_conninfo` and `primary_slot_name`).
         let ini = parse_ini("[global]\nrepo1-path=/a\nrepo1-path=/b\n").unwrap();
-        assert_eq!(ini.sections[&IniSection::Global]["repo1-path"], "/b");
+        assert_eq!(
+            ini.sections[&IniSection::Global]["repo1-path"],
+            vec!["/a".to_owned(), "/b".to_owned()]
+        );
     }
 
     #[test]

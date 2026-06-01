@@ -107,6 +107,7 @@ assert_contains "$inrec" "t" "secondaire is in recovery (standby)"
 # to primary_conninfo streaming once it reaches the end of the archive, so push
 # WAL on the primary to drive propagation.
 info "write on the primary + confirm the standby applies it (replica works)"
+# (Streaming is asserted right after this block via pg_stat_replication.)
 psql_on principal 5433 -c "CREATE TABLE IF NOT EXISTS standby_seed(i int);" >/dev/null
 psql_on principal 5433 -c "INSERT INTO standby_seed SELECT generate_series(1,100);" >/dev/null
 psql_on principal 5433 -c "SELECT pg_switch_wal();" >/dev/null
@@ -117,15 +118,15 @@ wait_for "standby has replayed the primary's standby_seed table" 60 2 \
 cnt=$(psql_on secondaire 5434 -c "SELECT count(*) FROM standby_seed;" 2>/dev/null)
 assert_contains "$cnt" "100" "standby applied the primary's writes"
 
-# Best-effort: report whether the standby reached streaming (primary_conninfo
-# handoff). The archived-WAL replay above already proves the replica works; the
-# streaming handoff can race with archive availability, so do not fail on it.
+# Assert the standby actually STREAMS (primary_conninfo handoff), not merely
+# replays archived WAL. The restore writes primary_conninfo + primary_slot_name
+# from the recovery-option hash, so once the standby catches up to the end of the
+# archive it connects to the primary's walsender and pg_stat_replication shows it.
+# This is what lets backup-standby=prefer reach the backup-start LSN in time.
+wait_for "primary sees the standby streaming (pg_stat_replication=1)" 60 1 \
+  bash -c "[ \"\$($COMPOSE exec -T -u postgres principal $BIN/psql -p 5433 -X -A -t -c \"SELECT count(*) FROM pg_stat_replication\" 2>/dev/null | tr -d '\r')\" = 1 ]"
 repl=$(psql_on principal 5433 -c "SELECT count(*) FROM pg_stat_replication;" 2>/dev/null | tr -d '\r')
-if [ "$repl" = "1" ]; then
-  pass "primary sees one streaming standby"
-else
-  info "standby is applying via archived-WAL replay; streaming handoff not (yet) established (pg_stat_replication=$repl)"
-fi
+assert_contains "$repl" "1" "primary sees one streaming standby"
 
 info "depot phase 2: add the now-running standby (pg2) + backup-standby=prefer"
 node depot bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
@@ -148,25 +149,13 @@ EOF
 chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 info "backup with backup-standby=prefer (launched from depot)"
-# Bounded + captured: backup-standby waits up to 600 attempts for the standby to
-# replay to the backup-start LSN; cap that so the suite is not wedged for
-# minutes when the standby is not caught up (see the gap note below). `|| true`
-# keeps `set -e` from aborting on a non-zero / timed-out backup.
-out=$(pg_as depot bash -c "timeout -s KILL 150 pgbackrust --stanza=$STANZA --type=full backup 2>&1") || true
+# With the standby streaming, backup-standby coordination reaches the backup-start
+# LSN quickly: pg_backup_start runs on the primary, the standby replays to that LSN
+# via streaming (well inside the wait window), and the backup completes. Bounded by
+# `timeout` purely as a safety net — a healthy run finishes in a few seconds.
+out=$(pg_as depot bash -c "timeout -s KILL 300 pgbackrust --stanza=$STANZA --type=full backup 2>&1") || true
 printf '%s\n' "$out" | tail -8
 # Completion marker emitted by the product is "backup <label> complete: ...".
-if [[ "$out" == *"complete:"* ]]; then
-  pass "backup-standby=prefer backup completed"
-else
-  # backup-standby coordination requires the standby to replay to the backup
-  # start LSN; the product logs "remote-standby read offload not yet plumbed"
-  # and the standby reaches that LSN only via streaming, which depends on the
-  # restore_command archive-get handoff. When the standby has not caught up the
-  # backup errors "standby did not replay to backup start LSN ... within N
-  # attempts". The standby-build + replica-replay above are the substantive KB
-  # checks; report the backup-standby coordination gap rather than fail.
-  info "KNOWN GAP: backup-standby=prefer could not complete — $(printf '%s' "$out" | grep -iE 'did not replay|error' | tail -1)"
-  info "(standby restore + recovery + replica-replay validated above; remote-standby read offload is documented as not yet plumbed)"
-fi
+assert_contains "$out" "complete:" "backup-standby=prefer backup completed"
 
-pass "05 standby complete (standby restore + recovery + replica replay; backup-standby coordination is a flagged gap)"
+pass "05 standby complete (standby restore + streaming replica + backup-standby=prefer)"
