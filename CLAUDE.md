@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `eol`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
+pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `main`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
 
 The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrust` binary (from `crates/pgbr-cli`). There is no C left to build.
 
@@ -81,7 +81,7 @@ These are embedded into `pgbr-build` at compile time, so a plain `cargo build` p
 
 ## CI gating
 
-`.github/workflows/test.yml` runs the Rust gate (fmt check, clippy `--all-targets -D warnings`, `cargo test --workspace`) on pushes/PRs to `eol` and on `**-ci` / `**-cig` branches. Pull requests target **`eol`**.
+`.github/workflows/test.yml` runs the Rust gate (fmt check, clippy `--all-targets -D warnings`, `cargo test --workspace`) on pushes/PRs to `main` and on `**-ci` / `**-cig` branches. Pull requests target **`main`**.
 
 ## Tip: branches ending in `-cig` push to GitHub Actions
 
