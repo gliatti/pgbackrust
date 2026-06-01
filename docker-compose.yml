@@ -28,7 +28,29 @@ services:
       RUSTUP_HOME: /rustup
     entrypoint: ["cargo"]
 
+  # Portable RELEASE builder (Debian 12 bookworm / glibc 2.36) used by
+  # integration/build-binary.sh. Its artifact runs on BOTH the bookworm Vagrant
+  # VMs and the trixie Docker nodes (glibc backward-compat). Separate compiled
+  # target volume (rust-target-bookworm) so it never clashes with the trixie dev
+  # target; the source caches (registry/git) are shared and toolchain-agnostic.
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    image: pgbackrust-build:latest
+    working_dir: /work/pgbackrust
+    volumes:
+      - .:/work/pgbackrust
+      - cargo-registry:/cargo/registry
+      - cargo-git:/cargo/git
+      - rust-target-bookworm:/work/target
+    environment:
+      CARGO_HOME: /cargo
+      RUSTUP_HOME: /rustup
+      CARGO_TARGET_DIR: /work/target
+
 volumes:
   cargo-registry:
   cargo-git:
   rust-target:
+  rust-target-bookworm:

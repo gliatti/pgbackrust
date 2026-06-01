@@ -1,0 +1,47 @@
+# Portable RELEASE builder for the integration harnesses.
+#
+# Why a separate image from Dockerfile.dev: the dev image is Debian 13 trixie
+# (glibc 2.41). A binary linked there records a minimum glibc requirement
+# (GLIBC_2.39) and therefore CANNOT run on older runtimes — notably the Vagrant
+# VMs (Debian 12 bookworm, glibc 2.36), where it dies at load with
+# `version GLIBC_2.39 not found`. glibc is backward- but NOT forward-compatible.
+#
+# Building on the LOWEST glibc we need to support (bookworm, 2.36) yields ONE
+# artifact that runs everywhere: the bookworm Vagrant VMs AND the trixie Docker
+# integration nodes (a 2.36 binary runs fine under 2.41). So build-binary.sh
+# uses THIS image, not the dev image, to produce integration/artifacts/pgbackrust.
+#
+# Pinned to Debian 12 bookworm; otherwise an exact mirror of Dockerfile.dev
+# (same Rust 1.95.0, same native libs) so the build is reproducible.
+FROM debian:12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    CARGO_HOME=/cargo \
+    RUSTUP_HOME=/rustup
+
+ARG RUST_VERSION=1.95.0
+
+# Native libraries kept because Rust crates link them:
+#   - libpq    -> libpq-sys     (pgbr-db)
+#   - libssh2  -> ssh2 / libssh2-sys (pgbr-storage sftp backend)
+#   - libssl   -> openssl-sys   (pgbr-crypto)
+#   - zlib / libbz2 / liblz4 / libzstd -> libz-sys / bzip2-sys / lz4-sys / zstd-sys (pgbr-compress codecs)
+# XML in this workspace comes from the pure-Rust quick-xml crate, so no libxml2-dev is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git rsync pkg-config build-essential cmake \
+        libssl-dev libpq-dev liblz4-dev libbz2-dev zlib1g-dev \
+        libssh2-1-dev libzstd-dev \
+        gzip bzip2 lz4 zstd \
+        python3 python3-pip \
+        clang lld \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
+            -c rustfmt -c clippy \
+    && cargo --version && rustc --version
+
+WORKDIR /work
