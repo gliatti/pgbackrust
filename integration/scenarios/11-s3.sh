@@ -20,7 +20,7 @@ $COMPOSE exec -T minio sh -c "
 " || info "bucket create best-effort (mc may differ); pgBackRust will create keys under the prefix"
 
 info "principal: S3 repo config (path-style, verify-tls off for the test endpoint)"
-node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-type=s3
 repo1-s3-uri-style=path
@@ -39,7 +39,7 @@ start-fast=y
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 # pgBackRust talks plain HTTP to a :9000 endpoint only if scheme handling allows
 # it; this scenario documents the KB S3 config and is the acceptance check for
 # the s3 backend against a real endpoint.
@@ -57,20 +57,15 @@ assert_contains "$chk" "check ok" "S3 check"
 out=$(pg_as principal pgbackrust --stanza=$STANZA info)
 assert_contains "$out" "status: ok" "S3 info"
 
-info "full backup against S3 (bounded — see product-bug note below)"
-# PRODUCT BUG (not harness state): `backup` against an S3 repo fails immediately
-# after "backup command begin" with `not found: backup/<stanza>/<label>`, before
-# writing any backup files, while the identical backup against a POSIX repo
-# succeeds (scenarios 01/04/06/08/10) and stanza-create + check work over this
-# same S3 endpoint. The S3 backend's early backup-label-directory existence
-# check uses directory semantics that do not hold on S3 (empty prefixes do not
-# "exist"). Report it as a known gap rather than failing the suite.
-if out=$(pg_as principal bash -c "timeout -s KILL 120 pgbackrust --stanza=$STANZA --type=full backup 2>&1"); then
-  printf '%s\n' "$out" | tail -6
-  info2=$(pg_as principal pgbackrust --stanza=$STANZA info)
-  assert_contains "$info2" "full backup" "S3 info shows a full backup"
-else
-  info "KNOWN PRODUCT BUG: backup against repo1-type=s3 fails with 'not found: backup/<stanza>/<label>'; stanza-create + check work over the same S3 endpoint, and the identical backup works on a POSIX repo."
-fi
+info "full backup against S3 (the is_local backup-label guard makes this complete)"
+# The S3 backend's early backup-label-directory existence check used to fail a
+# backup with `not found: backup/<stanza>/<label>` (S3 has no real directories /
+# empty prefixes), but the non-local repo HEAD guard skips that check for S3, so
+# a full backup now completes over the S3 HTTP/SigV4 transport just like POSIX.
+out=$(pg_as principal pgbackrust --stanza=$STANZA --type=full backup 2>&1)
+printf '%s\n' "$out" | tail -6
+assert_contains "$out" "complete:" "S3 backup completed"
+info2=$(pg_as principal pgbackrust --stanza=$STANZA info)
+assert_contains "$info2" "full backup" "S3 info shows a full backup"
 
-pass "11 s3 complete (S3 stanza-create + check over HTTP/SigV4; backup-on-s3 is a flagged product bug)"
+pass "11 s3 complete (S3 stanza-create + check + a full backup over HTTP/SigV4)"

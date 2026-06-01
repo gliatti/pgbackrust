@@ -6,7 +6,7 @@
 # backup --type=full / diff / incr, info, and restore --delta.
 #
 # Runs against the `principal` node which here doubles as its own repo host
-# (repo1-path local), matching the KB minimal /etc/pgbackrust.conf.
+# (repo1-path local), matching the KB minimal /etc/pgbackrest/pgbackrest.conf.
 set -euo pipefail
 . "$(dirname "$0")/_lib.sh"
 
@@ -16,7 +16,7 @@ BIN=/usr/lib/postgresql/$PGV/bin
 
 info "01 local-minimal: configure principal as its own repo host"
 node principal bash -c "install -d -o postgres -g postgres -m 0750 /srv/depot/pgbackrust"
-node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-path=/srv/depot/pgbackrust
 repo1-retention-full=2
@@ -27,7 +27,7 @@ start-fast=y
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 reset_principal "$DATADIR" "$BIN" "$STANZA"
 

@@ -70,7 +70,7 @@ info "depot: TLS server (bind 0.0.0.0) + reach principal's PG over SSH"
 # the literal '*', so use 0.0.0.0 (mirrors the vagrant scenario). depot reaches
 # principal's PG over SSH (pg1-host + pg1-host-user, host-type defaults to ssh)
 # since principal does not run its own TLS server.
-node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO; cat > /etc/pgbackrust.conf <<EOF
+node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO; cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -87,11 +87,11 @@ pg1-host-user=postgres
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 info "principal: TLS client to depot's repo (repo1-host-type=tls)"
 # repo*-host-user is only valid with host-type=ssh, so it is omitted here.
-node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-type=tls
@@ -105,7 +105,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 info "launch the depot pgbackrust TLS server (detached so it survives the exec)"
 # Launch with `docker compose exec -d` and NO shell wrapper / redirect: a
@@ -142,19 +142,15 @@ info "check over TLS (archive round-trip + repo read over the TLS transport)"
 chk=$(pg_as principal pgbackrust --stanza=$STANZA check 2>&1)
 assert_contains "$chk" "check ok" "TLS check"
 
-info "full backup over TLS from principal (bounded — see product-bug note below)"
+info "full backup over TLS from principal"
 psql_on principal 5433 -c "CREATE TABLE IF NOT EXISTS t(i int); INSERT INTO t SELECT generate_series(1,500);"
-# PRODUCT BUG (not harness state): a `backup` whose repository is reached over
-# repo1-host-type=tls hangs indefinitely right after "backup command begin",
-# while the byte-for-byte identical backup over repo1-host-type=ssh completes in
-# ~5s. archive-push, stanza-create and check all work over the SAME TLS
-# transport, so the failure is specific to the backup command's TLS repo I/O.
-# Bound the attempt so the suite is not wedged; report it as a known product gap.
-if out=$(pg_as principal bash -c "timeout -s KILL 120 pgbackrust --stanza=$STANZA --type=full backup 2>&1"); then
-  printf '%s\n' "$out" | tail -6
-  assert_contains "$out" "complete:" "TLS backup completed"
-else
-  info "KNOWN PRODUCT BUG: backup over repo1-host-type=tls hangs (timed out); identical backup over ssh completes. TLS transport works for archive-push/check but not backup."
-fi
+# A `backup` whose repository is reached over repo1-host-type=tls used to hang
+# right after "backup command begin"; the protocol sockets now set TCP_NODELAY,
+# so the TLS repo I/O no longer stalls and the backup completes (like the ssh
+# transport). archive-push, stanza-create, check and now backup all work over
+# the same TLS transport.
+out=$(pg_as principal pgbackrust --stanza=$STANZA --type=full backup 2>&1)
+printf '%s\n' "$out" | tail -6
+assert_contains "$out" "complete:" "TLS backup completed"
 
-pass "09 tls complete (cert v3/SAN + TLS server + stanza-create/check over TLS; backup-over-tls is a flagged product bug)"
+pass "09 tls complete (cert v3/SAN + TLS server + stanza-create/check + a full backup over TLS)"

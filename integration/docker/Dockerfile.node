@@ -1,6 +1,6 @@
 # A single image used for all three integration nodes (principal / secondaire /
 # depot). Extends the official postgres:16 (Debian bookworm) with openssh
-# (for the KB pull / remote scenarios) and the prebuilt Rust pgbackrest binary.
+# (for the KB pull / remote scenarios) and the prebuilt Rust pgbackrust binary.
 #
 # Build context is the repo root so the binary artifact can be COPYed in:
 #   docker build -f integration/docker/Dockerfile.node -t pgbr-node .
@@ -11,13 +11,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       openssh-server openssh-client ca-certificates openssl procps less \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /var/run/sshd /var/log/pgbackrest /var/spool/pgbackrest \
+ && mkdir -p /var/run/sshd /var/log/pgbackrust /var/spool/pgbackrust \
              /etc/pgbackrest/conf.d /etc/certs \
- && chown -R postgres:postgres /var/log/pgbackrest /var/spool/pgbackrest
+ && chown -R postgres:postgres /var/log/pgbackrust /var/spool/pgbackrust
 
 # The prebuilt Linux binary produced by integration/build-binary.sh.
-COPY integration/artifacts/pgbackrest /usr/bin/pgbackrest
-RUN chmod 0755 /usr/bin/pgbackrest
+COPY integration/artifacts/pgbackrust /usr/bin/pgbackrust
+RUN chmod 0755 /usr/bin/pgbackrust
 
 # Node entrypoint: configures sshd + role, then sleeps (orchestration is driven
 # by integration/scenarios/*.sh via `docker compose exec`).

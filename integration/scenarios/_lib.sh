@@ -89,7 +89,7 @@ reset_principal() {
 listen_addresses = '*'
 port = 5433
 archive_mode = on
-archive_command = '/usr/bin/pgbackrust --stanza=$stanza archive-push %p'
+archive_command = '/usr/bin/pgbackrest --stanza=$stanza archive-push %p'
 wal_level = replica
 max_wal_senders = 10
 max_replication_slots = 10

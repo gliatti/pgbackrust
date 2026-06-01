@@ -15,7 +15,7 @@ BIN=/usr/lib/postgresql/$PGV/bin
 
 info "02 remote-pull: depot config reaches principal over SSH"
 node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
-node depot bash -c "cat > /etc/pgbackrust.conf <<EOF
+node depot bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -29,10 +29,10 @@ pg1-path=$DATADIR
 pg1-port=5433
 pg1-user=postgres
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 info "principal config: archive WAL to depot over SSH (repo1-host)"
-node principal bash -c "cat > /etc/pgbackrust.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -43,7 +43,7 @@ compress-level=1
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrust.conf"
+chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
 
 reset_principal "$DATADIR" "$BIN" "$STANZA"
 
