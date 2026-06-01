@@ -1,4 +1,4 @@
-//! Cargo-native end-to-end tests for the pgBackRest Rust port.
+//! Cargo-native end-to-end tests for the pgBackRust Rust port.
 //!
 //! These run in CI under plain `cargo test` — no live `PostgreSQL`, no Docker,
 //! no external driver. They exercise two layers:
@@ -9,7 +9,7 @@
 //!    `verify` and assert the restored cluster is byte-identical to the
 //!    original and that `verify` finds zero problems.
 //!
-//! 2. The shipped `pgbackrest` binary itself: a `version` smoke test that runs
+//! 2. The shipped `pgbackrust` binary itself: a `version` smoke test that runs
 //!    the real `main` -> `pgbr_cli::run` pipeline, which resolves the full
 //!    embedded `config.yaml` (every default, including the suffixed `time`
 //!    options like `io-timeout=1m`). This is the test that caught the
@@ -185,27 +185,27 @@ fn dispatch_ok(command: &str, repo: &Posix, pg: &Posix, options: Vec<(&str, Opti
 
 #[test]
 fn e2e_binary_version_runs() {
-    // Run the shipped `pgbackrest` binary's `version` command. The binary
+    // Run the shipped `pgbackrust` binary's `version` command. The binary
     // resolves the full embedded config.yaml — including the suffixed `time`
     // defaults (`io-timeout=1m`, `protocol-timeout=31m`, …) — before the
     // command runs. A `parse_time` regression makes this fail config
     // resolution for *every* command, so this smoke test guards the whole
     // resolve pipeline as much as the version command itself.
-    let exe = env!("CARGO_BIN_EXE_pgbackrest");
+    let exe = env!("CARGO_BIN_EXE_pgbackrust");
     let output = Command::new(exe)
         .arg("version")
         .output()
-        .expect("running the pgbackrest binary should not fail to spawn");
+        .expect("running the pgbackrust binary should not fail to spawn");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "`pgbackrest version` must exit 0; stderr was:\n{stderr}\nstdout:\n{stdout}"
+        "`pgbackrust version` must exit 0; stderr was:\n{stderr}\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("pgBackRest"),
-        "`pgbackrest version` must print the version banner, got stdout:\n{stdout}"
+        stdout.contains("pgBackRust"),
+        "`pgbackrust version` must print the version banner, got stdout:\n{stdout}"
     );
 }

@@ -57,7 +57,7 @@ listen_addresses = '*'
 port = $PORT
 wal_level = replica
 archive_mode = on
-archive_command = '/usr/bin/pgbackrest --stanza=demo archive-push %p'
+archive_command = '/usr/bin/pgbackrust --stanza=demo archive-push %p'
 max_wal_senders = 10
 hot_standby = on
 CONF

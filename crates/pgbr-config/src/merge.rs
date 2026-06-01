@@ -1,10 +1,10 @@
-//! Merge CLI input + `PGBACKREST_<OPTION>` env vars + `pgbackrest.conf` +
+//! Merge CLI input + `PGBACKRUST_<OPTION>` env vars + `pgbackrust.conf` +
 //! option defaults into a final [`LoadedConfig`].
 //!
 //! Precedence, highest to lowest:
 //!
 //! 1. Explicit CLI argument (`--option=value`).
-//! 2. `PGBACKREST_<OPTION>` environment variable (see [`crate::env`]).
+//! 2. `PGBACKRUST_<OPTION>` environment variable (see [`crate::env`]).
 //! 3. `[<stanza>:<command>]` section in the INI file.
 //! 4. `[<stanza>]` section.
 //! 5. `[global:<command>]` section.
@@ -29,7 +29,7 @@ use crate::option::CfgOption;
 use crate::types::{ConfigCommandRole, DefaultType, OptionGroup, OptionType};
 use crate::value::{OptionValue, ValueError, parse_value};
 
-/// Raw `PGBACKREST_<OPTION>` env values keyed by `(option_name, group_index)`,
+/// Raw `PGBACKRUST_<OPTION>` env values keyed by `(option_name, group_index)`,
 /// as produced by [`crate::env::collect_env`]. Slotted into the merge between
 /// the CLI and the INI file.
 pub type EnvValues = BTreeMap<(String, Option<u32>), String>;
@@ -41,7 +41,7 @@ const DYNAMIC_TAG_BIN: &str = "bin";
 
 /// Fallback used for the `bin` dynamic default when the [`RuntimeContext`]
 /// doesn't carry an executable path.
-const DYNAMIC_BIN_FALLBACK: &str = "pgbackrest";
+const DYNAMIC_BIN_FALLBACK: &str = "pgbackrust";
 
 /// The option whose resolved value selects the "flavor" entry of a per-flavor
 /// sequence default (e.g. `compress-level`'s `[{gz: 6}, {zst: 3}, …]` is keyed
@@ -61,12 +61,12 @@ const FLAVOR_DEFAULT: &str = "gz";
 /// added here as more dynamic tags are implemented.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeContext {
-    /// Path of the running pgBackRest executable (`argv[0]`). Used by the
-    /// `bin` dynamic default. `None` falls back to `"pgbackrest"`.
+    /// Path of the running pgBackRust executable (`argv[0]`). Used by the
+    /// `bin` dynamic default. `None` falls back to `"pgbackrust"`.
     pub exe_path: Option<String>,
 }
 
-/// Final, fully merged configuration for one `pgbackrest <command>`
+/// Final, fully merged configuration for one `pgbackrust <command>`
 /// invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
@@ -238,7 +238,7 @@ pub fn load_config_with_context(
     load_config_with_env(cli, &EnvValues::new(), ini, cfg, ctx)
 }
 
-/// Merge a [`ResolvedCli`], the `PGBACKREST_<OPTION>` environment values
+/// Merge a [`ResolvedCli`], the `PGBACKRUST_<OPTION>` environment values
 /// (`env`), an [`IniFile`], and the defaults from a compiled [`Cfg`] into a
 /// final [`LoadedConfig`].
 ///
@@ -266,17 +266,17 @@ pub fn load_config_with_env(
     load_config_with_env_multi(cli, env, std::slice::from_ref(ini), cfg, ctx)
 }
 
-/// Merge a [`ResolvedCli`], the `PGBACKREST_<OPTION>` environment values
+/// Merge a [`ResolvedCli`], the `PGBACKRUST_<OPTION>` environment values
 /// (`env`), an ordered slice of [`IniFile`] config sources, and the defaults
 /// from a compiled [`Cfg`] into a final [`LoadedConfig`].
 ///
-/// This is the multi-source variant of [`load_config_with_env`]. pgBackRest
+/// This is the multi-source variant of [`load_config_with_env`]. pgBackRust
 /// reads the main `--config` file plus every `*.conf` under
 /// `--config-include-path`, treating them all as the same "config file"
 /// precedence level (below the CLI and env, above defaults). The slice is
 /// applied **in load order**: the main config first, then the include files
 /// (sorted by name). When two sources set the same key in the same INI
-/// section, a *later* source wins — matching pgBackRest, where include files
+/// section, a *later* source wins — matching pgBackRust, where include files
 /// are loaded after the main config and override it.
 ///
 /// The five-source precedence is therefore CLI, then ENV, then the combined
@@ -306,7 +306,7 @@ pub fn load_config_with_env_multi(
 /// [`IniFile`], applying later sources over earlier ones at the
 /// `(section, key)` granularity.
 ///
-/// This is how pgBackRest layers its config files: the main `--config` file is
+/// This is how pgBackRust layers its config files: the main `--config` file is
 /// loaded first, then each `*.conf` under the include path (sorted by name);
 /// a later file's value for the same key in the same section overrides the
 /// earlier one. A single-element slice returns that file unchanged, so the
@@ -325,7 +325,7 @@ fn merge_ini_files(inis: &[IniFile]) -> IniFile {
                 // Later file wins for the same (section, key): its full value
                 // list (one element for a scalar, N for a repeated hash/list
                 // option) replaces the earlier file's list wholesale, matching
-                // pgBackRest layering each config file's options independently.
+                // pgBackRust layering each config file's options independently.
                 entry.insert(key.clone(), value.clone());
             }
         }
@@ -379,7 +379,7 @@ fn load_config_with_env_single(
                     .collect();
                 if list.is_empty() {
                     // No occurrence anywhere — the option is implicitly
-                    // index 1 (matches pgBackRest's "default first index").
+                    // index 1 (matches pgBackRust's "default first index").
                     list.push(Some(1));
                 }
                 list
@@ -562,7 +562,7 @@ fn decode_grouped_key(raw_key: &str, cfg: &Cfg) -> Option<(String, u32)> {
     None
 }
 
-/// Resolve the `PGBACKREST_<OPTION>` env value for `(option_name, group_index)`
+/// Resolve the `PGBACKRUST_<OPTION>` env value for `(option_name, group_index)`
 /// from the pre-collected `env` map, parsing the raw string as `option_type`
 /// (just like [`lookup_ini`]). Returns `None` when no env var was set for this
 /// key.
@@ -631,7 +631,7 @@ fn lookup_ini(
 
 /// Build an [`OptionValue`] from every config-file line recorded for one key.
 ///
-/// pgBackRest writes a multi-valued option as one entry per line — `type: hash`
+/// pgBackRust writes a multi-valued option as one entry per line — `type: hash`
 /// (e.g. `recovery-option=primary_conninfo=…` then
 /// `recovery-option=primary_slot_name=…`) and `type: list` accumulate across
 /// lines. Each line is parsed in its own right and the per-line maps/vectors
@@ -746,7 +746,7 @@ fn value_to_match_str(v: &serde_yml::Value) -> Option<String> {
         serde_yml::Value::Number(n) => Some(n.to_string()),
         // A compile-time-feature-gated allow-list entry is a single-key mapping
         // `{value: FEATURE_FLAG}` — e.g. `{zst: HAVE_LIBZST}` in config.yaml,
-        // mirroring pgBackRest's `#ifdef HAVE_LIBZST`. This build links every
+        // mirroring pgBackRust's `#ifdef HAVE_LIBZST`. This build links every
         // optional codec (zstd, lz4, bz2, …) unconditionally, so the gate is
         // always satisfied: take the key as the permitted value.
         serde_yml::Value::Mapping(m) if m.len() == 1 => m.iter().next().and_then(|(k, _)| k.as_str().map(ToOwned::to_owned)),
@@ -787,7 +787,7 @@ fn option_value_match_candidates(v: &OptionValue) -> Vec<String> {
 /// Gate options on their `depend:` constraint.
 ///
 /// An option whose dependency is not satisfied is *inactive*: if its value was
-/// only a default it is silently dropped (matching pgBackRest, where e.g.
+/// only a default it is silently dropped (matching pgBackRust, where e.g.
 /// `repo-azure-*` defaults never apply unless `repo-type=azure`); if the user
 /// set it *explicitly* (CLI/INI) it is a [`LoadError::DependNotSatisfied`].
 /// Options whose dependency is satisfied (or that have no `depend:`) are kept.
@@ -934,12 +934,12 @@ fn resolve_default(
 /// Resolve a C preprocessor identifier used in a `default-type: literal`
 /// default to its string value. The C build generator expanded these when it
 /// emitted the auto files; the Rust pipeline reads the raw `config.yaml`, so
-/// the expansion happens here. Values mirror pgBackRest's `PROJECT_CONFIG_*`
+/// the expansion happens here. Values mirror pgBackRust's `PROJECT_CONFIG_*`
 /// (`src/version.h`) and the `CFGOPTDEF_CONFIG_PATH` define.
 fn literal_macro_value(ident: &str) -> Option<&'static str> {
     match ident {
-        "CFGOPTDEF_CONFIG_PATH" => Some("/etc/pgbackrest"),
-        "PROJECT_CONFIG_FILE" => Some("pgbackrest.conf"),
+        "CFGOPTDEF_CONFIG_PATH" => Some("/etc/pgbackrust"),
+        "PROJECT_CONFIG_FILE" => Some("pgbackrust.conf"),
         "PROJECT_CONFIG_INCLUDE_PATH" => Some("conf.d"),
         _ => None,
     }
@@ -1105,7 +1105,7 @@ option:
   repo-path:
     type: path
     group: repo
-    default: /var/lib/pgbackrest
+    default: /var/lib/pgbackrust
     command:
       backup: {}
       archive-push: {}
@@ -1127,7 +1127,7 @@ option:
         load_config(resolved, &ini, &cfg).map_err(|e| e.to_string())
     }
 
-    /// Like [`load`] but threads a `PGBACKREST_<OPTION>` environment through an
+    /// Like [`load`] but threads a `PGBACKRUST_<OPTION>` environment through an
     /// injected lookup, exercising the full five-source merge.
     fn load_with_env(cli_args: &[&str], env: &[(&str, &str)], ini_text: &str) -> Result<LoadedConfig, String> {
         let cfg = small_cfg();
@@ -1195,7 +1195,7 @@ option:
         assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(1024 * 1024));
         assert_eq!(
             r.options[&("repo-path".into(), Some(1))],
-            OptionValue::Path("/var/lib/pgbackrest".into())
+            OptionValue::Path("/var/lib/pgbackrust".into())
         );
     }
 
@@ -1626,14 +1626,14 @@ option:
 
     #[test]
     fn literal_default_expands_c_macro_expressions() {
-        assert_eq!(expand_literal_default("CFGOPTDEF_CONFIG_PATH"), "/etc/pgbackrest");
+        assert_eq!(expand_literal_default("CFGOPTDEF_CONFIG_PATH"), "/etc/pgbackrust");
         assert_eq!(
             expand_literal_default("CFGOPTDEF_CONFIG_PATH \"/\" PROJECT_CONFIG_FILE"),
-            "/etc/pgbackrest/pgbackrest.conf"
+            "/etc/pgbackrust/pgbackrust.conf"
         );
         assert_eq!(
             expand_literal_default("CFGOPTDEF_CONFIG_PATH \"/\" PROJECT_CONFIG_INCLUDE_PATH"),
-            "/etc/pgbackrest/conf.d"
+            "/etc/pgbackrust/conf.d"
         );
     }
 
@@ -1641,7 +1641,7 @@ option:
     fn real_config_info_resolves_end_to_end() {
         // Guards the two binary-blocking bugs: literal-macro defaults
         // (`config-path` etc.) and depend-gating on cloud-option defaults.
-        // `pgbackrest info --stanza=demo --repo1-path=/tmp/x` must fully resolve.
+        // `pgbackrust info --stanza=demo --repo1-path=/tmp/x` must fully resolve.
         let parsed = pgbr_build::parse_config(pgbr_build::inputs::CONFIG_YAML).unwrap();
         let cfg = crate::compile::compile(&parsed).unwrap();
         let cli = parse_cli(["info", "--stanza=demo", "--repo1-path=/tmp/x"]).unwrap();
@@ -1670,19 +1670,19 @@ option:
         let cfg = crate::compile::compile(&parsed).unwrap();
         let cli = parse_cli(["server"]).unwrap();
         let resolved = resolve_cli(cli, &cfg).unwrap();
-        let ini = crate::ini::parse_ini("[global]\nrepo1-path=/var/lib/pgbackrest\n").unwrap();
+        let ini = crate::ini::parse_ini("[global]\nrepo1-path=/var/lib/pgbackrust\n").unwrap();
         let loaded =
             load_config(resolved, &ini, &cfg).expect("server must resolve against the real config.yaml with a [global] repo1-path");
         assert_eq!(
             loaded.options.get(&("repo-path".to_owned(), Some(1))),
-            Some(&OptionValue::Path("/var/lib/pgbackrest".into())),
+            Some(&OptionValue::Path("/var/lib/pgbackrust".into())),
             "repo-path must be present in the resolved options for command `server`",
         );
     }
 
     #[test]
     fn repeated_recovery_option_lines_accumulate_into_one_hash() {
-        // Regression for the standby-streaming gap: pgBackRest writes a
+        // Regression for the standby-streaming gap: pgBackRust writes a
         // `type: hash` option (`recovery-option`) as one line per entry. The
         // INI parser used to collapse repeated keys (last-write-wins), so a
         // standby restore config with
@@ -1780,12 +1780,12 @@ option:
         let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
         let resolved = resolve_cli(cli, &cfg).unwrap();
         let ctx = RuntimeContext {
-            exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+            exe_path: Some("/usr/bin/pgbackrust".to_owned()),
         };
         let r = load_config_with_context(resolved, &crate::ini::IniFile::default(), &cfg, &ctx).unwrap();
         assert_eq!(
             r.options[&("cmd".into(), None)],
-            OptionValue::String("/usr/bin/pgbackrest".into())
+            OptionValue::String("/usr/bin/pgbackrust".into())
         );
     }
 
@@ -1794,9 +1794,9 @@ option:
         let cfg = dynamic_cfg();
         let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
         let resolved = resolve_cli(cli, &cfg).unwrap();
-        // Default context => no exe path => falls back to "pgbackrest".
+        // Default context => no exe path => falls back to "pgbackrust".
         let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
-        assert_eq!(r.options[&("cmd".into(), None)], OptionValue::String("pgbackrest".into()));
+        assert_eq!(r.options[&("cmd".into(), None)], OptionValue::String("pgbackrust".into()));
     }
 
     #[test]
@@ -1964,11 +1964,11 @@ option:
         );
         assert_eq!(
             r.options[&("repo-path".into(), Some(1))],
-            OptionValue::Path("/var/lib/pgbackrest".into())
+            OptionValue::Path("/var/lib/pgbackrust".into())
         );
     }
 
-    // ---- PGBACKREST_<OPTION> environment source ----------------------------
+    // ---- PGBACKRUST_<OPTION> environment source ----------------------------
 
     #[test]
     fn env_overrides_ini_and_default() {
@@ -1976,7 +1976,7 @@ option:
         // beats the option default. pg-path comes from the CLI (required).
         let r = load_with_env(
             &["backup", "--stanza=demo", "--pg1-path=/data"],
-            &[("PGBACKREST_BUFFER_SIZE", "4MiB"), ("PGBACKREST_LOG_LEVEL_FILE", "debug")],
+            &[("PGBACKRUST_BUFFER_SIZE", "4MiB"), ("PGBACKRUST_LOG_LEVEL_FILE", "debug")],
             "[global]\nbuffer-size=2MiB\n",
         )
         .unwrap();
@@ -1992,7 +1992,7 @@ option:
         // CLI buffer-size wins over the env var, which would otherwise win.
         let r = load_with_env(
             &["backup", "--stanza=demo", "--pg1-path=/data", "--buffer-size=8MiB"],
-            &[("PGBACKREST_BUFFER_SIZE", "4MiB")],
+            &[("PGBACKRUST_BUFFER_SIZE", "4MiB")],
             "",
         )
         .unwrap();
@@ -2001,11 +2001,11 @@ option:
 
     #[test]
     fn env_grouped_index_and_boolean() {
-        // A grouped env var (PGBACKREST_PG1_PATH) decodes to (pg-path, 1), and a
+        // A grouped env var (PGBACKRUST_PG1_PATH) decodes to (pg-path, 1), and a
         // boolean env value uses the y/n spelling.
         let r = load_with_env(
             &["backup", "--stanza=demo"],
-            &[("PGBACKREST_PG1_PATH", "/env/pg"), ("PGBACKREST_ONLINE", "n")],
+            &[("PGBACKRUST_PG1_PATH", "/env/pg"), ("PGBACKRUST_ONLINE", "n")],
             "",
         )
         .unwrap();
@@ -2053,7 +2053,7 @@ option:
     #[test]
     fn later_include_file_overrides_earlier_for_same_key() {
         // The main config sets buffer-size=2MiB; a later include file sets it to
-        // 8MiB in the same [global] section. The later source wins (pgBackRest
+        // 8MiB in the same [global] section. The later source wins (pgBackRust
         // loads include files after the main config).
         let r = load_multi(
             &["backup", "--stanza=demo", "--pg1-path=/data"],

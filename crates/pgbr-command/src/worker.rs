@@ -1,8 +1,8 @@
 //! The `local` / `remote` worker role: the callee side of the protocol.
 //!
-//! pgBackRest's main process does not touch a repository or PG data directory
+//! pgBackRust's main process does not touch a repository or PG data directory
 //! that lives on another host (or that it wants to parallelize on the same
-//! host) directly. Instead it spawns a subordinate `pgbackrest` invocation —
+//! host) directly. Instead it spawns a subordinate `pgbackrust` invocation —
 //! a `--remote` worker reached over SSH, or a `--local` worker on the same
 //! machine — and drives it over the JSON-line protocol from [`pgbr_protocol`]:
 //! every `Storage` (or DB) operation becomes one request/response exchange.
@@ -55,7 +55,7 @@ const STORAGE_PREFIX: &str = "storage-";
 /// stanza the caller is operating on (`stanza=<name>`). The TLS server side
 /// parses it before `authorize_client`, so per-connection CN authorization
 /// keys on the *client's* stanza rather than whatever stanza (if any) the
-/// `pgbackrest server` process was started with.
+/// `pgbackrust server` process was started with.
 const GREETING_STANZA_PREFIX: &str = "stanza=";
 
 /// Error code carried by [`ErrResponse`] for a request the worker refuses to
@@ -215,7 +215,7 @@ pub fn is_worker(config: &LoadedConfig) -> bool {
 /// Serve the worker protocol on the process's real stdin / stdout.
 ///
 /// This is the entry point the main process reaches after spawning the child
-/// (`pgbackrest ... --remote` / `--local`): the child reads requests from its
+/// (`pgbackrust ... --remote` / `--local`): the child reads requests from its
 /// stdin and writes responses to its stdout, which are the SSH / pipe channels
 /// back to the main process. The root is taken from the resolved config
 /// (`pg1-path`, else `repo1-path`).
@@ -522,9 +522,9 @@ mod tests {
         // fail with "permission denied: ./archive/<stanza>" at runtime.
         let cfg = config_with(vec![(
             ("repo-path", Some(1)),
-            OptionValue::Path("/var/lib/pgbackrest".to_owned()),
+            OptionValue::Path("/var/lib/pgbackrust".to_owned()),
         )]);
-        assert_eq!(worker_root(&cfg).unwrap(), PathBuf::from("/var/lib/pgbackrest"));
+        assert_eq!(worker_root(&cfg).unwrap(), PathBuf::from("/var/lib/pgbackrust"));
     }
 
     #[test]

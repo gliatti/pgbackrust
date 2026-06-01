@@ -1,19 +1,19 @@
-//! Inter-host storage integration tests for the `pgbackrest` binary.
+//! Inter-host storage integration tests for the `pgbackrust` binary.
 //!
 //! These prove the spawn -> worker -> `RemoteStorage` loop assembled in
-//! [`pgbr_cli::remote_storage`]: the parent process spawns a `pgbackrest`
+//! [`pgbr_cli::remote_storage`]: the parent process spawns a `pgbackrust`
 //! worker, which serves the storage protocol on its stdio (via
 //! `pgbr_command::worker::run_worker_stdio`, routed from `run`), and the parent
 //! proxies `Storage` calls to it through `RemoteStorage`.
 //!
 //! - [`remote_storage_over_spawned_binary_worker`] drives the *real* shipped
-//!   binary as a local worker (`pgbackrest backup:remote --repo1-path=<dir>`)
+//!   binary as a local worker (`pgbackrust backup:remote --repo1-path=<dir>`)
 //!   over real OS pipes — no SSH, no `PostgreSQL` — and round-trips
 //!   put / get / exists, asserting the bytes land on disk under the worker's
 //!   root. This is the end-to-end proof the inter-host wiring works with a real
 //!   subprocess.
 //! - [`remote_storage_over_ssh`] is the SSH variant, `#[ignore]`d and gated on
-//!   `PGBR_IT_SSH_HOST` since it needs a reachable host with `pgbackrest`
+//!   `PGBR_IT_SSH_HOST` since it needs a reachable host with `pgbackrust`
 //!   installed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -48,9 +48,9 @@ fn remote_storage_over_spawned_binary_worker() {
     // the `Remote` command role, which `run` routes to
     // `pgbr_command::worker::run_worker_stdio` before any command dispatch, so
     // the child serves the storage protocol on its stdin/stdout.
-    let exe = env!("CARGO_BIN_EXE_pgbackrest");
+    let exe = env!("CARGO_BIN_EXE_pgbackrust");
     let storage = RemoteProcessStorage::spawn_local(exe, &["backup:remote".to_owned(), repo_arg])
-        .expect("spawning the pgbackrest binary as a local worker should succeed");
+        .expect("spawning the pgbackrust binary as a local worker should succeed");
 
     let path = Path::new("subdir/file.txt");
     let payload = b"inter-host storage over a real spawned worker\n";
@@ -81,10 +81,10 @@ fn remote_storage_over_spawned_binary_worker() {
 }
 
 #[test]
-#[ignore = "requires an SSH-reachable host with pgbackrest installed; set PGBR_IT_SSH_HOST"]
+#[ignore = "requires an SSH-reachable host with pgbackrust installed; set PGBR_IT_SSH_HOST"]
 fn remote_storage_over_ssh() {
     // Gated on a real host: `PGBR_IT_SSH_HOST=user@host` (or just `host`) with
-    // `pgbackrest` on its PATH and a writable repo path. Optional
+    // `pgbackrust` on its PATH and a writable repo path. Optional
     // `PGBR_IT_SSH_REPO_PATH` overrides the remote repo root.
     let host = std::env::var("PGBR_IT_SSH_HOST").expect("PGBR_IT_SSH_HOST must be set for this test");
     let repo_path = std::env::var("PGBR_IT_SSH_REPO_PATH").unwrap_or_else(|_| "/tmp/pgbr-it-repo".to_owned());
@@ -93,7 +93,7 @@ fn remote_storage_over_ssh() {
     let (user, host) = host.split_once('@').map_or((None, host.as_str()), |(u, h)| (Some(u), h));
 
     let remote_args = vec!["backup:remote".to_owned(), format!("--repo1-path={repo_path}")];
-    let storage = RemoteProcessStorage::spawn_ssh(host, None, user, "pgbackrest", &remote_args)
+    let storage = RemoteProcessStorage::spawn_ssh(host, None, user, "pgbackrust", &remote_args)
         .expect("spawning the ssh worker should succeed");
 
     let path = Path::new("ssh-roundtrip.txt");

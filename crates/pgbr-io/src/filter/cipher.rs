@@ -1,7 +1,7 @@
 //! AES-256-CBC cipher filter, OpenSSL-compatible `Salted__` framing.
 //!
 //! Wire format (matches `openssl enc -aes-256-cbc -salt`, and the on-disk
-//! layout pgBackRest's repos use — pgBackRest's `CIPHER_BLOCK_MAGIC` is
+//! layout pgBackRust's repos use — pgBackRust's `CIPHER_BLOCK_MAGIC` is
 //! literally `"Salted__"`, see `src/common/crypto/cipherBlock.c`):
 //!
 //! ```text
@@ -15,7 +15,7 @@
 //! `digest(D_{n-1} || password || salt)` until 48 bytes are available; the
 //! first 32 are the AES-256 key and the next 16 are the IV. A single
 //! iteration is a known-weak KDF, but the on-disk format is locked for
-//! backward compatibility with existing pgBackRest repos.
+//! backward compatibility with existing pgBackRust repos.
 //!
 //! # Digest selection
 //!
@@ -24,12 +24,12 @@
 //! - [`CipherDigest::Md5`] — the `openssl enc` CLI default. Used by the
 //!   legacy [`Cipher::encrypt`] / [`Cipher::decrypt`] constructors so any
 //!   pre-existing repo bytes round-trip unchanged.
-//! - [`CipherDigest::Sha1`] — **pgBackRest's default digest** (its
+//! - [`CipherDigest::Sha1`] — **pgBackRust's default digest** (its
 //!   `cipherBlockDigestCode` falls back to `EVP_sha1()` when no digest is
 //!   passed, which is the case for info-file and backup-file encryption).
-//!   Use [`Cipher::encrypt_pgbackrest`] / [`Cipher::decrypt_pgbackrest`] for
-//!   byte-compatibility with a pgBackRest C repository.
-//! - [`CipherDigest::Sha256`] — available for completeness; pgBackRest can
+//!   Use [`Cipher::encrypt_pgbackrust`] / [`Cipher::decrypt_pgbackrust`] for
+//!   byte-compatibility with a pgBackRust C repository.
+//! - [`CipherDigest::Sha256`] — available for completeness; pgBackRust can
 //!   be asked for it explicitly but does not use it by default.
 //!
 //! # Implementation note (buffering)
@@ -75,7 +75,7 @@ pub enum CipherMode {
 
 /// Hash used by the `EVP_BytesToKey` key-derivation function.
 ///
-/// pgBackRest's `cipherBlockDigestCode` maps the optional `digest` parameter
+/// pgBackRust's `cipherBlockDigestCode` maps the optional `digest` parameter
 /// to one of these; when no digest is supplied it falls back to
 /// [`CipherDigest::Sha1`]. The `openssl enc` CLI defaults to
 /// [`CipherDigest::Md5`].
@@ -83,14 +83,14 @@ pub enum CipherMode {
 pub enum CipherDigest {
     /// MD5 — the `openssl enc -aes-256-cbc` CLI default.
     Md5,
-    /// SHA-1 — pgBackRest's default digest for info/backup-file encryption.
+    /// SHA-1 — pgBackRust's default digest for info/backup-file encryption.
     Sha1,
     /// SHA-256.
     Sha256,
 }
 
 /// AES-256-CBC filter compatible with `openssl enc -aes-256-cbc -salt` and
-/// with pgBackRest's `CipherBlock`.
+/// with pgBackRust's `CipherBlock`.
 ///
 /// The filter buffers its input in `process` and performs the actual
 /// encrypt / decrypt in `finish`. See the module docstring for why.
@@ -109,8 +109,8 @@ impl Cipher {
     /// password produce different ciphertexts.
     ///
     /// This is the historical constructor and is kept byte-for-byte stable;
-    /// for pgBackRest-repository compatibility use
-    /// [`Cipher::encrypt_pgbackrest`] instead.
+    /// for pgBackRust-repository compatibility use
+    /// [`Cipher::encrypt_pgbackrust`] instead.
     #[must_use]
     pub fn encrypt(password: &[u8]) -> Self {
         Self::new(CipherMode::Encrypt, CipherDigest::Md5, password)
@@ -124,18 +124,18 @@ impl Cipher {
         Self::new(CipherMode::Decrypt, CipherDigest::Md5, password)
     }
 
-    /// Build an encryption filter compatible with a pgBackRest C repository:
-    /// `"Salted__"` framing with the **SHA-1** KDF that pgBackRest uses by
+    /// Build an encryption filter compatible with a pgBackRust C repository:
+    /// `"Salted__"` framing with the **SHA-1** KDF that pgBackRust uses by
     /// default for info-file and backup-file encryption.
     #[must_use]
-    pub fn encrypt_pgbackrest(password: &[u8]) -> Self {
+    pub fn encrypt_pgbackrust(password: &[u8]) -> Self {
         Self::new(CipherMode::Encrypt, CipherDigest::Sha1, password)
     }
 
-    /// Build a decryption filter compatible with a pgBackRest C repository
-    /// (SHA-1 KDF). See [`Cipher::encrypt_pgbackrest`].
+    /// Build a decryption filter compatible with a pgBackRust C repository
+    /// (SHA-1 KDF). See [`Cipher::encrypt_pgbackrust`].
     #[must_use]
-    pub fn decrypt_pgbackrest(password: &[u8]) -> Self {
+    pub fn decrypt_pgbackrust(password: &[u8]) -> Self {
         Self::new(CipherMode::Decrypt, CipherDigest::Sha1, password)
     }
 
@@ -397,9 +397,9 @@ mod tests {
         assert_eq!(iv, expected_iv, "EVP_BytesToKey(MD5) iv drift");
     }
 
-    /// Known-answer vector for the SHA-1 KDF that pgBackRest uses by default.
+    /// Known-answer vector for the SHA-1 KDF that pgBackRust uses by default.
     ///
-    /// Reproduce with OpenSSL (matches what pgBackRest's `CipherBlock` feeds
+    /// Reproduce with OpenSSL (matches what pgBackRust's `CipherBlock` feeds
     /// libcrypto):
     ///
     /// ```sh
@@ -411,7 +411,7 @@ mod tests {
     /// cover the 48 key+iv bytes; the first 32 are the key and the next 16 the
     /// IV. Cross-checked against the `openssl enc` output above.
     #[test]
-    fn kdf_matches_pgbackrest_sha1_reference() {
+    fn kdf_matches_pgbackrust_sha1_reference() {
         let salt: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
         let (key, iv) = Cipher::derive_key_iv(CipherDigest::Sha1, b"password", &salt);
 
@@ -427,33 +427,33 @@ mod tests {
     }
 
     #[test]
-    fn pgbackrest_sha1_round_trips() {
+    fn pgbackrust_sha1_round_trips() {
         let plaintext = b"a repo sub-key stored inside archive.info / backup.info";
         let recovered = roundtrip_digest(plaintext, b"user passphrase", CipherDigest::Sha1);
         assert_eq!(recovered, plaintext);
     }
 
     #[test]
-    fn pgbackrest_constructors_use_sha1() {
+    fn pgbackrust_constructors_use_sha1() {
         // The convenience constructors must select the SHA-1 digest.
-        assert_eq!(Cipher::encrypt_pgbackrest(b"x").digest(), CipherDigest::Sha1);
-        assert_eq!(Cipher::decrypt_pgbackrest(b"x").digest(), CipherDigest::Sha1);
+        assert_eq!(Cipher::encrypt_pgbackrust(b"x").digest(), CipherDigest::Sha1);
+        assert_eq!(Cipher::decrypt_pgbackrust(b"x").digest(), CipherDigest::Sha1);
         // Legacy constructors stay on MD5.
         assert_eq!(Cipher::encrypt(b"x").digest(), CipherDigest::Md5);
         assert_eq!(Cipher::decrypt(b"x").digest(), CipherDigest::Md5);
     }
 
     #[test]
-    fn pgbackrest_encrypt_decrypt_round_trips_via_helpers() {
+    fn pgbackrust_encrypt_decrypt_round_trips_via_helpers() {
         let plaintext = b"chain: user pass -> repo sub-key -> backup sub-key -> file data";
-        let mut enc = Cipher::encrypt_pgbackrest(b"hunter2");
+        let mut enc = Cipher::encrypt_pgbackrust(b"hunter2");
         let mut ciphertext = Vec::new();
         Filter::process(&mut enc, plaintext, &mut ciphertext).unwrap();
         Filter::finish(&mut enc, &mut ciphertext).unwrap();
-        // pgBackRest framing: "Salted__" + 8-byte salt prefix.
+        // pgBackRust framing: "Salted__" + 8-byte salt prefix.
         assert_eq!(&ciphertext[..SALT_MAGIC.len()], SALT_MAGIC);
 
-        let mut dec = Cipher::decrypt_pgbackrest(b"hunter2");
+        let mut dec = Cipher::decrypt_pgbackrust(b"hunter2");
         let mut recovered = Vec::new();
         Filter::process(&mut dec, &ciphertext, &mut recovered).unwrap();
         Filter::finish(&mut dec, &mut recovered).unwrap();

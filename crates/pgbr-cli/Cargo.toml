@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "pgbackrest"
+name = "pgbackrust"
 path = "src/main.rs"
 
 [lib]
@@ -28,7 +28,7 @@ pgbr-protocol = { path = "../pgbr-protocol" }
 pgbr-storage = { path = "../pgbr-storage" }
 # The `repo-host-type=tls` / `pg-host-type=tls` worker transport opens a TLS
 # connection (built by `pgbr_command::server`) to the peer's running
-# `pgbackrest server` and runs the storage protocol over it. The `StreamOwned`
+# `pgbackrust server` and runs the storage protocol over it. The `StreamOwned`
 # the connector returns and the `Send`-able shared adapter built around it both
 # need rustls types. Match pgbr-command: ring provider, no aws-lc C build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

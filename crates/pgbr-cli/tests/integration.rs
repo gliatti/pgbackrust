@@ -1,4 +1,4 @@
-//! Integration test suite for the pgBackRest Rust port.
+//! Integration test suite for the pgBackRust Rust port.
 //!
 //! This complements the lifecycle smoke test in `tests/e2e.rs` and is purely
 //! cargo-native: no shell drivers, no external orchestrator.

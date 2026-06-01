@@ -2,7 +2,7 @@
 //!
 //! [`FileRead`] wraps [`std::fs::File`] for read-only streaming. [`FileWrite`]
 //! wraps it for write-only streaming with an explicit `close` step that
-//! `fsync`s the file to durable storage — matching pgBackRest's POSIX storage
+//! `fsync`s the file to durable storage — matching pgBackRust's POSIX storage
 //! semantics. Errors carry the offending path so callers don't have to thread
 //! it through manually.
 

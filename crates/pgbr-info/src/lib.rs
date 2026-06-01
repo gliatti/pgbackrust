@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! On-disk pgBackRest metadata files: `archive.info`, `backup.info`, and `backup.manifest`.
+//! On-disk pgBackRust metadata files: `archive.info`, `backup.info`, and `backup.manifest`.
 //!
-//! These files are INI-with-checksum documents that describe the state of a pgBackRest
+//! These files are INI-with-checksum documents that describe the state of a pgBackRust
 //! repository — what `PostgreSQL` clusters have been backed up, what backups exist for
 //! each cluster, what versions are supported, and what files each backup captured. This
 //! crate ships:

@@ -1,4 +1,4 @@
-//! Typed request / response shapes for the pgBackRest local/remote protocol.
+//! Typed request / response shapes for the pgBackRust local/remote protocol.
 //!
 //! See the crate-level documentation for the wire format. The types here
 //! preserve `param` and `out` payloads as raw [`serde_json::Value`] so each

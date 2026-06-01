@@ -40,7 +40,7 @@ const KEY_DB_VERSION: &str = "db-version";
 const KEY_DB_CATALOG_VERSION: &str = "db-catalog-version";
 const KEY_DB_CONTROL_VERSION: &str = "db-control-version";
 /// Per-backup record key holding that backup's encryption sub-key (the key the
-/// backup's manifest + file data are encrypted with). pgBackRest keeps this in
+/// backup's manifest + file data are encrypted with). pgBackRust keeps this in
 /// the manifest; recording it on the `[backup:current]` entry as well lets
 /// restore resolve the chain straight from `backup.info`.
 const KEY_BACKUP_CIPHER_PASS: &str = "backup-cipher-pass";
@@ -50,9 +50,9 @@ const KEY_BACKUP_CIPHER_PASS: &str = "backup-cipher-pass";
 /// description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfoBackup {
-    /// pgBackRest on-disk format version (currently `5`).
+    /// pgBackRust on-disk format version (currently `5`).
     pub backrest_format: u32,
-    /// pgBackRest version string of the writer that last persisted this file.
+    /// pgBackRust version string of the writer that last persisted this file.
     pub backrest_version: String,
     /// Active cluster's `db-id`.
     pub db_id: u32,
@@ -174,7 +174,7 @@ impl InfoBackup {
 
     /// Write `backup.info` (and its `.copy` mirror) to `path`, storing
     /// `cipher_pass` in the `[cipher]` section and encrypting under `passphrase`
-    /// when the repository is encrypted. Matches pgBackRest's
+    /// when the repository is encrypted. Matches pgBackRust's
     /// `infoBackupSaveFile`.
     ///
     /// # Errors

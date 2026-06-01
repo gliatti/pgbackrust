@@ -2,7 +2,7 @@
 //!
 //! The bar this suite enforces: *no command fails at config resolution*. Every
 //! one of the 23 dispatch commands, given a reasonable argv, must make it
-//! through the parse -> resolve -> `pgbackrest.conf` load -> default-resolution
+//! through the parse -> resolve -> `pgbackrust.conf` load -> default-resolution
 //! -> validation pipeline and reach its command implementation. The command's
 //! own runtime outcome (success, or a typed [`pgbr_command::CommandError`], or a
 //! storage/spawn error) is *not* this suite's concern — what must never happen
@@ -12,14 +12,14 @@
 //! - [`CliRunError::Load`] — the merge/default-resolution/validation step
 //!   rejected the resolved invocation (the class the literal-default and
 //!   depend-gating fixes targeted),
-//! - [`CliRunError::Ini`] — `pgbackrest.conf` parse failure,
+//! - [`CliRunError::Ini`] — `pgbackrust.conf` parse failure,
 //! - [`CliRunError::StorageConfig`] — a required storage option was missing or
 //!   had an unsupported value when building a backend.
 //!
 //! Each command is driven through the real `pgbr_cli::run_with_context` (the
 //! same entry the binary uses), with a deterministic [`RuntimeContext`] so the
 //! `default-type: dynamic` `bin` family resolves to a fixed path. A `--config`
-//! pointing at a guaranteed-absent file keeps the host's `/etc/pgbackrest`
+//! pointing at a guaranteed-absent file keeps the host's `/etc/pgbackrust`
 //! (if any) out of the picture: the loader falls back to an empty INI, so the
 //! resolution exercised is purely the embedded `config.yaml` defaults.
 
@@ -32,7 +32,7 @@ use pgbr_config::RuntimeContext;
 /// deterministically rather than depending on the test binary's location.
 fn ctx() -> RuntimeContext {
     RuntimeContext {
-        exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+        exe_path: Some("/usr/bin/pgbackrust".to_owned()),
     }
 }
 
@@ -110,7 +110,7 @@ fn check_command(command: &str, roots: Roots, extra: &[&str]) {
     // Always isolate `--lock-path` to a per-test tempdir for the commands
     // that accept it: `stop` writes `<lock-path>/<stanza>.stop` LOCALLY, and
     // `backup`/`archive-push`/… now gate on the same file, so a leaked sentinel
-    // under the shared default `/tmp/pgbackrest` would break sibling tests
+    // under the shared default `/tmp/pgbackrust` would break sibling tests
     // (e2e backup, lib.rs dispatch) in the same `cargo test` invocation.
     let lock = tempfile::tempdir().expect("lock tempdir");
 
@@ -294,7 +294,7 @@ fn server_ping_reaches_dispatch() {
     // config-resolution one.
     assert_reaches_dispatch(
         "server-ping",
-        run_with_context(["--config=/definitely/missing/pgbackrest.conf", "server-ping"], &ctx()),
+        run_with_context(["--config=/definitely/missing/pgbackrust.conf", "server-ping"], &ctx()),
     );
 }
 
@@ -359,7 +359,7 @@ fn server_resolves() {
     // resolution is what this suite cares about, so exercise the full
     // parse -> resolve -> load pipeline via `resolve_only` (which stops just
     // short of dispatch) and assert it does NOT fail config resolution.
-    match resolve_only(["--config=/definitely/missing/pgbackrest.conf", "server"], &ctx()) {
+    match resolve_only(["--config=/definitely/missing/pgbackrust.conf", "server"], &ctx()) {
         Ok(_) => {}
         Err(err @ (CliRunError::CliResolve(_) | CliRunError::Load(_) | CliRunError::Ini(_) | CliRunError::StorageConfig(_))) => {
             panic!("command `server` failed CONFIG RESOLUTION (must resolve): {err:?}");

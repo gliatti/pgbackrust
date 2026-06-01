@@ -15,7 +15,7 @@ BIN=/usr/lib/postgresql/$PGV/bin
 
 info "08 multi-repo: two local repos with different retention"
 node principal bash -c "install -d -o postgres -g postgres -m 0750 $R1 $R2"
-node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=$R1
 repo1-retention-full=1
@@ -27,7 +27,7 @@ start-fast=y
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 
 reset_principal "$DATADIR" "$BIN" "$STANZA"
 

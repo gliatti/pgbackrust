@@ -24,7 +24,7 @@ use crate::types::{ConfigCommandRole, DefaultType, OptionGroup, OptionSection, O
 // internal, secure, required, bool_like, beta). Bundling them into a state-
 // machine enum would be more boilerplate than insight, so suppress the lint.
 #[allow(clippy::struct_excessive_bools)]
-/// One pgBackRest option (e.g. `repo-path`, `pg1-host`, `compress-level`)
+/// One pgBackRust option (e.g. `repo-path`, `pg1-host`, `compress-level`)
 /// after resolution from `config.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfgOption {

@@ -15,11 +15,11 @@
 //! the repository for the plaintext segment first, then for each compression
 //! suffix, and runs the matching decompress filter so a WAL archived compressed
 //! is recovered regardless of the client's current `compress-type` — matching
-//! pgBackRest, which names archived WAL with the compression extension.
+//! pgBackRust, which names archived WAL with the compression extension.
 //!
 //! ## Multiple repositories
 //!
-//! pgBackRest copies every WAL segment into **every** configured repository: a
+//! pgBackRust copies every WAL segment into **every** configured repository: a
 //! segment is only "archived" once it is present on all of them. [`push`] takes
 //! a slice of repository [`Storage`] backends (one per configured repo, built by
 //! the CLI's `build_all_repo_storages`) and fans the copy out to each — if any
@@ -73,7 +73,7 @@ use crate::pipeline::{CompressType, RepoTransform};
 
 /// File extensions for stored WAL, in the order `archive-get` probes them
 /// once the plaintext form is found absent. Each maps to the compress codec
-/// that produced it. `pgbackrest` names archived WAL with the codec's
+/// that produced it. `pgbackrust` names archived WAL with the codec's
 /// extension, so a recovering client must try every suffix.
 const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
 
@@ -163,7 +163,7 @@ fn active_repo_index(config: &LoadedConfig) -> u32 {
 /// `None` when that repository is unencrypted.
 ///
 /// WAL is encrypted with the repository *sub-key* (the second level of
-/// pgBackRest's two-level scheme), not the user passphrase directly. The sub-key
+/// pgBackRust's two-level scheme), not the user passphrase directly. The sub-key
 /// is stored, encrypted under the user passphrase, in the `[cipher]` section of
 /// that repository's `archive.info`; [`InfoArchive::load_keyed`] returns it. A
 /// repository with no `archive.info` yet (uninitialised) returns `Ok(None)` —
@@ -286,7 +286,7 @@ fn write_segment_to_dest_arg(bytes: &[u8], dest_arg: &Path) -> Result<(), Comman
 /// `name` is the segment basename plus any compression suffix (e.g.
 /// `000000010000000000000001` or `000000010000000000000001.gz`). The
 /// `archive_id` is `<db-version>-<db-id>` from the stanza's `archive.info`
-/// (see [`archive_id`]), matching pgBackRest's per-cluster archive directory
+/// (see [`archive_id`]), matching pgBackRust's per-cluster archive directory
 /// and the layout the `check` command polls.
 fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
     PathBuf::from(format!("archive/{stanza}/{archive_id}/{name}"))
@@ -400,7 +400,7 @@ fn queue_max(config: &LoadedConfig, name: &str) -> Option<u64> {
 }
 
 /// Whether `archive-header-check` is enabled. Defaults to **true** (the option
-/// model's default) when unset, matching pgBackRest validating the WAL header on
+/// model's default) when unset, matching pgBackRust validating the WAL header on
 /// every `archive-push` unless explicitly disabled.
 fn archive_header_check(config: &LoadedConfig) -> bool {
     !matches!(
@@ -423,7 +423,7 @@ fn archive_missing_retry(config: &LoadedConfig) -> bool {
 /// 24-hex WAL segment names — the unarchived-WAL backlog the push-queue limit
 /// guards. A non-existent / unreadable directory contributes 0.
 ///
-/// pgBackRest's "Push-queue" check measures the WAL waiting to be archived; a
+/// pgBackRust's "Push-queue" check measures the WAL waiting to be archived; a
 /// completed WAL segment's name is a 24-hex string (optionally with a `.partial`
 /// / `.ready` companion, which are skipped here as they are not the WAL itself).
 /// Summing only segment-named files keeps the measurement to the WAL bytes that
@@ -496,7 +496,7 @@ fn push_queue_exceeded(queue_max: Option<u64>, backlog: u64) -> bool {
 
 /// Emit a `WARN` line that the push-queue limit dropped a WAL segment.
 ///
-/// pgBackRest returns success to `PostgreSQL` so PG recycles the WAL (rather than
+/// pgBackRust returns success to `PostgreSQL` so PG recycles the WAL (rather than
 /// the partition filling), logging a warning that the segment was dropped. The
 /// message is human-facing diagnostic output, so it is routed through the
 /// `pgbr_core::log` formatter ([`log_warn`]) rather than stdout, which is
@@ -510,7 +510,7 @@ fn warn_queue_dropped(segment: &str, backlog: u64, limit: u64) {
 
 /// Emit a human-facing `WARN` diagnostic through the `pgbr_core::log` formatter.
 ///
-/// pgBackRest sends progress / warning lines to its log (the console at
+/// pgBackRust sends progress / warning lines to its log (the console at
 /// `log-level-console`, plus the log file at `log-level-file`), keeping stdout
 /// free for machine-readable command output. This routes the warning through the
 /// migrated logger — the Rust analogue of the C `LOG_WARN` macro — so it is
@@ -594,7 +594,7 @@ fn check_wal_header(bytes: &[u8], segment: &str, info: &InfoArchive) -> Result<(
 /// to `archive-push` — a backup history file (`<seg>.<off>.backup`) and a
 /// timeline history file (`<tli>.history`) — which have no WAL page header and
 /// must be archived verbatim rather than header-checked (and rejected).
-/// Mirrors pgBackRest's `walIsSegment()`.
+/// Mirrors pgBackRust's `walIsSegment()`.
 fn is_checkable_wal_segment(name: &str) -> bool {
     let base = name.strip_suffix(".partial").unwrap_or(name);
     parse_wal_segment(base).is_some()
@@ -765,7 +765,7 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     // PostgreSQL's archiver retries the SAME file until it succeeds and never
     // advances the queue, so rejecting a `.backup` file blocks every later
     // segment — including the stop-segment `pg_backup_stop(wait_for_archive)`
-    // waits on — and the backup hangs forever. Mirrors pgBackRest gating the
+    // waits on — and the backup hangs forever. Mirrors pgBackRust gating the
     // header check on `walIsSegment()`.
     let header_info = (archive_header_check(config) && is_checkable_wal_segment(segment)).then_some(&archive_info);
 
@@ -847,7 +847,7 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
 /// `archive_info` is `Some`, i.e. `archive-header-check` is on and the file is a
 /// real WAL segment), and the plaintext copy written into out/. Staging copies
 /// the plaintext WAL — compression and encryption happen during the drain,
-/// matching pgBackRest (the async client never compresses). The
+/// matching pgBackRust (the async client never compresses). The
 /// foreground/drain handshake status (`.ok` / `.error`) is consumed by the
 /// caller before staging.
 fn stage_push_segment(
@@ -1017,7 +1017,7 @@ fn drain_one(
 /// to every staged segment — the per-repo-encryption counterpart of
 /// [`drain_push_spool`].
 ///
-/// pgBackRest's async client stages a single plaintext copy of each WAL segment;
+/// pgBackRust's async client stages a single plaintext copy of each WAL segment;
 /// the background drain is what actually compresses, encrypts, and writes it to
 /// each repository. Because each repository has its own cipher sub-key, the
 /// drain must run once per repository with that repository's `transform`
@@ -1568,7 +1568,7 @@ fn fetch_segment_with_retry(
     // Still missing. A timeline-history file (`<tli>.history`) that no repository
     // holds is not an error: PostgreSQL probes for `.history` files on every
     // higher timeline to discover branches, and a missing one simply means "no
-    // newer timeline". Stock pgBackRest returns exit 0 (no destination file
+    // newer timeline". Stock pgBackRust returns exit 0 (no destination file
     // written) for the missing case so the noisy "not found:" stderr line and
     // the non-zero exit go away. Match the segment name suffix exactly (plain
     // string, case-sensitive) — `.history` files are always lowercase per the
@@ -2297,7 +2297,7 @@ mod tests {
     }
 
     /// Regression test for the PG-18 alt-restore bug: when PG's `restore_command`
-    /// invokes `pgbackrest archive-get <seg> <relative-dest>` with cwd=PGDATA
+    /// invokes `pgbackrust archive-get <seg> <relative-dest>` with cwd=PGDATA
     /// and PGDATA != pg1-path, the WAL must land at the cwd-relative destination
     /// (where PG will `stat()` it), NOT under `<pg1-path>/<relative-dest>`. The
     /// pre-fix code wrote through `pg_storage` (a `Posix` rooted at pg1-path)
@@ -2351,7 +2351,7 @@ mod tests {
     /// Secondary fix: missing `.history` returns exit 0 (no file written).
     /// PG probes for every higher timeline's `.history` file on recovery; an
     /// archive that does not hold one means "no newer timeline", not an error.
-    /// Stock pgBackRest documents exit 0 for the missing case; the Rust port
+    /// Stock pgBackRust documents exit 0 for the missing case; the Rust port
     /// must match so the noisy "not found:" stderr line and non-zero exit go
     /// away.
     #[test]
@@ -2369,7 +2369,7 @@ mod tests {
         get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("missing .history must be exit 0");
 
         // No destination file: PG's restore_command treats exit 0 + missing
-        // file as "no newer timeline" (the documented stock-pgBackRest
+        // file as "no newer timeline" (the documented stock-pgBackRust
         // behaviour); writing an empty/spurious file would mislead PG.
         let cwd_dest = pg.path().join("pg_wal").join("RECOVERYHISTORY");
         assert!(
@@ -2972,7 +2972,7 @@ mod tests {
     // Per-repo archive encryption (Task 25)
     // -----------------------------------------------------------------------
 
-    /// pgBackRest's AES-256-CBC framing prefix; encrypted repo bytes start with
+    /// pgBackRust's AES-256-CBC framing prefix; encrypted repo bytes start with
     /// it (`"Salted__"`), so its presence proves a segment was encrypted.
     const CIPHER_MAGIC: &[u8] = b"Salted__";
 

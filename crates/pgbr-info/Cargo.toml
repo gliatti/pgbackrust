@@ -23,7 +23,7 @@ sha1 = "0.10"
 # Parsed sections / keys retain their insertion order so parse->render is byte-identical.
 indexmap = "2"
 # Base64 encoder for the random repository / backup encryption sub-keys, matching
-# pgBackRest's `strNewEncode(encodingBase64, ...)` in `cipherPassGen`.
+# pgBackRust's `strNewEncode(encodingBase64, ...)` in `cipherPassGen`.
 pgbr-encode = { path = "../pgbr-encode" }
 # CSPRNG for generating the 48-byte repository / backup sub-keys (cryptoRandomBytes).
 rand = "0.8"

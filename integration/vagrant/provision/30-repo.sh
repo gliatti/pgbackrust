@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Repository-server (depot) provisioning: the backup storage directory plus a
-# baseline /etc/pgbackrest.conf for the "pull from depot" scenarios. The depot
+# baseline /etc/pgbackrust.conf for the "pull from depot" scenarios. The depot
 # also runs the pgBackRust TLS server for the SSH-alternative scenario. The
 # config file uses the legacy 'e' path the current binary falls back to when
-# /etc/pgbackrest/pgbackrest.conf is absent.
+# /etc/pgbackrust/pgbackrust.conf is absent.
 set -euo pipefail
 
 REPO=/srv/nfs/depot/pgbackrust
 install -d -o postgres -g postgres -m 0750 "$REPO"
 
 # Baseline pull config (KB "Exemple 2"): depot reaches principal over SSH.
-cat > /etc/pgbackrest.conf <<EOF
+cat > /etc/pgbackrust.conf <<EOF
 [global]
 repo1-path=$REPO
 repo1-retention-full=2
@@ -28,6 +28,6 @@ pg1-path=/var/lib/postgresql/16/principal
 pg1-port=5433
 pg1-user=postgres
 EOF
-chown postgres:postgres /etc/pgbackrest.conf
+chown postgres:postgres /etc/pgbackrust.conf
 
 echo "[repo] depot ready: repo=$REPO"

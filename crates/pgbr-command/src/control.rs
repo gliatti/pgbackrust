@@ -16,7 +16,7 @@
 
 use crate::CommandError;
 
-const VERSION: &str = "pgBackRest 2.58";
+const VERSION: &str = "pgBackRust 2.58";
 
 /// Emit a human-facing progress line at `INFO` through the `pgbr_core::log`
 /// formatter.
@@ -73,7 +73,7 @@ pub(crate) fn log_warn(message: &str) {
 #[allow(clippy::print_stdout, clippy::unnecessary_wraps)]
 pub fn version(_config: &pgbr_config::LoadedConfig) -> Result<(), CommandError> {
     // TODO: source from build-time const (e.g. `env!("CARGO_PKG_VERSION")` once
-    // the workspace version matches the user-facing pgBackRest version, or a
+    // the workspace version matches the user-facing pgBackRust version, or a
     // dedicated `pgbr-build` constant).
     println!("{VERSION}");
     Ok(())

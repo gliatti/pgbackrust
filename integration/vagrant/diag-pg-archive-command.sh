@@ -49,7 +49,7 @@ timeout 30 vagrant ssh depot -c "sudo bash -c 'rm -rf /var/lib/pgbackrust/* /var
 # Write principal pgbackrust.conf (TLS client) — same as test-tls-server.sh
 CD=/etc/pgbackrust/certs
 timeout 30 vagrant ssh principal -c "
-sudo tee /etc/pgbackrest/pgbackrest.conf >/dev/null <<EOF
+sudo tee /etc/pgbackrust/pgbackrust.conf >/dev/null <<EOF
 [global]
 repo1-host=depot
 repo1-host-type=tls
@@ -65,7 +65,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$PRI
 pg1-port=5433
 EOF
-sudo chmod 0644 /etc/pgbackrest/pgbackrest.conf
+sudo chmod 0644 /etc/pgbackrust/pgbackrust.conf
 # Override PG's archive_command to use our traced wrapper.
 sudo -u postgres /usr/lib/postgresql/$PGV/bin/psql -p5433 -c \"ALTER SYSTEM SET archive_command = '/usr/local/bin/pgbr-traced-push %p'\"
 sudo -u postgres /usr/lib/postgresql/$PGV/bin/psql -p5433 -c \"SELECT pg_reload_conf()\"

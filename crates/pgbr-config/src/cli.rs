@@ -1,6 +1,6 @@
 //! Command-line argument tokenizer and resolver.
 //!
-//! Two-phase parsing of the `pgbackrest` invocation's argv:
+//! Two-phase parsing of the `pgbackrust` invocation's argv:
 //!
 //! 1. [`parse_cli`] turns a flat `argv`-style iterator into a [`CliInput`] —
 //!    a structurally validated form (command identifier, raw option entries,
@@ -118,7 +118,7 @@ where
                 return Err(CliError::EmptyKey);
             }
             let (modifier, key) = strip_modifier(&raw_key);
-            // pgBackRest CLI option VALUES are always given with `=`
+            // pgBackRust CLI option VALUES are always given with `=`
             // (`--type=full`, `--target='...'`); a bare `--option` is a flag
             // (boolean true, or `--no-`/`--reset-`). Bare tokens that follow are
             // positionals — the command or a parameter (e.g. the WAL path) — and
@@ -474,7 +474,7 @@ option:
 
     #[test]
     fn space_separated_token_is_positional_not_a_value() {
-        // pgBackRest option values use `=`; a bare token after a flag is a
+        // pgBackRust option values use `=`; a bare token after a flag is a
         // positional, NOT the option's value. `--stanza demo` => `--stanza`
         // flag (no value) + `demo` as the command.
         let r = parse_cli(["--stanza", "demo"]).unwrap();
@@ -485,7 +485,7 @@ option:
 
     #[test]
     fn boolean_flag_before_command_keeps_command() {
-        // Regression: `pgbackrest --stanza=demo --delta restore` must parse the
+        // Regression: `pgbackrust --stanza=demo --delta restore` must parse the
         // command as `restore`, not swallow it as `--delta`'s value.
         let r = parse_cli(["--stanza=demo", "--delta", "restore"]).unwrap();
         assert_eq!(r.command.as_deref(), Some("restore"));

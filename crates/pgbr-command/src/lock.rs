@@ -7,7 +7,7 @@
 //! Two distinct on-disk contracts live here, both unchanged from C:
 //!
 //! * **Stop files** — a stop file at `<lock-path>/<stanza>.stop` (or
-//!   `all.stop` when no stanza is supplied) tells the rest of pgBackRest to
+//!   `all.stop` when no stanza is supplied) tells the rest of pgBackRust to
 //!   refuse new commands. `--force` is recorded inside the stop file body.
 //!   Managed by [`stop`] / [`start`].
 //! * **Advisory locks** — before a mutating command (backup / restore /
@@ -26,7 +26,7 @@ use crate::CommandError;
 
 /// Default lock-path when `--lock-path` is not supplied. Matches the C
 /// default in `src/build/config/config.yaml`.
-const DEFAULT_LOCK_PATH: &str = "/tmp/pgbackrest";
+const DEFAULT_LOCK_PATH: &str = "/tmp/pgbackrust";
 
 /// Resolve the lock directory from the configured `lock-path`, falling back to
 /// [`DEFAULT_LOCK_PATH`].
@@ -58,11 +58,11 @@ fn stop_file(config: &LoadedConfig) -> PathBuf {
 }
 
 /// Write `<lock-path>/<stanza>.stop` (or `all.stop` if no stanza) so the
-/// rest of pgBackRest refuses new commands. With `--force`, the file body
+/// rest of pgBackRust refuses new commands. With `--force`, the file body
 /// records `force=1\n`.
 ///
-/// Stop files are intrinsically LOCAL to the host running `pgbackrest`
-/// (stock pgBackRest C uses `storageLocalWrite` in
+/// Stop files are intrinsically LOCAL to the host running `pgbackrust`
+/// (stock pgBackRust C uses `storageLocalWrite` in
 /// `src/command/control/stop.c`). Going through a `Storage` backend would
 /// route the path through whichever repository is configured — on S3 /
 /// Azure / GCS / SFTP it would create an object key inside the bucket

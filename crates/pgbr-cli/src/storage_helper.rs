@@ -5,8 +5,8 @@
 //! Routing (per the C reference):
 //!
 //! - If `repo-host` (resp. `pg-host`) is set the storage is *remote* — driven
-//!   over an SSH tunnel by the protocol layer. We spawn a `pgbackrest` worker
-//!   on that host (`ssh <host> pgbackrest <command>:remote …`, see
+//!   over an SSH tunnel by the protocol layer. We spawn a `pgbackrust` worker
+//!   on that host (`ssh <host> pgbackrust <command>:remote …`, see
 //!   [`crate::remote_storage`]) and proxy every [`Storage`] call to it through
 //!   [`pgbr_storage::remote::RemoteStorage`]. C ref: `src/protocol/helper.c`.
 //! - Otherwise the repo backend is selected by `repo-type` (default `posix`):
@@ -16,7 +16,7 @@
 //!
 //! ## Multiple repositories (`--repo=N`)
 //!
-//! pgBackRest indexes its repository options by a 1-based group index
+//! pgBackRust indexes its repository options by a 1-based group index
 //! (`repo1-type`, `repo2-path`, …). The `--repo` integer option (default `1`)
 //! selects the *active* repository for single-repo commands (`info`, `expire`,
 //! `restore`, …) — `--repo=2 info` reads `repo2-*`. [`build_repo_storage`]
@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use pgbr_config::{LoadedConfig, OptionValue};
-use pgbr_protocol::PGBACKREST_PROGRAM;
+use pgbr_protocol::PGBACKRUST_PROGRAM;
 use pgbr_storage::s3::{S3Encryption, S3UriStyle};
 use pgbr_storage::sftp::{HostKeyCheck, HostKeyHashType};
 use pgbr_storage::{
@@ -48,7 +48,7 @@ use std::sync::Arc;
 use crate::CliRunError;
 use crate::remote_storage::{RemoteProcessStorage, RemoteTlsStorage};
 
-/// The `pgbackrest` command the spawned worker is invoked with, in the
+/// The `pgbackrust` command the spawned worker is invoked with, in the
 /// `<command>:remote` form so the child's [`pgbr_command::worker::is_worker`]
 /// recognises the `Remote` command role and serves the storage protocol on its
 /// stdio. `backup` is used because it declares the `remote` role and accepts
@@ -60,7 +60,7 @@ const WORKER_COMMAND_REMOTE: &str = "backup:remote";
 
 /// Default `repo-path` when the option is absent (matches `config.yaml`'s
 /// `repo-path` default).
-const DEFAULT_REPO_PATH: &str = "/var/lib/pgbackrest";
+const DEFAULT_REPO_PATH: &str = "/var/lib/pgbackrust";
 
 /// Default `repo-type` (matches `config.yaml`'s `repo-type` default).
 const DEFAULT_REPO_TYPE: &str = "posix";
@@ -69,11 +69,11 @@ const DEFAULT_REPO_TYPE: &str = "posix";
 /// transport.
 const DEFAULT_HOST_TYPE: &str = "ssh";
 
-/// The TLS host transport: connect to the peer's running `pgbackrest server`
+/// The TLS host transport: connect to the peer's running `pgbackrust server`
 /// over mutual TLS instead of spawning a worker over SSH.
 const HOST_TYPE_TLS: &str = "tls";
 
-/// Default `tls-server-port` the peer `pgbackrest server` listens on (matches
+/// Default `tls-server-port` the peer `pgbackrust server` listens on (matches
 /// `config.yaml`'s `tls-server-port` default), used as the TLS transport port
 /// when no `tls-server-port` is configured.
 const DEFAULT_TLS_PORT: u16 = 8432;
@@ -84,7 +84,7 @@ const PG_INDEX: u32 = 1;
 
 /// Resolve the active repository index from the `--repo` integer option,
 /// defaulting to `1` when unset (matching `config.yaml`, where `repo` is an
-/// ungrouped integer with no explicit default and pgBackRest's
+/// ungrouped integer with no explicit default and pgBackRust's
 /// "default first index" behaviour).
 #[must_use]
 pub fn active_repo_index(cfg: &LoadedConfig) -> u32 {
@@ -99,7 +99,7 @@ pub fn active_repo_index(cfg: &LoadedConfig) -> u32 {
 ///
 /// Selects the backend from `repoN-type` (default `posix`) and constructs it
 /// from the matching `repoN-*` option family at the active index. When
-/// `repoN-host` is set the repository lives on another host: a `pgbackrest`
+/// `repoN-host` is set the repository lives on another host: a `pgbackrust`
 /// worker is spawned there over SSH and every [`Storage`] call is proxied to it
 /// (see [`build_remote_host_storage`]).
 ///
@@ -124,7 +124,7 @@ pub fn build_repo_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRun
 ///
 /// As [`build_repo_storage`].
 fn build_repo_storage_at(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Storage>, CliRunError> {
-    // Inter-host operation: the repo lives on another host. Spawn a pgbackrest
+    // Inter-host operation: the repo lives on another host. Spawn a pgbackrust
     // worker there over SSH and proxy storage to it. The worker is rooted at the
     // remote `repo1-path`, which the worker side resolves from the same option.
     //
@@ -169,7 +169,7 @@ fn build_repo_storage_at(cfg: &LoadedConfig, index: u32) -> Result<Box<dyn Stora
 /// `{1}`). The active `--repo` index is always included so a `--repo=N` that
 /// only relies on defaults still participates.
 ///
-/// Mirrors pgBackRest's repo iteration (`cfgOptionGroupIdxTotal` over the
+/// Mirrors pgBackRust's repo iteration (`cfgOptionGroupIdxTotal` over the
 /// `cfgOptGrpRepo` group) in `src/config/config.c`.
 #[must_use]
 pub fn configured_repo_indexes(cfg: &LoadedConfig) -> Vec<u32> {
@@ -216,7 +216,7 @@ pub fn build_all_repo_storages(cfg: &LoadedConfig) -> Result<Vec<IndexedRepoStor
 
 /// Build the `PostgreSQL` data-directory [`Storage`] backend from the resolved
 /// config: a [`Posix`] store rooted at `pg-path`, or — when `pg-host` is set — a
-/// proxy to a `pgbackrest` worker spawned on that host over SSH (see
+/// proxy to a `pgbackrust` worker spawned on that host over SSH (see
 /// [`build_remote_host_storage`]).
 ///
 /// # Errors
@@ -262,10 +262,10 @@ fn force_local(cfg: &LoadedConfig, local_option: &str, family: &str, index: u32)
 /// Build the inter-host storage transport for `host`, selecting SSH or TLS by
 /// the `<family>-host-type` option (default `ssh`).
 ///
-/// `family` is `"repo"` or `"pg"`. For `ssh` (the default) a `pgbackrest` worker
+/// `family` is `"repo"` or `"pg"`. For `ssh` (the default) a `pgbackrust` worker
 /// is spawned on the host over SSH and proxied via [`RemoteProcessStorage`]
 /// (see [`build_ssh_host_storage`]). For `tls` a mutual-TLS connection is opened
-/// to the host's running `pgbackrest server` and the same storage protocol is
+/// to the host's running `pgbackrust server` and the same storage protocol is
 /// run over it via [`RemoteTlsStorage`] (see [`build_tls_host_storage`]).
 /// Mirrors the `ssh` / `tls` branches of the C `protocolRemoteParam` in
 /// `src/protocol/helper.c`.
@@ -295,11 +295,11 @@ fn build_remote_host_storage(
     }
 }
 
-/// Spawn a `pgbackrest` worker on `host` over SSH and wrap it in a
+/// Spawn a `pgbackrust` worker on `host` over SSH and wrap it in a
 /// [`RemoteProcessStorage`] proxy.
 ///
 /// The `*-host-{user,port,cmd}` family supplies the SSH user / port and the
-/// remote `pgbackrest` program path. The worker is invoked as
+/// remote `pgbackrust` program path. The worker is invoked as
 /// `<host-cmd> <command>:remote --stanza=<s> --<path_flag>=<remote_path>`, so it
 /// roots at `remote_path` and serves the storage protocol on its stdio.
 ///
@@ -317,11 +317,11 @@ fn build_ssh_host_storage(
     // SSH connection params from the matching `*-host-{user,port,cmd}` family.
     let ssh_user = string_option(cfg, &format!("{family}-host-user"), index);
     let ssh_port = integer_option(cfg, &format!("{family}-host-port"), index).and_then(|p| u16::try_from(p).ok());
-    // The remote `pgbackrest` program path. `*-host-cmd` is a `default-type:
+    // The remote `pgbackrust` program path. `*-host-cmd` is a `default-type:
     // dynamic` "bin" option that resolves to the *local* exe path; on the remote
     // host the same install path is the usual convention, falling back to the
-    // bare `pgbackrest` program name found on the remote PATH.
-    let remote_program = string_option(cfg, &format!("{family}-host-cmd"), index).unwrap_or_else(|| PGBACKREST_PROGRAM.to_owned());
+    // bare `pgbackrust` program name found on the remote PATH.
+    let remote_program = string_option(cfg, &format!("{family}-host-cmd"), index).unwrap_or_else(|| PGBACKRUST_PROGRAM.to_owned());
 
     // Remote worker argv: the worker role command plus the stanza and the root
     // path the worker should serve. The worker side reads `pg1-path` /
@@ -342,7 +342,7 @@ fn build_ssh_host_storage(
 /// spawned worker loads the operator-specified config file / paths on the remote
 /// host instead of its own defaults.
 ///
-/// pgBackRest lets the operator point a remote worker at a non-default config
+/// pgBackRust lets the operator point a remote worker at a non-default config
 /// location with `repo-host-config` / `pg-host-config` (the main config file),
 /// `*-host-config-path` (the base config directory) and
 /// `*-host-config-include-path` (the `*.conf` include directory). Each, when set,
@@ -371,8 +371,8 @@ fn append_host_config_args(cfg: &LoadedConfig, family: &str, index: u32, args: &
 }
 
 /// Resolve the TLS host transport's connect address `<host>:<port>` from the
-/// `tls-server-port` option (default [`DEFAULT_TLS_PORT`]) — pgBackRest connects
-/// to the peer's `pgbackrest server` listener, whose port is `tls-server-port`.
+/// `tls-server-port` option (default [`DEFAULT_TLS_PORT`]) — pgBackRust connects
+/// to the peer's `pgbackrust server` listener, whose port is `tls-server-port`.
 fn tls_host_address(cfg: &LoadedConfig, host: &str) -> String {
     let port = integer_option(cfg, "tls-server-port", 1)
         .and_then(|p| u16::try_from(p).ok())
@@ -380,7 +380,7 @@ fn tls_host_address(cfg: &LoadedConfig, host: &str) -> String {
     format!("{host}:{port}")
 }
 
-/// Open a mutual-TLS connection to `host`'s running `pgbackrest server` and wrap
+/// Open a mutual-TLS connection to `host`'s running `pgbackrust server` and wrap
 /// it in a [`RemoteTlsStorage`] proxy running the same storage protocol.
 ///
 /// The `<family>-host-ca-file` (a single CA PEM) and/or `<family>-host-ca-path`
@@ -389,7 +389,7 @@ fn tls_host_address(cfg: &LoadedConfig, host: &str) -> String {
 /// `<family>-host-cert-file` / `<family>-host-key-file` (both required for mutual
 /// TLS) are the client certificate the peer authorizes by its Common Name
 /// against `tls-server-auth`. `tls-cipher-12` / `tls-cipher-13`, when set,
-/// restrict the negotiated ciphers. The peer serves a `pgbackrest server` rooted
+/// restrict the negotiated ciphers. The peer serves a `pgbackrust server` rooted
 /// at its configured path, so no remote argv / root is passed here (unlike the
 /// SSH worker).
 ///
@@ -430,7 +430,7 @@ fn build_tls_host_storage(cfg: &LoadedConfig, host: &str, family: &str, index: u
     // `sck-block` (default false) toggles blocking socket mode on the connecting
     // socket; only enforced when set (the transport relies on blocking I/O).
     let sck_block = boolean_option(cfg, "sck-block", 1).unwrap_or(false);
-    // The peer's `pgbackrest server` is typically started without `--stanza`
+    // The peer's `pgbackrust server` is typically started without `--stanza`
     // so it can serve many stanzas off one listener; CN authorization must
     // run against the *client's* stanza, which the greeting noOp carries.
     // `cfg.stanza` is the resolved `--stanza=<name>` for this run.
@@ -550,7 +550,7 @@ fn resolve_s3_credentials(cfg: &LoadedConfig, index: u32, key_type: &str) -> Res
 
 /// Resolve the S3 server-side-encryption settings from `repo-s3-kms-key-id` and
 /// `repo-s3-sse-customer-key`. KMS takes precedence when both are set (they are
-/// mutually exclusive in practice; pgBackRest disallows configuring both).
+/// mutually exclusive in practice; pgBackRust disallows configuring both).
 fn s3_encryption_from(cfg: &LoadedConfig, index: u32) -> S3Encryption {
     if let Some(kms) = string_option(cfg, "repo-s3-kms-key-id", index) {
         return S3Encryption::Kms(kms);
@@ -688,7 +688,7 @@ fn gcs_service_account_auth(path: &str) -> Result<GcsAuth, CliRunError> {
 
 /// Assemble an [`SftpConfig`] from the resolved `repo-sftp-*` option family.
 ///
-/// pgBackRest's SFTP repository authenticates with a private key
+/// pgBackRust's SFTP repository authenticates with a private key
 /// (`repo-sftp-private-key-file`, optional `repo-sftp-private-key-passphrase`);
 /// `repo-sftp-host` / `repo-sftp-host-user` are required and
 /// `repo-sftp-host-port` defaults to 22. The remote root is `repo-path`. Pure
@@ -977,7 +977,7 @@ mod tests {
     #[test]
     fn build_repo_storage_defaults_to_posix() {
         // No repo-type → posix; no repo-path → the documented default. We can't
-        // round-trip through /var/lib/pgbackrest, so just assert it constructs.
+        // round-trip through /var/lib/pgbackrust, so just assert it constructs.
         let config = cfg("info", &[]);
         assert!(build_repo_storage(&config).is_ok());
     }
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn remote_host_spawns_worker_not_not_supported() {
-        // `repo-host` now spawns an `ssh <host> pgbackrest backup:remote …`
+        // `repo-host` now spawns an `ssh <host> pgbackrust backup:remote …`
         // worker and proxies storage to it, instead of the old
         // `NotSupportedYet` placeholder. The spawn itself either succeeds (ssh
         // on PATH) and yields a constructed `RemoteProcessStorage`, or fails to
@@ -1083,7 +1083,7 @@ mod tests {
             "info",
             &[
                 ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn pg_host_spawns_worker_not_not_supported() {
         // `pg-host` (with the required `pg-path`) spawns an
-        // `ssh <host> pgbackrest backup:remote …` worker rather than returning
+        // `ssh <host> pgbackrust backup:remote …` worker rather than returning
         // the old `NotSupportedYet` placeholder. As with the repo case, the
         // spawn either succeeds or fails to launch `ssh` — never
         // `NotSupportedYet`.
@@ -1172,18 +1172,18 @@ mod tests {
                     Some(1),
                     OptionValue::String("backup.example.com".to_owned()),
                 ),
-                ("repo-sftp-host-user", Some(1), OptionValue::String("pgbackrest".to_owned())),
+                ("repo-sftp-host-user", Some(1), OptionValue::String("pgbackrust".to_owned())),
                 (
                     "repo-sftp-private-key-file",
                     Some(1),
-                    OptionValue::Path("/home/pgbackrest/.ssh/id_ed25519".to_owned()),
+                    OptionValue::Path("/home/pgbackrust/.ssh/id_ed25519".to_owned()),
                 ),
                 ("repo-path", Some(1), OptionValue::Path("/srv/backups".to_owned())),
             ],
         );
         let sftp = sftp_config_from(&config, 1).expect("sftp config");
         assert_eq!(sftp.host, "backup.example.com");
-        assert_eq!(sftp.user, "pgbackrest");
+        assert_eq!(sftp.user, "pgbackrust");
         assert_eq!(sftp.port, 22, "port defaults to 22");
         assert_eq!(sftp.base_path, Path::new("/srv/backups"));
         match sftp.auth {
@@ -1192,7 +1192,7 @@ mod tests {
                 public_key,
                 passphrase,
             } => {
-                assert_eq!(private_key, Path::new("/home/pgbackrest/.ssh/id_ed25519"));
+                assert_eq!(private_key, Path::new("/home/pgbackrust/.ssh/id_ed25519"));
                 assert!(public_key.is_none());
                 assert!(passphrase.is_none());
             }
@@ -1461,7 +1461,7 @@ mod tests {
                     Some(1),
                     OptionValue::String("/no/such/ca.pem".to_owned()),
                 ),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1483,7 +1483,7 @@ mod tests {
             &[
                 ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
                 ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1527,7 +1527,7 @@ mod tests {
             &[
                 ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
                 ("repo-host-type", Some(1), OptionValue::StringId("ssh".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1544,7 +1544,7 @@ mod tests {
             &[
                 ("repo-host", Some(1), OptionValue::String("h".to_owned())),
                 ("repo-host-type", Some(1), OptionValue::StringId("carrier-pigeon".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1591,7 +1591,7 @@ mod tests {
             &[
                 ("repo-host", Some(1), OptionValue::String("backup.example.com".to_owned())),
                 ("repo-local", Some(1), OptionValue::Boolean(false)),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1654,17 +1654,17 @@ mod tests {
                 (
                     "repo-host-config",
                     Some(1),
-                    OptionValue::Path("/etc/pgbackrest.conf".to_owned()),
+                    OptionValue::Path("/etc/pgbackrust.conf".to_owned()),
                 ),
                 (
                     "repo-host-config-path",
                     Some(1),
-                    OptionValue::Path("/etc/pgbackrest".to_owned()),
+                    OptionValue::Path("/etc/pgbackrust".to_owned()),
                 ),
                 (
                     "repo-host-config-include-path",
                     Some(1),
-                    OptionValue::Path("/etc/pgbackrest/conf.d".to_owned()),
+                    OptionValue::Path("/etc/pgbackrust/conf.d".to_owned()),
                 ),
             ],
         );
@@ -1673,9 +1673,9 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--config=/etc/pgbackrest.conf".to_owned(),
-                "--config-path=/etc/pgbackrest".to_owned(),
-                "--config-include-path=/etc/pgbackrest/conf.d".to_owned(),
+                "--config=/etc/pgbackrust.conf".to_owned(),
+                "--config-path=/etc/pgbackrust".to_owned(),
+                "--config-include-path=/etc/pgbackrust/conf.d".to_owned(),
             ]
         );
     }
@@ -1686,7 +1686,7 @@ mod tests {
         let config = cfg(
             "backup",
             &[
-                ("pg-host-config", Some(1), OptionValue::Path("/db/pgbackrest.conf".to_owned())),
+                ("pg-host-config", Some(1), OptionValue::Path("/db/pgbackrust.conf".to_owned())),
                 (
                     "pg-host-config-include-path",
                     Some(1),
@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--config=/db/pgbackrest.conf".to_owned(),
+                "--config=/db/pgbackrust.conf".to_owned(),
                 "--config-include-path=/db/conf.d".to_owned(),
             ]
         );
@@ -1749,7 +1749,7 @@ mod tests {
                 ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
                 ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
                 ("repo-host-ca-path", Some(1), OptionValue::Path("/no/such/cadir".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {
@@ -1770,7 +1770,7 @@ mod tests {
             &[
                 ("repo-host", Some(1), OptionValue::String("127.0.0.1".to_owned())),
                 ("repo-host-type", Some(1), OptionValue::StringId("tls".to_owned())),
-                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrest".to_owned())),
+                ("repo-path", Some(1), OptionValue::Path("/var/lib/pgbackrust".to_owned())),
             ],
         );
         match build_repo_storage(&config) {

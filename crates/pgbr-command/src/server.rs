@@ -3,9 +3,9 @@
 //! C reference: `src/command/server/server.c` and
 //! `src/command/server/ping.c`.
 //!
-//! The real pgBackRest `server` command binds a TLS listener on a TCP
+//! The real pgBackRust `server` command binds a TLS listener on a TCP
 //! socket and serves the local/remote JSON-line protocol to each remote
-//! pgBackRest process that connects; `server-ping` is the client that
+//! pgBackRust process that connects; `server-ping` is the client that
 //! connects and issues a no-op to confirm the server is alive.
 //!
 //! The transport-agnostic *protocol* core both commands drive lives here:
@@ -25,7 +25,7 @@
 //! - [`serve_listener`] / [`serve_tcp`] accept connections and run [`serve`]
 //!   per connection; [`ping_tcp`] connects and runs [`ping_exchange`].
 //!
-//! **TLS** (matching the real pgBackRest, C reference `src/common/io/tls/`):
+//! **TLS** (matching the real pgBackRust, C reference `src/common/io/tls/`):
 //!
 //! - [`TlsIo`] adapts a [`rustls`] stream ([`rustls::StreamOwned`] over a
 //!   [`TcpStream`], server or client side) to [`IoRead`] / [`IoWrite`] — the
@@ -80,7 +80,7 @@ const DEFAULT_ADDRESS: &str = "127.0.0.1:8432";
 /// Hard cap on the number of in-flight per-connection worker threads spawned
 /// by the `server` accept loops (TLS and plain TCP).
 ///
-/// Stock pgBackRest's C `server.c` `fork()`s per accepted connection so a
+/// Stock pgBackRust's C `server.c` `fork()`s per accepted connection so a
 /// long-running backup transfer does not block PG's `archive_command`
 /// invocations of `archive-push`. The Rust port mirrors that with a
 /// `std::thread::spawn` per accepted connection (no Tokio: the protocol layer
@@ -88,7 +88,7 @@ const DEFAULT_ADDRESS: &str = "127.0.0.1:8432";
 /// runaway or malicious peer could exhaust the host — so the loop refuses
 /// new connections (dropping the freshly accepted stream so the kernel
 /// resets the peer) once this many threads are in flight, logging a
-/// rate-limited warning. `32` is a generous ceiling: a typical pgBackRest
+/// rate-limited warning. `32` is a generous ceiling: a typical pgBackRust
 /// deployment serves one to a handful of simultaneous workers (one backup
 /// stream + a small fan-out of `archive-push` calls), and the OS scheduler
 /// handles dozens of these effortlessly. Tests exercise a smaller cap via
@@ -97,7 +97,7 @@ const MAX_WORKER_THREADS: usize = 32;
 
 /// Rate at which the accept loop logs a warning when an incoming connection
 /// is dropped because the worker-thread cap is full. Once per minute is the
-/// pgBackRest convention for "noisy but worth knowing".
+/// pgBackRust convention for "noisy but worth knowing".
 const CAP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// RAII guard that decrements an `Arc<AtomicUsize>` worker counter when
@@ -265,7 +265,7 @@ fn keepalive_secs(config: &LoadedConfig, name: &str) -> Option<u32> {
 /// Resolve the `sck-block` boolean from the configuration (default `false`).
 ///
 /// `sck-block` selects blocking (`true`) vs non-blocking (`false`) socket mode
-/// for the protocol sockets. pgBackRest defaults it to `false` (non-blocking) —
+/// for the protocol sockets. pgBackRust defaults it to `false` (non-blocking) —
 /// see the `sck-block` definition in `config.yaml`. Returns the resolved flag.
 fn sck_block(config: &LoadedConfig) -> bool {
     match config.options.get(&("sck-block".to_owned(), None)) {
@@ -308,7 +308,7 @@ fn apply_sck_block(stream: &TcpStream, block: bool) {
 ///
 /// A failure to set the option is logged and ignored, exactly like keepalive and
 /// blocking-mode tuning: it is an optimisation, never a reason to drop an
-/// otherwise-good connection. Stock pgBackRest sets `TCP_NODELAY` unconditionally
+/// otherwise-good connection. Stock pgBackRust sets `TCP_NODELAY` unconditionally
 /// on every socket — C ref: `sckOptionSet` / `src/common/io/socket/common.c`.
 fn apply_nodelay(stream: &TcpStream) {
     if let Err(err) = stream.set_nodelay(true) {
@@ -484,7 +484,7 @@ fn split(stream: TcpStream) -> Result<(TcpIo, TcpIo), CommandError> {
 /// does not bring the listener down; only an unrecoverable
 /// [`accept`](TcpListener::accept) failure (an I/O error other than
 /// `Interrupted` / `WouldBlock`) returns. `serve_tcp` and the configured
-/// `server` command keep the listener alive across many pgBackRest
+/// `server` command keep the listener alive across many pgBackRust
 /// connections through this entry point. Tests drive the loop with a
 /// shutdown predicate via [`serve_listener_with_continue`].
 ///
@@ -524,7 +524,7 @@ fn serve_listener_with_continue(
 /// [`serve`], closes the writer, and exits. The accept loop returns to
 /// [`accept`](TcpListener::accept) immediately so a long-running connection
 /// does not block subsequent peers — this is the same isolation stock
-/// pgBackRest's C `server.c` gets from `fork()`.
+/// pgBackRust's C `server.c` gets from `fork()`.
 ///
 /// Concurrency is bounded by `max_workers`: an
 /// `Arc<AtomicUsize>` counter is incremented before each spawn (via a
@@ -935,7 +935,7 @@ const AUTH_STANZA_WILDCARD: &str = "*";
 /// hash, where each value is a comma-separated stanza list) into a CN ->
 /// stanza-list map.
 ///
-/// pgBackRest's `tls-server-auth` is a `hash` option: each key is a client
+/// pgBackRust's `tls-server-auth` is a `hash` option: each key is a client
 /// certificate Common Name and each value is the stanza (or comma-separated set
 /// of stanzas, or `*` for all) that client may operate on. C reference:
 /// `cfgOptionKvGet(cfgOptTlsServerAuth)` consumed in `src/command/server/server.c`.
@@ -1249,7 +1249,7 @@ fn build_client_config(
 /// Trusts the CA in `ca_file` and/or every CA file in the directory `ca_path`
 /// (`*-host-ca-file` / `*-host-ca-path`, both additive), and — when `cert_file`
 /// and `key_file` are both `Some` — presents that client certificate (the
-/// mutual-TLS leg the peer `pgbackrest server` authorizes by Common Name).
+/// mutual-TLS leg the peer `pgbackrust server` authorizes by Common Name).
 /// `cipher_names`, when non-empty, is a `tls-cipher-12` / `tls-cipher-13` style
 /// suite list that restricts the negotiated ciphers.
 ///
@@ -1286,7 +1286,7 @@ pub fn build_client_config_from_files(
 /// the returned single bidirectional encrypted stream is what the caller adapts
 /// to whatever reader / writer the protocol layer needs. Used by the
 /// `repo-host-type=tls` / `pg-host-type=tls` worker transport to reach the
-/// peer's running `pgbackrest server`.
+/// peer's running `pgbackrust server`.
 ///
 /// # Errors
 ///
@@ -1377,7 +1377,7 @@ pub fn serve_tls(
 ///
 /// This is the server side of the `repo-host-type=tls` / `pg-host-type=tls`
 /// transport — the same protocol the SSH `--remote` worker serves, but over
-/// a mutual-TLS socket. A remote pgBackRest connects presenting its client
+/// a mutual-TLS socket. A remote pgBackRust connects presenting its client
 /// certificate; the handshake validates it against the configured client CA;
 /// the connection's first request is the no-op greeting that declares the
 /// stanza the client is operating on; the certificate's CN is then checked
@@ -1461,7 +1461,7 @@ fn serve_tls_storage_with_continue(
 /// [`accept`](TcpListener::accept) immediately so a long-running connection
 /// (e.g. a backup uploading hundreds of files over minutes) does not block
 /// concurrent `archive-push` calls from PG's `archive_command`. This
-/// mirrors stock pgBackRest's C `server.c`, which `fork()`s per accepted
+/// mirrors stock pgBackRust's C `server.c`, which `fork()`s per accepted
 /// connection.
 ///
 /// Concurrency is bounded by `max_workers`: an `Arc<AtomicUsize>` counter
@@ -1754,7 +1754,7 @@ fn server_root(config: &LoadedConfig) -> std::path::PathBuf {
     std::path::PathBuf::from(".")
 }
 
-/// `server` — listen for protocol connections from remote pgBackRest processes
+/// `server` — listen for protocol connections from remote pgBackRust processes
 /// and serve the storage / liveness protocol per connection.
 ///
 /// The bind address comes from `tls-server-address` / `tls-server-port`
@@ -2016,9 +2016,9 @@ mod tests {
         // value, defaulting the TLS server to "." and failing at runtime.
         let cfg = config_with(vec![(
             ("repo-path", Some(1)),
-            OptionValue::Path("/var/lib/pgbackrest".to_owned()),
+            OptionValue::Path("/var/lib/pgbackrust".to_owned()),
         )]);
-        assert_eq!(server_root(&cfg), std::path::PathBuf::from("/var/lib/pgbackrest"));
+        assert_eq!(server_root(&cfg), std::path::PathBuf::from("/var/lib/pgbackrust"));
     }
 
     #[test]

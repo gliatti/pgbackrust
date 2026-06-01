@@ -7,7 +7,7 @@
 //! backup's `backup-annotation` object in `backup.info`:
 //!
 //! - a non-empty value sets / updates the key,
-//! - an empty value removes the key (pgBackRest's delete convention),
+//! - an empty value removes the key (pgBackRust's delete convention),
 //! - an annotation object emptied by removals is dropped entirely so the
 //!   `backup-annotation` field disappears from the entry.
 //!
@@ -77,7 +77,7 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 /// without any storage or `backup.info` plumbing:
 ///
 /// - a non-empty value sets / updates the key,
-/// - an empty value removes the key (pgBackRest's delete convention),
+/// - an empty value removes the key (pgBackRust's delete convention),
 /// - if every key is removed the result is `None`, so the caller drops the
 ///   `backup-annotation` field entirely (matches the C
 ///   `backupAnnotation = NULL` behaviour).

@@ -1,9 +1,9 @@
-//! `Storage` over a spawned `pgbackrest` worker, for inter-host operation.
+//! `Storage` over a spawned `pgbackrust` worker, for inter-host operation.
 //!
 //! Mirrors the caller side of the C `src/storage/remote/storage.c` +
 //! `src/protocol/helper.c` pair: when `repo-host` / `pg-host` is set, the main
 //! process does not touch the remote resource directly. It spawns a subordinate
-//! `pgbackrest` worker (over SSH for a remote host, or the binary itself for a
+//! `pgbackrust` worker (over SSH for a remote host, or the binary itself for a
 //! local worker) and proxies every [`Storage`] call to it over the JSON-line
 //! protocol from [`pgbr_protocol`].
 //!
@@ -13,7 +13,7 @@
 //!   plus a [`ProtocolClient`] over its piped stdin/stdout.
 //! - [`pgbr_storage::remote::RemoteStorage`] implements [`Storage`] by issuing
 //!   one protocol request per method through a [`ProtocolClient`].
-//! - the spawned `pgbackrest` runs [`pgbr_command::worker::run_worker_stdio`]
+//! - the spawned `pgbackrust` runs [`pgbr_command::worker::run_worker_stdio`]
 //!   (wired in [`crate::run_with_context`]) to answer the protocol on its
 //!   stdio.
 //!
@@ -42,7 +42,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 /// reads the worker's stdout and writes the worker's stdin.
 type ChildRemoteStorage = RemoteStorage<PipeRead<ChildStdout>, PipeWrite<ChildStdin>>;
 
-/// A [`Storage`] backed by a spawned `pgbackrest` worker.
+/// A [`Storage`] backed by a spawned `pgbackrust` worker.
 ///
 /// Owns the worker [`Child`] so its stdin/stdout pipes stay live for as long as
 /// the proxy is used, and the [`RemoteStorage`] proxy built over those pipes.
@@ -75,7 +75,7 @@ impl RemoteProcessStorage {
     /// Spawn a remote worker over SSH and wrap it.
     ///
     /// `ssh [opts] [-p port] [user@]host <remote_program> <remote_args...>` —
-    /// the remote `pgbackrest` is invoked in a worker role (see
+    /// the remote `pgbackrust` is invoked in a worker role (see
     /// [`pgbr_command::worker::is_worker`]) so it serves the storage protocol on
     /// its stdio.
     ///
@@ -96,7 +96,7 @@ impl RemoteProcessStorage {
     /// Spawn a worker on the local host (`<program> <args...>`) and wrap it.
     ///
     /// Used both for same-host parallel workers and — in tests — to drive the
-    /// real `pgbackrest` binary as a worker without an SSH hop.
+    /// real `pgbackrust` binary as a worker without an SSH hop.
     ///
     /// # Errors
     ///
@@ -264,10 +264,10 @@ impl IoWrite for SyncTlsIo {
     }
 }
 
-/// A [`Storage`] backed by a TLS connection to a peer's running `pgbackrest
+/// A [`Storage`] backed by a TLS connection to a peer's running `pgbackrust
 /// server`, for the `repo-host-type=tls` / `pg-host-type=tls` transport.
 ///
-/// Where [`RemoteProcessStorage`] spawns an `ssh <host> pgbackrest …` worker and
+/// Where [`RemoteProcessStorage`] spawns an `ssh <host> pgbackrust …` worker and
 /// proxies the storage protocol over its stdio, this opens a mutual-TLS
 /// connection (presenting the configured client certificate) to
 /// `<host>:<tls-server-port>` and runs the **same** storage protocol over that
@@ -279,7 +279,7 @@ impl IoWrite for SyncTlsIo {
 /// ownership of it and call [`RemoteStorage::close`] (a consuming method that
 /// sends the protocol `exit` verb plus a TLS `close_notify`) at end of scope.
 /// Without that explicit close, the socket dies abruptly when the proxy is
-/// dropped: the peer `pgbackrest server`'s accept loop then cannot cleanly
+/// dropped: the peer `pgbackrust server`'s accept loop then cannot cleanly
 /// serve the *next* connection — which is what archive-async over TLS hits,
 /// because `PostgreSQL` spawns a fresh `archive-push` process for every WAL
 /// segment, and each one builds and drops its own `RemoteTlsStorage`.
@@ -298,7 +298,7 @@ pub struct RemoteTlsStorage<R: IoRead + Send + 'static = SyncTlsIo, W: IoWrite +
 /// storage protocol does many small request→response rounds; with Nagle enabled
 /// small responses are buffered awaiting an ACK, stalling `backup` (many small
 /// rounds) while `archive-push` (one ~16MB segment) bypasses Nagle. Mirrors stock
-/// pgBackRest, which sets `TCP_NODELAY` unconditionally on all sockets
+/// pgBackRust, which sets `TCP_NODELAY` unconditionally on all sockets
 /// (`src/common/io/socket/common.c`).
 ///
 /// # Errors
@@ -322,7 +322,7 @@ impl RemoteTlsStorage<SyncTlsIo, SyncTlsIo> {
     /// mirroring the server side).
     ///
     /// `stanza` is the stanza the caller is operating on. The peer's
-    /// `pgbackrest server` daemon was typically started without `--stanza`
+    /// `pgbackrust server` daemon was typically started without `--stanza`
     /// (it serves many stanzas off one listener), so its own per-process
     /// stanza would resolve to `<none>` and reject every authorized CN.
     /// Sending the stanza in the greeting lets the server authorize the
@@ -352,7 +352,7 @@ impl RemoteTlsStorage<SyncTlsIo, SyncTlsIo> {
         // default) a small response is buffered awaiting an ACK while the peer
         // blocks reading it, stalling `backup` (many small rounds) while
         // `archive-push` (one ~16MB segment) bypasses Nagle and works. Stock
-        // pgBackRest sets TCP_NODELAY unconditionally on all sockets
+        // pgBackRust sets TCP_NODELAY unconditionally on all sockets
         // (src/common/io/socket/common.c). Mirror the connect-failure mapping
         // to `ProtocolError::Spawn`.
         apply_nodelay(&socket).map_err(|e| ProtocolError::Spawn(format!("tls set nodelay {addr}: {e}")))?;
@@ -570,7 +570,7 @@ mod tests {
     }
 
     /// Dropping a `RemoteTlsStorage` must send the protocol `exit` verb so the
-    /// peer's accept loop (in production: the `pgbackrest server` daemon) sees
+    /// peer's accept loop (in production: the `pgbackrust server` daemon) sees
     /// a clean end-of-connection and can serve the next request. Without the
     /// `Drop` impl this regresses to a half-closed socket and archive-async
     /// over TLS hangs on the second `archive-push`.

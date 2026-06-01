@@ -52,7 +52,7 @@ const API_VERSION: &str = "2021-08-06";
 
 /// Resolved authentication mechanism for an [`Azure`] backend.
 ///
-/// Mirrors pgBackRest's two azure auth modes: Shared Key (the account key signs
+/// Mirrors pgBackRust's two azure auth modes: Shared Key (the account key signs
 /// requests) and SAS (a pre-signed token appended to request URLs).
 #[derive(Debug, Clone)]
 pub enum AzureAuth {

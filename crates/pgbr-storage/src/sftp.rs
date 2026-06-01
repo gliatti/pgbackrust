@@ -486,7 +486,7 @@ fn verify_against_known_hosts(
         CheckResult::NotFound if accept_new => {
             // Append the new key to the first configured known_hosts file.
             known
-                .add(host, key, "added by pgbackrest accept-new", fmt)
+                .add(host, key, "added by pgbackrust accept-new", fmt)
                 .map_err(|err| map_ssh_error(&err, base))?;
             if let Some(target) = files.first() {
                 known

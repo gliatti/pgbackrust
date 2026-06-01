@@ -1,4 +1,4 @@
-//! Remote DB control over a spawned `pgbackrest` worker, for the dedicated
+//! Remote DB control over a spawned `pgbackrust` worker, for the dedicated
 //! repository host ("pull") topology.
 //!
 //! When `pgN-host` is set, backup / check / stanza-create run **on the repo
@@ -35,11 +35,11 @@ use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_db::{DbProtocolClient, QueryRows};
 use pgbr_io::{IoRead, IoWrite};
 use pgbr_protocol::transport::{PipeRead, PipeWrite};
-use pgbr_protocol::{PGBACKREST_PROGRAM, ProcessClient, ProtocolClient};
+use pgbr_protocol::{PGBACKRUST_PROGRAM, ProcessClient, ProtocolClient};
 
 use crate::CommandError;
 
-/// The `pgbackrest` command the spawned worker is invoked with. The
+/// The `pgbackrust` command the spawned worker is invoked with. The
 /// `<command>:remote` form makes the child's [`crate::worker::is_worker`]
 /// recognise the `Remote` command role and serve the protocol (storage **and**
 /// db) on its stdio. `backup` declares the `remote` role and accepts `pg-path`,
@@ -170,7 +170,7 @@ pub fn spawn_pg_worker(config: &LoadedConfig, host: &str, index: u32) -> Result<
 
     let ssh_user = pg_string_option(config, "host-user", index);
     let ssh_port = pg_integer_option(config, "host-port", index).and_then(|p| u16::try_from(p).ok());
-    let remote_program = pg_string_option(config, "host-cmd", index).unwrap_or_else(|| PGBACKREST_PROGRAM.to_owned());
+    let remote_program = pg_string_option(config, "host-cmd", index).unwrap_or_else(|| PGBACKRUST_PROGRAM.to_owned());
 
     let mut remote_args = vec![WORKER_COMMAND_REMOTE.to_owned()];
     if let Some(stanza) = &config.stanza {
@@ -313,7 +313,7 @@ mod tests {
             ("pg-socket-path", Some(1), OptionValue::Path("/var/run/postgresql".to_owned())),
             ("pg-port", Some(1), OptionValue::Integer(5433)),
             ("pg-database", Some(1), OptionValue::String("postgres".to_owned())),
-            ("pg-user", Some(1), OptionValue::String("pgbackrest".to_owned())),
+            ("pg-user", Some(1), OptionValue::String("pgbackrust".to_owned())),
         ]);
         let conninfo = local_conninfo_for_index(&config, 1, &[]);
         assert!(
@@ -323,7 +323,7 @@ mod tests {
         assert!(conninfo.contains("host=/var/run/postgresql"), "{conninfo:?}");
         assert!(conninfo.contains("port=5433"), "{conninfo:?}");
         assert!(conninfo.contains("dbname=postgres"), "{conninfo:?}");
-        assert!(conninfo.contains("user=pgbackrest"), "{conninfo:?}");
+        assert!(conninfo.contains("user=pgbackrust"), "{conninfo:?}");
     }
 
     #[test]

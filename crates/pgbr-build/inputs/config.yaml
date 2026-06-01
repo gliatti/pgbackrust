@@ -839,7 +839,7 @@ option:
   lock-path:
     section: global
     type: path
-    default: /tmp/pgbackrest
+    default: /tmp/pgbackrust
     command:
       annotate: {}
       archive-get: {}
@@ -896,7 +896,7 @@ option:
   spool-path:
     section: global
     type: path
-    default: /var/spool/pgbackrest
+    default: /var/spool/pgbackrust
     command:
       archive-get:
         depend:
@@ -995,7 +995,7 @@ option:
   log-path:
     section: global
     type: path
-    default: /var/log/pgbackrest
+    default: /var/log/pgbackrust
 
   log-subprocess:
     section: global
@@ -1680,7 +1680,7 @@ option:
     section: global
     group: repo
     type: path
-    default: /var/lib/pgbackrest
+    default: /var/lib/pgbackrust
     command: repo-type
     deprecate:
       repo-path: {}
@@ -2082,7 +2082,7 @@ option:
       async: {}
       main: {}
       local: {}
-    default: pgbackrest
+    default: pgbackrust
     depend:
       option: repo-host-type
       list:

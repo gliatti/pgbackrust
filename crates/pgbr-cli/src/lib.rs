@@ -1,5 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! Top-level entry point for the `pgbackrest` Rust binary.
+//! Top-level entry point for the `pgbackrust` Rust binary.
 //!
 //! Wires `pgbr_build` (config schema), `pgbr_config` (CLI/INI/merge),
 //! and `pgbr_command` (per-command implementations) into one invocation. This
@@ -26,41 +26,41 @@ use pgbr_storage::StorageError;
 pub mod remote_storage;
 mod storage_helper;
 
-/// The pgBackRest schema (`config.yaml`), embedded at compile time by
+/// The pgBackRust schema (`config.yaml`), embedded at compile time by
 /// `pgbr-build` so the binary carries it without a runtime file dependency.
 const CONFIG_YAML: &str = pgbr_build::inputs::CONFIG_YAML;
 
-/// Default path to `pgbackrest.conf` if `--config` is not supplied.
-const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrest/pgbackrest.conf";
+/// Default path to `pgbackrust.conf` if `--config` is not supplied.
+const DEFAULT_CONFIG_PATH: &str = "/etc/pgbackrust/pgbackrust.conf";
 
 /// Legacy default path checked when `--config` is not supplied and the modern
 /// [`DEFAULT_CONFIG_PATH`] does not exist on disk.
 ///
-/// Mirrors stock pgBackRest's `PGBACKREST_CONFIG_ORIG_PATH_FILE` fallback in
+/// Mirrors stock pgBackRust's `PGBACKRUST_CONFIG_ORIG_PATH_FILE` fallback in
 /// `cfgFileLoad` (`src/config/parse.c`): "The default location for the
-/// configuration file is `/etc/pgbackrest/pgbackrest.conf`. If no file exists in
-/// that location then the old default of `/etc/pgbackrest.conf` will be checked"
+/// configuration file is `/etc/pgbackrust/pgbackrust.conf`. If no file exists in
+/// that location then the old default of `/etc/pgbackrust.conf` will be checked"
 /// (see `help.xml`). The fallback only applies when the user did **not** supply
 /// an explicit `--config` (i.e. the path is still the default).
-const LEGACY_CONFIG_PATH: &str = "/etc/pgbackrest.conf";
+const LEGACY_CONFIG_PATH: &str = "/etc/pgbackrust.conf";
 
 /// Default base config directory (the `config-path` option's default), used to
 /// derive the include-path default `<config-path>/conf.d` when neither
 /// `--config-include-path` nor `--config-path` is supplied. Mirrors
 /// `CFGOPTDEF_CONFIG_PATH` in `config.yaml`.
-const DEFAULT_CONFIG_DIR: &str = "/etc/pgbackrest";
+const DEFAULT_CONFIG_DIR: &str = "/etc/pgbackrust";
 
 /// Sub-directory of `config-path` scanned for additional `*.conf` files when
 /// `--config-include-path` is not supplied. Mirrors `PROJECT_CONFIG_INCLUDE_PATH`.
 const DEFAULT_INCLUDE_SUBDIR: &str = "conf.d";
 
 /// Extension of the include files loaded from the config-include-path. Only
-/// entries ending in `.conf` are read (matching pgBackRest's `cfgLoad`).
+/// entries ending in `.conf` are read (matching pgBackRust's `cfgLoad`).
 const INCLUDE_FILE_EXT: &str = ".conf";
 
 /// Process exit code for configuration / option errors.
 ///
-/// pgBackRest's C error table assigns `OptionError` code 27; this is the
+/// pgBackRust's C error table assigns `OptionError` code 27; this is the
 /// closest single bucket for the "couldn't resolve the invocation" family
 /// (`CliResolve`, `Load`, `Ini`, `ReadConfigFile`). Exact parity with the full
 /// error-code table is a later refinement — see [`CliRunError::exit_code`].
@@ -79,7 +79,7 @@ const EXIT_CODE_INTERNAL_ERROR: i32 = 1;
 /// Top-level errors.
 ///
 /// The exit code reflects the error category (matches the rough shape of
-/// pgBackRest's C error codes — exact alignment is a future commit). See
+/// pgBackRust's C error codes — exact alignment is a future commit). See
 /// [`CliRunError::exit_code`] for the mapping.
 #[derive(Debug)]
 pub enum CliRunError {
@@ -92,7 +92,7 @@ pub enum CliRunError {
     Cli(pgbr_config::CliError),
     /// `resolve_cli` failed (unknown command/option, …).
     CliResolve(CliResolveError),
-    /// Reading `pgbackrest.conf` failed (path missing, permission, …).
+    /// Reading `pgbackrust.conf` failed (path missing, permission, …).
     ReadConfigFile {
         /// Path that failed to read.
         path: PathBuf,
@@ -184,7 +184,7 @@ impl std::error::Error for CliRunError {}
 /// Build the [`RuntimeContext`] from the running process, carrying the
 /// executable path so `default-type: dynamic` options (the `bin` family:
 /// `cmd`, `pg-host-cmd`, `repo-host-cmd`) resolve to the real binary path
-/// instead of the `"pgbackrest"` fallback.
+/// instead of the `"pgbackrust"` fallback.
 fn env_context() -> RuntimeContext {
     RuntimeContext {
         exe_path: std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_owned)),
@@ -203,7 +203,7 @@ fn env_context() -> RuntimeContext {
 ///
 /// Returns [`CliRunError`] when the embedded `config.yaml` fails to parse or
 /// compile, when argv resolution hits a typed error other than
-/// `MissingCommand`, when reading or parsing `pgbackrest.conf` fails, or when
+/// `MissingCommand`, when reading or parsing `pgbackrust.conf` fails, or when
 /// the final merge / validation rejects the resolved options. The
 /// `MissingCommand` case is handled inline: a hint is printed to stderr and
 /// `Ok(1)` is returned.
@@ -231,15 +231,15 @@ where
     let resolved = match resolve_cli(cli, &cfg) {
         Ok(r) => r,
         Err(CliResolveError::MissingCommand) => {
-            eprintln!("pgbackrest: no command supplied");
-            eprintln!("Try `pgbackrest help` for the list of commands.");
+            eprintln!("pgbackrust: no command supplied");
+            eprintln!("Try `pgbackrust help` for the list of commands.");
             return Ok(1);
         }
         Err(err) => return Err(CliRunError::CliResolve(err)),
     };
 
     // Worker invocation (`<command>:remote` / `<command>:local`): this process
-    // was spawned by a parent pgbackrest (over SSH or locally) to serve the
+    // was spawned by a parent pgbackrust (over SSH or locally) to serve the
     // storage protocol on its stdin/stdout. Route to the worker BEFORE the full
     // config merge + command dispatch: a worker is handed every option it needs
     // explicitly on the argv (the parent builds them), so it does not need the
@@ -407,7 +407,7 @@ fn finish_dispatch(result: Result<(), pgbr_command::CommandError>) -> Result<i32
     match result {
         Ok(()) => Ok(0),
         Err(pgbr_command::CommandError::NotYetImplemented { command }) => {
-            eprintln!("pgbackrest: command `{command}` is not yet implemented in the Rust port");
+            eprintln!("pgbackrust: command `{command}` is not yet implemented in the Rust port");
             Ok(2)
         }
         Err(err) => Err(CliRunError::Command(err)),
@@ -419,25 +419,25 @@ fn load_static_cfg() -> Result<Cfg, CliRunError> {
     compile(&parsed).map_err(CliRunError::Compile)
 }
 
-/// Read the main `pgbackrest.conf` plus every `*.conf` under the
+/// Read the main `pgbackrust.conf` plus every `*.conf` under the
 /// config-include-path (falling back to an empty INI when the main file is
 /// absent and to no extra files when the include dir is absent), collect the
-/// `PGBACKREST_<OPTION>` environment variables, and merge them with `resolved`
+/// `PGBACKRUST_<OPTION>` environment variables, and merge them with `resolved`
 /// and the runtime `ctx` into a [`LoadedConfig`]. Shared by
 /// [`run_with_context`] and [`resolve_only`].
 ///
 /// The five-source precedence is CLI > ENV > stanza:cmd > stanza > global:cmd >
-/// global > default, matching pgBackRest (`src/config/load.c` / `cfgLoad`): the
+/// global > default, matching pgBackRust (`src/config/load.c` / `cfgLoad`): the
 /// process environment is read via [`env_values_from_process`] and slotted
 /// between the CLI and the config files by [`load_config_with_env_multi`]. The
 /// main config file and the include files are all "config file" level; the
 /// include files are loaded *after* the main file, so a value they set wins for
-/// the same key (pgBackRest's documented load order).
+/// the same key (pgBackRust's documented load order).
 fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Result<LoadedConfig, CliRunError> {
     // Determine the config file to read. `--config=<path>` lives in
     // `resolved.options[("config", None)]`; `--no-config` disables the file
-    // entirely. With neither, the default `/etc/pgbackrest/pgbackrest.conf` is
-    // used, falling back to the legacy `/etc/pgbackrest.conf` when the modern
+    // entirely. With neither, the default `/etc/pgbackrust/pgbackrust.conf` is
+    // used, falling back to the legacy `/etc/pgbackrust.conf` when the modern
     // default is absent.
     let main_ini = match config_file_choice(&resolved) {
         // `--no-config`: read no config file at all (stock parity).
@@ -463,7 +463,7 @@ fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Resu
     // file (sorted by name for determinism) after the main config.
     inis.extend(load_include_files(&resolved)?);
 
-    // `PGBACKREST_<OPTION>` environment variables: the env source sits below the
+    // `PGBACKRUST_<OPTION>` environment variables: the env source sits below the
     // CLI but above the config files in precedence.
     let env = env_values_from_process(cfg);
 
@@ -476,7 +476,7 @@ fn load_resolved(resolved: ResolvedCli, cfg: &Cfg, ctx: &RuntimeContext) -> Resu
 ///
 /// The include path is `--config-include-path` if supplied on the CLI,
 /// otherwise `<config-path>/conf.d` where `<config-path>` is `--config-path`
-/// (CLI) or [`DEFAULT_CONFIG_DIR`]. pgBackRest scans the include path even when
+/// (CLI) or [`DEFAULT_CONFIG_DIR`]. pgBackRust scans the include path even when
 /// `--config` is given explicitly — the include path is its own option — so the
 /// scan always runs.
 ///
@@ -625,7 +625,7 @@ fn read_optional_ini(path: &PathBuf) -> Result<Option<IniFile>, CliRunError> {
 // ---------------------------------------------------------------------------
 
 /// Default `log-path` when the option is absent (matches `config.yaml`).
-const DEFAULT_LOG_PATH: &str = "/var/log/pgbackrest";
+const DEFAULT_LOG_PATH: &str = "/var/log/pgbackrust";
 
 /// Fallback console log level when `log-level-console` is absent from the
 /// resolved map (matches `config.yaml`'s default).
@@ -694,7 +694,7 @@ fn detail_level_raises_console(loaded: &LoadedConfig) -> bool {
 /// Build the extra argv tokens that propagate logging into a spawned
 /// remote / local worker when `log-subprocess` is enabled.
 ///
-/// pgBackRest's `log-subprocess` (a `global`, `boolean`, default `false` option)
+/// pgBackRust's `log-subprocess` (a `global`, `boolean`, default `false` option)
 /// asks the parent to enable file logging in any subprocess it creates, using
 /// the parent's `log-level-file`. The worker is otherwise launched with console
 /// logging only; with `log-subprocess=true` the parent passes the flag plus the
@@ -755,7 +755,7 @@ fn time_ms_option(loaded: &LoadedConfig, name: &str) -> Option<u64> {
 /// Fold the deprecated `compress` boolean into the modern `compress-type` (and,
 /// implicitly, `compress-level`) options on the resolved config.
 ///
-/// pgBackRest keeps `compress` only for backward compatibility (`cfgLoadUpdateOption`
+/// pgBackRust keeps `compress` only for backward compatibility (`cfgLoadUpdateOption`
 /// in `src/config/load.c`): `compress=y` selects `compress-type=gz` and
 /// `compress=n` selects `compress-type=none`, but only when `compress-type` was
 /// not set explicitly (the modern option wins). The command stack reads
@@ -782,7 +782,7 @@ fn apply_legacy_compress(loaded: &mut LoadedConfig) {
 /// the low-level crates read, then initialise the logger.
 fn apply_process_options(loaded: &LoadedConfig, cfg: &Cfg) {
     // neutral-umask (default y): clear the umask so files/dirs are created with
-    // their full mode, matching pgBackRest. Best-effort and Unix-only.
+    // their full mode, matching pgBackRust. Best-effort and Unix-only.
     if bool_option(loaded, "neutral-umask").unwrap_or(true) {
         set_neutral_umask();
     }
@@ -930,7 +930,7 @@ fn resolve_process_id(loaded: &LoadedConfig) -> u32 {
 /// it as the logger's file sink.
 ///
 /// Best-effort: if the path can't be created or opened the file sink stays
-/// disabled (the console / stderr sinks still work) — pgBackRest likewise does
+/// disabled (the console / stderr sinks still work) — pgBackRust likewise does
 /// not abort the command on a log-file open failure here.
 #[allow(clippy::print_stderr)] // a log-open failure is surfaced to stderr by design.
 fn open_log_file(loaded: &LoadedConfig) {
@@ -1030,7 +1030,7 @@ mod tests {
 
     /// Serializes the one test that mutates the process-global environment
     /// (`env_var_takes_effect`). Holding it across the set -> read -> unset
-    /// window keeps the `PGBACKREST_*` var from leaking into any other test
+    /// window keeps the `PGBACKRUST_*` var from leaking into any other test
     /// that reads the live environment through `run` / `resolve_only`.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1154,7 +1154,7 @@ mod tests {
         // the read path raises `ReadConfigFile` instead of treating
         // ENOENT as "no INI file present". Use `info` since it accepts
         // `--config` and short-circuits without needing a stanza.
-        let result = run(["--config=/definitely/missing/path/pgbackrest.conf", "info"]);
+        let result = run(["--config=/definitely/missing/path/pgbackrust.conf", "info"]);
         // Anything except a `ReadConfigFile` error is acceptable: the
         // fallback path was taken. `Load`/`CliResolve` errors are downstream
         // of the fallback we care about.
@@ -1185,7 +1185,7 @@ mod tests {
         let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
         assert_eq!(
             super::config_include_path(&resolved),
-            std::path::PathBuf::from("/etc/pgbackrest/conf.d"),
+            std::path::PathBuf::from("/etc/pgbackrust/conf.d"),
         );
 
         // `--config-path` redirects the default include dir under it.
@@ -1216,10 +1216,10 @@ mod tests {
         assert!(matches!(super::config_file_choice(&resolved), ConfigFileChoice::Default));
 
         // `--config=<path>`: read exactly that file (no legacy fallback).
-        let cli = pgbr_config::parse_cli(["info", "--config=/custom/pgbackrest.conf"]).unwrap();
+        let cli = pgbr_config::parse_cli(["info", "--config=/custom/pgbackrust.conf"]).unwrap();
         let resolved = pgbr_config::resolve_cli(cli, &cfg).unwrap();
         match super::config_file_choice(&resolved) {
-            ConfigFileChoice::Explicit(p) => assert_eq!(p, std::path::PathBuf::from("/custom/pgbackrest.conf")),
+            ConfigFileChoice::Explicit(p) => assert_eq!(p, std::path::PathBuf::from("/custom/pgbackrust.conf")),
             other => panic!("expected Explicit, got {other:?}"),
         }
 
@@ -1232,7 +1232,7 @@ mod tests {
     #[test]
     fn read_optional_ini_returns_none_for_missing_file() {
         // A nonexistent path is "no config present" (None), not an error.
-        let missing = std::path::PathBuf::from("/definitely/missing/pgbackrest.conf");
+        let missing = std::path::PathBuf::from("/definitely/missing/pgbackrust.conf");
         let ini = super::read_optional_ini(&missing).expect("missing file must not error");
         assert!(ini.is_none(), "a missing config file yields None");
     }
@@ -1241,7 +1241,7 @@ mod tests {
     fn read_optional_ini_parses_an_existing_file() {
         // An existing, well-formed file parses to Some(IniFile).
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pgbackrest.conf");
+        let path = dir.path().join("pgbackrust.conf");
         std::fs::write(&path, "[global]\nrepo1-path=/srv/repo\n").expect("write conf");
         let ini = super::read_optional_ini(&path).expect("existing file parses");
         assert!(ini.is_some(), "an existing config file yields Some");
@@ -1249,8 +1249,8 @@ mod tests {
 
     #[test]
     fn legacy_config_path_falls_back_when_modern_default_absent() {
-        // The legacy `/etc/pgbackrest.conf` default is consulted when the modern
-        // `/etc/pgbackrest/pgbackrest.conf` does not exist. We cannot write to
+        // The legacy `/etc/pgbackrust.conf` default is consulted when the modern
+        // `/etc/pgbackrust/pgbackrust.conf` does not exist. We cannot write to
         // `/etc` in tests, but we can prove the fallback *order* against two temp
         // files standing in for the two defaults: when the "modern" temp path is
         // absent, the "legacy" temp path is read.
@@ -1280,7 +1280,7 @@ mod tests {
     /// (which never reads the process environment) and feed the resulting INI
     /// sources through the multi-source merge with an explicit empty env. This
     /// avoids the live-environment race that `resolve_only` is subject to (the
-    /// `PGBACKREST_*` var set by `env_var_takes_effect` can leak across
+    /// `PGBACKRUST_*` var set by `env_var_takes_effect` can leak across
     /// concurrently-running tests), while still exercising the real include-file
     /// loading + ordering + merge.
     fn resolve_include_repo_path(confd: &std::path::Path, main_ini: &str) -> Option<OptionValue> {
@@ -1302,7 +1302,7 @@ mod tests {
             &inis,
             &cfg,
             &RuntimeContext {
-                exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+                exe_path: Some("/usr/bin/pgbackrust".to_owned()),
             },
         )
         .expect("merge resolves");
@@ -1387,9 +1387,9 @@ mod tests {
         //     context — proving `load_config_with_context` ran with it.
         //  2. The dynamic `bin` resolution itself is exercised against a minimal
         //     config built from `config.yaml`'s `cmd` shape, confirming the
-        //     threaded `exe_path` (not the `"pgbackrest"` fallback) is selected.
+        //     threaded `exe_path` (not the `"pgbackrust"` fallback) is selected.
         let ctx = RuntimeContext {
-            exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+            exe_path: Some("/usr/bin/pgbackrust".to_owned()),
         };
 
         // (1) Pipeline runs end-to-end with the threaded context. The point of
@@ -1401,9 +1401,9 @@ mod tests {
         match resolve_only(["verify", "--stanza=demo", "--repo1-path=/tmp/repo"], &ctx) {
             Ok(loaded) => {
                 // If the load succeeds, the dynamic `cmd` default must carry
-                // our threaded exe path (not the "pgbackrest" fallback).
+                // our threaded exe path (not the "pgbackrust" fallback).
                 if let Some(cmd) = loaded.options.get(&("cmd".to_owned(), None)) {
-                    assert_eq!(cmd, &OptionValue::String("/usr/bin/pgbackrest".to_owned()));
+                    assert_eq!(cmd, &OptionValue::String("/usr/bin/pgbackrust".to_owned()));
                 }
             }
             // A `Load`-stage error means the pipeline reached config merge with
@@ -1436,8 +1436,8 @@ option:
         let loaded = pgbr_config::load_config_with_context(resolved, &pgbr_config::IniFile::default(), &cfg, &ctx).unwrap();
         assert_eq!(
             loaded.options[&("cmd".to_owned(), None)],
-            OptionValue::String("/usr/bin/pgbackrest".to_owned()),
-            "the threaded exe_path should win over the \"pgbackrest\" fallback",
+            OptionValue::String("/usr/bin/pgbackrust".to_owned()),
+            "the threaded exe_path should win over the \"pgbackrust\" fallback",
         );
 
         // The env-derived context must yield a non-empty exe path (the running
@@ -1451,7 +1451,7 @@ option:
 
     #[test]
     fn env_var_takes_effect() {
-        // A `PGBACKREST_<OPTION>` environment variable set in the process must
+        // A `PGBACKRUST_<OPTION>` environment variable set in the process must
         // flow through `run` / `resolve_only` and land on the resolved option,
         // proving the binary feeds the live environment through
         // `env_values_from_process` + `load_config_with_env`. Here the env source
@@ -1462,7 +1462,7 @@ option:
         // against itself (so a re-run / future second env test can't interleave
         // their set/unset windows). The other tests in this binary read the live
         // environment via `run` / `resolve_only` without taking the lock, but the
-        // `PGBACKREST_REPO1_PATH` we set is harmless if it briefly leaks: every
+        // `PGBACKRUST_REPO1_PATH` we set is harmless if it briefly leaks: every
         // such test either passes an explicit `--repo1-path` (CLI overrides the
         // env source) or tolerates a `Load` / `Command` outcome regardless of the
         // resolved repo path. set_var / remove_var are `unsafe` in edition 2024;
@@ -1477,29 +1477,29 @@ option:
         // data-race hazard with concurrent env access; this test keeps the window
         // short and the value benign (see the leak note above).
         unsafe {
-            std::env::set_var("PGBACKREST_REPO1_PATH", &repo_path);
+            std::env::set_var("PGBACKRUST_REPO1_PATH", &repo_path);
         }
 
         // `--config` points at a guaranteed-absent file so the host's
-        // `/etc/pgbackrest` (if any) can't shadow the env value; the loader
+        // `/etc/pgbackrust` (if any) can't shadow the env value; the loader
         // falls back to an empty INI. `info` is repo-only and resolves cleanly.
         let result = resolve_only(
-            ["--config=/definitely/missing/pgbackrest.conf", "info", "--stanza=demo"],
+            ["--config=/definitely/missing/pgbackrust.conf", "info", "--stanza=demo"],
             &RuntimeContext {
-                exe_path: Some("/usr/bin/pgbackrest".to_owned()),
+                exe_path: Some("/usr/bin/pgbackrust".to_owned()),
             },
         );
 
         // SAFETY: same short, benign-value window as the set above.
         unsafe {
-            std::env::remove_var("PGBACKREST_REPO1_PATH");
+            std::env::remove_var("PGBACKRUST_REPO1_PATH");
         }
 
         let loaded = result.expect("info should resolve with repo-path supplied via env");
         assert_eq!(
             loaded.options.get(&("repo-path".to_owned(), Some(1))),
             Some(&OptionValue::Path(repo_path)),
-            "the PGBACKREST_REPO1_PATH env value should resolve onto repo1-path",
+            "the PGBACKRUST_REPO1_PATH env value should resolve onto repo1-path",
         );
     }
 

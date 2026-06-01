@@ -1,9 +1,9 @@
-//! Remote storage proxy over the pgBackRest local/remote protocol.
+//! Remote storage proxy over the pgBackRust local/remote protocol.
 //!
 //! Mirrors the C `src/storage/remote/` pair (`storage.c` on the caller side,
-//! `protocol.c` on the worker side). A pgBackRest process that needs to reach a
+//! `protocol.c` on the worker side). A pgBackRust process that needs to reach a
 //! repository or PG data directory living on another host does not access it
-//! directly: it drives a helper worker (a child `pgbackrest` reached over SSH,
+//! directly: it drives a helper worker (a child `pgbackrust` reached over SSH,
 //! or a `--local` worker) over the JSON-line protocol from [`pgbr_protocol`].
 //! Each [`Storage`] call becomes one protocol [`Request`]; the worker answers
 //! with one [`Response`].

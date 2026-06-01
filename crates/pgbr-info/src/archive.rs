@@ -2,7 +2,7 @@
 //!
 //! `archive.info` lives at the root of an `archive/` repository and records:
 //!
-//! - the `pgBackRest` format version and the writer version that last touched it,
+//! - the `pgBackRust` format version and the writer version that last touched it,
 //! - the currently-active `PostgreSQL` cluster (its `db-id`, `db-system-id`, `db-version`),
 //! - and the full history of clusters that have ever written to this repository, keyed by the
 //!   per-cluster `db-id` integer.
@@ -50,9 +50,9 @@ pub struct DbHistoryEntry {
 /// Decoded `archive.info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfoArchive {
-    /// pgBackRest on-disk format version (currently `5`).
+    /// pgBackRust on-disk format version (currently `5`).
     pub backrest_format: u32,
-    /// pgBackRest version string of the writer that last persisted this file.
+    /// pgBackRust version string of the writer that last persisted this file.
     pub backrest_version: String,
     /// Active cluster's `db-id` (the integer index into `[db:history]`).
     pub db_id: u32,
@@ -112,7 +112,7 @@ impl InfoArchive {
     /// Decode an `archive.info` document that may be encrypted under the user
     /// passphrase, returning the parsed wrapper **and** the repository sub-key
     /// recovered from the `[cipher]` section (if present). When `passphrase` is
-    /// `Some`, the bytes are first decrypted (pgBackRest `"Salted__"` + SHA-1
+    /// `Some`, the bytes are first decrypted (pgBackRust `"Salted__"` + SHA-1
     /// framing) and then parsed; when `None`, the bytes are parsed directly.
     ///
     /// # Errors
@@ -174,7 +174,7 @@ impl InfoArchive {
 
     /// Write `archive.info` (and its `.copy` mirror) to `path` via `storage`,
     /// storing `cipher_pass` in the `[cipher]` section and encrypting under
-    /// `passphrase` when the repository is encrypted. Matches pgBackRest's
+    /// `passphrase` when the repository is encrypted. Matches pgBackRust's
     /// `infoArchiveSaveFile`, which always writes both the primary and the
     /// `.copy` file from the same buffer.
     ///
@@ -231,7 +231,7 @@ impl InfoArchive {
 
     /// Build the [`InfoFile`], optionally injecting the repository sub-key into
     /// a `[cipher]` section. The cipher section is placed right after
-    /// `[backrest]`, matching pgBackRest's `infoSave`.
+    /// `[backrest]`, matching pgBackRust's `infoSave`.
     fn to_file_with_cipher(&self, cipher_pass: Option<&str>) -> InfoFile {
         let mut file = InfoFile::new();
 
@@ -289,7 +289,7 @@ pub(crate) fn bytes_to_text(bytes: Vec<u8>) -> Result<String, InfoError> {
     })
 }
 
-/// Write `bytes` to `path` and to its `.copy` mirror, matching pgBackRest's
+/// Write `bytes` to `path` and to its `.copy` mirror, matching pgBackRust's
 /// `infoArchiveSaveFile` / `infoBackupSaveFile` (both files are written from
 /// the same buffer so they stay in lock-step).
 ///
@@ -345,7 +345,7 @@ pub(crate) static COPY_RECOVERY_WARNINGS: std::sync::atomic::AtomicUsize = std::
 /// error just because the log pipe is gone.
 ///
 /// `pgbr-info` does not pull in `pgbr-core` for logging, so this writes
-/// directly to `stderr` — pgBackRest's `LOG_WARN` lines surface the same way
+/// directly to `stderr` — pgBackRust's `LOG_WARN` lines surface the same way
 /// (the in-process logger fans out to whichever sinks `logInit` has open,
 /// stderr being one).
 pub(crate) fn log_copy_recovery(path: &Path, err: &InfoError) {
@@ -472,7 +472,7 @@ mod tests {
 
         // Encrypt the whole file under the user passphrase.
         let bytes = archive.to_bytes_keyed(Some("user-passphrase"), Some(&sub_key)).unwrap();
-        assert_eq!(&bytes[..8], b"Salted__", "encrypted info file uses pgBackRest framing");
+        assert_eq!(&bytes[..8], b"Salted__", "encrypted info file uses pgBackRust framing");
 
         // Decrypt + parse recovers the original (including the [cipher] sub-key).
         let (parsed, sub) = InfoArchive::from_bytes_keyed(&bytes, Some("user-passphrase")).unwrap();

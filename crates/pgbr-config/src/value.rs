@@ -1,7 +1,7 @@
 //! Typed values for option types.
 //!
 //! Maps the textual form a user types on the command line or writes in
-//! `pgbackrest.conf` into a typed `OptionValue`, applying the size/time/bool
+//! `pgbackrust.conf` into a typed `OptionValue`, applying the size/time/bool
 //! conventions documented in `help.xml`'s preamble:
 //!
 //! - **Boolean**: `y`/`n`, `yes`/`no`, `true`/`false`, case-insensitive.
@@ -12,7 +12,7 @@
 //!   the SI shorthand `k`, `m`, `g`, … as 1024-based aliases). Fractional
 //!   values are rejected.
 //! - **Time**: number with an optional unit suffix, stored internally as
-//!   **milliseconds** (matching pgBackRest, whose `allow-range` lower bounds
+//!   **milliseconds** (matching pgBackRust, whose `allow-range` lower bounds
 //!   like `100ms` prove the canonical unit is ms). Suffixes: `ms` (`×1`),
 //!   `s` (`×1000`), `m` (`×60_000`), `h` (`×3_600_000`), `d` (`×86_400_000`); a
 //!   bare number with no suffix is **seconds** (`×1000`). The numeric part is
@@ -192,7 +192,7 @@ fn parse_size(raw: &str) -> Result<u64, ValueError> {
 /// The numeric part is parsed as `f64` (so `1.5h` works) and multiplied by the
 /// suffix's millisecond factor: `ms` is `×1`, `s` is `×1000`, `m` is `×60_000`,
 /// `h` is `×3_600_000`, `d` is `×86_400_000`. A bare number with no suffix is
-/// seconds (`×1000`), matching pgBackRest. The product is rounded to the nearest
+/// seconds (`×1000`), matching pgBackRust. The product is rounded to the nearest
 /// `u64` millisecond; a negative, non-finite, or out-of-`u64`-range result is
 /// rejected.
 // The `u64::MAX as f64` bound comparison loses precision (acceptable — it only
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn time_parses_to_milliseconds_with_suffixes() {
-        // Bare number = seconds (pgBackRest convention); explicit unit suffixes
+        // Bare number = seconds (pgBackRust convention); explicit unit suffixes
         // map to milliseconds. Internal unit is ms.
         let cases = [
             ("60", 60_000_u64),  // bare = seconds
@@ -417,8 +417,8 @@ mod tests {
     #[test]
     fn path_must_begin_with_slash_no_double_no_trailing() {
         assert_eq!(
-            parse_value(OptionType::Path, "/var/lib/pgbackrest").unwrap(),
-            OptionValue::Path("/var/lib/pgbackrest".to_owned())
+            parse_value(OptionType::Path, "/var/lib/pgbackrust").unwrap(),
+            OptionValue::Path("/var/lib/pgbackrust".to_owned())
         );
         assert_eq!(parse_value(OptionType::Path, "/").unwrap(), OptionValue::Path("/".to_owned()));
         assert!(matches!(

@@ -1,7 +1,7 @@
 //! `config.yaml` parser.
 //!
 //! `src/build/config/config.yaml` is the single source of truth for every
-//! pgBackRest command, option group, and option. It is read at build time by
+//! pgBackRust command, option group, and option. It is read at build time by
 //! the C generator (which emits `config.auto.h` and `parse.auto.c.inc`) and,
 //! starting with the Rust rewrite, by this crate (which exposes the same data
 //! as typed Rust structures consumed by `pgbr-config`).

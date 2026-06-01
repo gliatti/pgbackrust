@@ -1,6 +1,6 @@
-# pgBackRest <br/> Contributing
+# pgBackRust <br/> Contributing
 
-This fork is a from-scratch rewrite of pgBackRest in Rust. See `README.md` for an
+This fork is a from-scratch rewrite of pgBackRust in Rust. See `README.md` for an
 overview and `CODING.md` for the coding standards. This document describes how to
 get changes in.
 
@@ -22,7 +22,7 @@ Common commands (all from the repo root):
 
 ```
 docker compose run --rm cargo check --workspace                 # quick type-check
-docker compose run --rm cargo build --workspace --release       # build the pgbackrest binary
+docker compose run --rm cargo build --workspace --release       # build the pgbackrust binary
 docker compose run --rm cargo run -p pgbr-cli -- info           # run the binary
 docker compose exec dev bash                                    # interactive shell in the dev container
 ```

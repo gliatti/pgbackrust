@@ -42,7 +42,7 @@ impl Compress {
     ///
     /// `level` matches the legacy `lz4CompressNew` parameter (`-5..=12`). `raw=false`
     /// enables LZ4's frame content checksum (the default for all callers); `raw=true`
-    /// disables it (used for "raw" frames embedded in the pgBackRest block-incremental
+    /// disables it (used for "raw" frames embedded in the pgBackRust block-incremental
     /// repository format). Returns `Err(code)` with the raw `LZ4F_errorCode_t` on
     /// failure so the caller can hand it to `lz4Error`.
     pub fn new(level: i32, raw: bool) -> Result<Self, usize> {

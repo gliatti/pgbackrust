@@ -20,7 +20,7 @@ $COMPOSE exec -T minio sh -c "
 " || info "bucket create best-effort (mc may differ); pgBackRust will create keys under the prefix"
 
 info "principal: S3 repo config (path-style, verify-tls off for the test endpoint)"
-node principal bash -c "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+node principal bash -c "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-type=s3
 repo1-s3-uri-style=path
@@ -39,7 +39,7 @@ start-fast=y
 pg1-path=$DATADIR
 pg1-port=5433
 EOF
-chown postgres:postgres /etc/pgbackrest/pgbackrest.conf"
+chown postgres:postgres /etc/pgbackrust/pgbackrust.conf"
 # pgBackRust talks plain HTTP to a :9000 endpoint only if scheme handling allows
 # it; this scenario documents the KB S3 config and is the acceptance check for
 # the s3 backend against a real endpoint.

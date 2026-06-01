@@ -17,7 +17,7 @@
 //! [`header_version`] resolves a decoded header back to the matching
 //! [`VersionInterface`] entry (or `None` if the catalog is unknown).
 //!
-//! Beyond the header, pgBackRest consumes a handful of further
+//! Beyond the header, pgBackRust consumes a handful of further
 //! `pg_control` fields — the checkpoint LSN, the cluster [`DBState`], the
 //! page size (`BLCKSZ`), the WAL segment size (`wal_segment_size`) and the
 //! data-page checksum version (`data_checksum_version`, which backup reads
@@ -242,7 +242,7 @@ impl DbState {
     }
 }
 
-/// Byte offsets of the version-specific `pg_control` fields pgBackRest
+/// Byte offsets of the version-specific `pg_control` fields pgBackRust
 /// reads for one `ControlFileData` layout.
 ///
 /// `state` and `checkPoint` live ahead of the embedded variable-size
@@ -310,7 +310,7 @@ const CHECK_POINT_OFFSET: usize = 32;
 /// (`REL9_6_STABLE`, `REL_18_STABLE`, `REL_17_STABLE`, … field lists
 /// confirmed against the upstream headers). Verified with `offsetof`
 /// compiled for the x86-64 `SysV` ABI (8-byte max alignment, little-endian)
-/// — the platform pgBackRest targets — in the dev container; the same
+/// — the platform pgBackRust targets — in the dev container; the same
 /// reconstruction reproduces the pre-existing `blcksz`/`xlog_seg_size`
 /// offsets (216/228) exactly, which anchors the new constant.
 const OFFSETS_WIDE: ControlOffsets = ControlOffsets {
@@ -360,7 +360,7 @@ const fn offsets_for(pg_control_version: u32) -> Option<ControlOffsets> {
     }
 }
 
-/// Fuller `pg_control` data beyond the version header. Fields pgBackRest
+/// Fuller `pg_control` data beyond the version header. Fields pgBackRust
 /// consumes. Offsets are version-dependent; this slice supports the
 /// versions enumerated in [`decode_pg_control_data`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

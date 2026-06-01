@@ -12,7 +12,7 @@
 //! the filter wiring inside `src/command/backup/backup.c` /
 //! `src/command/restore/restore.c`.
 //!
-//! # pgBackRest semantics modelled here
+//! # pgBackRust semantics modelled here
 //!
 //! - **Order.** Backup compresses *then* encrypts; restore decrypts *then*
 //!   decompresses. Compressing before encrypting is mandatory — ciphertext is
@@ -92,7 +92,7 @@ impl CompressType {
         }
     }
 
-    /// A sane default compression level for this codec, matching pgBackRest's
+    /// A sane default compression level for this codec, matching pgBackRust's
     /// per-type defaults: `gz`=6, `bz2`=9, `lz4`=1, `zst`=3. Used when
     /// `compress-level` is not supplied.
     #[must_use]
@@ -126,7 +126,7 @@ pub struct RepoTransform {
     /// file data) — rather than the raw user passphrase. The cipher digest is
     /// selected by which builder produced the chain (see
     /// [`RepoTransform::forward_chain`] for the legacy MD5 path and
-    /// [`RepoTransform::forward_chain_keyed`] for the pgBackRest SHA-1 path).
+    /// [`RepoTransform::forward_chain_keyed`] for the pgBackRust SHA-1 path).
     pub cipher_pass: Option<String>,
 }
 
@@ -187,8 +187,8 @@ impl RepoTransform {
     /// data), as produced by [`pgbr_info::RepoKeys`]. Pair it with the keyed
     /// chain builders ([`RepoTransform::forward_chain_keyed`] /
     /// [`reverse_chain_keyed`](Self::reverse_chain_keyed)) so the cipher uses
-    /// pgBackRest's default SHA-1 KDF, making the repo bytes byte-compatible
-    /// with a pgBackRest C repository.
+    /// pgBackRust's default SHA-1 KDF, making the repo bytes byte-compatible
+    /// with a pgBackRust C repository.
     ///
     /// `compress_type` / `compress_level` come from the resolved options; pass
     /// `None` for `cipher_pass` to layer compression only.
@@ -289,9 +289,9 @@ impl RepoTransform {
     }
 
     /// Build the forward chain for the real two-level key scheme: compress
-    /// **then** encrypt with pgBackRest's default **SHA-1** KDF. Pair this with
+    /// **then** encrypt with pgBackRust's default **SHA-1** KDF. Pair this with
     /// a [`cipher_pass`](Self::cipher_pass) that is a resolved sub-key (see
-    /// [`RepoTransform::with_key`]) so the repo bytes match a pgBackRest C
+    /// [`RepoTransform::with_key`]) so the repo bytes match a pgBackRust C
     /// repository.
     #[must_use]
     pub fn forward_chain_keyed(&self) -> FilterChain {

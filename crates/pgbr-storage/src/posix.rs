@@ -239,7 +239,7 @@ impl Storage for Posix {
     fn create_symlink(&self, link_path: &Path, target: &Path) -> Result<(), StorageError> {
         // `link_path` is resolved against the configured root (it is a path inside
         // the managed tree); `target` is written into the link verbatim, exactly as
-        // pgBackRest records it in the manifest (typically an absolute path).
+        // pgBackRust records it in the manifest (typically an absolute path).
         let resolved = self.resolve(link_path);
         std::os::unix::fs::symlink(target, &resolved).map_err(|err| map_io(&err, &resolved))
     }

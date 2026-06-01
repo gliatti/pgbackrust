@@ -71,7 +71,7 @@ prepare_principal_cfg() {
   local extra="$1"
   reset_principal_cluster
   on principal "rm -rf /var/lib/pgbackrust/* 2>/dev/null; true"
-  on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+  on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 $extra
@@ -82,7 +82,7 @@ start-fast=y
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf
+chmod 0644 /etc/pgbackrust/pgbackrust.conf
 install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
 
   ok "stanza-create" principal "pgbackrust --stanza=demo stanza-create"
@@ -102,7 +102,7 @@ want() { [ -z "$WANT" ] && return 0; case " $WANT " in *" $1 "*) return 0;; *) r
 hd "Sanity: binary runs on each node"
 for node in depot principal secondaire; do
   out=$(pg "$node" "pgbackrust version")
-  assert_contains "$out" "pgBackRest" "$node: pgbackrust version"
+  assert_contains "$out" "pgBackRust" "$node: pgbackrust version"
 done
 
 ############################################################################
@@ -209,7 +209,7 @@ on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g po
 # Also clear principal's LOCAL repo so the placement check reflects only this
 # scenario (the remote backup must put NOTHING in principal's local repo).
 on principal "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -222,7 +222,7 @@ start-fast=y
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 
 ok "stanza-create (remote repo on depot)" principal "pgbackrust --stanza=demo stanza-create"
 ok "check (remote repo write + WAL archive over SSH)" principal "pgbackrust --stanza=demo check"
@@ -334,7 +334,7 @@ hd "Scenario 7 — create a streaming standby on secondaire (restore --type=stan
 SEC=/var/lib/postgresql/$PGV/secondaire
 reset_principal_cluster
 on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -347,7 +347,7 @@ start-fast=y
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "stanza-create (standby scenario)" principal "pgbackrust --stanza=demo stanza-create"
 ok "check (standby scenario)" principal "pgbackrust --stanza=demo check"
 # Replication role the standby connects as (reset-cluster's pg_hba allows the
@@ -359,7 +359,7 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 ok "full backup (for standby)" principal "pgbackrust --stanza=demo --type=full backup"
 
 # Configure pgbackrust on secondaire (same remote repo on depot, its own data dir).
-on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on secondaire "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -370,7 +370,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$SEC
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf
+chmod 0644 /etc/pgbackrust/pgbackrust.conf
 install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust"
 # Stop any prior standby + wipe its data dir, then restore as a standby from depot.
 on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
@@ -431,7 +431,7 @@ if want 9; then
 hd "Scenario 9 — multiple repositories (repo1 + repo2, both local on principal)"
 reset_principal_cluster
 on principal "rm -rf /var/lib/pgbackrust/* /var/lib/pgbackrust2/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/lib/pgbackrust2 /var/log/pgbackrust"
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
@@ -444,7 +444,7 @@ start-fast=y
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "stanza-create (2 repos)" principal "pgbackrust --stanza=demo stanza-create"
 ok "check (2 repos)" principal "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
@@ -477,7 +477,7 @@ hd "Scenario 10 — pull backup from a dedicated repo host (KB Exemple 2: depot 
 # repository is local to depot; principal archives WAL to depot.
 reset_principal_cluster
 on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/log/pgbackrust"
-on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on depot "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 repo1-retention-full=2
@@ -490,8 +490,8 @@ pg1-host-user=postgres
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -502,7 +502,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "pull stanza-create (on depot, pg1-host=principal via SSH worker)" depot "pgbackrust --stanza=demo stanza-create"
 ok "pull check (on depot, control connection on principal worker)" depot "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
@@ -623,7 +623,7 @@ on depot "rm -rf /var/lib/pgbackrust/* 2>/dev/null; install -d -o postgres -g po
 # Step 1: initial config on depot (pg1 only) so we can take a base backup that
 # the standby will restore from. backup-standby is enabled later, once the
 # standby is up; turning it on now would make `check` fail (no pg2 yet).
-on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on depot "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 log-level-console=info
@@ -635,10 +635,10 @@ pg1-host-user=postgres
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 # principal also needs a pgbackrust.conf so PG's archive_command (set by
 # reset-cluster) actually pushes WAL to depot, mirroring Scenario 10's setup.
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -649,7 +649,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "stanza-create (backup-standby setup, on depot)" depot "pgbackrust --stanza=demo stanza-create"
 ok "check (initial, no standby)" depot "pgbackrust --stanza=demo check"
 psql_on principal 5433 "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replicator'" >/dev/null
@@ -659,7 +659,7 @@ psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
 ok "initial full backup (primary, no standby yet)" depot "pgbackrust --stanza=demo --type=full backup"
 # Step 2: restore secondaire as a streaming standby from the depot repo.
 on secondaire "sudo -u postgres $BIN/pg_ctl -D $SEC -m immediate -w stop >/dev/null 2>&1 || true; rm -rf $SEC; install -d -o postgres -g postgres -m 0700 $SEC"
-on secondaire "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on secondaire "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -670,7 +670,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$SEC
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf
+chmod 0644 /etc/pgbackrust/pgbackrust.conf
 install -d -o postgres -g postgres -m 0750 /var/log/pgbackrust"
 ok "restore --type=standby (on secondaire, from depot)" secondaire \
   "pgbackrust --stanza=demo --type=standby --recovery-option=primary_conninfo='host=principal port=5433 user=replicator password=replicator' --delta restore"
@@ -688,7 +688,7 @@ srows=$(psql_on secondaire 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' |
 if [ "$prows" = "2000" ] && [ "$srows" = "2000" ]; then pass "primary + standby caught up (2000 rows each)"
 else fail "replication mismatch (primary=$prows standby=$srows, want 2000/2000)"; fi
 # Step 3: re-config depot with pg1+pg2 + backup-standby=y and take the standby backup.
-on depot "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on depot "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-path=/var/lib/pgbackrust
 backup-standby=y
@@ -705,7 +705,7 @@ pg2-host-user=postgres
 pg2-path=$SEC
 pg2-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "full backup --backup-standby=y (start/stop on pg1, files from pg2)" depot "pgbackrust --stanza=demo --type=full backup"
 out=$(pg depot "pgbackrust --stanza=demo info")
 fulls=$(printf '%s' "$out" | grep -cE 'full backup')
@@ -714,7 +714,7 @@ else fail "info doesn't show >=2 full backups (got $fulls)"; fi
 # Cross-validate: restore the latest (standby) backup on principal, verify 2000 rows.
 pg secondaire "$BIN/pg_ctl -D $SEC -m fast -w stop" >/dev/null 2>&1
 pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
-on principal "cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
 [global]
 repo1-host=depot
 repo1-host-user=postgres
@@ -725,7 +725,7 @@ log-path=/var/log/pgbackrust
 pg1-path=$PRI
 pg1-port=5433
 EOF
-chmod 0644 /etc/pgbackrest/pgbackrest.conf"
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
 ok "restore the standby backup (on principal, repo on depot)" principal "pgbackrust --stanza=demo --delta restore"
 pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
 sleep 4
@@ -966,7 +966,7 @@ hd "Scenario 22 — start / stop commands (pause/resume archiving + backups)"
 # refuse with "stop file exists for stanza <name>" until `start` removes it.
 # Companion to 44dd361c4 (control: write stop file locally + gate backup +
 # archive on stop file), which fixed the previously-noop pair.
-LOCK=/tmp/pgbackrest
+LOCK=/tmp/pgbackrust
 prepare_principal
 # Ensure no stale stop file from a prior run / scenario.
 on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
@@ -997,7 +997,7 @@ hd "Scenario 23 — stanza-delete (gated on stop file, repo cleared)"
 # without stop refuses with a clear error, (b) after stop the delete clears
 # archive/<stanza> + backup/<stanza>, (c) a clean stanza-create succeeds
 # afterwards proving no residue.
-LOCK=/tmp/pgbackrest
+LOCK=/tmp/pgbackrust
 prepare_principal
 on principal "rm -f $LOCK/*.stop 2>/dev/null; true"
 psql_on principal 5433 "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,300)" >/dev/null

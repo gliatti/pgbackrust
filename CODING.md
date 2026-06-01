@@ -1,4 +1,4 @@
-# pgBackRest <br/> Coding Standards
+# pgBackRust <br/> Coding Standards
 
 This project is a Rust workspace. The standards below describe what the tooling
 actually enforces. All commands run inside the `pgbackrust-dev` Docker image

@@ -34,7 +34,7 @@
 //!   the C side when a manifest is loaded for a specific `--set`; omitted here.
 //! - `annotation` — user-supplied key/value labels attached via the `annotate`
 //!   command. Emitted per-backup in the repo-wide listing whenever the backup
-//!   has any (matching stock pgBackRest's `formatTextBackup` behaviour), and
+//!   has any (matching stock pgBackRust's `formatTextBackup` behaviour), and
 //!   also inherited by the `--set` detail view.
 //! - text timestamps are rendered in UTC (`YYYY-MM-DD HH:MM:SS+0000`) rather
 //!   than the C side's local time + computed offset, to keep rendering pure
@@ -138,7 +138,7 @@ pub struct BackupSummary {
     /// `backup-annotation` — user-supplied key/value labels attached via the
     /// `annotate` command. Empty when the backup has no annotations. Stored as
     /// a [`BTreeMap`] so iteration yields deterministic sorted output (matching
-    /// stock pgBackRest's `formatTextBackup` ordering).
+    /// stock pgBackRust's `formatTextBackup` ordering).
     pub annotation: BTreeMap<String, String>,
 }
 
@@ -158,10 +158,10 @@ pub struct StanzaSummary {
     /// Active cluster's `pg_control.system_identifier`. `None` when neither
     /// info file loaded.
     pub pg_system_id: Option<u64>,
-    /// pgBackRest format version from `backup.info` (or `archive.info`).
+    /// pgBackRust format version from `backup.info` (or `archive.info`).
     /// `None` when neither info file loaded.
     pub backrest_format: Option<u32>,
-    /// pgBackRest writer version string. `None` when neither info file loaded.
+    /// pgBackRust writer version string. `None` when neither info file loaded.
     pub backrest_version: Option<String>,
     /// Backups discovered in `[backup:current]`. Empty when `backup.info`
     /// did not load or the section was empty.
@@ -193,7 +193,7 @@ fn human_size(bytes: u64) -> String {
     const TIB: u64 = GIB * 1024;
 
     // Casts lose precision for sizes above 2^53 bytes (8 PiB), which is well outside
-    // the range of any realistic pgBackRest backup. Suppressed locally.
+    // the range of any realistic pgBackRust backup. Suppressed locally.
     if bytes >= TIB {
         format!("{:.1}TiB", bytes as f64 / TIB as f64)
     } else if bytes >= GIB {
@@ -541,7 +541,7 @@ fn render_backup_text(out: &mut String, b: &BackupSummary) {
         let _ = writeln!(out, "            backup reference list: {}", b.reference.join(", "));
     }
 
-    // Annotations — emitted last per backup, mirroring stock pgBackRest's
+    // Annotations — emitted last per backup, mirroring stock pgBackRust's
     // `formatTextBackup` rendering (12-space header indent, 20-space k: v
     // indent). Omitted entirely when the backup has no annotations so backups
     // without any render byte-for-byte unchanged. Iteration order is
@@ -740,7 +740,7 @@ pub fn render_json(stanzas: &[StanzaInfo]) -> String {
 /// Whether the `--report` boolean was requested.
 ///
 /// `report` is declared in `config.yaml` as an `internal`, `boolean` option
-/// (default `false`). Upstream pgBackRest scopes it to the `check` command,
+/// (default `false`). Upstream pgBackRust scopes it to the `check` command,
 /// where it asks for a machine-readable check report; this fork has no separate
 /// check-report renderer, so for `info` it is wired as an **alias for the JSON
 /// ("report") output** — `--report` (or `--report=y`) selects the structured,

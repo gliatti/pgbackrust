@@ -3,7 +3,7 @@
 //! In practice `CIFS` shares mount as `POSIX`-looking paths, so this backend
 //! delegates to [`Posix`] for every operation. The intended behavioural
 //! difference is that [`IoWrite::close`] skips the `fsync`-equivalent: `SMB`
-//! sync semantics are unreliable across the network, and pgBackRest's C side
+//! sync semantics are unreliable across the network, and pgBackRust's C side
 //! treats `CIFS` sync as a no-op.
 //!
 //! The current implementation forwards `close` straight through to the

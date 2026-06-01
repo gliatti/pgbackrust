@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration node entrypoint. Sets up passwordless SSH for the postgres user
 # across nodes, starts sshd, and (for PG nodes) keeps PGDATA ready. The actual
-# pgBackRest scenarios are driven externally via `docker compose exec`.
+# pgBackRust scenarios are driven externally via `docker compose exec`.
 set -euo pipefail
 
 ROLE="${PGBR_ROLE:-repo}"

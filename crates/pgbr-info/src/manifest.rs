@@ -62,7 +62,7 @@ const BACKUP_SECTION: &str = "backup";
 /// Section that holds the backed-up cluster's identity.
 const BACKUP_DB_SECTION: &str = "backup:db";
 /// Section that records the per-backup applied option values. Mirrors
-/// pgBackRest's `[backup:option]` section, which surfaces the effective value of
+/// pgBackRust's `[backup:option]` section, which surfaces the effective value of
 /// each user-visible toggle (e.g. `option-checksum-page`) for tooling like
 /// `info` / `verify` / `expire`. Booleans use the `y`/`n` short form, matching
 /// the C writer.
@@ -83,16 +83,16 @@ const KEY_TIMESTAMP_STOP: &str = "backup-timestamp-stop";
 const KEY_DB_SYSTEM_ID: &str = "db-system-id";
 const KEY_DB_VERSION: &str = "db-version";
 /// `[backup:option]` key that records whether page-checksum validation was
-/// applied to relation files in this backup. Mirrors pgBackRest's
+/// applied to relation files in this backup. Mirrors pgBackRust's
 /// `option-checksum-page`.
 const KEY_OPTION_CHECKSUM_PAGE: &str = "option-checksum-page";
 
-/// pgBackRest on-disk format version this writer emits.
+/// pgBackRust on-disk format version this writer emits.
 const BACKREST_FORMAT: u32 = 5;
-/// pgBackRest version string this writer stamps into the file.
+/// pgBackRust version string this writer stamps into the file.
 const BACKREST_VERSION: &str = "2.58";
 
-/// Per-file page-checksum-validation outcome. Mirrors stock pgBackRest's
+/// Per-file page-checksum-validation outcome. Mirrors stock pgBackRust's
 /// `"checksum-page"` field on a relation file's `[target:file]` manifest entry:
 ///
 /// - [`ChecksumPage::Validated`] renders / parses as JSON `true` — every page
@@ -105,7 +105,7 @@ const BACKREST_VERSION: &str = "2.58";
 ///   not eligible for validation (non-relation, page-unaligned, or
 ///   `--checksum-page` disabled).
 ///
-/// pgBackRest stock writes `true` per validated relation file and an
+/// pgBackRust stock writes `true` per validated relation file and an
 /// invalid-block list per file with corrupt pages, so widening from the prior
 /// `Option<bool>` (which could not represent the array form) is required to
 /// surface corruption faithfully in the manifest.
@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for ChecksumPage {
             where
                 E: de::Error,
             {
-                // `true` is the validated marker pgBackRest writes; `false`
+                // `true` is the validated marker pgBackRust writes; `false`
                 // is not part of the on-disk vocabulary (an invalid file
                 // always renders as the block-list array form) but accept it
                 // as the validated marker's complement to keep the
@@ -320,7 +320,7 @@ pub struct ManifestFile {
     /// `Some(ChecksumPage::Validated)` when every page passed; and
     /// `Some(ChecksumPage::InvalidBlocks(blocks))` when one or more pages
     /// failed (the contained block numbers identify the bad pages, matching
-    /// stock pgBackRest's manifest array form).
+    /// stock pgBackRust's manifest array form).
     pub checksum_page: Option<ChecksumPage>,
     /// Backup the file's bytes are stored in. `None` when this backup holds the
     /// bytes itself; `Some(label)` when a differential / incremental backup
@@ -389,7 +389,7 @@ pub struct Manifest {
     /// The effective `--checksum-page` value applied to this backup, recorded
     /// in the manifest's `[backup:option]` section as `option-checksum-page`.
     /// `None` when the manifest predates the section / does not record it (old
-    /// manifests). Pgbackrest's true default ties the option to whether the
+    /// manifests). Pgbackrust's true default ties the option to whether the
     /// source cluster has `data_checksums` enabled (`pg_control`'s
     /// `data_checksum_version`); the producer fills this with the resolved
     /// effective value so tooling like `info` / `verify` can surface it.
@@ -436,7 +436,7 @@ impl Manifest {
 
     /// Decode a `backup.manifest` document that may be encrypted under
     /// `passphrase` (the repository sub-key). When `passphrase` is `Some`, the
-    /// bytes are first decrypted (pgBackRest `"Salted__"` framing) and then
+    /// bytes are first decrypted (pgBackRust `"Salted__"` framing) and then
     /// parsed; when `None`, the bytes are parsed directly.
     ///
     /// # Errors
@@ -528,7 +528,7 @@ impl Manifest {
 
         // `[backup:option].option-checksum-page` is optional (manifests written
         // before this section was emitted simply do not carry it). Stock
-        // pgBackRest renders booleans here as the `y`/`n` short form, with the
+        // pgBackRust renders booleans here as the `y`/`n` short form, with the
         // historical `true`/`false` and `1`/`0` spellings also tolerated.
         let option_checksum_page = file
             .get(BACKUP_OPTION_SECTION, KEY_OPTION_CHECKSUM_PAGE)
@@ -696,13 +696,13 @@ fn parse_required_i64(file: &InfoFile, section: &'static str, key: &'static str)
         .map_err(|_| InfoError::MissingField { section, key })
 }
 
-/// Render a `bool` as pgBackRest's `y` / `n` short form used in info-file
+/// Render a `bool` as pgBackRust's `y` / `n` short form used in info-file
 /// section keys (e.g. `[backup:option]`).
 const fn bool_y_n(value: bool) -> &'static str {
     if value { "y" } else { "n" }
 }
 
-/// Parse a pgBackRest info-file boolean. Accepts the canonical `y` / `n`
+/// Parse a pgBackRust info-file boolean. Accepts the canonical `y` / `n`
 /// short form, plus the `true` / `false` and `1` / `0` spellings tolerated by
 /// the C parser for forward / backward compatibility. Returns `Err(())` when
 /// the value is none of those, leaving the caller free to map it onto a
@@ -1138,7 +1138,7 @@ mod tests {
 
         // Encrypt the whole manifest under the repository sub-key.
         let bytes = manifest.to_bytes_keyed(Some(&sub_key)).unwrap();
-        assert_eq!(&bytes[..8], b"Salted__", "encrypted manifest uses pgBackRest framing");
+        assert_eq!(&bytes[..8], b"Salted__", "encrypted manifest uses pgBackRust framing");
 
         // Decrypt + parse recovers the original.
         let parsed = Manifest::from_bytes_keyed(&bytes, Some(&sub_key)).unwrap();

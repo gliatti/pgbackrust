@@ -17,14 +17,14 @@ echo "[build] cargo build --release -p pgbr-cli (in bookworm 'build' image, glib
 docker compose run --rm build bash -c '
   set -e
   cargo build --release -p pgbr-cli
-  # The pgbr-cli crate names its binary `pgbackrest` (the historical spelling;
-  # see crates/pgbr-cli/Cargo.toml `[[bin]] name = "pgbackrest"`), so cargo emits
-  # target/release/pgbackrest — NOT `pgbackrust`. Copying the wrong name silently
+  # The pgbr-cli crate names its binary `pgbackrust` (the historical spelling;
+  # see crates/pgbr-cli/Cargo.toml `[[bin]] name = "pgbackrust"`), so cargo emits
+  # target/release/pgbackrust — NOT `pgbackrust`. Copying the wrong name silently
   # shipped a stale leftover binary and masked landed fixes. /work/pgbackrust is
   # the synced repo root on the host; landing the artifact (named `pgbackrust`)
   # here makes it visible outside the container. CARGO_TARGET_DIR=/work/target in
   # the build service, so release artifacts live there.
-  cp "${CARGO_TARGET_DIR:-/work/pgbackrust/target}/release/pgbackrest" /work/pgbackrust/integration/artifacts/pgbackrust
+  cp "${CARGO_TARGET_DIR:-/work/pgbackrust/target}/release/pgbackrust" /work/pgbackrust/integration/artifacts/pgbackrust
 '
 
 chmod +x integration/artifacts/pgbackrust

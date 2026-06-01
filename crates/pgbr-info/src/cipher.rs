@@ -1,6 +1,6 @@
 //! Repository two-level encryption key management.
 //!
-//! pgBackRest does **not** encrypt repository file data directly with the
+//! pgBackRust does **not** encrypt repository file data directly with the
 //! user-supplied passphrase (`repo-cipher-pass`). Instead it uses a chain of
 //! keys, mirroring `src/info/info.c` + `src/command/stanza/common.c` +
 //! `src/info/infoArchive.c` / `infoBackup.c`:
@@ -26,16 +26,16 @@
 //! # Sub-key generation
 //!
 //! Both the repo sub-key and the per-backup sub-key are 48 random bytes
-//! base64-encoded (64 characters), exactly as pgBackRest's `cipherPassGen`:
+//! base64-encoded (64 characters), exactly as pgBackRust's `cipherPassGen`:
 //! "48 is the amount of entropy needed to get a 64 base key".
 //!
 //! # Cipher framing
 //!
 //! Info files (and manifests, and file data) are wrapped with the
 //! `"Salted__"`-framed AES-256-CBC cipher using the **SHA-1** KDF that
-//! pgBackRest defaults to ([`pgbr_io::filter::Cipher::encrypt_pgbackrest`] /
-//! [`decrypt_pgbackrest`](pgbr_io::filter::Cipher::decrypt_pgbackrest)). The
-//! produced bytes are byte-compatible with a pgBackRest C repository.
+//! pgBackRust defaults to ([`pgbr_io::filter::Cipher::encrypt_pgbackrust`] /
+//! [`decrypt_pgbackrust`](pgbr_io::filter::Cipher::decrypt_pgbackrust)). The
+//! produced bytes are byte-compatible with a pgBackRust C repository.
 
 use pgbr_encode::{EncodingType, encode};
 use pgbr_io::Filter as _;
@@ -46,7 +46,7 @@ use crate::InfoError;
 
 /// Number of random bytes drawn for a sub-key before base64 encoding.
 ///
-/// pgBackRest: "48 is the amount of entropy needed to get a 64 base key".
+/// pgBackRust: "48 is the amount of entropy needed to get a 64 base key".
 const SUB_KEY_RANDOM_BYTES: usize = 48;
 
 /// The repository cipher type, parsed from `repo-cipher-type`.
@@ -54,7 +54,7 @@ const SUB_KEY_RANDOM_BYTES: usize = 48;
 pub enum CipherType {
     /// No encryption — the repository stores plaintext.
     None,
-    /// AES-256-CBC with the pgBackRest two-level key scheme.
+    /// AES-256-CBC with the pgBackRust two-level key scheme.
     Aes256Cbc,
 }
 
@@ -88,7 +88,7 @@ impl CipherType {
 /// Generate a fresh random encryption sub-key.
 ///
 /// Returns 48 cryptographically-random bytes encoded as standard base64
-/// (64 characters), matching pgBackRest's `cipherPassGen`. Used for both the
+/// (64 characters), matching pgBackRust's `cipherPassGen`. Used for both the
 /// repository sub-key (at `stanza-create`) and the per-backup sub-key (at
 /// `backup`).
 #[must_use]
@@ -110,7 +110,7 @@ fn encode_base64(raw: &[u8]) -> String {
 }
 
 /// Encrypt `plaintext` (rendered info-file text) under the user `passphrase`,
-/// producing pgBackRest's `"Salted__"`-framed AES-256-CBC ciphertext.
+/// producing pgBackRust's `"Salted__"`-framed AES-256-CBC ciphertext.
 ///
 /// This is what wraps the *whole* `archive.info` / `backup.info` document
 /// before it is written to storage when the repository is encrypted.
@@ -119,7 +119,7 @@ fn encode_base64(raw: &[u8]) -> String {
 ///
 /// Propagates any [`pgbr_io::IoError`] raised by the cipher filter.
 pub fn encrypt_info(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, InfoError> {
-    let mut filter = Cipher::encrypt_pgbackrest(passphrase.as_bytes());
+    let mut filter = Cipher::encrypt_pgbackrust(passphrase.as_bytes());
     run(&mut filter, plaintext)
 }
 
@@ -131,7 +131,7 @@ pub fn encrypt_info(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, InfoE
 /// Propagates any [`pgbr_io::IoError`] raised by the cipher filter (e.g. a
 /// wrong passphrase surfaces as a decryption failure / bad padding).
 pub fn decrypt_info(passphrase: &str, ciphertext: &[u8]) -> Result<Vec<u8>, InfoError> {
-    let mut filter = Cipher::decrypt_pgbackrest(passphrase.as_bytes());
+    let mut filter = Cipher::decrypt_pgbackrust(passphrase.as_bytes());
     run(&mut filter, ciphertext)
 }
 
@@ -321,8 +321,8 @@ mod tests {
 
     #[test]
     fn encode_base64_matches_known_vector() {
-        // base64("pgBackRest") == "cGdCYWNrUmVzdA==".
-        assert_eq!(encode_base64(b"pgBackRest"), "cGdCYWNrUmVzdA==");
+        // base64("pgBackRust") == "cGdCYWNrUnVzdA==".
+        assert_eq!(encode_base64(b"pgBackRust"), "cGdCYWNrUnVzdA==");
         assert_eq!(encode_base64(b""), "");
         assert_eq!(encode_base64(b"f"), "Zg==");
     }
@@ -332,7 +332,7 @@ mod tests {
         let plaintext = b"[backrest]\nbackrest-format=5\n\n[cipher]\ncipher-pass=\"sub\"\n";
         let cipher = encrypt_info("user secret", plaintext).unwrap();
         assert_ne!(cipher.as_slice(), plaintext.as_slice());
-        // pgBackRest framing.
+        // pgBackRust framing.
         assert_eq!(&cipher[..8], b"Salted__");
         let recovered = decrypt_info("user secret", &cipher).unwrap();
         assert_eq!(recovered, plaintext);

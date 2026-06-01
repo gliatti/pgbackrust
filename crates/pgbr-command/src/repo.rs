@@ -139,7 +139,7 @@ impl SortOrder {
     }
 }
 
-/// The pgBackRest type string for a [`StorageKind`], used as the `"type"`
+/// The pgBackRust type string for a [`StorageKind`], used as the `"type"`
 /// field of the JSON output. Matches the C `storageListRenderInfo` mapping:
 /// `file` / `link` / `path` / `special`.
 const fn kind_str(kind: StorageKind) -> &'static str {

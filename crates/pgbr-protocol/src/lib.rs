@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! Wire-format types for the pgBackRest local/remote protocol.
+//! Wire-format types for the pgBackRust local/remote protocol.
 //!
-//! pgBackRest's main process drives helper processes (local workers and
+//! pgBackRust's main process drives helper processes (local workers and
 //! remote SSH endpoints) over a JSON-line RPC protocol. Each direction of
 //! the conversation is a stream of newline-terminated JSON objects:
 //!
@@ -26,7 +26,7 @@ pub use crate::codec::{CodecError, read_message, write_message};
 pub use crate::message::{ErrResponse, Message, OkResponse, Request, Response};
 pub use crate::parallel::{Job, JobResult, ParallelExecutor};
 pub use crate::transport::{
-    EXIT_COMMAND, NOOP_COMMAND, PGBACKREST_PROGRAM, PipeRead, PipeWrite, ProcessClient, ProtocolClient, ProtocolError,
+    EXIT_COMMAND, NOOP_COMMAND, PGBACKRUST_PROGRAM, PipeRead, PipeWrite, ProcessClient, ProtocolClient, ProtocolError,
     RequestHandler, SSH_PROGRAM, build_local_command, build_ssh_command, serve,
 };
 

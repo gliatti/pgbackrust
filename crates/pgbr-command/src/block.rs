@@ -12,7 +12,7 @@
 //!
 //! Two pure, unit-testable pieces live here:
 //!
-//! - [`block_size`] — the age + size → block-size policy. pgBackRest scales the
+//! - [`block_size`] — the age + size → block-size policy. pgBackRust scales the
 //!   block size up for bigger and older files (so the per-block bookkeeping stays
 //!   proportional to the data), and disables the block map entirely for very old
 //!   files (whose blocks are unlikely to ever change again, so a map would be
@@ -22,7 +22,7 @@
 //!
 //! # Explicit tuning overrides
 //!
-//! pgBackRest exposes five options that let an operator override the built-in
+//! pgBackRust exposes five options that let an operator override the built-in
 //! heuristic (C ref: `backupBlockIncr*` in `src/command/backup/backup.c`):
 //!
 //! - `repo-block-size-map` — `<file size>=<block size>` pairs. The block size for
@@ -51,7 +51,7 @@ const MIB: u64 = 1024 * KIB;
 
 /// Files at least this old (in seconds, relative to the backup start) get **no**
 /// block map — their contents have long since stopped changing, so per-block
-/// bookkeeping would be pure overhead. Mirrors pgBackRest's oldest age-map bucket
+/// bookkeeping would be pure overhead. Mirrors pgBackRust's oldest age-map bucket
 /// dropping the map for ancient files (`src/command/backup/backup.c`,
 /// `backupBlockIncrSize`'s age handling). Roughly four weeks.
 const AGE_NO_BLOCK_SECS: i64 = 4 * 7 * 24 * 60 * 60;
@@ -59,10 +59,10 @@ const AGE_NO_BLOCK_SECS: i64 = 4 * 7 * 24 * 60 * 60;
 /// A file must be at least this large to be worth a block map at all. Smaller
 /// files are bundled / stored whole — splitting them yields no benefit and the
 /// map overhead dominates. Mirrors the smallest super-block / block thresholds in
-/// pgBackRest.
+/// pgBackRust.
 const MIN_BLOCK_FILE_SIZE: u64 = 128 * KIB;
 
-/// The smallest block size pgBackRest uses (its base bucket). Block sizes scale
+/// The smallest block size pgBackRust uses (its base bucket). Block sizes scale
 /// up from here for larger / older files.
 const BASE_BLOCK_SIZE: u64 = 8 * KIB;
 
@@ -82,7 +82,7 @@ pub const DEFAULT_SUPER_SIZE: u64 = 256 * KIB;
 pub const DEFAULT_SUPER_SIZE_FULL: u64 = MIB;
 
 /// Default per-block checksum size in bytes when no `repo-block-checksum-size-map`
-/// bucket matches. pgBackRest uses a 6-byte truncated checksum by default.
+/// bucket matches. pgBackRust uses a 6-byte truncated checksum by default.
 pub const DEFAULT_CHECKSUM_SIZE: u64 = 6;
 
 /// Explicit block-incremental tuning overrides, parsed from the resolved
@@ -90,7 +90,7 @@ pub const DEFAULT_CHECKSUM_SIZE: u64 = 6;
 ///
 /// Each map is a sorted list of `(threshold, value)` pairs. Lookups select the
 /// entry with the **largest threshold not exceeding** the probe (file size, file
-/// age, or chosen block size), mirroring pgBackRest's bucketed maps. An empty map
+/// age, or chosen block size), mirroring pgBackRust's bucketed maps. An empty map
 /// means "no override" — the heuristic / defaults apply.
 ///
 /// [`BlockOverrides::none`] (every map empty, both super sizes at their defaults)
@@ -227,7 +227,7 @@ impl BlockOverrides {
 /// old (backup start timestamp minus the file's mtime), or `None` when no block
 /// map should be written for it.
 ///
-/// The policy mirrors pgBackRest's `backupBlockIncrSize`:
+/// The policy mirrors pgBackRust's `backupBlockIncrSize`:
 ///
 /// - A file smaller than [`MIN_BLOCK_FILE_SIZE`] gets no map (stored whole).
 /// - A file older than [`AGE_NO_BLOCK_SECS`] gets no map (its blocks will not

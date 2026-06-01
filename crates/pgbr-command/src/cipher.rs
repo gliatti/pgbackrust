@@ -1,6 +1,6 @@
 //! Shared per-repository cipher resolution for the command layer.
 //!
-//! pgBackRest's repository encryption is two-level (see
+//! pgBackRust's repository encryption is two-level (see
 //! [`pgbr_info::cipher`]):
 //!
 //! - `archive.info` / `backup.info` are encrypted with a key derived directly

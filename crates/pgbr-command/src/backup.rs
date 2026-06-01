@@ -4,7 +4,7 @@
 //!
 //! This slice implements the **full** backup path: every non-excluded file in
 //! the PG data directory is read, its **plaintext** SHA-1 + size are computed
-//! (pgBackRest records the uncompressed checksum), the plaintext is run through
+//! (pgBackRust records the uncompressed checksum), the plaintext is run through
 //! the [`RepoTransform`] forward chain (compress then encrypt), and the
 //! transformed bytes are written to `backup/<stanza>/<label>/<relpath><suffix>`
 //! in the repository — where `<suffix>` is the compression extension
@@ -78,7 +78,7 @@ use crate::pipeline::{RepoTransform, metadata_compress_type_key, metadata_encryp
 
 /// Emit a human progress line at `INFO` through the process-global logger.
 ///
-/// pgBackRest funnels every human-facing line through `logInternal`
+/// pgBackRust funnels every human-facing line through `logInternal`
 /// (`src/common/log.c`); this fork's logger ([`pgbr_core::log`]) is the Rust
 /// port. Backup progress (command begin / end, planned dry-run actions, resume /
 /// stop-auto / expire-auto notices) goes here instead of `println!` so it honours
@@ -174,7 +174,7 @@ impl BackupType {
 /// `pg_wal` is archived separately; the remaining directories hold transient
 /// runtime state that cannot be reused after recovery and so must not be
 /// captured. A trailing-`/`-free entry matches either the directory itself or
-/// any path beneath it. Mirrors pgBackRest's `manifestBuildInfo` directory
+/// any path beneath it. Mirrors pgBackRust's `manifestBuildInfo` directory
 /// exclusions (C ref: `src/info/manifest/manifest.c`, the
 /// `MANIFEST_TARGET_PGDATA` path skips).
 const EXCLUDE_PREFIXES: &[&str] = &[
@@ -187,7 +187,7 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "pg_stat_tmp",
     "pg_subtrans",
     // `log/` is where the postmaster writes its server log when
-    // `logging_collector = on` (the default `log_directory`). pgBackRest
+    // `logging_collector = on` (the default `log_directory`). pgBackRust
     // unconditionally excludes the postmaster log tree: the bytes are runtime
     // diagnostic output that cannot help a restored cluster, and the file is
     // actively being written / rotated while the backup runs, so capturing it
@@ -197,10 +197,10 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     "log",
 ];
 
-/// Exact PG-data **root-level** file names pgBackRest always excludes.
+/// Exact PG-data **root-level** file names pgBackRust always excludes.
 ///
 /// These are skipped only when the file sits directly in the data root (the
-/// path has no `/` separator), exactly as pgBackRest's `manifestBuildInfo`
+/// path has no `/` separator), exactly as pgBackRust's `manifestBuildInfo`
 /// gates them on `manifestParentName == MANIFEST_TARGET_PGDATA`:
 ///
 /// - `postmaster.pid` / `postmaster.opts` — running-process state that would
@@ -210,11 +210,11 @@ const EXCLUDE_PREFIXES: &[&str] = &[
 /// - `postgresql.auto.conf.tmp` — temp file for the atomic auto.conf rewrite.
 /// - `backup_label` / `backup_label.old` — obsolete in-progress backup markers.
 /// - `backup_manifest` / `backup_manifest.tmp` (PG >= 13) — server-side backup
-///   manifests, unrelated to pgBackRest's own manifest.
+///   manifests, unrelated to pgBackRust's own manifest.
 ///
-/// The per-version gating in pgBackRest is intentionally not reproduced here:
+/// The per-version gating in pgBackRust is intentionally not reproduced here:
 /// each name is excluded unconditionally, which is safe because none of these
-/// is a real file pgBackRest would ever want to capture on any version.
+/// is a real file pgBackRust would ever want to capture on any version.
 const EXCLUDE_ROOT_FILES: &[&str] = &[
     "postmaster.pid",
     "postmaster.opts",
@@ -229,7 +229,7 @@ const EXCLUDE_ROOT_FILES: &[&str] = &[
     "backup_manifest.tmp",
     // A root-level postmaster server log: written by `pg_ctl -l <pgdata>/server.log`
     // and by `logging_collector` when configured to write at the data root.
-    // pgBackRest unconditionally excludes it (transient runtime output, actively
+    // pgBackRust unconditionally excludes it (transient runtime output, actively
     // rotated, no value to a restored cluster). C ref: `manifestBuildInfo`'s
     // PGDATA-root file skips (`src/info/manifest/manifest.c`).
     "server.log",
@@ -240,11 +240,11 @@ const EXCLUDE_ROOT_FILES: &[&str] = &[
     "current_logfiles",
 ];
 
-/// Basename pgBackRest excludes wherever it appears in a db path.
+/// Basename pgBackRust excludes wherever it appears in a db path.
 ///
 /// `pg_internal.init` is recreated on startup, so it is skipped regardless of
 /// which directory holds it (e.g. `base/<db>/pg_internal.init`,
-/// `global/pg_internal.init`). pgBackRest also tolerates a stray temp variant
+/// `global/pg_internal.init`). pgBackRust also tolerates a stray temp variant
 /// `pg_internal.init.<pid>`; both forms are matched by [`is_pg_internal_init`].
 const PG_INTERNAL_INIT: &str = "pg_internal.init";
 
@@ -266,7 +266,7 @@ pub struct BackupOutcome {
 /// The `PostgreSQL` backup-control bracket captured around the file copy: the
 /// start / stop LSNs and the WAL segment names they fall in.
 ///
-/// pgBackRest records all four in the manifest and the `backup.info`
+/// pgBackRust records all four in the manifest and the `backup.info`
 /// `[backup:current]` entry (`backup-lsn-start` / `backup-lsn-stop` /
 /// `backup-archive-start` / `backup-archive-stop`) so expire / restore can
 /// reason about WAL retention and recovery start points.
@@ -407,7 +407,7 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 ///
 /// Lock-path resolution mirrors the rest of the crate: a real CLI run always
 /// has the `lock-path` option resolved (its `config.yaml` default is
-/// `/tmp/pgbackrest`), so the option is present and
+/// `/tmp/pgbackrust`), so the option is present and
 /// [`crate::lock::resolved_lock_path`] returns the configured directory and the
 /// lock is genuinely taken. Hand-built test configs that omit the `lock-path`
 /// option no-op (empty `Vec`) so the many unit tests that drive these entry
@@ -431,7 +431,7 @@ pub(crate) fn acquire_command_lock(
         return Ok(Vec::new());
     }
     // Only lock when a lock-path is actually configured. A resolved CLI run
-    // always carries the option (default `/tmp/pgbackrest`); hand-built test
+    // always carries the option (default `/tmp/pgbackrust`); hand-built test
     // configs that omit it skip locking so parallel tests don't share a file.
     if !config.options.contains_key(&("lock-path".to_owned(), None)) {
         return Ok(Vec::new());
@@ -442,7 +442,7 @@ pub(crate) fn acquire_command_lock(
 }
 
 /// Whether a PG-data-relative path is excluded from the backup by the
-/// **built-in** pgBackRest exclusion set (independent of any `--exclude`).
+/// **built-in** pgBackRust exclusion set (independent of any `--exclude`).
 ///
 /// A path is excluded when any of the following holds:
 ///
@@ -462,7 +462,7 @@ fn is_excluded(rel: &str) -> bool {
     }
 
     // Root-level exact-name files: only excluded when directly in the data root
-    // (mirrors pgBackRest gating these on `manifestParentName == PGDATA`).
+    // (mirrors pgBackRust gating these on `manifestParentName == PGDATA`).
     if !rel.contains('/') && EXCLUDE_ROOT_FILES.contains(&rel) {
         return true;
     }
@@ -475,7 +475,7 @@ fn is_excluded(rel: &str) -> bool {
 /// Whether a PG-data-relative path is **exactly** one of [`EXCLUDE_PREFIXES`]
 /// (the directory itself, not a path beneath it).
 ///
-/// pgBackRest keeps these transient runtime directories in the manifest as
+/// pgBackRust keeps these transient runtime directories in the manifest as
 /// *empty* paths so restore recreates the directory, while still excluding
 /// every file/subdir under them. This distinguishes the directory (recorded)
 /// from its contents (skipped). Used by [`plan_backup`] and to gate recursion
@@ -487,7 +487,7 @@ fn is_excluded_dir(rel: &str) -> bool {
 /// Whether a basename is `pg_internal.init` or a `pg_internal.init.<digits>`
 /// temp variant.
 ///
-/// pgBackRest skips `pg_internal.init` (recreated on startup) and tolerates a
+/// pgBackRust skips `pg_internal.init` (recreated on startup) and tolerates a
 /// stray temp file `pg_internal.init.<pid>`. C ref: the `PG_FILE_PGINTERNALINIT`
 /// check in `manifestBuildInfo`, which matches the bare name or the name
 /// followed by `\.[0-9]+`.
@@ -506,7 +506,7 @@ fn is_pg_internal_init(basename: &str) -> bool {
 /// Whether a PG-data-relative path is excluded by a user-supplied `--exclude`
 /// entry.
 ///
-/// pgBackRest's `--exclude` accepts paths relative to the PG data root. For this
+/// pgBackRust's `--exclude` accepts paths relative to the PG data root. For this
 /// slice each entry is treated as such a relative path: `rel_path` is excluded
 /// when it equals an entry exactly, or sits underneath one (the entry names a
 /// directory whose entire subtree is excluded — i.e. `rel_path` starts with
@@ -532,7 +532,7 @@ const PAGE_SIZE: usize = pgbr_postgres::page::BLCKSZ;
 ///
 /// A relation file holds the heap / index / fork data `PostgreSQL` writes in
 /// `PAGE_SIZE`-aligned data pages, each carrying the `pd_checksum` header field
-/// that page-checksum validation verifies. pgBackRest validates the main, fsm
+/// that page-checksum validation verifies. pgBackRust validates the main, fsm
 /// and vm forks; this slice recognises a file as a relation segment when **all**
 /// of the following hold:
 ///
@@ -589,7 +589,7 @@ fn is_relation_segment_name(name: &str) -> bool {
 
 /// Whether a single `PAGE_SIZE` page passes validation.
 ///
-/// An all-zero page is treated as valid (pgBackRest's empty-page handling: a
+/// An all-zero page is treated as valid (pgBackRust's empty-page handling: a
 /// freshly extended but never-written page is all zeroes and carries no
 /// meaningful checksum). Any other page is valid iff:
 ///
@@ -636,7 +636,7 @@ fn validate_relation_pages(bytes: &[u8], check_header: bool) -> Vec<u32> {
 /// `checksum_page` field (the [`ChecksumPage::InvalidBlocks`] variant), so
 /// consumers like `verify` / `info` can see which blocks failed without
 /// re-reading the file. This helper additionally surfaces the same diagnostic
-/// through the `WARN` logger so a `backup` run still mirrors pgBackRest's
+/// through the `WARN` logger so a `backup` run still mirrors pgBackRust's
 /// `WARN: invalid page checksum(s) found in file ...` line in the log stream
 /// — the on-disk manifest array and the streamed warning carry the same data.
 fn warn_invalid_pages(rel: &str, invalid_blocks: &[u32]) {
@@ -714,7 +714,7 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
                 // A built-in excluded runtime directory (`pg_notify`, `pg_wal`, …)
                 // is emitted as a path so restore recreates the empty dir, but we
                 // never descend into it: its contents are transient (and may
-                // vanish mid-walk), and pgBackRest captures only the dir itself.
+                // vanish mid-walk), and pgBackRust captures only the dir itself.
                 if descend {
                     walk_into(storage, &child_dir, &rel, out)?;
                 }
@@ -769,7 +769,7 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     let process_max = process_max(config);
     // Resolve the effective `--checksum-page` value: honour an explicit user
     // value, else read `global/pg_control` and default to the cluster's
-    // `data_checksum_version` (the dynamic default stock pgBackRest uses).
+    // `data_checksum_version` (the dynamic default stock pgBackRust uses).
     let checksum_page = resolve_checksum_page(config, pg_storage);
     let excludes = excludes_from_config(config);
     let start_fast = start_fast_enabled(config);
@@ -792,11 +792,11 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
     // Explicit block-incremental tuning overrides (`repo-block-*-map`,
     // `repo-block-size-super*`) and the per-file copy retry policy
     // (`job-retry` / `job-retry-interval`). Both default to "no override" /
-    // "pgBackRest defaults" when unset, leaving the prior behaviour unchanged.
+    // "pgBackRust defaults" when unset, leaving the prior behaviour unchanged.
     let block_overrides = block_overrides_from_options(config);
     let job_retry = JobRetry::from_options(config);
 
-    // Surface the applied user exclusions: pgBackRest records these in the
+    // Surface the applied user exclusions: pgBackRust records these in the
     // manifest's `[backup:option]` metadata, but the `Manifest` struct here owns
     // no exclude field (another concern), so for this slice the applied entries
     // are logged and used only to filter the walk.
@@ -925,7 +925,7 @@ struct ControlConnections {
 /// Open the backup-control connection(s) the `backup-standby` policy calls for.
 ///
 /// The candidate clusters are `DATABASE_URL` (treated as `pg1`) plus every
-/// configured `pgN-host` / `pgN-socket-path` (`N` = 1..=8, pgBackRest's maximum).
+/// configured `pgN-host` / `pgN-socket-path` (`N` = 1..=8, pgBackRust's maximum).
 /// Each reachable candidate is probed with `pg_is_in_recovery()`:
 ///
 /// - the first non-recovery cluster becomes the `primary` (runs start/stop);
@@ -941,14 +941,14 @@ struct ControlConnections {
 ///
 /// When no DB source is configured at all, returns `{ primary: None, standby:
 /// None }` (the DB-free file-copy path); `backup-standby=y` with no DB source is
-/// an error, mirroring pgBackRest refusing a standby backup it cannot reach.
+/// an error, mirroring pgBackRust refusing a standby backup it cannot reach.
 ///
 /// # Errors
 ///
 /// [`CommandError::Other`] when a connection fails, when `backup-standby=y` but
 /// no standby is reachable, or when no primary is reachable for a DB-driven run.
 fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Result<ControlConnections, CommandError> {
-    /// Highest `pgN` index pgBackRest supports.
+    /// Highest `pgN` index pgBackRust supports.
     const MAX_PG_INDEX: u32 = 8;
 
     // Gather candidate `(pgN-index, conninfo)` pairs, deduplicated, primary
@@ -1019,7 +1019,7 @@ fn resolve_control_connections(config: &LoadedConfig, mode: StandbyMode) -> Resu
 /// transport by `pgN-host`.
 ///
 /// When `pgN-host` is set (the dedicated-repo-host pull topology) the control
-/// connection must run on the PG host: a `pgbackrest` worker is spawned there
+/// connection must run on the PG host: a `pgbackrust` worker is spawned there
 /// over SSH and opened against the PG host's *local* cluster (no `host=<pghost>`
 /// — libpq uses the unix socket with peer / trust auth, no password), wrapped in
 /// a [`RemoteBackupControl`]. Otherwise a local libpq [`LibpqBackupControl`] is
@@ -1133,7 +1133,7 @@ fn page_header_check_enabled(config: &LoadedConfig) -> bool {
 }
 
 /// Resolve `--archive-timeout` (a [`OptionValue::Time`] in milliseconds) into a
-/// [`std::time::Duration`], defaulting to 60s (the pgBackRest default) when
+/// [`std::time::Duration`], defaulting to 60s (the pgBackRust default) when
 /// unset. Used to bound the `archive-check` wait for required WAL.
 fn archive_timeout(config: &LoadedConfig) -> std::time::Duration {
     match config.options.get(&("archive-timeout".to_owned(), None)) {
@@ -1250,7 +1250,7 @@ fn derive_conninfo_for_index(config: &LoadedConfig, pg_index: u32) -> Option<Str
     // A `pgN-host` / `pgN-socket-path` names where the server listens; when both
     // are absent but a local data dir (`pgN-path`) is configured, the cluster is
     // local and reached through libpq's default unix-socket directory (e.g.
-    // `/var/run/postgresql`) — pgBackRest connects to a local cluster without an
+    // `/var/run/postgresql`) — pgBackRust connects to a local cluster without an
     // explicit host. So `host` is optional: omit it for the local case.
     let host = opt("host").or_else(|| opt("socket-path"));
     if host.is_none() && opt("path").is_none() {
@@ -1405,7 +1405,7 @@ impl BackupFeatures {
     ///
     /// `repo-bundle` / `repo-block` are booleans; `repo-bundle-size` /
     /// `repo-bundle-limit` are `Size` (bytes). Absent size options fall back to
-    /// pgBackRest's defaults (20 MiB / 2 MiB).
+    /// pgBackRust's defaults (20 MiB / 2 MiB).
     #[must_use]
     pub fn from_options(config: &LoadedConfig) -> Self {
         let boolean = |name: &str| matches!(config.options.get(&(name.to_owned(), None)), Some(OptionValue::Boolean(true)));
@@ -1472,7 +1472,7 @@ fn repo_hardlink_enabled(config: &LoadedConfig) -> bool {
 }
 
 /// Read a boolean group option that resolved with a group index (`repo1-...`),
-/// scanning indices 1..=8 (pgBackRest's repo maximum).
+/// scanning indices 1..=8 (pgBackRust's repo maximum).
 fn boolean_indexed(config: &LoadedConfig, name: &str) -> bool {
     (1..=8).any(|idx| {
         matches!(
@@ -1598,7 +1598,7 @@ fn process_max(config: &LoadedConfig) -> usize {
 
 /// Resolve the effective `--checksum-page` value.
 ///
-/// pgBackRest's documented behaviour is: when the user explicitly sets
+/// pgBackRust's documented behaviour is: when the user explicitly sets
 /// `--checksum-page` / `--no-checksum-page`, that value wins; otherwise the
 /// default is **dynamic** — `on` when the cluster has `data_checksums` enabled
 /// (`pg_control.data_checksum_version != 0`) and `off` otherwise. This matches
@@ -1650,7 +1650,7 @@ fn resolve_checksum_page(config: &LoadedConfig, pg_storage: &dyn Storage) -> boo
     })
 }
 
-/// Default number of retries for a failed file-copy job (`job-retry`). pgBackRest
+/// Default number of retries for a failed file-copy job (`job-retry`). pgBackRust
 /// defaults `backup`/`restore` `job-retry` to 2.
 pub(crate) const DEFAULT_JOB_RETRY: u32 = 2;
 
@@ -1661,7 +1661,7 @@ pub(crate) const DEFAULT_JOB_RETRY_INTERVAL_MS: u64 = 15_000;
 /// Retry policy for a single file-copy / restore job (`job-retry` +
 /// `job-retry-interval`).
 ///
-/// When a per-file copy fails, pgBackRest retries the job up to `retries` more
+/// When a per-file copy fails, pgBackRust retries the job up to `retries` more
 /// times, sleeping `interval` between attempts, before failing the command. This
 /// covers transient I/O / network blips against the repository without aborting a
 /// long backup. C ref: `cmdBackup` / `cmdRestore` job dispatch with
@@ -1695,7 +1695,7 @@ impl JobRetry {
     }
 
     /// Read `job-retry` (count) and `job-retry-interval` (time, milliseconds)
-    /// from the resolved configuration, falling back to pgBackRest's defaults
+    /// from the resolved configuration, falling back to pgBackRust's defaults
     /// (2 retries, 15s) when absent or out of range.
     #[must_use]
     pub(crate) fn from_options(config: &LoadedConfig) -> Self {
@@ -1775,7 +1775,7 @@ fn incr_backup_label(full_root: &str, timestamp: i64) -> String {
 
 /// The full backup at the root of a chain, given any backup label.
 ///
-/// pgBackRest anchors every diff/incr label to its chain's full: the full's
+/// pgBackRust anchors every diff/incr label to its chain's full: the full's
 /// label is the first `_`-separated segment (`<YYYYMMDD-HHMMSS>F`). A full label
 /// has no `_`, so it is its own root.
 fn full_root_label(label: &str) -> &str {
@@ -1949,7 +1949,7 @@ fn plan_file(
 
 /// Compute the plaintext SHA-1 (lowercase hex) of `bytes`.
 ///
-/// pgBackRest records the *uncompressed* checksum regardless of how the bytes
+/// pgBackRust records the *uncompressed* checksum regardless of how the bytes
 /// are stored in the repo, so this is taken over the plaintext on both the
 /// reference-detection (main thread) and copy (worker) paths.
 fn plaintext_sha1(bytes: &[u8]) -> Result<String, CommandError> {
@@ -3017,7 +3017,7 @@ fn truncate_checksum(checksum: &str, checksum_size: u64) -> String {
 /// At least one block per super block (a `super_size` smaller than `block_size`,
 /// or a zero of either, degrades to one block per super block). A super block
 /// groups consecutive blocks so they are stored contiguously in one bundle
-/// region, mirroring pgBackRest's "a super block contains multiple blocks to
+/// region, mirroring pgBackRust's "a super block contains multiple blocks to
 /// improve compression efficiency" (block reads start at the super block).
 fn super_block_layout(block_count: usize, block_size: u64, super_size: u64) -> Vec<usize> {
     if block_count == 0 {
@@ -3155,7 +3155,7 @@ fn build_block_map(
 /// Find the label of the latest full backup recorded in `backup.info`.
 ///
 /// "Latest" is the lexicographically-greatest label whose `backup-type` is
-/// `full` — pgBackRest full labels sort chronologically. Returns `None` when no
+/// `full` — pgBackRust full labels sort chronologically. Returns `None` when no
 /// full backup exists.
 fn latest_full_label(info: &InfoBackup) -> Option<String> {
     info.current
@@ -3420,7 +3420,7 @@ fn run_copy_jobs(
             .map_err(|err| err.to_string())?;
         // `checksum_page` is `Option<ChecksumPage>`: it serialises to `null` for
         // `None`, JSON `true` for `Validated`, and a JSON array of block numbers
-        // for `InvalidBlocks` — i.e. the same wire shape stock pgBackRest writes
+        // for `InvalidBlocks` — i.e. the same wire shape stock pgBackRust writes
         // in the manifest. The decoder below maps each variant back.
         let checksum_page_json =
             serde_json::to_value(&copied.checksum_page).map_err(|err| format!("encode checksumPage for {}: {err}", job.rel))?;
@@ -3660,7 +3660,7 @@ fn run_unbundled_copy(mut ctx: UnbundledCopyCtx<'_>) -> Result<(Vec<ManifestFile
         bytes_since_save += copied.repo_bytes;
         // A file with one or more invalid pages records its invalid block list
         // in `checksum_page` and emits a `WARN` line naming the bad blocks —
-        // the same diagnostic stock pgBackRest surfaces. The manifest then
+        // the same diagnostic stock pgBackRust surfaces. The manifest then
         // carries the array form (`[0, 3, …]`) so consumers like `verify` can
         // see which blocks failed without re-reading the file.
         if let Some(ChecksumPage::InvalidBlocks(blocks)) = copied.checksum_page.as_ref() {
@@ -4341,7 +4341,7 @@ fn run_backup(
         db_system_id: info.db_system_id,
         files,
         // Record the resolved `--checksum-page` value in `[backup:option]`.
-        // pgBackRest stock emits this so `info` / `verify` can show whether the
+        // pgBackRust stock emits this so `info` / `verify` can show whether the
         // backup actually validated relation pages; the value is the bool the
         // caller resolved (either explicit user setting or the dynamic
         // `pg_control.data_checksum_version` default).
@@ -4477,7 +4477,7 @@ fn validate_server_against_stanza(control: &mut dyn BackupControl, info: &InfoBa
 /// Write the `backup_label` and (when non-empty) `tablespace_map` files
 /// returned by `pg_backup_stop` into the backup root.
 ///
-/// pgBackRest stores these alongside the copied data so a restore can place
+/// pgBackRust stores these alongside the copied data so a restore can place
 /// `backup_label` at the data-root and re-create the tablespace symlinks from
 /// `tablespace_map`. An empty `spcmapfile` (a cluster with no tablespaces) is
 /// not written.
@@ -4513,7 +4513,7 @@ fn write_repo_file(repo_storage: &dyn Storage, rel: &str, bytes: &[u8]) -> Resul
 /// Poll a standby's replay position until it has caught up to (or past) the
 /// backup `start_lsn`.
 ///
-/// pgBackRest reads the standby's data files only after the standby has replayed
+/// pgBackRust reads the standby's data files only after the standby has replayed
 /// the WAL up to the primary's backup start point; otherwise the copied files
 /// could predate the start LSN and the restore would be inconsistent. C ref:
 /// `backupStandbyInit` / the `pg_last_wal_replay_lsn()` loop in
@@ -4615,7 +4615,7 @@ fn build_bracket(
 ///    decompressing whatever stored form is present) via
 ///    [`crate::archive::read_archived_segment`]. A required segment that is
 ///    absent from the archive is a hard error — the backup cannot be made
-///    consistent without it (matching pgBackRest, which errors rather than
+///    consistent without it (matching pgBackRust, which errors rather than
 ///    silently omitting WAL).
 /// 2. Run the plaintext through this backup [`RepoTransform`] (compress then
 ///    encrypt) just like any backup file, and write it to
@@ -5064,7 +5064,7 @@ mod tests {
         assert!(is_excluded("server.log"));
         assert!(is_excluded("current_logfiles"));
         // Nested copies under a relation directory are NOT root files, so the
-        // root-file rule does not exclude them (the gating mirrors pgBackRest's
+        // root-file rule does not exclude them (the gating mirrors pgBackRust's
         // PGDATA-root check; a real cluster would never put these there).
         assert!(!is_excluded("base/1/server.log"));
         assert!(!is_excluded("base/1/current_logfiles"));
@@ -5088,11 +5088,11 @@ mod tests {
 
         // The same names *nested* under a subdir are NOT root files, so they are
         // not excluded by the root-file rule (a relation named recovery.signal is
-        // implausible, but the gating must match pgBackRest's PGDATA-root check).
+        // implausible, but the gating must match pgBackRust's PGDATA-root check).
         assert!(!is_excluded("base/1/recovery.signal"));
         assert!(!is_excluded("subdir/backup_label"));
 
-        // tablespace_map is a REAL file pgBackRest backs up — never excluded.
+        // tablespace_map is a REAL file pgBackRust backs up — never excluded.
         assert!(!is_excluded("tablespace_map"));
 
         // pg_internal.init is excluded wherever it appears (db paths), incl. the
@@ -6442,7 +6442,7 @@ mod tests {
         //   dynamic default must engage and validate every relation page.
         // - One page is deliberately corrupted (its stored checksum bit-flipped).
         //
-        // Stock pgBackRest emits a WARN line naming the bad block AND records
+        // Stock pgBackRust emits a WARN line naming the bad block AND records
         // the invalid block list in the manifest's per-file checksum-page
         // field. Both of those must now happen here.
         let _guard = CHECKSUM_PAGE_LOG_LOCK
@@ -6467,7 +6467,7 @@ mod tests {
         let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes utf-8");
         pgbr_core::log::capture::uninstall();
 
-        // (a) The WARN line stock pgBackRest emits names the relation + bad block.
+        // (a) The WARN line stock pgBackRust emits names the relation + bad block.
         assert!(
             captured.contains("invalid page checksum(s) found in file base/1/16384 at block(s) 0"),
             "expected WARN naming the bad block, got: {captured:?}"
