@@ -84,6 +84,13 @@ reset_principal() {
   info "reset principal cluster (fresh initdb, clean postgresql.conf for stanza=$stanza)"
   pg_as principal bash -c "$bin/pg_ctl -D $datadir -m immediate -w stop >/dev/null 2>&1 || true"
   pg_as principal bash -c "rm -rf $datadir/* $datadir/.[!.]* 2>/dev/null || true"
+  # Wipe the pgBackRest repo(s) too, so this scenario's stanza-create starts from
+  # a clean slate. Otherwise a prior scenario's `demo` stanza survives in
+  # /srv/depot and stanza-create (non-idempotent) errors "stanza already exists".
+  # The repo lives on principal (local-repo scenarios) or depot (remote repo-host
+  # scenarios), so clear both. Mirrors what the Vagrant harness reset already does.
+  pg_as principal bash -c "rm -rf /srv/depot/* 2>/dev/null || true"
+  node depot bash -c "rm -rf /srv/depot/* 2>/dev/null || true"
   pg_as principal bash -c "$bin/initdb -D $datadir --data-checksums >/dev/null"
   pg_as principal bash -c "cat > $datadir/postgresql.conf <<EOF
 listen_addresses = '*'
