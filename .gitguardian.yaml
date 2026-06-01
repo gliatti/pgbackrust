@@ -1,0 +1,27 @@
+# GitGuardian / ggshield configuration.
+#
+# Every secret GitGuardian flags in this repository is a TEST FIXTURE, a FAKE
+# certificate, or a documentation example — none grants access to any real
+# service, so the paths below are ignored to stop false-positive noise.
+#
+# Reviewed 2026-06-01: the findings are
+#   - crates/**/tests/data/**    a generated test RSA keypair used only by the
+#                                gcs.rs JWT-signing unit tests (no real account)
+#   - integration/**             throwaway local test-topology credentials
+#                                (minio / postgres passwords for ephemeral
+#                                containers + Vagrant VMs that exist only during
+#                                a test run)
+#   - test/certificate/**        upstream pgBackRest test TLS certs/keys
+#                                (removed from the tree; still in git history)
+#   - doc/resource/fake-cert/**  explicitly-fake doc-build certs
+#                                (removed from the tree; still in git history)
+#
+# IMPORTANT: never add a *real* secret under these paths — it would be ignored.
+version: 2
+
+secret:
+  ignored-paths:
+    - "crates/**/tests/data/**"
+    - "integration/**"
+    - "test/certificate/**"
+    - "doc/resource/fake-cert/**"
