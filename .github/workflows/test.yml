@@ -3,12 +3,12 @@ name: test
 on:
   push:
     branches:
-      - eol
+      - main
       - '**-ci'
       - '**-cig'
   pull_request:
     branches:
-      - eol
+      - main
 
 # Limit permissions on the repository
 permissions:

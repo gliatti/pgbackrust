@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbakrest`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `main`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbakrest/issues/238).
+pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.md`). This fork (`gliatti/pgbackrust`) **rewrote the codebase entirely in Rust** under `crates/`. PRs target `main`. The work is tracked by a single epic: [#238](https://github.com/gliatti/pgbackrust/issues/238).
 
 The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrust` binary (from `crates/pgbr-cli`). There is no C left to build.
 
