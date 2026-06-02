@@ -1,15 +1,25 @@
-//! In-memory log capture sink used by the in-crate `#[cfg(test)] mod tests` blocks
-//! across the workspace.
+//! In-memory log capture sink used by the in-crate `#[cfg(test)] mod tests`
+//! blocks across the workspace.
 //!
-//! When [`is_installed`] is true, [`super::format::log_post`] routes the file sink (the
-//! `level_file` channel) to [`append`] instead of `write(2)`. Test code reads the
-//! captured bytes via [`drain`] / [`contains`] and clears them between assertions.
+//! When [`is_installed`] is true, [`super::format::log_post`] routes the file
+//! sink (the `level_file` channel) to [`append`] instead of `write(2)`. Test
+//! code reads the captured bytes via [`drain`] / [`contains`] and clears them
+//! between assertions.
 //!
-//! Threading model is the same single-threaded fork-per-process invariant as the rest of
-//! `pgbr_core::log` — no internal locking.
+//! # Threading
+//!
+//! Unlike the fork-per-process C original, the Rust port runs real threads: the
+//! `cargo test` harness parallelises test functions, and the server /
+//! parallel-dispatch paths spawn worker threads. Several of those threads emit
+//! log lines, and the `installed` flag is process-global — so a test that
+//! installs capture makes *every* concurrently-running thread route its file
+//! sink through [`append`]. The previous implementation guarded the state with
+//! an `unsafe impl Sync` over an `UnsafeCell` and a "single-threaded" comment;
+//! that invariant does not hold here, and concurrent `append`s raced on the
+//! buffer's `Vec` reallocation, intermittently aborting the process with
+//! `free(): invalid next size`. The state is therefore guarded by a [`Mutex`].
 
-use std::cell::UnsafeCell;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Process-global capture state.
 struct CaptureState {
@@ -26,48 +36,30 @@ impl CaptureState {
     }
 }
 
-#[allow(clippy::non_send_fields_in_send_ty)]
-struct UnsafeGlobal<T>(UnsafeCell<T>);
-// SAFETY: same single-threaded contract as the rest of `pgbr_core::log`.
-unsafe impl<T> Sync for UnsafeGlobal<T> {}
-unsafe impl<T> Send for UnsafeGlobal<T> {}
+/// Process-global capture buffer, serialised by a `Mutex` so concurrent
+/// [`append`] calls from parallel threads cannot race on the inner `Vec`.
+static STATE: Mutex<CaptureState> = Mutex::new(CaptureState::new());
 
-static STATE: OnceLock<UnsafeGlobal<CaptureState>> = OnceLock::new();
-
-fn cell() -> &'static UnsafeCell<CaptureState> {
-    &STATE.get_or_init(|| UnsafeGlobal(UnsafeCell::new(CaptureState::new()))).0
-}
-
-/// # Safety
+/// Lock the capture state, tolerating a poisoned mutex.
 ///
-/// Caller upholds the single-threaded contract (no two threads holding `&mut` at once).
-#[allow(clippy::mut_from_ref)]
-unsafe fn state_mut() -> &'static mut CaptureState {
-    // SAFETY: see the contract above.
-    unsafe { &mut *cell().get() }
+/// A panicking test thread can poison the lock; the captured bytes are
+/// diagnostic scratch, so recovering the guard (rather than propagating the
+/// poison) keeps unrelated tests running — and never leaves the logger wedged.
+fn lock() -> MutexGuard<'static, CaptureState> {
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// # Safety
-///
-/// Same single-threaded contract as [`state_mut`].
-unsafe fn state_ref() -> &'static CaptureState {
-    // SAFETY: see the contract above.
-    unsafe { &*cell().get() }
-}
-
-/// Enable capture. Subsequent file-sink writes go to the capture buffer instead of
-/// `fd_file`. Idempotent — calling twice clears the buffer the second time.
+/// Enable capture. Subsequent file-sink writes go to the capture buffer instead
+/// of `fd_file`. Idempotent — calling twice clears the buffer the second time.
 pub fn install() {
-    // SAFETY: see `state_mut`.
-    let s = unsafe { state_mut() };
+    let mut s = lock();
     s.installed = true;
     s.buffer.clear();
 }
 
 /// Disable capture and discard any buffered bytes.
 pub fn uninstall() {
-    // SAFETY: see `state_mut`.
-    let s = unsafe { state_mut() };
+    let mut s = lock();
     s.installed = false;
     s.buffer.clear();
     s.buffer.shrink_to_fit();
@@ -76,53 +68,43 @@ pub fn uninstall() {
 /// Whether capture is currently active. Cheap read used by `format::log_post`.
 #[must_use]
 pub fn is_installed() -> bool {
-    // SAFETY: see `state_ref`.
-    unsafe { state_ref() }.installed
+    lock().installed
 }
 
 /// Append `bytes` to the capture buffer.
 ///
-/// Called by the formatter when capture is installed. Allocates only on first growth past
-/// the previously-drained capacity.
+/// Called by the formatter when capture is installed. No-op when capture is not
+/// installed.
 pub fn append(bytes: &[u8]) {
-    // SAFETY: see `state_mut`.
-    let s = unsafe { state_mut() };
+    let mut s = lock();
     if s.installed {
         s.buffer.extend_from_slice(bytes);
     }
 }
 
-/// Take the captured bytes and reset the buffer. Returns an empty `Vec` when capture is
-/// not installed or has already been drained.
+/// Take the captured bytes and reset the buffer. Returns an empty `Vec` when
+/// capture is not installed or has already been drained.
 #[must_use]
 pub fn drain() -> Vec<u8> {
-    // SAFETY: see `state_mut`.
-    let s = unsafe { state_mut() };
-    core::mem::take(&mut s.buffer)
+    core::mem::take(&mut lock().buffer)
 }
 
-/// Whether the captured bytes contain `needle` as a UTF-8 substring. Returns `false` when
-/// the captured bytes are not valid UTF-8 (the harness only ever feeds ASCII / UTF-8).
+/// Whether the captured bytes contain `needle` as a UTF-8 substring. Returns
+/// `false` when the captured bytes are not valid UTF-8 (the harness only ever
+/// feeds ASCII / UTF-8).
 #[must_use]
 pub fn contains(needle: &str) -> bool {
-    // SAFETY: see `state_ref`.
-    let s = unsafe { state_ref() };
-    let Ok(captured) = core::str::from_utf8(&s.buffer) else {
-        return false;
-    };
-    captured.contains(needle)
+    let s = lock();
+    core::str::from_utf8(&s.buffer).is_ok_and(|captured| captured.contains(needle))
 }
 
-/// Reset capture state to its default (installed = false, empty buffer). Called by
-/// `log::test_support::fresh_state` so a previous `capture::tests::*` test that left
-/// `installed = true` cannot route a later `log::format::tests::*` file-sink write
-/// into the capture buffer instead of the temp-file fd. The shared `TEST_LOCK`
-/// already serialises tests, so the caller upholds the single-threaded contract.
+/// Reset capture state to its default (installed = false, empty buffer). Called
+/// by `log::test_support::fresh_state` so a previous `capture::tests::*` test
+/// that left `installed = true` cannot route a later `log::format::tests::*`
+/// file-sink write into the capture buffer instead of the temp-file fd.
 #[cfg(test)]
 pub(super) fn reset_state() {
-    // SAFETY: see `state_mut`. The caller (`fresh_state`) holds `TEST_LOCK`.
-    let s = unsafe { state_mut() };
-    *s = CaptureState::new();
+    *lock() = CaptureState::new();
 }
 
 #[cfg(test)]
@@ -137,9 +119,7 @@ mod tests {
         let g = super::super::test_support::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: TEST_LOCK serialises tests so no other reference is alive.
-        let s = unsafe { state_mut() };
-        *s = CaptureState::new();
+        reset_state();
         g
     }
 
@@ -187,5 +167,45 @@ mod tests {
         append(b"P00   WARN: hello world\n");
         assert!(contains("WARN: hello"));
         assert!(!contains("ERROR"));
+    }
+
+    /// Regression guard for the `free(): invalid next size` heap corruption:
+    /// hammer `append` from many threads at once. Before the `Mutex`, the
+    /// concurrent `Vec::extend_from_slice` calls raced on a reallocation and
+    /// intermittently aborted the process; with the lock the run is sound and
+    /// every byte is accounted for.
+    ///
+    /// Holds `TEST_LOCK` for the duration so it does not interleave with the
+    /// other (serial) capture tests, then spawns its own worker threads — the
+    /// concurrency under test is between those workers, which the capture
+    /// `Mutex` (not `TEST_LOCK`) is responsible for making safe.
+    #[test]
+    fn concurrent_appends_do_not_corrupt_the_heap() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 4_000;
+
+        let _g = fresh();
+        install();
+
+        // Each thread appends a fixed 8-byte record many times.
+        let record = *b"abcdefgh";
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..PER_THREAD {
+                        append(&record);
+                    }
+                });
+            }
+        });
+
+        let captured = drain();
+        // No bytes lost or duplicated, and the buffer is internally consistent.
+        assert_eq!(captured.len(), THREADS * PER_THREAD * record.len());
+        assert!(
+            captured.chunks_exact(record.len()).all(|c| c == record),
+            "every 8-byte record must be intact (no torn writes)"
+        );
     }
 }

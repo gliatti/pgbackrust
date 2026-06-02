@@ -115,8 +115,16 @@ impl LogState {
 
 #[allow(clippy::non_send_fields_in_send_ty)]
 struct UnsafeGlobal<T>(UnsafeCell<T>);
-// SAFETY: pgBackRust forks for parallelism rather than threading; logging happens from a
-// single thread per process. The legacy C code already relies on this invariant.
+// SAFETY: access to the inner `LogState` is serialised, so no two threads ever hold
+// overlapping references:
+//   * message emission (`format::log_internal` / `log_internal_fmt`) takes the
+//     process-global `format::EMISSION_LOCK` for its whole body, covering every
+//     `state_ref` / `state_mut` reached through the field accessors during a dispatch;
+//   * configuration (`init` and the setters) runs once at process start, before any
+//     worker thread is spawned, so it cannot overlap an emission.
+// The original "pgBackRust forks, never threads" invariant no longer holds — the Rust
+// port threads (test harness, server, parallel dispatch) — so the lock, not the fork
+// model, is what makes this `Sync` sound.
 unsafe impl<T> Sync for UnsafeGlobal<T> {}
 unsafe impl<T> Send for UnsafeGlobal<T> {}
 
