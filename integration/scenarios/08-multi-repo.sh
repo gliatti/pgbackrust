@@ -42,9 +42,10 @@ wait_for "WAL on repo1" 30 1 bash -c "$COMPOSE exec -T principal bash -c 'ls $R1
 wait_for "WAL on repo2" 30 1 bash -c "$COMPOSE exec -T principal bash -c 'ls $R2/archive/$STANZA/*/0000* 2>/dev/null | grep -q .'"
 
 info "backups are taken per-repo with --repo=N (first backup of each repo is full)"
-# Each repo starts empty, so its first backup must be a full. The implicit
-# backup type does not auto-promote to full per-repo here, so request it
-# explicitly (the assertions below verify a full landed in each repo).
+# Each repo starts empty, so its first backup must be a full. The default type
+# is now full, and an explicit incr/diff with no prior base auto-promotes to a
+# full anyway; we still pass --type=full explicitly to make the intent obvious
+# (the assertions below verify a full landed in each repo).
 pg_as principal pgbackrust --stanza=$STANZA --repo=1 --type=full backup
 pg_as principal pgbackrust --stanza=$STANZA --repo=2 --type=full backup
 

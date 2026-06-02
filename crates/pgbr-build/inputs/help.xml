@@ -2187,6 +2187,8 @@
                                 <list-item><id>incr</id> - incremental from the last successful backup.</list-item>
                                 <list-item><id>diff</id> - like an incremental backup but always based on the last full backup.</list-item>
                             </list>
+
+                            <p>The default is <id>full</id>. If a <id>diff</id> is requested when no full backup exists, or an <id>incr</id> is requested when no backup of any type exists, a <id>full</id> backup is performed instead.</p>
                         </text>
 
                         <example>full</example>

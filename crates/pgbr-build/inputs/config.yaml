@@ -523,7 +523,7 @@ option:
           - full
           - diff
           - incr
-        default: incr
+        default: full
       info:
         required: false
         allow-list:

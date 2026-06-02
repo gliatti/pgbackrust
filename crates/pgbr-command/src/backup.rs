@@ -3846,10 +3846,14 @@ fn plan_backup(
 /// A diff's prior is the latest full backup; an incr's prior is the latest
 /// backup of any type. A full backup has no prior — `(None, None)`.
 ///
+/// When the requested type has no qualifying base — a diff with no prior full,
+/// or an incr with no prior backup at all — this also returns `(None, None)`, so
+/// the caller can promote the backup to a full (upstream pgBackRust behaviour);
+/// it is **not** an error. `(None, None)` therefore means "treat this as a full".
+///
 /// # Errors
 ///
-/// [`CommandError::Other`] if a diff has no prior full, if an incr has no prior
-/// backup at all, or if the prior's `backup.manifest` cannot be loaded.
+/// [`CommandError::Other`] if the prior's `backup.manifest` cannot be loaded.
 fn resolve_prior(
     repo_storage: &dyn Storage,
     stanza: &str,
@@ -3859,11 +3863,16 @@ fn resolve_prior(
 ) -> Result<(Option<String>, Option<Manifest>), CommandError> {
     let prior_label = match backup_type {
         BackupType::Full => return Ok((None, None)),
-        BackupType::Diff => latest_full_label(info)
-            .ok_or_else(|| CommandError::Other("differential backup requires a prior full backup".to_owned()))?,
-        BackupType::Incr => {
-            latest_any_label(info).ok_or_else(|| CommandError::Other("incremental backup requires a prior backup".to_owned()))?
-        }
+        // No prior full (diff) / no prior backup at all (incr) → no base to
+        // reference; signal the caller (run_backup) to promote this to a full.
+        BackupType::Diff => match latest_full_label(info) {
+            Some(label) => label,
+            None => return Ok((None, None)),
+        },
+        BackupType::Incr => match latest_any_label(info) {
+            Some(label) => label,
+            None => return Ok((None, None)),
+        },
     };
 
     // The prior backup's manifest is encrypted with the repository sub-key on an
@@ -3890,8 +3899,9 @@ fn resolve_prior(
 ///
 /// 1. Load `backup/<stanza>/backup.info` (error if the stanza is uninitialised).
 /// 2. For a diff: locate the latest full backup; for an incr: locate the latest
-///    backup of any type (the "prior"). Load the prior's `backup.manifest`
-///    (error if no qualifying prior exists).
+///    backup of any type (the "prior"). Load the prior's `backup.manifest`. If
+///    no qualifying prior exists (a diff with no full, an incr with no backup at
+///    all) the backup is promoted to a full instead.
 /// 3. Recursively walk the PG data dir via `pg_storage`, applying
 ///    [`EXCLUDE_PREFIXES`].
 /// 4. For each non-excluded file: compute the **plaintext** SHA-1 + size
@@ -3910,10 +3920,10 @@ fn resolve_prior(
 ///
 /// # Errors
 ///
-/// - [`CommandError::Other`] if the stanza is not initialised, if a diff is
-///   requested with no prior full backup, if an incr is requested with no prior
-///   backup at all, or if `backup.info` / `backup.manifest` cannot be read or
-///   written.
+/// - [`CommandError::Other`] if the stanza is not initialised, or if
+///   `backup.info` / `backup.manifest` cannot be read or written. (A diff with
+///   no prior full, or an incr with no prior backup at all, is **not** an error —
+///   it is promoted to a full.)
 /// - [`CommandError::Io`] if a filter in the transform chain fails.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] for repository / PG-data
 ///   read/write failures.
@@ -4107,6 +4117,23 @@ fn run_backup(
     // For a diff/incr, resolve the prior backup and load its manifest so
     // unchanged files can be detected by (size, checksum).
     let (prior_label, prior_manifest) = resolve_prior(repo_storage, stanza, backup_type, &info, transform.cipher_pass.as_deref())?;
+
+    // Auto-promotion (as upstream): a diff with no prior full, or an incr with no
+    // prior backup at all, has no base and so becomes a full. `prior_label` is
+    // None here only when no qualifying base exists — a real full also yields None
+    // but is excluded by the `!= Full` guard. Rebinding `backup_type` propagates
+    // the promotion to every downstream use (label, `is_full`, the manifest's
+    // `backup-type`, the `backup.info` entry); `prior_manifest` stays None so all
+    // files are copied (full semantics).
+    let backup_type = if prior_label.is_none() && backup_type != BackupType::Full {
+        log_warn(&format!(
+            "no prior backup exists, {} backup has been changed to full backup",
+            backup_type.as_str()
+        ));
+        BackupType::Full
+    } else {
+        backup_type
+    };
 
     let label = label.map_or_else(
         || derive_label(backup_type, prior_label.as_deref(), timestamp_start),
@@ -5537,13 +5564,14 @@ mod tests {
     }
 
     #[test]
-    fn diff_requires_prior_full() {
-        // A diff with no prior full backup in backup.info is a hard error.
+    fn diff_without_full_promotes_to_full() {
+        // A diff with no prior full backup has no base, so it is promoted to a
+        // full (upstream behaviour) rather than erroring.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        let err = backup_inner_typed(
+        let outcome = backup_inner_typed(
             "demo",
             &repo_s,
             &pg_s,
@@ -5552,11 +5580,23 @@ mod tests {
             1_704_196_800,
             &RepoTransform::identity(),
         )
-        .expect_err("diff without a full must error");
-        match err {
-            CommandError::Other(msg) => assert_eq!(msg, "differential backup requires a prior full backup"),
-            other => panic!("expected Other(requires prior full), got {other:?}"),
-        }
+        .expect("diff without a full must be promoted to a full");
+
+        // A full label is `<ts>F` — no `_<...>D` / `_<...>I` chain suffix.
+        assert!(
+            outcome.label.ends_with('F'),
+            "promoted label must be a full: {}",
+            outcome.label
+        );
+        assert!(
+            !outcome.label.contains('_'),
+            "promoted label must not be a diff/incr chain: {}",
+            outcome.label
+        );
+
+        let manifest =
+            Manifest::load(&repo_s, Path::new(&format!("backup/demo/{}/backup.manifest", outcome.label))).expect("load manifest");
+        assert_eq!(manifest.backup_type, "full", "promoted backup must be recorded as full");
     }
 
     #[test]
@@ -5646,13 +5686,14 @@ mod tests {
     }
 
     #[test]
-    fn incr_requires_prior_backup() {
-        // An incr with an empty [backup:current] block is a hard error.
+    fn incr_without_prior_promotes_to_full() {
+        // An incr with an empty [backup:current] block has no base, so it is
+        // promoted to a full (upstream behaviour) rather than erroring.
         let (_repo, _pg, repo_s, pg_s) = posix_pair();
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        let err = backup_inner_typed(
+        let outcome = backup_inner_typed(
             "demo",
             &repo_s,
             &pg_s,
@@ -5661,11 +5702,23 @@ mod tests {
             1_704_196_800,
             &RepoTransform::identity(),
         )
-        .expect_err("incr without a prior must error");
-        match err {
-            CommandError::Other(msg) => assert_eq!(msg, "incremental backup requires a prior backup"),
-            other => panic!("expected Other(requires prior backup), got {other:?}"),
-        }
+        .expect("incr without a prior must be promoted to a full");
+
+        // A full label is `<ts>F` — no `_<...>D` / `_<...>I` chain suffix.
+        assert!(
+            outcome.label.ends_with('F'),
+            "promoted label must be a full: {}",
+            outcome.label
+        );
+        assert!(
+            !outcome.label.contains('_'),
+            "promoted label must not be a diff/incr chain: {}",
+            outcome.label
+        );
+
+        let manifest =
+            Manifest::load(&repo_s, Path::new(&format!("backup/demo/{}/backup.manifest", outcome.label))).expect("load manifest");
+        assert_eq!(manifest.backup_type, "full", "promoted backup must be recorded as full");
     }
 
     #[test]
