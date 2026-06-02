@@ -25,6 +25,12 @@ permissions:
   contents: write
   packages: write
 
+# One release run per tag at a time. A pushed tag and a manual re-dispatch of the
+# same tag would otherwise race on the GHCR push and the release-asset upload.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   # Tag name from either trigger, e.g. "v0.1.0".
   REF: ${{ inputs.tag || github.ref_name }}
