@@ -1,0 +1,49 @@
+# nfpm config for building the pgbackrust .deb / .rpm packages.
+# Driven by the release workflow (.github/workflows/release.yml), which sets:
+#   PKG_VERSION  e.g. 0.1.0          (release version, no leading "v")
+#   PKG_ARCH     amd64 | arm64       (nfpm Go-style arch; translated per packager)
+#   PKG_BIN      path to the prebuilt `pgbackrust` binary for that arch
+#
+# Build with:  nfpm package -f packaging/nfpm.yaml -p deb -t .
+#              nfpm package -f packaging/nfpm.yaml -p rpm -t .
+name: pgbackrust
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: database
+priority: optional
+maintainer: pgBackRust contributors <noreply@github.com>
+description: |
+  Reliable PostgreSQL backup and restore.
+  Rust rewrite of pgBackRest (pre-production; see the project README).
+vendor: gliatti/pgbackrust
+homepage: https://github.com/gliatti/pgbackrust
+license: MIT
+
+contents:
+  - src: ${PKG_BIN}
+    dst: /usr/bin/pgbackrust
+    file_info:
+      mode: 0755
+
+# Runtime shared libraries the binary links (libpq, libssh2, zlib, bz2, lz4,
+# zstd, openssl). Package names differ between Debian and RPM ecosystems, so
+# they are declared per-packager below.
+overrides:
+  deb:
+    depends:
+      - libpq5
+      - libssh2-1
+      - zlib1g
+      - libbz2-1.0
+      - liblz4-1
+      - libzstd1
+      - libssl3
+  rpm:
+    depends:
+      - libpq
+      - libssh2
+      - zlib
+      - bzip2-libs
+      - lz4-libs
+      - libzstd

@@ -1,0 +1,19 @@
+# Runtime image for the released pgbackrust binary, built multi-arch by
+# .github/workflows/release.yml. The binaries are produced by the `binaries`
+# jobs and dropped into the build context as `pgbackrust-<docker-arch>`
+# (pgbackrust-amd64 / pgbackrust-arm64); buildx selects the matching one per
+# target platform via $TARGETARCH, so no in-image compilation (or QEMU-built
+# Rust) is needed — only the small runtime apt layer runs per arch.
+FROM debian:bookworm-slim
+
+# Shared libraries the binary dynamically links.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libpq5 libssh2-1 zlib1g libbz2-1.0 liblz4-1 libzstd1 libssl3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+COPY pgbackrust-${TARGETARCH} /usr/bin/pgbackrust
+RUN chmod 0755 /usr/bin/pgbackrust && /usr/bin/pgbackrust version
+
+ENTRYPOINT ["/usr/bin/pgbackrust"]

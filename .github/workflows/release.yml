@@ -1,0 +1,196 @@
+name: release
+
+# Builds and publishes release artifacts for a version tag:
+#   * portable Linux binaries for x86_64 and aarch64 (built on glibc 2.35 runners
+#     so they run on any glibc >= 2.35),
+#   * .deb and .rpm packages for both arches (nfpm),
+#   * a multi-arch container image pushed to GHCR,
+# then attaches the binaries + packages + checksums to the GitHub Release.
+#
+# Triggers on a pushed `v*` tag, or manually via workflow_dispatch for an
+# existing tag (e.g. to (re)publish v0.1.0).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  # Tag name from either trigger, e.g. "v0.1.0".
+  REF: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  binaries:
+    name: binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            docker_arch: amd64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            docker_arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config build-essential \
+            libpq-dev libssh2-1-dev liblz4-dev libbz2-dev zlib1g-dev libzstd-dev
+
+      - name: Install Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          cargo --version && rustc --version
+
+      - name: Build release binary
+        run: cargo build --release -p pgbr-cli
+
+      - name: Stage artifacts
+        run: |
+          VERSION="${REF#v}"
+          install -m0755 target/release/pgbackrust "pgbackrust-${VERSION}-linux-${{ matrix.arch }}"
+          # docker-arch-named copy consumed by the image build context.
+          install -m0755 target/release/pgbackrust "pgbackrust-${{ matrix.docker_arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: |
+            pgbackrust-*-linux-${{ matrix.arch }}
+            pgbackrust-${{ matrix.docker_arch }}
+          if-no-files-found: error
+
+  packages:
+    name: deb + rpm (${{ matrix.arch }})
+    needs: binaries
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            nfpm_arch: amd64
+          - arch: aarch64
+            nfpm_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+
+      - name: Install nfpm + envsubst
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gettext-base
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.46.3/nfpm_2.46.3_Linux_x86_64.tar.gz -o /tmp/nfpm.tgz
+          sudo tar -xzf /tmp/nfpm.tgz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build deb + rpm
+        env:
+          PKG_ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          VERSION="${REF#v}"
+          export PKG_VERSION="$VERSION"
+          export PKG_BIN="pgbackrust-${VERSION}-linux-${{ matrix.arch }}"
+          chmod 0755 "$PKG_BIN"
+          # nfpm does not reliably expand env vars in `contents.src`; pre-expand
+          # the whole template ourselves so PKG_ARCH/VERSION/BIN are substituted.
+          envsubst < packaging/nfpm.yaml > nfpm.gen.yaml
+          nfpm package -f nfpm.gen.yaml -p deb -t .
+          nfpm package -f nfpm.gen.yaml -p rpm -t .
+          ls -l *.deb *.rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.arch }}
+          path: |
+            *.deb
+            *.rpm
+          if-no-files-found: error
+
+  docker:
+    name: container image (GHCR)
+    needs: binaries
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        run: |
+          VERSION="${REF#v}"
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f packaging/Dockerfile.release \
+            -t "${REPO}:${VERSION}" \
+            -t "${REPO}:latest" \
+            --push .
+
+  publish:
+    name: attach to release
+    needs: [binaries, packages]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          VERSION="${REF#v}"
+          sha256sum pgbackrust-${VERSION}-linux-* *.deb *.rpm | tee SHA256SUMS
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${REF#v}"
+          gh release upload "${REF}" \
+            "pgbackrust-${VERSION}-linux-x86_64" \
+            "pgbackrust-${VERSION}-linux-aarch64" \
+            *.deb *.rpm SHA256SUMS \
+            --clobber --repo "$GITHUB_REPOSITORY"
