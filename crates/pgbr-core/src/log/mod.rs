@@ -23,7 +23,7 @@ pub mod format;
 
 use core::ffi::{CStr, c_char};
 use std::cell::UnsafeCell;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Documented production size of a single log message including its header.
 ///
@@ -151,6 +151,29 @@ unsafe fn state_ref() -> &'static LogState {
     unsafe { &*cell().get() }
 }
 
+/// Process-global lock serialising *mutable* access to [`LogState`] and the shared scratch
+/// buffer across threads.
+///
+/// Two kinds of caller take it:
+///   * message emission (`format::log_internal` / `log_internal_fmt`) holds it for the
+///     whole render+dispatch, covering the scratch buffer and every field it reads;
+///   * the configuration mutators below (`init`, the `set_*` setters, `any_set`) take it
+///     for their tiny body so a setter cannot tear a field a concurrent emission reads.
+///
+/// The field *getters* and `set_file_banner` / `buffer_ptr` stay lock-free on purpose:
+/// they are reached only from inside an emission that already holds this lock, or as cheap
+/// scalar reads whose only writers hold the lock. `close` is unguarded because it merely
+/// delegates to the guarded `init`. The original "pgBackRust forks, never threads"
+/// invariant does not hold in the Rust port, so this lock — not the fork model — is what
+/// makes the `unsafe` global access sound.
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`LOG_LOCK`], recovering a poisoned mutex so a thread that panicked mid-log
+/// cannot wedge all subsequent logging.
+pub(super) fn log_lock() -> MutexGuard<'static, ()> {
+    LOG_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// In-place promotion of `level_any` to the loudest of the three output sinks. The file
 /// level only counts when the file descriptor is actually open (matches `logAnySet` in
 /// `src/common/log.c:108-122`).
@@ -170,6 +193,7 @@ const fn any_set_in(state: &mut LogState) {
 
 /// Promote `level_any` to the loudest of the three open output sinks.
 pub fn any_set() {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     any_set_in(unsafe { state_mut() });
 }
@@ -201,6 +225,7 @@ pub fn init(
     debug_assert!(process_id <= 999, "process_id out of range");
     debug_assert!(process_max <= 999, "process_max out of range");
 
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     let state = unsafe { state_mut() };
     state.level_std_out = level_std_out;
@@ -265,6 +290,7 @@ pub fn level_std_out() -> i32 {
 }
 
 pub fn set_level_std_out(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.level_std_out = value;
 }
@@ -276,6 +302,7 @@ pub fn level_std_err() -> i32 {
 }
 
 pub fn set_level_std_err(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.level_std_err = value;
 }
@@ -287,6 +314,7 @@ pub fn level_file() -> i32 {
 }
 
 pub fn set_level_file(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.level_file = value;
 }
@@ -304,6 +332,7 @@ pub fn fd_std_out() -> i32 {
 }
 
 pub fn set_fd_std_out(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.fd_std_out = value;
 }
@@ -315,6 +344,7 @@ pub fn fd_std_err() -> i32 {
 }
 
 pub fn set_fd_std_err(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.fd_std_err = value;
 }
@@ -326,6 +356,7 @@ pub fn fd_file() -> i32 {
 }
 
 pub fn set_fd_file(value: i32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.fd_file = value;
 }
@@ -348,6 +379,7 @@ pub fn timestamp() -> bool {
 }
 
 pub fn set_timestamp(value: bool) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.timestamp = value;
 }
@@ -359,6 +391,7 @@ pub fn process_id() -> u32 {
 }
 
 pub fn set_process_id(value: u32) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.process_id = value;
 }
@@ -376,6 +409,7 @@ pub fn dry_run() -> bool {
 }
 
 pub fn set_dry_run(value: bool) {
+    let _g = log_lock();
     // SAFETY: see `state_mut`.
     unsafe { state_mut() }.dry_run = value;
 }

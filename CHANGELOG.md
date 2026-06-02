@@ -71,6 +71,17 @@ This is a **pre-production** release: see *Known limitations* below.
 
 ### Fixed
 
+- **Thread-safe logging.** The log subsystem kept its process-global state (the
+  shared format scratch buffer and the in-memory capture buffer) behind an
+  `unsafe impl Sync` justified by a "pgBackRust forks, never threads" invariant
+  carried over from the C original — which is false in the threaded Rust port
+  (the test harness and the server / parallel-dispatch paths use real threads).
+  Concurrent log emission could race the capture buffer's `Vec` reallocation and
+  abort the process with `free(): invalid next size`. Log emission and the
+  capture buffer are now serialized by a `Mutex`, and the configuration setters
+  share the same lock. The stale "single-threaded" safety notes on the
+  (currently unused) `stack_trace` / `mem_context` globals were corrected to
+  warn against the same trap.
 - Corrected the `repository` URL typo (`pgbakrest` → `pgbackrust`) in the
   workspace manifest.
 

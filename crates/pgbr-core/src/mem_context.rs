@@ -941,6 +941,14 @@ const fn make_top() -> MemContextTop {
 static TOP_NAME: [c_char; 4] = [b'T' as c_char, b'O' as c_char, b'P' as c_char, 0];
 
 /// Process-wide top context, the root of the mem-context tree.
+///
+/// Thread-safety: this and the `MEM_CONTEXT_*` `static mut`s below are **not** synchronised.
+/// They are reached only from single-threaded contexts today (this module's serialised
+/// `#[cfg(test)]` tests; the Rust port has no live multi-threaded caller of the mem-context
+/// allocator). The `core::ptr::read`/`write` dance avoids `&mut`-to-`static mut` lints but
+/// does **not** make concurrent access sound — before any multi-threaded use these must be
+/// guarded by a lock (or the whole subsystem retired). The "pgBackRust forks, never
+/// threads" assumption is false in the Rust port.
 pub static mut TOP_CONTEXT: MemContextTop = make_top();
 
 /// Initialise the bitfields on [`TOP_CONTEXT`] and prime `MEM_CONTEXT_STACK[0]` with its address.
