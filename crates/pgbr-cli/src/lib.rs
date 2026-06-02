@@ -159,7 +159,12 @@ impl CliRunError {
     /// - runtime command failures ([`Self::Command`], [`Self::Storage`],
     ///   [`Self::Protocol`]) → [`EXIT_CODE_RUNTIME_ERROR`] (1).
     /// - internal / embedded-schema errors ([`Self::ConfigYaml`],
-    ///   [`Self::Compile`], [`Self::Cli`]) → [`EXIT_CODE_INTERNAL_ERROR`] (1).
+    ///   [`Self::Compile`]) → [`EXIT_CODE_INTERNAL_ERROR`] (1).
+    ///
+    /// [`Self::Cli`] (the argv tokenizer: malformed key, missing value,
+    /// single-dash option) is a user-input error in the same family as
+    /// [`Self::CliResolve`], so it maps to [`EXIT_CODE_CONFIG_ERROR`] (27),
+    /// matching the `unknown command` path it used to fall through to.
     ///
     /// Note: success (0) and not-yet-implemented (2) are returned as `Ok`
     /// codes by [`run`] and never surface as a [`CliRunError`], so they have
@@ -167,14 +172,15 @@ impl CliRunError {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::CliResolve(_)
+            Self::Cli(_)
+            | Self::CliResolve(_)
             | Self::Load(_)
             | Self::Ini(_)
             | Self::ReadConfigFile { .. }
             | Self::StorageConfig(_)
             | Self::NotSupportedYet(_) => EXIT_CODE_CONFIG_ERROR,
             Self::Command(_) | Self::Storage(_) | Self::Protocol(_) => EXIT_CODE_RUNTIME_ERROR,
-            Self::ConfigYaml(_) | Self::Compile(_) | Self::Cli(_) => EXIT_CODE_INTERNAL_ERROR,
+            Self::ConfigYaml(_) | Self::Compile(_) => EXIT_CODE_INTERNAL_ERROR,
         }
     }
 }
@@ -1545,9 +1551,12 @@ option:
             EXIT_CODE_RUNTIME_ERROR,
         );
 
-        // Internal / embedded-schema errors map to the internal bucket (1).
+        // argv tokenizer errors are user-input/option errors (27), same family
+        // as `unknown command` / unknown option.
         let cli_err = pgbr_config::parse_cli(["--=bad"]).unwrap_err();
-        assert_eq!(CliRunError::Cli(cli_err).exit_code(), EXIT_CODE_INTERNAL_ERROR);
+        assert_eq!(CliRunError::Cli(cli_err).exit_code(), EXIT_CODE_CONFIG_ERROR);
+        let dash_err = pgbr_config::parse_cli(["-config=/x", "info"]).unwrap_err();
+        assert_eq!(CliRunError::Cli(dash_err).exit_code(), EXIT_CODE_CONFIG_ERROR);
 
         // The documented constant values themselves.
         assert_eq!(EXIT_CODE_CONFIG_ERROR, 27);

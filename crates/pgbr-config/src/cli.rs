@@ -71,6 +71,13 @@ pub enum CliError {
     MissingValue { key: String },
     /// `--=value` or other malformed key.
     EmptyKey,
+    /// A single-dash token like `-config` (or `-config=/path`). pgBackRust has
+    /// no short options — every option is `--long` — so this is almost always a
+    /// dropped dash. Caught here so it surfaces as an actionable hint instead of
+    /// falling through to the positional path and resurfacing later as a baffling
+    /// "unknown command" error. `option` is the key without its leading dash or
+    /// any `=value` suffix (e.g. `config`).
+    SingleDashOption { option: String },
 }
 
 impl fmt::Display for CliError {
@@ -78,6 +85,10 @@ impl fmt::Display for CliError {
         match self {
             Self::MissingValue { key } => write!(f, "option `--{key}` is missing its value"),
             Self::EmptyKey => f.write_str("option key is empty"),
+            Self::SingleDashOption { option } => write!(
+                f,
+                "option `-{option}` must be written with two dashes — did you mean `--{option}`?",
+            ),
         }
     }
 }
@@ -134,6 +145,15 @@ where
                 raw_key: key.to_owned(),
                 modifier,
                 value,
+            });
+        } else if let Some(rest) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            // Single leading dash, and not the bare `-` (which stays a positional
+            // by the usual stdin convention). pgBackRust has no short options, so
+            // `-config` / `-config=/path` is a dropped dash; fail with a hint
+            // pointing at the `--` form rather than letting it become the command.
+            let option = rest.split_once('=').map_or(rest, |(name, _)| name);
+            return Err(CliError::SingleDashOption {
+                option: option.to_owned(),
             });
         } else {
             push_positional(&mut out, arg.to_owned());
@@ -532,6 +552,52 @@ option:
     fn empty_key_is_rejected() {
         let err = parse_cli(["backup", "--=value"]).unwrap_err();
         assert_eq!(err, CliError::EmptyKey);
+    }
+
+    #[test]
+    fn single_dash_option_with_value_is_rejected_with_hint() {
+        // The classic dropped-dash mistake: `-config=/path` used to slip through
+        // as the command and resurface as `unknown command \`-config=…\``.
+        let err = parse_cli(["-config=/etc/pgbackrust.conf", "info"]).unwrap_err();
+        assert_eq!(
+            err,
+            CliError::SingleDashOption {
+                option: "config".to_owned()
+            }
+        );
+        // The message points the user straight at the `--` form.
+        assert_eq!(
+            err.to_string(),
+            "option `-config` must be written with two dashes — did you mean `--config`?",
+        );
+    }
+
+    #[test]
+    fn single_dash_flag_without_value_is_rejected() {
+        let err = parse_cli(["-stanza", "info"]).unwrap_err();
+        assert_eq!(
+            err,
+            CliError::SingleDashOption {
+                option: "stanza".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn bare_single_dash_stays_a_positional() {
+        // A lone `-` keeps its stdin-convention meaning — it is NOT an option.
+        let r = parse_cli(["archive-push", "-"]).unwrap();
+        assert_eq!(r.command.as_deref(), Some("archive-push"));
+        assert_eq!(r.params, vec!["-".to_owned()]);
+    }
+
+    #[test]
+    fn dash_prefixed_positional_after_terminator_is_kept() {
+        // `--` still escapes a genuine value that begins with a dash; the
+        // single-dash guard must not fire on tokens past the terminator.
+        let r = parse_cli(["archive-get", "--", "-weird-wal-name"]).unwrap();
+        assert_eq!(r.command.as_deref(), Some("archive-get"));
+        assert_eq!(r.params, vec!["-weird-wal-name".to_owned()]);
     }
 
     // ---- resolve_cli (against Cfg) ----------------------------------------
