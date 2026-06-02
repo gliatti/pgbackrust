@@ -15,9 +15,15 @@
 //!
 //! # Threading
 //!
-//! Same single-threaded contract as the rest of the crate. pgBackRust forks for
-//! parallelism rather than threading; concurrent `log_internal` / `log_internal_fmt` /
-//! `log_signal` calls are unsound and would race on the shared scratchpad.
+//! The shared scratchpad and the parent module's `LogState` are process-global, but the
+//! Rust port runs real threads (the test harness, the server, parallel dispatch). The two
+//! message entry points — [`log_internal`] / [`log_internal_fmt`] — therefore take the
+//! process-global [`EMISSION_LOCK`] for their whole body, serialising every access to the
+//! scratchpad and to the `LogState` fields read during a dispatch. Configuration
+//! (`super::init` and the setters) is performed once at process start, before any worker
+//! thread is spawned, so it cannot race a concurrent emission. [`log_signal`] is the lone
+//! exception: it runs from a signal handler at process death, where locking a `Mutex` is
+//! not async-signal-safe, so it stays lock-free and best-effort (as the C original was).
 //!
 //! # Errors
 //!
@@ -29,6 +35,7 @@
 use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use core::mem::MaybeUninit;
 use std::format;
+use std::sync::{Mutex, PoisonError};
 
 use pgbr_error::format::{Arg, format_message};
 use pgbr_error::{Error, ErrorType};
@@ -52,6 +59,17 @@ const DRY_RUN_PREFIX: &[u8] = b"[DRY-RUN] ";
 /// without re-allocating. The legacy C buffer is `87`; we keep the same outer bound so
 /// the `indent_size < INDENT_BUFFER.len()` assertion behaves the same.
 const INDENT_BUFFER: [u8; 90] = [b' '; 90];
+
+/// Serialises message emission across threads.
+///
+/// The formatter renders into a single process-global scratchpad and reads the parent
+/// module's `LogState` mid-dispatch; both are shared mutable state. Holding this lock for
+/// the entire body of [`log_internal`] / [`log_internal_fmt`] guarantees only one emission
+/// touches that state at a time, which is what the `unsafe` global accessors actually rely
+/// on now that the port is multi-threaded (the original "fork, never thread" invariant no
+/// longer holds). [`log_signal`] deliberately does **not** take this lock — it runs in a
+/// signal handler where `Mutex` acquisition is not async-signal-safe.
+static EMISSION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Result of [`log_pre`] — three offsets into the shared scratchpad.
 #[derive(Debug, Clone, Copy)]
@@ -141,8 +159,14 @@ unsafe fn strerror_string(errnum: c_int) -> String {
 // Buffer access.
 // ---------------------------------------------------------------------------
 
-/// SAFETY contract enforced by the single-threaded invariant: only one logger call runs
-/// at a time, so handing out a `&mut [u8]` to the shared 32 KiB scratchpad is sound.
+/// Hand out a `&mut [u8]` to the shared scratchpad.
+///
+/// # Safety
+///
+/// The caller must guarantee exclusive access. Both message entry points hold
+/// [`EMISSION_LOCK`] for the duration, so only one renders at a time; [`log_signal`] runs
+/// only at signal-driven process death. Two concurrent emissions would alias this `&mut`,
+/// which is undefined behaviour — hence the lock.
 #[allow(clippy::mut_from_ref)]
 unsafe fn buffer_slice() -> &'static mut [u8] {
     // SAFETY: `buffer_ptr` returns a pointer to the shared `LogState` scratch buffer
@@ -479,6 +503,9 @@ pub fn log_internal(
     code: i32,
     message: &str,
 ) -> Result<(), Error> {
+    // Serialise the whole render+dispatch against the shared scratchpad / LogState.
+    let _emit = EMISSION_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let mut data = log_pre(level, process_id_param, file_name, function_name, code);
 
     // SAFETY: see `buffer_slice`.
@@ -508,6 +535,9 @@ pub fn log_internal_fmt(
     template: &str,
     args: &[Arg<'_>],
 ) -> Result<(), Error> {
+    // Serialise the whole render+dispatch against the shared scratchpad / LogState.
+    let _emit = EMISSION_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let mut data = log_pre(level, process_id_param, file_name, function_name, code);
 
     // SAFETY: see `buffer_slice`.
