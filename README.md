@@ -33,18 +33,18 @@ The build is driven entirely by Cargo. The `pgbackrust` binary is produced by
 | `pgbr-core` | String, blob, memory primitives; log formatting, debug, stack trace, object base. |
 | `pgbr-error` | Typed `Error` / `ErrorType` (generated from `error.yaml` by `build.rs`), format, retry. |
 | `pgbr-encode` | Hex / base64 encoders. |
-| `pgbr-crypto` | xxhash. |
+| `pgbr-crypto` | OpenSSL-backed crypto: OpenSSL init + secure random (`common`), MD5/SHA1/SHA256 hashing + HMAC (`hash`; MD5 via the pure-Rust `md-5` crate to survive a FIPS OpenSSL), a symmetric cipher (`cipher`), and XXH3-128 (`xxhash3`, used to identify backup blocks for incremental). |
 | `pgbr-compress` | gz / bz2 / lz4 / zstd compress + decompress, exposed as `pgbr_io::Filter` adapters. |
 | `pgbr-regex` | Regex wrapper. |
 | `pgbr-build` | Typed parsers for the four pgBackRust definition files, embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files live in `crates/pgbr-build/inputs/`. |
-| `pgbr-config` | Full configuration pipeline: option model, compile/inheritance, value parsing, CLI tokenizer, `pgbackrust.conf` ini parsing, and `load_config` with the CLI > stanza:cmd > stanza > global:cmd > global > default precedence plus allow-list / allow-range / depend validation. |
+| `pgbr-config` | Full configuration pipeline: option model, compile/inheritance, value parsing, CLI tokenizer, `PGBACKRUST_<OPTION>` environment-variable source, `pgbackrust.conf` ini parsing, and `load_config` with the CLI > ENV > stanza:cmd > stanza > global:cmd > global > default precedence plus allow-list / allow-range / depend validation. |
 | `pgbr-io` | `IoRead` / `IoWrite` traits, in-memory and file-backed implementations, `FilterChain`, and built-in filters (`Sha1`, `Sha256`, `Size`, `Cipher` AES-256-CBC). |
 | `pgbr-storage` | `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2). |
 | `pgbr-db` | Safe libpq wrapper (`Connection`, `QueryResult`). |
 | `pgbr-protocol` | JSON-line `Request` / `Response` message types + codec. |
 | `pgbr-postgres` | `crc32c_one`, version registry (PG 9.6 .. 18), `pg_control` header parsing, and `pg_checksum_page`. |
 | `pgbr-info` | On-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 format. |
-| `pgbr-command` | Every command implementation plus the `dispatch` entry point (see below). |
+| `pgbr-command` | Every command implementation plus the dispatch entry point — `dispatch_multi` (the real router over all configured repositories) and its single-repo wrapper `dispatch` (see below). |
 | `pgbr-cli` | The `pgbackrust` binary: parse argv → load config → resolve → `pgbr_command::dispatch`. |
 
 `pgbr-command` implements: backup (full / differential / incremental), restore

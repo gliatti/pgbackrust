@@ -52,18 +52,18 @@ docker compose run --rm dev cargo test --workspace
 - `pgbr-core` — string, blob, memory primitives, log formatting, debug, stack trace, object base
 - `pgbr-error` — typed `Error` / `ErrorType` (generated from `error.yaml` by `build.rs`), format, retry
 - `pgbr-encode` — hex / base64 encoders
-- `pgbr-crypto` — xxhash
+- `pgbr-crypto` — OpenSSL-backed crypto: `common` (OpenSSL init + `random_bytes`), `hash` (MD5/SHA1/SHA256 + HMAC; MD5 via the pure-Rust `md-5` crate so it survives a FIPS OpenSSL), `cipher` (symmetric `State` + `derive_key_iv`), and `xxhash3` (XXH3-128, used to identify backup blocks for incremental)
 - `pgbr-compress` — gz / bz2 / lz4 / zst compress + decompress, exposed as `pgbr_io::Filter` adapters (`filter` module)
 - `pgbr-regex` — regex wrapper
 - `pgbr-build` — typed parsers for the four pgBackRust definition files, which are embedded at compile time and exposed as `pgbr_build::inputs::{CONFIG_YAML, ERROR_YAML, HELP_XML, POSTGRES_YAML}`. The files themselves live in `crates/pgbr-build/inputs/`
-- `pgbr-config` — full configuration pipeline: `types`, `command` (`CfgCommand`), `option` (`CfgOption`), `compile` (`Cfg`, inheritance + `+role`/`+inherit`/`-command` expansion), `value` (`OptionValue`, `parse_value`), `cli` (`parse_cli` + `resolve_cli`), `ini` (`parse_ini`), `merge` (`load_config` / `load_config_with_context` with CLI > stanza:cmd > stanza > global:cmd > global > default precedence + allow-list/allow-range/depend validation + dynamic & per-flavor defaults)
+- `pgbr-config` — full configuration pipeline: `types`, `command` (`CfgCommand`), `option` (`CfgOption`), `compile` (`Cfg`, inheritance + `+role`/`+inherit`/`-command` expansion), `value` (`OptionValue`, `parse_value`), `cli` (`parse_cli` + `resolve_cli`), `env` (`PGBACKRUST_<OPTION>` environment-variable source, `collect_env`), `ini` (`parse_ini`), `merge` (`load_config` / `load_config_with_context` with **CLI > ENV > stanza:cmd > stanza > global:cmd > global > default** precedence + allow-list/allow-range/depend validation + dynamic & per-flavor defaults)
 - `pgbr-io` — `IoRead`/`IoWrite` traits (with `Box<dyn>`/`&mut` blanket impls + `copy`), `MemRead`/`MemWrite`, `FileRead`/`FileWrite`, `FilterChain`, and the `filter` module (`Sha1`, `Sha256`, `Size`, `Cipher` AES-256-CBC)
 - `pgbr-storage` — `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2)
 - `pgbr-db` — safe libpq wrapper (`Connection`, `QueryResult`); `Connection` is `!Send`
 - `pgbr-protocol` — JSON-line `Request` / `Response` message types + `read_message`/`write_message` codec
 - `pgbr-postgres` — `crc32c_one`, `version` registry (PG 9.6 .. 18), `control` (`pg_control` header + per-version field offsets), `page` (`pg_checksum_page`)
 - `pgbr-info` — on-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 `format`
-- `pgbr-command` — every command + the `dispatch` entry: backup (full/diff/incr), restore (+ delta + reference resolution), archive-push/get, expire (backup + WAL retention), verify, check, info, stanza-create/delete/upgrade, repo-ls/get/put/rm, annotate, manifest, start/stop, server/server-ping (TCP + TLS), help, version; plus the shared `pipeline::RepoTransform` (compress + encrypt)
+- `pgbr-command` — every command + the dispatch entry (`dispatch_multi` is the real router, taking all configured repositories; `dispatch` is the single-repo convenience wrapper that calls it with `[(1, repo)]`): backup (full/diff/incr), restore (+ delta + reference resolution), archive-push/get, expire (backup + WAL retention), verify, check, info, stanza-create/delete/upgrade, repo-ls/get/put/rm, annotate, manifest, start/stop, server/server-ping (TCP + TLS), help, version; plus the shared `pipeline::RepoTransform` (compress + encrypt)
 - `pgbr-cli` — the `pgbackrust` binary: parse argv → load `config.yaml` + `pgbackrust.conf` → resolve → `pgbr_command::dispatch`
 
 ## Adding a configuration option
@@ -78,6 +78,23 @@ These are embedded into `pgbr-build` at compile time, so a plain `cargo build` p
 ## Testing
 
 `cargo test --workspace` runs all unit + integration tests. Per-module tests live in `#[cfg(test)] mod tests` inside the owning crate. Cloud-backend and DB round-trip tests that need a live endpoint are `#[ignore]`d and gated on env vars (`PGBR_S3_*`, `PGBR_AZURE_*`, `PGBR_GCS_*`, `PGBR_SFTP_*`, `DATABASE_URL`).
+
+Scope the run while iterating (everything still goes through the `cargo` service):
+
+```
+docker compose run --rm cargo test -p pgbr-config                       # one crate
+docker compose run --rm cargo test -p pgbr-config merge::tests          # one module
+docker compose run --rm cargo test -p pgbr-config -- --exact merge::tests::precedence_cli_wins   # one test
+docker compose run --rm cargo test -p pgbr-config -- --nocapture        # show stdout/println!
+```
+
+To run the `#[ignore]`d endpoint tests, pass `-- --ignored` and inject the required env vars with `docker compose run -e` (they are read inside the container, so host exports don't reach them):
+
+```
+docker compose run --rm -e DATABASE_URL=postgres://... cargo test -p pgbr-db -- --ignored
+```
+
+The same `-p <crate>` / name-filter scoping works for clippy (`cargo clippy -p pgbr-config --all-targets -- -D warnings`) and for running the binary (`cargo run -p pgbr-cli -- <command>`).
 
 ## Integration testing (`integration/`)
 
