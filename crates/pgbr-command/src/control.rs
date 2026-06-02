@@ -2,8 +2,13 @@
 //!
 //! C reference: `src/command/control/control.c`. The C source pulls the
 //! version string from the Meson-generated `version.h` (`PROJECT_VERSION`).
-//! The Rust port hard-codes 2.58 for now and will switch to a build-time
-//! const once the workspace exposes one.
+//! The Rust port sources it from the cargo workspace version at compile time
+//! (`env!("CARGO_PKG_VERSION")`), so the banner tracks the crate version.
+//!
+//! Note: this *product* version is distinct from the on-disk format version
+//! (`backrest-version`, currently `2.58`) stamped into info/manifest files,
+//! which is deliberately pinned to the pgBackRest format this port targets so
+//! existing repositories stay compatible.
 //!
 //! This module also hosts the crate-internal [`log_info`] / [`log_warn`]
 //! helpers (see below): the thin wrappers that reroute *human-facing*
@@ -16,7 +21,7 @@
 
 use crate::CommandError;
 
-const VERSION: &str = "pgBackRust 2.58";
+const VERSION: &str = concat!("pgBackRust ", env!("CARGO_PKG_VERSION"));
 
 /// Emit a human-facing progress line at `INFO` through the `pgbr_core::log`
 /// formatter.
@@ -72,9 +77,6 @@ pub(crate) fn log_warn(message: &str) {
 // `print_stdout`: CLI command writes to stdout by design.
 #[allow(clippy::print_stdout, clippy::unnecessary_wraps)]
 pub fn version(_config: &pgbr_config::LoadedConfig) -> Result<(), CommandError> {
-    // TODO: source from build-time const (e.g. `env!("CARGO_PKG_VERSION")` once
-    // the workspace version matches the user-facing pgBackRust version, or a
-    // dedicated `pgbr-build` constant).
     println!("{VERSION}");
     Ok(())
 }

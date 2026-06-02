@@ -15,6 +15,13 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 cd "$ROOT"
 
+# Docker Desktop's buildx "bake" path builds all compose services in parallel
+# and races when several of them export the SAME image tag — the three nodes
+# share pgbr-node:latest — failing with `image ... already exists`. Default to
+# the classic sequential builder so a plain run works out of the box; callers
+# can still override (e.g. COMPOSE_BAKE=true) on engines without the race.
+export COMPOSE_BAKE="${COMPOSE_BAKE:-false}"
+
 # 1. binary artifact
 if [ ! -x integration/artifacts/pgbackrust ]; then
   info "building pgbackrust binary"

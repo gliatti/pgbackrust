@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 authors = ["pgBackRust contributors"]
-repository = "https://github.com/gliatti/pgbakrest"
+repository = "https://github.com/gliatti/pgbackrust"
 
 [profile.release]
 lto = "fat"
