@@ -54,4 +54,17 @@ i2=$(pg_as principal pgbackrust --stanza=$STANZA --repo=2 info)
 assert_contains "$i1" "full backup" "repo1 info"
 assert_contains "$i2" "full backup" "repo2 info"
 
+# Lightweight repo-sync smoke check: both repos already received the same WAL
+# (archived simultaneously above) and carry default bundling/block/cipher
+# settings, so they are consistent mirrors for WAL. `repo-sync --type=wal` from
+# the active repo (repo1) to repo2 must therefore run cleanly and be a pure
+# idempotent no-op — every segment is already present on repo2 — without
+# disturbing the per-repo backups asserted above. See scenario 12 for the full
+# byte-identical mirror exercise.
+info "repo-sync --type=wal is a clean no-op when repo2 already has the WAL"
+sync_out=$(pg_as principal pgbackrust --stanza=$STANZA --type=wal repo-sync)
+assert_contains "$sync_out" "repo-sync" "repo-sync output"
+i2b=$(pg_as principal pgbackrust --stanza=$STANZA --repo=2 info)
+assert_contains "$i2b" "full backup" "repo2 info unchanged after repo-sync --type=wal"
+
 pass "08 multi-repo complete"

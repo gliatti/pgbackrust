@@ -1044,6 +1044,109 @@ else fail "hello.txt still listed after repo-rm"; fi
 
 ############################################################################
 fi
+if want 25; then
+hd "Scenario 25 — repo-sync: byte-identical mirroring of backups + WAL (repo1 -> repo2)"
+# Layer-1 repo-sync. Repos in a set are byte-identical mirrors (compression
+# global; bundling / block / cipher-type identical; cipher sub-key shared), so
+# syncing a backup or WAL to another repo is a PURE RAW BYTE COPY of the stored
+# objects at the SAME repo paths — no decode / re-encode / re-bundle. This
+# mirrors Docker scenario 12 adapted to the Vagrant topology: two LOCAL repos on
+# principal (repo1=/var/lib/pgbackrust, repo2=/var/lib/pgbackrust2), exactly the
+# two-repo layout scenario 9 uses. Exercises three documented behaviours:
+#   (a) the inline --repo-sync option on `backup` (mirror the just-completed
+#       backup to every other repo immediately),
+#   (b) the standalone `repo-sync` command (reconcile repos later; syncs WAL +
+#       backups, idempotent, ancestor-backfill for diff/incr chains),
+#   (c) byte-for-byte identity of a synced object (the synced backup is not a
+#       re-bundle/re-compress: a stored file in repo2 is identical to repo1).
+reset_principal_cluster
+on principal "rm -rf /var/lib/pgbackrust/* /var/lib/pgbackrust2/* 2>/dev/null; install -d -o postgres -g postgres -m 0750 /var/lib/pgbackrust /var/lib/pgbackrust2 /var/log/pgbackrust"
+# Both repos must be CONFIGURED IDENTICAL MIRRORS (same bundling/block/cipher):
+# repo-sync's consistency check refuses a raw copy between mismatched repos.
+on principal "cat > /etc/pgbackrust/pgbackrust.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrust
+repo1-retention-full=2
+repo2-path=/var/lib/pgbackrust2
+repo2-retention-full=2
+log-level-console=info
+log-path=/var/log/pgbackrust
+start-fast=y
+[demo]
+pg1-path=$PRI
+pg1-port=5433
+EOF
+chmod 0644 /etc/pgbackrust/pgbackrust.conf"
+# stanza-create initialises BOTH repos (repo-sync mirrors objects into an
+# already-initialised stanza; it does not create one).
+ok "stanza-create (2 identical repos)" principal "pgbackrust --stanza=demo stanza-create"
+ok "check (2 repos)" principal "pgbackrust --stanza=demo check"
+
+# --- (a) inline --repo-sync on backup ------------------------------------
+# Back up to the active repo (repo1, the default source) WITH --repo-sync, so
+# the just-completed backup is mirrored to repo2 in the same run.
+psql_on principal 5433 "CREATE TABLE t(i int)" >/dev/null
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1,1500)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "full backup --repo-sync (mirror just-completed backup to repo2)" principal "pgbackrust --stanza=demo --type=full --repo-sync backup"
+r1=$(on principal "ls /var/lib/pgbackrust/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+r2=$(on principal "ls /var/lib/pgbackrust2/backup/demo/ 2>/dev/null | grep -cE 'F\$'")
+if [ "${r1:-0}" = "1" ] && [ "${r2:-0}" = "1" ]; then pass "inline --repo-sync mirrored the full backup to repo2 (repo1=$r1 repo2=$r2)"
+else fail "inline --repo-sync placement (repo1=$r1 repo2=$r2, want 1/1)"; fi
+# repo2's backup.info must now know the synced backup (verbatim merge).
+out=$(pg principal "pgbackrust --stanza=demo --repo=2 info")
+assert_contains "$out" "full backup" "repo2 info shows the mirrored full backup"
+
+# --- (c) byte-for-byte identity of a synced object -----------------------
+# repo-sync is a raw byte copy, NOT a re-bundle/re-compress. Pick a backed-up
+# file present in both repos and compare its bytes via sha256sum.
+LABEL=$(on principal "ls -d /var/lib/pgbackrust/backup/demo/*F | head -1 | xargs -n1 basename")
+SAMPLE=$(on principal "find /var/lib/pgbackrust/backup/demo/$LABEL/global -type f -name 'pg_control*' | head -1 | xargs -n1 basename")
+s1=$(on principal "sha256sum /var/lib/pgbackrust/backup/demo/$LABEL/global/$SAMPLE 2>/dev/null | cut -d' ' -f1")
+s2=$(on principal "sha256sum /var/lib/pgbackrust2/backup/demo/$LABEL/global/$SAMPLE 2>/dev/null | cut -d' ' -f1")
+if [ -n "$s1" ] && [ "$s1" = "$s2" ]; then pass "synced object is byte-identical in repo2 ($SAMPLE sha256 matches)"
+else fail "synced object differs (repo1=$s1 repo2=$s2) — raw-copy regression"; fi
+
+# --- (b) standalone repo-sync command (WAL + a later backup) -------------
+# Take a SECOND backup to repo1 ONLY (no --repo-sync), plus some new WAL, then
+# reconcile with the standalone command. It must mirror BOTH the new backup and
+# the archived WAL into repo2.
+psql_on principal 5433 "INSERT INTO t SELECT generate_series(1501,2000)" >/dev/null
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "incr backup to repo1 only (no --repo-sync)" principal "pgbackrust --stanza=demo --type=incr backup"
+# repo2 must still hold only the first backup at this point.
+r2_before=$(on principal "ls /var/lib/pgbackrust2/backup/demo/ 2>/dev/null | grep -cE 'I\$' || true")
+psql_on principal 5433 "SELECT pg_switch_wal()" >/dev/null
+ok "standalone repo-sync (--type=all: WAL + backups, repo1 -> repo2)" principal "pgbackrust --stanza=demo repo-sync"
+# The incremental backup (and its full ancestor) must now be present in repo2.
+r2_incr=$(on principal "ls /var/lib/pgbackrust2/backup/demo/ 2>/dev/null | grep -cE 'I\$' || true")
+if [ "${r2_before:-0}" = "0" ] && [ "${r2_incr:-0}" -ge 1 ]; then pass "standalone repo-sync mirrored the incr backup to repo2 (before=$r2_before after=$r2_incr)"
+else fail "standalone repo-sync backup mirror (incr in repo2 before=$r2_before after=$r2_incr, want 0 -> >=1)"; fi
+# WAL must be mirrored too: repo2's archive dir holds segment files.
+w2=$(on principal "ls /var/lib/pgbackrust2/archive/demo/*/0000* 2>/dev/null | wc -l" | tr -d ' ')
+if [ "${w2:-0}" -ge 1 ]; then pass "standalone repo-sync mirrored WAL to repo2 ($w2 segment(s))"
+else fail "standalone repo-sync mirrored no WAL to repo2 (got: $w2)"; fi
+# repo2 info now shows BOTH backups.
+out=$(pg principal "pgbackrust --stanza=demo --repo=2 info")
+assert_contains "$out" "incr backup" "repo2 info shows the mirrored incr backup"
+
+# --- idempotency: re-running repo-sync is a no-op success ----------------
+ok "repo-sync again (idempotent: all objects already present)" principal "pgbackrust --stanza=demo repo-sync"
+r2_again=$(on principal "ls /var/lib/pgbackrust2/backup/demo/ 2>/dev/null | grep -cE 'F\$|I\$' || true")
+if [ "${r2_again:-0}" -ge 2 ]; then pass "idempotent repo-sync left repo2 unchanged ($r2_again backup dirs)"
+else fail "idempotent repo-sync changed repo2 (backup dirs=$r2_again, want >=2)"; fi
+
+# --- restore from the synced repo2 proves the mirror is valid ------------
+pg principal "$BIN/pg_ctl -D $PRI -w stop" >/dev/null 2>&1
+ok "delta restore from repo2 (the synced mirror)" principal "pgbackrust --stanza=demo --repo=2 --delta restore"
+pg principal "$BIN/pg_ctl -D $PRI -l $PRI/server.log -w -t 90 start" >/dev/null 2>&1
+sleep 4
+rows=$(psql_on principal 5433 "SELECT count(*) FROM t" | grep -oE '^[0-9]+$' | head -1)
+if [ "$rows" = "2000" ]; then pass "restore from synced repo2 recovered all data (2000 rows)"
+else pg principal "tail -20 $PRI/server.log" 2>&1 | grep -vE 'Connection to' >&2; fail "restore from synced repo2 (got: $rows, want 2000)"; fi
+
+############################################################################
+fi
 printf '\n==================================================\n'
 printf 'VALIDATION SUMMARY: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '==================================================\n'

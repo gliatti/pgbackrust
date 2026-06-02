@@ -328,6 +328,8 @@ fn worker_loaded_config(resolved: &ResolvedCli) -> LoadedConfig {
 const MULTI_REPO_COMMANDS: &[&str] = &[
     "archive-push",
     "archive-get",
+    "backup",
+    "repo-sync",
     "stanza-create",
     "stanza-delete",
     "stanza-upgrade",

@@ -126,6 +126,13 @@ command:
     log-level-default: DEBUG
     parameter-allowed: true
 
+  repo-sync:
+    command-role:
+      remote: {}
+    lock-remote-required: true
+    lock-required: true
+    lock-type: backup
+
   restore:
     command-role:
       local: {}
@@ -403,6 +410,7 @@ option:
       manifest:
         default: latest
         required: true
+      repo-sync: {}
       restore:
         default: latest
         required: true
@@ -440,6 +448,7 @@ option:
         required: false
       repo-rm:
         required: false
+      repo-sync: {}
       restore: {}
       stanza-create: {}
       stanza-delete: {}
@@ -524,6 +533,12 @@ option:
           - diff
           - incr
         default: full
+      repo-sync:
+        allow-list:
+          - all
+          - wal
+          - backup
+        default: all
       info:
         required: false
         allow-list:
@@ -1202,6 +1217,15 @@ option:
     command-role:
       main: {}
 
+  repo-sync:
+    section: global
+    type: boolean
+    default: false
+    command:
+      backup: {}
+    command-role:
+      main: {}
+
   start-fast:
     section: global
     type: boolean
@@ -1648,6 +1672,7 @@ option:
       repo-ls: {}
       repo-put: {}
       repo-rm: {}
+      repo-sync: {}
       restore: {}
       server: {}
       stanza-create:
@@ -1855,6 +1880,7 @@ option:
     default: false
     command:
       backup: {}
+      repo-sync: {}
     command-role:
       main: {}
 
@@ -1866,6 +1892,7 @@ option:
     allow-range: [1MiB, 1PiB]
     command:
       backup: {}
+      repo-sync: {}
     command-role:
       main: {}
     depend:
@@ -1885,6 +1912,7 @@ option:
     default: false
     command:
       backup: {}
+      repo-sync: {}
     command-role:
       main: {}
     depend:

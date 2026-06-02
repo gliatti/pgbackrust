@@ -1543,6 +1543,16 @@
                         <example>y</example>
                     </config-key>
 
+                    <config-key id="repo-sync" name="Repo Sync">
+                        <summary>Sync the just-completed backup to other repositories.</summary>
+
+                        <text>
+                            <p>When multiple repositories are configured and this option is enabled, the backup just written to the active repository is mirrored byte-for-byte to every other configured repository immediately after a successful backup. Because repositories in a set are identical mirrors the copy is a raw byte copy with no recompression or re-encryption. The standalone <cmd>repo-sync</cmd> command can also be run later to reconcile repositories.</p>
+                        </text>
+
+                        <example>y</example>
+                    </config-key>
+
                     <config-key id="stop-auto" name="Stop Auto">
                         <summary>Stop prior failed backup on new backup.</summary>
 
@@ -2500,6 +2510,44 @@
                         </text>
 
                         <example>y</example>
+                    </option>
+                </option-list>
+            </command>
+
+            <command id="repo-sync" name="Repository Sync">
+                <summary>Sync backups and WAL between repositories.</summary>
+
+                <text>
+                    <p>Mirrors backups and archived WAL from the active repository (the highest priority repository, or the one given by <br-option>{[dash]}-repo</br-option>) to every other configured repository. Repositories in a set are byte-identical mirrors, so the sync is a raw byte copy of the stored objects with no recompression, re-encryption, or re-bundling.</p>
+
+                    <p>The command is idempotent: objects already present in a destination repository are skipped, and the ancestors of a differential or incremental backup are synced first so dependency chains are never broken.</p>
+                </text>
+
+                <option-list>
+                    <option id="type" name="Type">
+                        <summary>What to sync.</summary>
+
+                        <text>
+                            <p>The following sync types are supported:</p>
+
+                            <list>
+                                <list-item><id>all</id> - sync both WAL and backups (the default).</list-item>
+                                <list-item><id>wal</id> - sync archived WAL only.</list-item>
+                                <list-item><id>backup</id> - sync backups only.</list-item>
+                            </list>
+                        </text>
+
+                        <example>backup</example>
+                    </option>
+
+                    <option id="set" name="Set">
+                        <summary>Backup set to sync.</summary>
+
+                        <text>
+                            <p>Sync only the specified backup set (the backup label and all of its dependent backups). When not specified, every backup in the source repository is synced.</p>
+                        </text>
+
+                        <example>20150131-153358F_20150131-153401I</example>
                     </option>
                 </option-list>
             </command>

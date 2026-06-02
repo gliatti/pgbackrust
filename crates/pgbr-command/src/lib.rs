@@ -38,6 +38,7 @@ pub mod repo;
 pub mod restore;
 pub mod server;
 pub mod stanza;
+pub mod sync;
 pub mod verify;
 pub mod worker;
 
@@ -175,7 +176,8 @@ pub fn dispatch_multi(
         "repo-get" => repo::get(config, repo_storage),
         "repo-put" => repo::put(config, repo_storage),
         "repo-rm" => repo::rm(config, repo_storage),
-        "backup" => backup::backup(config, repo_storage, pg_storage),
+        "backup" => backup::backup(config, repo_storage, repo_storages, pg_storage),
+        "repo-sync" => sync::command(config, repo_storage, repo_storages),
         "restore" => restore::restore(config, repo_storage, pg_storage),
         "archive-get" => archive_get_with_prefetch(config, &archive_repos, pg_storage),
         "archive-push" => archive::push(config, &archive_repos, pg_storage),

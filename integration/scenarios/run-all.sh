@@ -42,6 +42,11 @@ trap '$COMPOSE down -v >/dev/null 2>&1 || true' EXIT
 
 # 4. run scenarios (filtered by optional args)
 #
+# The numbered scenarios (auto-discovered by the glob below) are:
+#   01-local-minimal      02-remote-pull-ssh   03-pitr            04-encryption
+#   05-standby            06-tablespaces       07-async-queuing   08-multi-repo
+#   09-tls                10-bundling-block    11-s3              12-repo-sync
+#
 # Each scenario runs against a freshly reset topology: `down -v` wipes every
 # volume (principal-data, secondaire-data, depot-repo, minio-data) so no
 # cross-scenario state (leftover timelines, stale WAL, cumulatively-appended
