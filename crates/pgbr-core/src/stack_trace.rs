@@ -2,8 +2,13 @@
 //! `STACK_TRACE_POP` machinery and the parameter-logging helpers.
 //!
 //! The state is process-global (matching the legacy `static struct stackTraceLocal` in
-//! `src/common/stackTrace.c`) and not safe for concurrent access — pgBackRust forks for
-//! parallelism, so each child process has its own copy of this state.
+//! `src/common/stackTrace.c`) and is **not** synchronised. It is currently reached only
+//! from single-threaded contexts (this module's own serialised `#[cfg(test)]` tests); the
+//! Rust port has no live caller wiring it into the multi-threaded paths. **Before any
+//! multi-threaded code uses it, it must be guarded by a lock or made `thread_local!`** —
+//! exactly the bug that bit `log::capture` (an unsynchronised global `Vec` raced across
+//! threads and corrupted the heap). Do not trust the "forks, never threads" model: the
+//! Rust port threads.
 //!
 //! The libbacktrace integration stays on the C side: `backtrace_full` calls back into a
 //! C function that reads frames here through the FFI getters
@@ -96,8 +101,11 @@ impl StackTraceLocal {
 
 #[allow(clippy::non_send_fields_in_send_ty)]
 struct UnsafeGlobal<T>(UnsafeCell<T>);
-// SAFETY: pgBackRust forks for parallelism rather than threading; logging happens from a
-// single thread per process. The legacy C code already relies on this invariant.
+// SAFETY: this `Sync` impl only exists to satisfy `OnceLock<T>`'s `T: Sync` bound for the
+// `static` below; it does NOT make concurrent access sound. The state has no live
+// multi-threaded caller (only this module's serialised tests reach it). If that ever
+// changes, the access must move behind a lock first — see the module-level warning. The
+// original "pgBackRust forks, never threads" rationale is false in the Rust port.
 unsafe impl<T> Sync for UnsafeGlobal<T> {}
 unsafe impl<T> Send for UnsafeGlobal<T> {}
 
