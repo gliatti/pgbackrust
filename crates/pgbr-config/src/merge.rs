@@ -52,6 +52,55 @@ const FLAVOR_SOURCE_OPTION: &str = "compress-type";
 /// `compress-type`'s own scalar default in `config.yaml`.
 const FLAVOR_DEFAULT: &str = "gz";
 
+/// Placeholder substituted for the value of a `secure:` option (secrets such
+/// as `repo-cipher-pass`, `repo-s3-key`, `repo-azure-key`, …) in any
+/// user-facing error message. The raw secret must never appear in a
+/// [`LoadError`]'s `Display`, so it is masked at construction time.
+const REDACTED: &str = "<redacted>";
+
+/// Whether `option_name` is declared `secure:` in `cfg`. A secure option's
+/// value is a secret and must be masked in error messages. Unknown options
+/// (not in `cfg`) are treated as non-secure.
+fn is_secure(cfg: &Cfg, option_name: &str) -> bool {
+    cfg.options.get(option_name).is_some_and(|o| o.secure)
+}
+
+/// Wrap a [`ValueError`] into a [`LoadError::ValueParse`], masking the raw
+/// value when `secure` so a failing secret parse (e.g. a malformed
+/// `repo-cipher-pass`) never echoes the secret back. The parse-failure reason
+/// and option type are preserved; only the offending text is redacted.
+fn value_parse_error(option: &str, group_index: Option<u32>, error: ValueError, secure: bool) -> LoadError {
+    let error = if secure { redact_value_error(error) } else { error };
+    LoadError::ValueParse {
+        option: option.to_owned(),
+        group_index,
+        error,
+    }
+}
+
+/// Replace the raw text carried by a [`ValueError`] with [`REDACTED`], keeping
+/// the variant/type/reason so the diagnostic still says *what* went wrong
+/// without disclosing the secret itself.
+fn redact_value_error(error: ValueError) -> ValueError {
+    match error {
+        ValueError::Invalid { option_type, reason, .. } => ValueError::Invalid {
+            option_type,
+            raw: REDACTED.to_owned(),
+            reason,
+        },
+        ValueError::InvalidPath { reason, .. } => ValueError::InvalidPath {
+            raw: REDACTED.to_owned(),
+            reason,
+        },
+        ValueError::InvalidHashEntry { .. } => ValueError::InvalidHashEntry {
+            raw: REDACTED.to_owned(),
+        },
+        ValueError::SizeOverflow { .. } => ValueError::SizeOverflow {
+            raw: REDACTED.to_owned(),
+        },
+    }
+}
+
 /// Runtime values that feed dynamic default resolution.
 ///
 /// `default-type: dynamic` options carry a tag (e.g. `bin`) instead of a
@@ -396,7 +445,7 @@ fn load_config_with_env_single(
             let env_value = if resetted {
                 None
             } else {
-                lookup_env(name, idx, env, opt.option_type)?
+                lookup_env(name, idx, env, opt.option_type, opt.secure)?
             };
             let ini_value = if resetted {
                 None
@@ -464,6 +513,19 @@ fn load_config_with_env_single(
     }
 
     apply_depends(&mut options, &explicit, cfg, &cli.command)?;
+
+    // Enforce per-flavor `allow-range` now that every option (including the
+    // flavor source `compress-type`) is resolved. The simple `[min, max]`
+    // shape was already checked inline in `validate_value`; the per-flavor
+    // shape (`[{bz2: [1, 9]}, {gz: [-1, 9]}]`) is resolved against the final
+    // flavor here.
+    validate_flavor_allow_ranges(&options, cfg, &cli.command)?;
+
+    // Reject INI keys that don't decode to any declared option. A typo such as
+    // `repo1-cipher-pas` (for `repo1-cipher-pass`) must surface as an error
+    // rather than being silently ignored — otherwise a misconfigured secret or
+    // path is dropped without warning.
+    check_unknown_ini_keys(ini, cfg)?;
 
     Ok(LoadedConfig {
         command: cli.command,
@@ -541,6 +603,68 @@ fn discover_group_indices(cli: &ResolvedCli, env: &EnvValues, ini: &IniFile, cfg
     out
 }
 
+/// Scan every INI section and raise [`LoadError::UnknownIniKey`] for the first
+/// key that resolves to no declared option (taking group prefixes and
+/// deprecated aliases into account). Keys are checked deterministically
+/// (sections then keys are `BTreeMap`-ordered) so the reported key is stable.
+fn check_unknown_ini_keys(ini: &IniFile, cfg: &Cfg) -> Result<(), LoadError> {
+    for (section, values) in &ini.sections {
+        for raw_key in values.keys() {
+            if !ini_key_resolves(raw_key, cfg) {
+                return Err(LoadError::UnknownIniKey {
+                    section: section.clone(),
+                    key: raw_key.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an INI key names a declared option. A key resolves when it is:
+///
+/// - a plain (non-group) option name present in `cfg`; or
+/// - a `pgN-`/`repoN-` prefixed key decoding to a declared group option
+///   (via [`decode_grouped_key`]); or
+/// - a declared deprecated alias of some option. Deprecated spellings may
+///   carry a literal index (`db-path`) or a `?` index-wildcard (`db?-path`,
+///   matching `db1-path`, `db2-path`, …); both forms are accepted.
+fn ini_key_resolves(raw_key: &str, cfg: &Cfg) -> bool {
+    // Direct option name (command-line-only options never appear in the INI,
+    // but a matching name is still "known" — the merge simply won't read it).
+    if cfg.options.contains_key(raw_key) {
+        return true;
+    }
+    // Grouped `pgN-`/`repoN-` key mapping to a real group option.
+    if decode_grouped_key(raw_key, cfg).is_some() {
+        return true;
+    }
+    // Deprecated aliases (possibly with a `?` index wildcard).
+    cfg.options.values().any(|opt| {
+        opt.deprecate
+            .iter()
+            .any(|pattern| deprecate_pattern_matches(pattern, raw_key))
+    })
+}
+
+/// Match a `deprecate:` pattern against an INI key. A `?` in the pattern stands
+/// for a run of one or more decimal digits (the group index), so `db?-path`
+/// matches `db1-path` / `db99-path`; a pattern without `?` must match exactly.
+fn deprecate_pattern_matches(pattern: &str, key: &str) -> bool {
+    let Some((head, tail)) = pattern.split_once('?') else {
+        return pattern == key;
+    };
+    // `<head><digits><tail>` — strip the fixed head and tail, require the
+    // middle to be a non-empty digit run.
+    let Some(rest) = key.strip_prefix(head) else {
+        return false;
+    };
+    let Some(mid) = rest.strip_suffix(tail) else {
+        return false;
+    };
+    !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn decode_grouped_key(raw_key: &str, cfg: &Cfg) -> Option<(String, u32)> {
     for (prefix, group) in [("pg", OptionGroup::Pg), ("repo", OptionGroup::Repo)] {
         if let Some(after) = raw_key.strip_prefix(prefix) {
@@ -571,15 +695,12 @@ fn lookup_env(
     group_index: Option<u32>,
     env: &EnvValues,
     option_type: OptionType,
+    secure: bool,
 ) -> Result<Option<OptionValue>, LoadError> {
     let Some(raw) = env.get(&(option_name.to_owned(), group_index)) else {
         return Ok(None);
     };
-    let value = parse_value(option_type, raw).map_err(|error| LoadError::ValueParse {
-        option: option_name.to_owned(),
-        group_index,
-        error,
-    })?;
+    let value = parse_value(option_type, raw).map_err(|error| value_parse_error(option_name, group_index, error, secure))?;
     Ok(Some(value))
 }
 
@@ -618,11 +739,8 @@ fn lookup_ini(
             && let Some(raws) = section_values.get(&raw_key)
             && !raws.is_empty()
         {
-            let value = parse_ini_values(option_type, raws).map_err(|error| LoadError::ValueParse {
-                option: option_name.to_owned(),
-                group_index,
-                error,
-            })?;
+            let value = parse_ini_values(option_type, raws)
+                .map_err(|error| value_parse_error(option_name, group_index, error, opt.secure))?;
             return Ok(Some(value));
         }
     }
@@ -683,7 +801,8 @@ fn validate_value(
             return Err(LoadError::NotInAllowList {
                 option: option_name.to_owned(),
                 group_index,
-                value: value_str,
+                // A secure option's value is a secret: never echo it back.
+                value: if opt.secure { REDACTED.to_owned() } else { value_str },
                 allowed: allowed_strs,
             });
         }
@@ -719,6 +838,85 @@ fn validate_value(
         }
     }
     Ok(())
+}
+
+/// Enforce per-flavor `allow-range` constraints across the fully-resolved
+/// option set. A per-flavor range in `config.yaml` is a sequence of single-key
+/// maps — `[{bz2: [1, 9]}, {gz: [-1, 9]}]` — keyed by the resolved flavor
+/// (the value of [`FLAVOR_SOURCE_OPTION`], defaulting to [`FLAVOR_DEFAULT`]).
+/// The matching `[min, max]` entry is applied to the option's numeric value;
+/// the simple non-per-flavor shape is already validated inline by
+/// [`validate_value`], so it is skipped here.
+fn validate_flavor_allow_ranges(
+    options: &BTreeMap<(String, Option<u32>), OptionValue>,
+    cfg: &Cfg,
+    command: &str,
+) -> Result<(), LoadError> {
+    let flavor = resolved_flavor(options);
+    for ((name, idx), value) in options {
+        let Some(opt) = cfg.options.get(name) else {
+            continue;
+        };
+        if !opt.commands.contains_key(command) {
+            continue;
+        }
+        let Some(range) = opt.allow_range.as_ref() else {
+            continue;
+        };
+        let Some((min, max)) = per_flavor_range(range, &flavor) else {
+            // Not a per-flavor range (or no entry for this flavor) — the
+            // simple `[min, max]` shape was already checked in `validate_value`.
+            continue;
+        };
+        let n = match value {
+            OptionValue::Integer(n) => Some(*n),
+            OptionValue::Time(n) | OptionValue::Size(n) => i64::try_from(*n).ok(),
+            _ => None,
+        };
+        if let Some(v) = n
+            && (v < min || v > max)
+        {
+            return Err(LoadError::OutOfAllowRange {
+                option: name.clone(),
+                group_index: *idx,
+                value: v.to_string(),
+                range: format!("[{min}, {max}]"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// If `range` is a per-flavor `allow-range` (a sequence of single-key maps like
+/// `[{bz2: [1, 9]}, {gz: [-1, 9]}]`), return the `[min, max]` pair for `flavor`.
+/// Returns `None` when `range` isn't per-flavor or has no entry for `flavor`.
+fn per_flavor_range(range: &serde_yml::Value, flavor: &str) -> Option<(i64, i64)> {
+    let serde_yml::Value::Sequence(items) = range else {
+        return None;
+    };
+    for item in items {
+        let serde_yml::Value::Mapping(map) = item else {
+            // A bare `[min, max]` sequence is the simple shape, not per-flavor.
+            return None;
+        };
+        if map.len() != 1 {
+            return None;
+        }
+        let (key, bounds) = map.iter().next()?;
+        let matches = matches!(key, serde_yml::Value::String(s) if s == flavor);
+        if !matches {
+            continue;
+        }
+        let serde_yml::Value::Sequence(pair) = bounds else {
+            return None;
+        };
+        if pair.len() != 2 {
+            return None;
+        }
+        let (min, max) = (yaml_to_i64(&pair[0])?, yaml_to_i64(&pair[1])?);
+        return Some((min, max));
+    }
+    None
 }
 
 /// Whether `value` is permitted by the option's allow-list. For `size`/`time`
@@ -853,13 +1051,20 @@ fn apply_depends(
         let key = (name.clone(), *idx);
         if explicit.contains(&key) {
             // The user set this explicitly but the dependency isn't met → error.
+            // Mask the depended option's value when it is a secure secret so it
+            // never leaks into the error message.
+            let dep_secure = is_secure(cfg, &depend.option);
             let depend_value = dep_value.map_or_else(
                 || "unset".to_owned(),
                 |v| {
-                    option_value_match_candidates(v)
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "<opaque>".to_owned())
+                    if dep_secure {
+                        REDACTED.to_owned()
+                    } else {
+                        option_value_match_candidates(v)
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "<opaque>".to_owned())
+                    }
                 },
             );
             return Err(LoadError::DependNotSatisfied {
@@ -923,11 +1128,8 @@ fn resolve_default(
         scalar
     };
 
-    let value = parse_value(opt.option_type, &scalar).map_err(|error| LoadError::ValueParse {
-        option: option_name.to_owned(),
-        group_index,
-        error,
-    })?;
+    let value =
+        parse_value(opt.option_type, &scalar).map_err(|error| value_parse_error(option_name, group_index, error, opt.secure))?;
     Ok(Some(value))
 }
 
@@ -1340,17 +1542,78 @@ option:
     }
 
     #[test]
-    fn unknown_options_in_ini_are_ignored() {
-        // The merge currently ignores unknown INI keys silently. Callers can
-        // post-process the IniFile if they want strict validation; keeping
-        // this lenient matches the C behavior of accepting unknown keys when
-        // they don't get queried.
-        let r = load(
+    fn unknown_ini_key_is_rejected() {
+        // A key that matches no declared option (nor any deprecated alias) is
+        // a typo / stale option and must be reported rather than silently
+        // ignored.
+        let err = load(
             &["backup", "--stanza=demo", "--pg1-path=/data"],
             "[global]\nfuture-option=42\n",
         )
+        .unwrap_err();
+        assert!(err.contains("future-option"), "error should name the offending key: {err}");
+        assert!(err.contains("unknown"), "error should flag the key as unknown: {err}");
+    }
+
+    #[test]
+    fn typo_on_grouped_key_is_rejected() {
+        // `repo1-pat` (typo of `repo1-path`) decodes to no option.
+        let cfg = small_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--pg1-path=/data"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let ini = crate::ini::parse_ini("[global]\nrepo1-pat=/x\n").unwrap();
+        let err = load_config(resolved, &ini, &cfg).unwrap_err();
+        match err {
+            LoadError::UnknownIniKey { key, .. } => assert_eq!(key, "repo1-pat"),
+            other => panic!("expected UnknownIniKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_grouped_and_plain_keys_are_accepted() {
+        // A well-formed grouped key (`repo1-path`) and a plain option
+        // (`buffer-size`) both resolve, so no UnknownIniKey is raised.
+        let r = load(
+            &["backup", "--stanza=demo", "--pg1-path=/data"],
+            "[global]\nrepo1-path=/var/lib/pgbackrust\nbuffer-size=2MiB\n",
+        )
         .unwrap();
-        assert_eq!(r.command, "backup");
+        assert_eq!(r.options[&("buffer-size".into(), None)], OptionValue::Size(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn deprecated_alias_key_is_accepted() {
+        // A deprecated alias — plain (`old-name`) and `?`-wildcard indexed
+        // (`db?-path` → `db3-path`) — must not be flagged as unknown.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup:
+  pg: {}
+option:
+  pg-path:
+    type: path
+    group: pg
+    required: true
+    deprecate:
+      db-path: {}
+      db?-path: {}
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--pg1-path=/data"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        // Both `db-path` (exact) and `db3-path` (wildcard) resolve to pg-path.
+        let ini = crate::ini::parse_ini("[global]\ndb-path=/a\ndb3-path=/b\n").unwrap();
+        // No UnknownIniKey for the deprecated spellings.
+        let r = load_config(resolved, &ini, &cfg);
+        assert!(r.is_ok(), "deprecated aliases must be accepted, got {r:?}");
     }
 
     #[test]
@@ -2271,5 +2534,213 @@ option:
             }
             other => panic!("expected DependNotSatisfied at (pg-host, Some(2)), got {other:?}"),
         }
+    }
+
+    // ---- secure-option redaction -------------------------------------------
+
+    /// Config with a `secure:` string-id option carrying an allow-list, plus a
+    /// secure path option (so an invalid-value parse can be exercised).
+    fn secure_cfg() -> Cfg {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup:
+  repo: {}
+option:
+  repo-cipher-pass:
+    type: string
+    group: repo
+    secure: true
+    command:
+      backup: {}
+  repo-cipher-type:
+    type: string-id
+    group: repo
+    secure: true
+    allow-list:
+      - none
+      - aes-256-cbc
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        crate::compile::compile(&parse_config(yaml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn secure_option_allow_list_error_is_redacted() {
+        // A secure option's out-of-allow-list value must never appear verbatim
+        // in the error; it is masked to <redacted>.
+        let cfg = secure_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--repo1-cipher-type=super-secret-algo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::NotInAllowList { value, .. } => {
+                assert_eq!(value, "<redacted>", "secure value must be masked");
+            }
+            other => panic!("expected NotInAllowList, got {other:?}"),
+        }
+        // Belt-and-braces: the rendered message must not contain the secret.
+        let cfg = secure_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--repo1-cipher-type=super-secret-algo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let msg = load_config(resolved, &crate::ini::IniFile::default(), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains("super-secret-algo"), "secret leaked in message: {msg}");
+    }
+
+    #[test]
+    fn secure_option_parse_error_is_redacted() {
+        // A `secure:` path option that fails to parse must not echo the raw
+        // secret text back through the ValueParse error.
+        let yaml = r"
+command:
+  backup: {}
+optionGroup:
+  repo: {}
+option:
+  repo-secret-path:
+    type: path
+    group: repo
+    secure: true
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        // Invalid path (no leading slash) supplied via the INI so it flows
+        // through lookup_ini's parse path.
+        let ini = crate::ini::parse_ini("[global]\nrepo1-secret-path=not-a-secret-but-still-secure\n").unwrap();
+        let err = load_config(resolved, &ini, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not-a-secret-but-still-secure"),
+            "secure raw value leaked: {msg}"
+        );
+        assert!(msg.contains("<redacted>"), "expected redacted placeholder: {msg}");
+    }
+
+    #[test]
+    fn non_secure_option_value_is_not_redacted() {
+        // Sanity: a non-secure option's out-of-allow-list value is echoed in
+        // full (only `secure:` options are masked).
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  output:
+    type: string-id
+    default: text
+    allow-list:
+      - text
+      - json
+    command:
+      backup: {}
+  stanza:
+    type: string
+    command:
+      backup: {}
+";
+        let cfg = crate::compile::compile(&parse_config(yaml).unwrap()).unwrap();
+        let cli = parse_cli(["backup", "--stanza=demo", "--output=xml"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::NotInAllowList { value, .. } => assert_eq!(value, "xml"),
+            other => panic!("expected NotInAllowList, got {other:?}"),
+        }
+    }
+
+    // ---- per-flavor allow-range --------------------------------------------
+
+    /// Config mirroring `compress-level`'s per-flavor `allow-range` keyed by
+    /// `compress-type`: gz allows [-1, 9], zst allows [0, 22].
+    fn flavor_range_cfg() -> Cfg {
+        let yaml = r"
+command:
+  backup: {}
+optionGroup: {}
+option:
+  compress-type:
+    type: string-id
+    default: gz
+    command:
+      backup: {}
+  compress-level:
+    type: integer
+    required: false
+    allow-range:
+      - gz: [-1, 9]
+      - zst: [0, 22]
+    command:
+      backup: {}
+  stanza:
+    type: string
+    required: true
+    command:
+      backup: {}
+";
+        crate::compile::compile(&parse_config(yaml).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn per_flavor_allow_range_accepts_in_range_for_flavor() {
+        // zst allows up to 22; 15 is fine for compress-type=zst.
+        let cfg = flavor_range_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-type=zst", "--compress-level=15"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(15));
+    }
+
+    #[test]
+    fn per_flavor_allow_range_rejects_out_of_range_for_flavor() {
+        // gz only allows up to 9; 15 is out of range for compress-type=gz even
+        // though it would be valid for zst.
+        let cfg = flavor_range_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-type=gz", "--compress-level=15"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        match err {
+            LoadError::OutOfAllowRange { option, range, .. } => {
+                assert_eq!(option, "compress-level");
+                assert_eq!(range, "[-1, 9]");
+            }
+            other => panic!("expected OutOfAllowRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_flavor_allow_range_uses_default_flavor_when_source_unset() {
+        // No compress-type on CLI: it defaults to gz, so the gz range [-1, 9]
+        // applies and level 12 is rejected.
+        let cfg = flavor_range_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-level=12"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let err = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap_err();
+        assert!(matches!(err, LoadError::OutOfAllowRange { .. }));
+    }
+
+    #[test]
+    fn per_flavor_allow_range_allows_negative_gz_level() {
+        // gz permits -1 (its documented "auto"); the range lower bound is -1.
+        let cfg = flavor_range_cfg();
+        let cli = parse_cli(["backup", "--stanza=demo", "--compress-type=gz", "--compress-level=-1"]).unwrap();
+        let resolved = resolve_cli(cli, &cfg).unwrap();
+        let r = load_config(resolved, &crate::ini::IniFile::default(), &cfg).unwrap();
+        assert_eq!(r.options[&("compress-level".into(), None)], OptionValue::Integer(-1));
     }
 }

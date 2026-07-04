@@ -31,6 +31,8 @@ pub mod azure;
 pub mod cifs;
 pub mod gcs;
 pub mod http;
+pub(crate) mod pagination;
+pub mod path_validate;
 pub mod posix;
 pub mod remote;
 pub mod s3;
@@ -40,6 +42,7 @@ pub use crate::azure::{Azure, AzureAuth, AzureConfig};
 pub use crate::cifs::Cifs;
 pub use crate::gcs::{Gcs, GcsAuth, GcsConfig};
 pub use crate::http::HttpOptions;
+pub use crate::path_validate::validate_relative;
 pub use crate::posix::Posix;
 pub use crate::remote::{RemoteStorage, StorageInfoDto, StorageKindDto, StorageRequestHandler};
 pub use crate::s3::{S3, S3Config};
@@ -82,6 +85,12 @@ pub enum StorageError {
     PermissionDenied { path: PathBuf },
     /// Wrapped error from the backend (filesystem, HTTP, …) that doesn't map to a category above.
     Backend { path: PathBuf, message: String },
+    /// The backend does not support this operation at all (e.g. symlink
+    /// creation or link-target reads on an object store). Distinct from
+    /// [`Self::Backend`] so callers can treat "not supported here" as a typed
+    /// condition instead of matching on the message text, and so a genuine I/O
+    /// failure (which maps to `Backend`) is never mistaken for it.
+    Unsupported { path: PathBuf, message: String },
     /// Raised by the [`IoRead`] / [`IoWrite`] layer when used through this backend.
     Io(IoError),
 }
@@ -93,6 +102,7 @@ impl fmt::Display for StorageError {
             Self::AlreadyExists { path } => write!(f, "already exists: {}", path.display()),
             Self::PermissionDenied { path } => write!(f, "permission denied: {}", path.display()),
             Self::Backend { path, message } => write!(f, "backend error at {}: {message}", path.display()),
+            Self::Unsupported { path, message } => write!(f, "unsupported at {}: {message}", path.display()),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -104,6 +114,51 @@ impl From<IoError> for StorageError {
     fn from(err: IoError) -> Self {
         Self::Io(err)
     }
+}
+
+/// Crash-safe local file write, usable outside the [`Storage`] trait.
+///
+/// Streams `bytes` to a sibling `<path>.tmp`, `fsync(2)`s the data,
+/// `rename(2)`s onto `path`, then `fsync(2)`s the parent directory (on Unix; a
+/// clean no-op on Windows). `rename(2)` is atomic on POSIX within one
+/// filesystem, so a concurrent reader — or a crash before the rename completes
+/// — never observes a half-written or truncated primary, and the trailing
+/// directory fsync makes the published name durable across a power loss.
+///
+/// This is the same logic the [`Posix`] backend applies in
+/// [`Storage::write_atomic_path`]; it is exposed here for callers (e.g.
+/// `archive-push` and `restore` in `pgbr-command`) that write to an
+/// already-resolved absolute filesystem path directly, outside any `Storage`
+/// instance. `path` **must** be the fully-resolved (absolute) target — this
+/// helper performs no root-joining or path resolution.
+///
+/// # Errors
+///
+/// Surfaces any backend / I/O failure from the create, `write_all`,
+/// `sync_all`, rename, or parent-directory fsync as a [`StorageError`]. On a
+/// rename failure the temp file is left in place carrying the would-be-new
+/// content; callers should treat the write as failed and ignore the stale temp
+/// file (a later successful write replaces it).
+pub fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    crate::posix::write_atomic_local(path, bytes)
+}
+
+/// `fsync(2)` the directory containing `path` so a just-published rename (or
+/// freshly created entry) survives a power loss.
+///
+/// On Unix this opens the parent directory of `path` and `sync_all`s it. On
+/// non-Unix platforms (Windows) there is no directory file handle to fsync —
+/// NTFS metadata journalling already makes the rename durable — so this is a
+/// clean no-op. Exposed for callers in `pgbr-command` (`archive-push`,
+/// `restore`) that publish a file by hand and need the directory entry to be
+/// durable without going through the [`Storage`] trait.
+///
+/// # Errors
+///
+/// On Unix, returns a [`StorageError`] if the parent directory cannot be opened
+/// or its `sync_all` fails. Never errors on non-Unix platforms.
+pub fn fsync_dir(path: &Path) -> Result<(), StorageError> {
+    crate::posix::fsync_parent_dir(path)
 }
 
 /// Polymorphic storage backend.
@@ -224,9 +279,30 @@ pub trait Storage: Send + Sync {
     /// backends return [`StorageError`] variants for permission / backend failures or
     /// [`StorageError::AlreadyExists`] when `link_path` already exists.
     fn create_symlink(&self, link_path: &Path, _target: &Path) -> Result<(), StorageError> {
-        Err(StorageError::Backend {
+        Err(StorageError::Unsupported {
             path: link_path.to_path_buf(),
             message: "symlinks not supported by this backend".to_owned(),
+        })
+    }
+
+    /// Read the target path of the symbolic link at `path`.
+    ///
+    /// Like [`Storage::create_symlink`], link targets only make sense on a real
+    /// filesystem, so this has a default implementation returning a
+    /// [`StorageError::Backend`] "not supported" error. Filesystem backends
+    /// (e.g. [`Posix`]) override it; callers that walk a data directory to build
+    /// a manifest use it to record each symlink's destination and should treat
+    /// the default "not supported" error as "target unknown on this backend".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] from the default implementation.
+    /// Overriding backends return [`StorageError::NotFound`] if `path` is not a
+    /// symlink, or other variants for permission / backend failures.
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        Err(StorageError::Unsupported {
+            path: path.to_path_buf(),
+            message: "read_link not supported by this backend".to_owned(),
         })
     }
 

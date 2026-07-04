@@ -2,8 +2,15 @@
 //!
 //! `Posix` is the local-disk backend. All paths passed to its trait methods are interpreted
 //! relative to the configured `root` (or accepted verbatim if absolute). The wrapper does not
-//! attempt to enforce a chroot — callers are responsible for not handing absolute paths to a
-//! `Posix` instance whose root is meant to be authoritative.
+//! attempt to enforce a chroot — internal callers legitimately hand it already-rooted absolute
+//! paths (e.g. a manifest scan of `/var/lib/postgresql/data`), so `resolve` cannot reject them.
+//!
+//! **Untrusted (network-sourced) paths are NOT validated here.** A path arriving from a remote
+//! peer over the storage protocol is validated by [`crate::path_validate::validate_relative`]
+//! in [`crate::remote::StorageRequestHandler`] *before* it reaches this backend: the peer may
+//! neither pass an absolute path nor climb out of the root with `..`. Enforcing the chroot in
+//! the worker (rather than in `resolve`) keeps the internal already-rooted callers working while
+//! still closing the traversal hole for every network request. See `path_validate.rs`.
 //!
 //! `PosixRead` / `PosixWrite` adapt `std::fs::File` into the `IoRead` / `IoWrite` traits from
 //! `pgbr-io`. When `pgbr-io` ships dedicated `FileRead` / `FileWrite` types in a later phase
@@ -38,6 +45,15 @@ impl Posix {
         &self.root
     }
 
+    /// Resolve `path` against the configured root.
+    ///
+    /// A relative path is joined onto `root`; an absolute path is accepted
+    /// verbatim. This intentionally does **not** enforce a chroot: internal
+    /// callers pass already-rooted absolute paths (a manifest scan of a PG
+    /// data directory, a `.tmp` sibling built from an absolute target, …) and
+    /// must keep working. Untrusted network-sourced paths never reach here
+    /// un-validated — the remote worker checks them with
+    /// [`crate::path_validate::validate_relative`] first (see the module docs).
     fn resolve(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
@@ -75,9 +91,11 @@ fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
 }
 
 /// Crash-safe local write: stream `bytes` to `<path>.tmp`, `fsync(2)` the
-/// data, then `rename(2)` onto `path`. `rename(2)` is atomic on POSIX, so a
-/// concurrent reader (or a crash before the rename completes) never observes
-/// a half-written or truncated primary file.
+/// data, `rename(2)` onto `path`, then `fsync(2)` the parent directory.
+/// `rename(2)` is atomic on POSIX, so a concurrent reader (or a crash before
+/// the rename completes) never observes a half-written or truncated primary
+/// file; the trailing directory fsync makes the published name itself durable
+/// across a power loss (on Unix — a clean no-op on Windows).
 ///
 /// `path` must be the fully-resolved (root-joined) target path — this helper
 /// does no path resolution.
@@ -112,7 +130,34 @@ pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8]) -> Result<(), Storag
     }
 
     // Atomic publish.
-    fs::rename(&tmp_path, path).map_err(|err| map_io(&err, path))
+    fs::rename(&tmp_path, path).map_err(|err| map_io(&err, path))?;
+
+    // Durability of the rename itself: `rename(2)` is atomic, but the updated
+    // directory entry only survives a power loss once the *parent directory* is
+    // fsync'd. Without this a crash right after the rename can leave the
+    // directory reflecting neither the old nor the new name, defeating the
+    // "atomic across power loss" promise. On Windows there is no directory fd to
+    // fsync (NTFS metadata journalling makes the rename durable), so this is a
+    // clean no-op there.
+    fsync_parent_dir(path)
+}
+
+/// fsync the directory containing `path` so a just-published rename survives a
+/// power loss. No-op on platforms (Windows) where directories cannot be opened
+/// as a file handle for `sync_all`.
+#[cfg(unix)]
+pub(crate) fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
+    // A resolved target always has a parent (it lives under `root`); fall back
+    // to "." defensively so we never index past the start of the path.
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let dir = fs::File::open(parent).map_err(|err| map_io(&err, parent))?;
+    dir.sync_all().map_err(|err| map_io(&err, parent))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn fsync_parent_dir(_path: &Path) -> Result<(), StorageError> {
+    Ok(())
 }
 
 fn info_from_metadata(path: PathBuf, meta: &fs::Metadata) -> StorageInfo {
@@ -242,6 +287,15 @@ impl Storage for Posix {
         // pgBackRust records it in the manifest (typically an absolute path).
         let resolved = self.resolve(link_path);
         std::os::unix::fs::symlink(target, &resolved).map_err(|err| map_io(&err, &resolved))
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        // `path` is resolved against the configured root; the returned target is
+        // whatever the link stores verbatim (typically an absolute path), which
+        // is exactly what a backup records in the manifest and what a restore
+        // hands back to `create_symlink`.
+        let resolved = self.resolve(path);
+        fs::read_link(&resolved).map_err(|err| map_io(&err, &resolved))
     }
 }
 

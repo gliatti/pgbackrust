@@ -26,7 +26,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::{Arc, Mutex};
 
@@ -162,6 +162,10 @@ impl Storage for RemoteProcessStorage {
 
     fn create_symlink(&self, link_path: &Path, target: &Path) -> Result<(), StorageError> {
         self.inner.create_symlink(link_path, target)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        self.inner.read_link(path)
     }
 }
 
@@ -459,6 +463,10 @@ impl<R: IoRead + Send + 'static, W: IoWrite + Send + 'static> Storage for Remote
 
     fn create_symlink(&self, link_path: &Path, target: &Path) -> Result<(), StorageError> {
         self.inner().create_symlink(link_path, target)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        self.inner().read_link(path)
     }
 }
 

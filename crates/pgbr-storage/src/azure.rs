@@ -368,17 +368,28 @@ struct ListEntry {
     modified: Option<i64>,
 }
 
-/// Parse a List Blobs XML response body into its `<Blob>` entries.
+/// One parsed page of a List Blobs response: the `<Blob>` entries plus the
+/// `<NextMarker>` continuation token needed to fetch the next page.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ListPage {
+    entries: Vec<ListEntry>,
+    /// The `<NextMarker>` value to re-inject as `marker=` on the next request.
+    /// `None` (or empty in the response) means the listing is complete.
+    next_marker: Option<String>,
+}
+
+/// Parse a List Blobs XML response body into one [`ListPage`].
 ///
 /// The relevant shape is:
 /// `<EnumerationResults><Blobs><Blob><Name>..</Name>`
 /// `<Properties><Content-Length>..</Content-Length>`
-/// `<Last-Modified>..</Last-Modified></Properties></Blob>…</Blobs>…`.
-fn parse_list_blobs(xml: &str) -> Result<Vec<ListEntry>, String> {
+/// `<Last-Modified>..</Last-Modified></Properties></Blob>…</Blobs>`
+/// `<NextMarker>..</NextMarker></EnumerationResults>`.
+fn parse_list_blobs(xml: &str) -> Result<ListPage, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut entries = Vec::new();
+    let mut page = ListPage::default();
     let mut in_blob = false;
     let mut cur_tag: Option<String> = None;
     let mut name = String::new();
@@ -399,15 +410,20 @@ fn parse_list_blobs(xml: &str) -> Result<Vec<ListEntry>, String> {
                 cur_tag = Some(tag);
             }
             Ok(Event::Text(e)) => {
-                if !in_blob {
-                    continue;
-                }
                 let text = e.xml_content().map_err(|err| err.to_string())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("Name") => name = text,
-                    Some("Content-Length") => size = text.trim().parse().unwrap_or(0),
-                    Some("Last-Modified") => modified = parse_http_date_secs(&text),
-                    _ => {}
+                if in_blob {
+                    match cur_tag.as_deref() {
+                        Some("Name") => name = text,
+                        Some("Content-Length") => size = text.trim().parse().unwrap_or(0),
+                        Some("Last-Modified") => modified = parse_http_date_secs(&text),
+                        _ => {}
+                    }
+                } else if cur_tag.as_deref() == Some("NextMarker") {
+                    // Top-level continuation marker (outside <Blobs>).
+                    let marker = text.trim();
+                    if !marker.is_empty() {
+                        page.next_marker = Some(marker.to_string());
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -415,7 +431,7 @@ fn parse_list_blobs(xml: &str) -> Result<Vec<ListEntry>, String> {
                 let tag = String::from_utf8_lossy(tag.as_ref()).into_owned();
                 if tag == "Blob" {
                     in_blob = false;
-                    entries.push(ListEntry {
+                    page.entries.push(ListEntry {
                         name: std::mem::take(&mut name),
                         size,
                         modified,
@@ -429,7 +445,7 @@ fn parse_list_blobs(xml: &str) -> Result<Vec<ListEntry>, String> {
         }
     }
 
-    Ok(entries)
+    Ok(page)
 }
 
 /// Append a SAS token query string to `base_url`.
@@ -637,58 +653,80 @@ impl Storage for Azure {
             prefix.push('/');
         }
 
-        let ms_headers = Self::ms_base_headers();
-        // Query params that participate in the canonicalized resource. The
-        // List Blobs operation is keyed on the container (empty blob name).
-        let mut query: Vec<(String, String)> = vec![
-            ("comp".to_string(), "list".to_string()),
-            ("restype".to_string(), "container".to_string()),
-        ];
-        if !prefix.is_empty() {
-            query.push(("prefix".to_string(), prefix.clone()));
-        }
-        let resource = self.canonicalized_resource("", &query);
-        let authorization = self.authorization("GET", "", "", &ms_headers, &resource);
+        // Follow `<NextMarker>` (re-injected as `marker=`) until it is empty (via
+        // the shared paginate driver, which also guards against a marker that
+        // fails to advance), so a container with more blobs than the per-response
+        // cap (5000) is returned in full rather than silently truncated to the
+        // first page. Azure's only termination signal is an empty NextMarker, so
+        // the driver's anti-loop guard is what stops an endpoint that echoes the
+        // same non-empty marker (S3 also cross-checks IsTruncated; Azure has no
+        // such flag).
+        let mut entries = crate::pagination::paginate(|marker: Option<&str>| {
+            let ms_headers = Self::ms_base_headers();
+            // Query params that participate in the canonicalized resource. The
+            // List Blobs operation is keyed on the container (empty blob name).
+            let mut query: Vec<(String, String)> = vec![
+                ("comp".to_string(), "list".to_string()),
+                ("restype".to_string(), "container".to_string()),
+            ];
+            if let Some(marker) = marker {
+                query.push(("marker".to_string(), marker.to_string()));
+            }
+            if !prefix.is_empty() {
+                query.push(("prefix".to_string(), prefix.clone()));
+            }
+            let resource = self.canonicalized_resource("", &query);
+            let authorization = self.authorization("GET", "", "", &ms_headers, &resource);
 
-        // Build the wire URL with the operation query string ourselves so the
-        // SAS token (if any) can be appended after it via `request_url`. The
-        // prefix value is percent-encoded the same way ureq's `.query()` would.
-        let mut base_url = format!("{}/{}?restype=container&comp=list", self.endpoint, self.container);
-        if !prefix.is_empty() {
-            base_url.push_str("&prefix=");
-            base_url.push_str(&percent_encode_query(&prefix));
-        }
-        let url = self.request_url(&base_url);
-        let mut req = self.agent.get(&url);
-        for (name, value) in &ms_headers {
-            req = req.set(name, value);
-        }
-        if let Some(authorization) = &authorization {
-            req = req.set("Authorization", authorization);
-        }
+            // Build the wire URL with the operation query string ourselves so the
+            // SAS token (if any) can be appended after it via `request_url`. The
+            // prefix/marker values are percent-encoded the same way ureq's
+            // `.query()` would.
+            let mut base_url = format!("{}/{}?restype=container&comp=list", self.endpoint, self.container);
+            if let Some(marker) = marker {
+                base_url.push_str("&marker=");
+                base_url.push_str(&percent_encode_query(marker));
+            }
+            if !prefix.is_empty() {
+                base_url.push_str("&prefix=");
+                base_url.push_str(&percent_encode_query(&prefix));
+            }
+            let url = self.request_url(&base_url);
+            let mut req = self.agent.get(&url);
+            for (name, value) in &ms_headers {
+                req = req.set(name, value);
+            }
+            if let Some(authorization) = &authorization {
+                req = req.set("Authorization", authorization);
+            }
 
-        let body = match req.call() {
-            Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+            let body = match req.call() {
+                Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                })?,
+                Err(err) => return Err(map_ureq_error(err, &prefix)),
+            };
+
+            let page = parse_list_blobs(&body).map_err(|message| StorageError::Backend {
                 path: path.to_path_buf(),
-                message: err.to_string(),
-            })?,
-            Err(err) => return Err(map_ureq_error(err, &prefix)),
-        };
+                message,
+            })?;
 
-        let parsed = parse_list_blobs(&body).map_err(|message| StorageError::Backend {
-            path: path.to_path_buf(),
-            message,
+            let mapped: Vec<StorageInfo> = page
+                .entries
+                .into_iter()
+                .map(|e| StorageInfo {
+                    path: PathBuf::from(e.name),
+                    kind: StorageKind::File,
+                    size: e.size,
+                    modified: e.modified,
+                })
+                .collect();
+
+            Ok((mapped, page.next_marker))
         })?;
 
-        let mut entries: Vec<StorageInfo> = parsed
-            .into_iter()
-            .map(|e| StorageInfo {
-                path: PathBuf::from(e.name),
-                kind: StorageKind::File,
-                size: e.size,
-                modified: e.modified,
-            })
-            .collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -1217,7 +1255,8 @@ mod tests {
     <NextMarker />
 </EnumerationResults>"#;
 
-        let entries = parse_list_blobs(xml).unwrap();
+        let page = parse_list_blobs(xml).unwrap();
+        let entries = &page.entries;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "archive/000000010000000000000001");
         assert_eq!(entries[0].size, 16_777_216);
@@ -1225,6 +1264,8 @@ mod tests {
         assert_eq!(entries[1].size, 42);
         // Mon, 12 Oct 2009 17:50:30 GMT == 1255369830 epoch seconds.
         assert_eq!(entries[0].modified, Some(1_255_369_830));
+        // Empty <NextMarker /> means the listing is complete.
+        assert_eq!(page.next_marker, None);
     }
 
     #[test]
@@ -1234,7 +1275,93 @@ mod tests {
     <Blobs />
     <NextMarker />
 </EnumerationResults>"#;
-        assert!(parse_list_blobs(xml).unwrap().is_empty());
+        assert!(parse_list_blobs(xml).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn list_parses_page_with_next_marker_then_final_page() {
+        // First page: a non-empty <NextMarker> signals more blobs follow.
+        let page1 = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="mycontainer">
+    <Prefix>archive/</Prefix>
+    <MaxResults>1</MaxResults>
+    <Blobs>
+        <Blob>
+            <Name>archive/000000010000000000000001</Name>
+            <Properties>
+                <Last-Modified>Mon, 12 Oct 2009 17:50:30 GMT</Last-Modified>
+                <Content-Length>16</Content-Length>
+                <BlobType>BlockBlob</BlobType>
+            </Properties>
+        </Blob>
+    </Blobs>
+    <NextMarker>example-next-marker</NextMarker>
+</EnumerationResults>"#;
+        let parsed1 = parse_list_blobs(page1).unwrap();
+        assert_eq!(parsed1.entries.len(), 1);
+        assert_eq!(parsed1.entries[0].name, "archive/000000010000000000000001");
+        assert_eq!(parsed1.next_marker.as_deref(), Some("example-next-marker"));
+
+        // Second page: empty <NextMarker> — the loop terminates.
+        let page2 = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="mycontainer">
+    <Prefix>archive/</Prefix>
+    <MaxResults>1</MaxResults>
+    <Blobs>
+        <Blob>
+            <Name>archive/000000010000000000000002</Name>
+            <Properties>
+                <Last-Modified>Mon, 12 Oct 2009 17:51:00 GMT</Last-Modified>
+                <Content-Length>42</Content-Length>
+                <BlobType>BlockBlob</BlobType>
+            </Properties>
+        </Blob>
+    </Blobs>
+    <NextMarker />
+</EnumerationResults>"#;
+        let parsed2 = parse_list_blobs(page2).unwrap();
+        assert_eq!(parsed2.entries.len(), 1);
+        assert_eq!(parsed2.entries[0].name, "archive/000000010000000000000002");
+        assert_eq!(parsed2.next_marker, None);
+    }
+
+    #[test]
+    fn list_pagination_no_progress_guard_terminates() {
+        // Reproduces the `list()` loop-tail decision in isolation: a hostile or
+        // buggy endpoint that keeps echoing the same non-empty NextMarker must
+        // terminate the loop instead of advancing forever. Azure has no
+        // IsTruncated flag, so the only defence is "did the marker advance?".
+        //
+        // `advance` mirrors the guard: it returns the marker to use for the next
+        // request, or `None` to break out of the loop.
+        fn advance(marker: Option<&String>, next_marker: Option<String>) -> Option<String> {
+            match next_marker {
+                Some(next) if Some(&next) != marker => Some(next),
+                _ => None,
+            }
+        }
+
+        // A genuinely new marker keeps the loop going.
+        let marker: Option<String> = Some("page-1".to_string());
+        assert_eq!(
+            advance(marker.as_ref(), Some("page-2".to_string())),
+            Some("page-2".to_string())
+        );
+
+        // The same non-empty marker echoed back stops the loop.
+        let marker: Option<String> = Some("stuck".to_string());
+        assert_eq!(advance(marker.as_ref(), Some("stuck".to_string())), None);
+
+        // First page (no marker yet) followed by a non-empty marker advances.
+        let marker: Option<String> = None;
+        assert_eq!(
+            advance(marker.as_ref(), Some("page-1".to_string())),
+            Some("page-1".to_string())
+        );
+
+        // Empty NextMarker always stops the loop (the normal completion path).
+        let marker: Option<String> = Some("page-1".to_string());
+        assert_eq!(advance(marker.as_ref(), None), None);
     }
 
     #[test]

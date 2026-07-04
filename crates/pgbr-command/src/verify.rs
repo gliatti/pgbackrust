@@ -18,8 +18,14 @@
 //!    value. A file whose manifest entry carries a `reference` is read from the
 //!    backup that physically holds its bytes
 //!    (`backup/<stanza>/<reference>/<path>`), exactly as restore resolves
-//!    differential / incremental references. Missing files and size mismatches
-//!    are detected too. C ref: `verifyFile`.
+//!    differential / incremental references. On an **encrypted** repository the
+//!    info files, each `backup.manifest`, and the file data are decrypted with
+//!    the same keys restore uses — the user passphrase (`repo-cipher-pass`) for
+//!    the info files and the repository sub-key recovered from `archive.info`'s
+//!    `[cipher]` section for the manifest + data — before the SHA-1 is
+//!    recomputed, so a healthy encrypted repo verifies clean instead of being
+//!    re-hashed as ciphertext. Missing files and size mismatches are detected
+//!    too. C ref: `verifyFile`.
 //! 3. **WAL archive.** Walk `archive/<stanza>/` and verify every WAL segment.
 //!    The C implementation lays archives out as
 //!    `archive/<archive-id>/<wal-path>/<segment>-<sha1>` and verifies the
@@ -232,13 +238,21 @@ fn select_backups(config: &LoadedConfig, info: &InfoBackup) -> Vec<String> {
 
 /// Load `backup.info`, mapping a missing file / parse failure to a structural
 /// [`CommandError`] (verify cannot proceed without it).
-fn load_backup_info(repo: &dyn Storage, stanza: &str) -> Result<InfoBackup, CommandError> {
-    InfoBackup::load(repo, &backup_info_path(stanza)).map_err(|err| match err {
-        InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
-            path: backup_info_path(stanza),
-        }),
-        other => CommandError::Other(other.to_string()),
-    })
+///
+/// `backup.info` is encrypted directly under the user passphrase on an encrypted
+/// repository, so it is loaded keyed with `user_pass` (`None` on an unencrypted
+/// repo → the plaintext path). The recovered `[cipher]` sub-key ride-along is
+/// dropped here; verify resolves the sub-key once, up front, via
+/// [`crate::cipher::active_sub_key`].
+fn load_backup_info(repo: &dyn Storage, stanza: &str, user_pass: Option<&str>) -> Result<InfoBackup, CommandError> {
+    InfoBackup::load_keyed(repo, &backup_info_path(stanza), user_pass)
+        .map(|(info, _sub_key)| info)
+        .map_err(|err| match err {
+            InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
+                path: backup_info_path(stanza),
+            }),
+            other => CommandError::Other(other.to_string()),
+        })
 }
 
 /// Verify the cross-file consistency of `backup.info` and `archive.info`, the
@@ -246,8 +260,17 @@ fn load_backup_info(repo: &dyn Storage, stanza: &str) -> Result<InfoBackup, Comm
 /// recorded as a note, not a hard error, since a repository can legitimately
 /// hold only backups); a malformed one is recorded too. Any disagreement on the
 /// active database identity or the history lists is appended to `notes`.
-fn verify_info_consistency(repo: &dyn Storage, stanza: &str, backup: &InfoBackup, notes: &mut Vec<String>) {
-    let archive = match InfoArchive::load(repo, &archive_info_path(stanza)) {
+///
+/// `archive.info`, like `backup.info`, is encrypted directly under the user
+/// passphrase, so it is loaded keyed with `user_pass` (`None` → plaintext path).
+fn verify_info_consistency(
+    repo: &dyn Storage,
+    stanza: &str,
+    backup: &InfoBackup,
+    user_pass: Option<&str>,
+    notes: &mut Vec<String>,
+) {
+    let archive = match InfoArchive::load_keyed(repo, &archive_info_path(stanza), user_pass).map(|(archive, _sub_key)| archive) {
         Ok(archive) => archive,
         Err(InfoError::Storage(StorageError::NotFound { .. })) => {
             notes.push("archive.info is missing; skipping archive/backup history consistency check".to_owned());
@@ -301,22 +324,35 @@ fn hash_repo_file_reversed(repo: &dyn Storage, path: &Path, transform: &RepoTran
 /// `other_label`'s directory and were written with **that** backup's transform,
 /// not the backup being verified. Stock pgBackRust's restore looks the holder's
 /// `compress-type` / `encrypted` flags up in `backup.info`'s `[backup:current]`
-/// entry for that label (see [`RepoTransform::from_metadata`]); verify mirrors
-/// the same lookup. When the holder is not listed (a stray reference that
-/// `backup.info` did not record) we fall back to the identity transform, which
-/// is the same conservative default `from_metadata` would yield with no
-/// recorded compress / encrypt flags.
+/// entry for that label; verify mirrors the same lookup, and — exactly like
+/// restore ([`RepoTransform::from_metadata_checked`]) — injects the resolved
+/// repository `sub_key` so the reverse chain actually decrypts the holder's
+/// bytes. Without the key an encrypted holder would be re-hashed as ciphertext
+/// and flagged as corrupt.
+///
+/// When the holder is not listed in `backup.info` (a stray reference the info
+/// file did not record) we fall back to the identity transform, the same
+/// conservative default `from_metadata_checked` yields with no recorded
+/// compress / encrypt flags. An encrypted holder with no resolvable `sub_key`
+/// is a hard error (mirroring restore), not a silent ciphertext hash.
 fn transform_for_holder<'a>(
     holder: &str,
     info: &InfoBackup,
     config: &LoadedConfig,
+    sub_key: Option<&str>,
     cache: &'a mut HashMap<String, RepoTransform>,
-) -> &'a RepoTransform {
-    cache.entry(holder.to_owned()).or_insert_with(|| {
-        info.current
-            .get(holder)
-            .map_or_else(RepoTransform::identity, |entry| RepoTransform::from_metadata(entry, config))
-    })
+) -> Result<&'a RepoTransform, CommandError> {
+    if !cache.contains_key(holder) {
+        let transform = match info.current.get(holder) {
+            Some(entry) => RepoTransform::from_metadata_checked(entry, config, sub_key)?,
+            None => RepoTransform::identity(),
+        };
+        cache.insert(holder.to_owned(), transform);
+    }
+    // Just inserted (or already present); the lookup cannot miss.
+    cache
+        .get(holder)
+        .ok_or_else(|| CommandError::Other(format!("verify: transform cache miss for holder `{holder}`")))
 }
 
 /// SHA-1 of `bytes` as lowercase hex, computed exactly the way verify compares.
@@ -570,9 +606,14 @@ fn verify_backup(
     label: &str,
     info: &InfoBackup,
     config: &LoadedConfig,
+    sub_key: Option<&str>,
     report: &mut VerifyReport,
 ) -> Result<(), CommandError> {
-    let manifest = Manifest::load(repo, &manifest_path(stanza, label)).map_err(|err| match err {
+    // The `backup.manifest` is encrypted with the repository sub-key (not the
+    // user passphrase), the same key the backup wrote it with. `load_keyed` with
+    // `sub_key = None` is the byte-for-byte plaintext path for an unencrypted
+    // repo, so existing behaviour is unchanged there.
+    let manifest = Manifest::load_keyed(repo, &manifest_path(stanza, label), sub_key).map_err(|err| match err {
         InfoError::Storage(StorageError::NotFound { .. }) => CommandError::Storage(StorageError::NotFound {
             path: manifest_path(stanza, label),
         }),
@@ -612,7 +653,7 @@ fn verify_backup(
         // otherwise they live in this backup's own directory. The on-disk
         // filename carries that backup's compression suffix.
         let holder = file.reference.as_deref().unwrap_or(label);
-        let transform = transform_for_holder(holder, info, config, &mut transforms).clone();
+        let transform = transform_for_holder(holder, info, config, sub_key, &mut transforms)?.clone();
         let suffixed = format!("{}{}", file.path, transform.repo_suffix());
         let path = backup_file_path(stanza, holder, &suffixed);
 
@@ -843,14 +884,28 @@ pub fn verify_inner(config: &LoadedConfig, repo: &dyn Storage) -> Result<VerifyR
         info_problems: Vec::new(),
     };
 
+    // Repository encryption keys (both `None` for an unencrypted repo, the
+    // common case, so every keyed load below falls back to the plaintext path):
+    //
+    // - `user_pass` (`repo-cipher-pass`) decrypts the info files themselves
+    //   (`backup.info` / `archive.info`), which are keyed directly off the user
+    //   passphrase.
+    // - `sub_key` is the repository sub-key recovered from `archive.info`'s
+    //   `[cipher]` section; it decrypts each `backup.manifest` and the backed-up
+    //   file data — exactly the key restore resolves via
+    //   [`crate::cipher::active_sub_key`]. Without it verify would re-hash
+    //   ciphertext and flag a healthy encrypted repo as corrupt.
+    let user_pass = crate::cipher::active_user_pass(config)?;
+    let sub_key = crate::cipher::active_sub_key(repo, config, stanza)?;
+
     // Stage 1: info-file consistency.
-    let info = load_backup_info(repo, stanza)?;
-    verify_info_consistency(repo, stanza, &info, &mut report.info_problems);
+    let info = load_backup_info(repo, stanza, user_pass.as_deref())?;
+    verify_info_consistency(repo, stanza, &info, user_pass.as_deref(), &mut report.info_problems);
 
     // Stage 2: per-backup files (with reference resolution).
     let labels = select_backups(config, &info);
     for label in &labels {
-        verify_backup(repo, stanza, label, &info, config, &mut report)?;
+        verify_backup(repo, stanza, label, &info, config, sub_key.as_deref(), &mut report)?;
     }
 
     // Stage 3: WAL archive.
@@ -1491,8 +1546,8 @@ mod tests {
 
     /// Seed `backup.info` where each `(label, compress_type)` pair records the
     /// matching `backup-info-compress-type` flag in `[backup:current]`. This is
-    /// what verify reads back via `RepoTransform::from_metadata` so each backup
-    /// is checksummed against the transform it was actually written with.
+    /// what verify reads back via `RepoTransform::from_metadata_checked` so each
+    /// backup is checksummed against the transform it was actually written with.
     fn seed_backup_info_with_compress(repo: &Posix, stanza: &str, entries: &[(&str, &str)]) {
         let mut current = BTreeMap::new();
         for (label, compress_type) in entries {
@@ -1559,7 +1614,7 @@ mod tests {
         let full_zst = "20240102-120000F";
 
         // Each label records its own compress-type in [backup:current]. The
-        // verify pass reads these via `RepoTransform::from_metadata`.
+        // verify pass reads these via `RepoTransform::from_metadata_checked`.
         seed_backup_info_with_compress(&repo, "demo", &[(full_gz, "gz"), (full_zst, "zst")]);
 
         // Build the transforms verify will reconstruct.
@@ -1971,5 +2026,199 @@ mod tests {
         }
         assert!(saw_size, "size mismatch must be reported: {:?}", report.problems);
         assert!(saw_csum, "checksum mismatch must be reported: {:?}", report.problems);
+    }
+
+    /// A `verify` config carrying `repo-cipher-type=aes-256-cbc` +
+    /// `repo-cipher-pass=<user_pass>` (the user passphrase, which unlocks the
+    /// recorded sub-key — not the sub-key itself), exactly as a real encrypted
+    /// verify invocation resolves its keys via `crate::cipher`.
+    fn cfg_encrypted(stanza: &str, user_pass: &str) -> LoadedConfig {
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        options.insert(
+            ("repo-cipher-pass".to_owned(), Some(1)),
+            OptionValue::String(user_pass.to_owned()),
+        );
+        LoadedConfig {
+            command: "verify".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(stanza.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    /// Seed a fully **encrypted** stanza the way stanza-create + backup would:
+    /// `backup.info` keyed under `user_pass`, `archive.info` keyed under
+    /// `user_pass` and carrying `sub_key` in its `[cipher]` section, a
+    /// `backup.manifest` keyed under the `sub_key`, and every data file written
+    /// through the sub-key forward chain (`backup-info-encrypted=true`). Returns
+    /// the manifest-relative path of the single seeded data file.
+    fn seed_encrypted_backup(repo: &Posix, stanza: &str, label: &str, user_pass: &str, sub_key: &str, plaintext: &[u8]) -> String {
+        // Encrypted archive.info (user pass + recorded sub-key).
+        let mut history = BTreeMap::new();
+        history.insert(
+            1,
+            DbHistoryEntry {
+                db_id: 6_873_049_345_984_568_091,
+                db_version: "14".to_owned(),
+            },
+        );
+        let archive = InfoArchive {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            history: history.clone(),
+        };
+        repo.create_path(Path::new(&format!("archive/{stanza}")), true)
+            .expect("create archive dir");
+        archive
+            .save_keyed(repo, &super::archive_info_path(stanza), Some(user_pass), Some(sub_key))
+            .expect("save encrypted archive.info");
+
+        // Encrypted backup.info (user pass), the entry marked encrypted so
+        // `from_metadata_checked` demands a key.
+        let mut current = BTreeMap::new();
+        current.insert(
+            label.to_owned(),
+            json!({
+                "backup-info-size": 100,
+                "backup-label": label,
+                "backup-timestamp-stop": 1_704_110_410_i64,
+                "backup-type": "full",
+                "backup-info-encrypted": true,
+            }),
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history,
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}")), true)
+            .expect("create backup dir");
+        info.save_keyed(repo, &super::backup_info_path(stanza), Some(user_pass), Some(sub_key))
+            .expect("save encrypted backup.info");
+
+        // Encrypted backup.manifest (sub-key). The plaintext SHA-1 the manifest
+        // records is taken over the plaintext, as the backup writer does.
+        let rel = "pg_data/base/1/1259";
+        let manifest = Manifest {
+            backup_label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: vec![file_entry(rel, plaintext, Some(sha1_hex(plaintext)))],
+            option_checksum_page: None,
+            paths: Vec::new(),
+            links: Vec::new(),
+        };
+        repo.create_path(Path::new(&format!("backup/{stanza}/{label}")), true)
+            .expect("create backup label dir");
+        manifest
+            .save_keyed(repo, &super::manifest_path(stanza, label), Some(sub_key))
+            .expect("save encrypted manifest");
+
+        // Encrypted data file: forward the plaintext through the sub-key chain,
+        // exactly as the backup writer would.
+        let tf = crate::pipeline::RepoTransform::with_key(crate::pipeline::CompressType::None, 0, Some(sub_key.to_owned()));
+        let repo_bytes = tf.apply_forward_keyed(plaintext).expect("encrypt data file");
+        write_backup_file(repo, stanza, label, rel, &repo_bytes);
+
+        rel.to_owned()
+    }
+
+    #[test]
+    fn verify_clean_encrypted_repo_has_no_problems() {
+        // REGRESSION: verify on an encrypted repo previously re-hashed the
+        // ciphertext (it never injected the repo sub-key) and declared a
+        // healthy encrypted repo CORRUPT. It must now decrypt with the resolved
+        // sub-key and report zero problems.
+        let (_dir, repo) = empty_repo();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let user_pass = "user-secret-pass";
+        let sub_key = pgbr_info::cipher_pass_gen();
+        let plaintext = b"relation data that must round-trip through decrypt cleanly";
+
+        seed_encrypted_backup(&repo, stanza, label, user_pass, &sub_key, plaintext);
+
+        let report = verify_inner(&cfg_encrypted(stanza, user_pass), &repo).expect("verify_inner on encrypted repo");
+        assert!(
+            report.problems.is_empty(),
+            "a clean ENCRYPTED repo must report zero problems (was re-hashing ciphertext): {:?}",
+            report.problems
+        );
+        assert!(
+            report.info_problems.is_empty(),
+            "encrypted info files must decrypt and agree: {:?}",
+            report.info_problems
+        );
+        assert_eq!(report.files_checked, 1);
+        assert_eq!(report.backups_checked, 1);
+        assert_eq!(report.backups[0].valid, 1);
+        assert_eq!(report.backups[0].total, 1);
+        assert!(report.backups[0].errors.is_empty());
+    }
+
+    #[test]
+    fn verify_encrypted_repo_detects_tampered_ciphertext() {
+        // A corrupted ciphertext byte must be DETECTED (checksum/size mismatch
+        // in the report, or a decrypt failure surfaced as a CommandError) — not
+        // silently pass, and not spuriously "MissingFile".
+        let (_dir, repo) = empty_repo();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let user_pass = "user-secret-pass";
+        let sub_key = pgbr_info::cipher_pass_gen();
+        let plaintext = b"relation data that must round-trip through decrypt cleanly";
+
+        let rel = seed_encrypted_backup(&repo, stanza, label, user_pass, &sub_key, plaintext);
+
+        // Flip the last byte of the encrypted data file on disk.
+        let on_disk = super::backup_file_path(stanza, label, &rel);
+        let mut bytes = {
+            let mut r = repo.open_read(&on_disk).expect("open encrypted file");
+            r.read_all().expect("read encrypted file")
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        {
+            let mut w = repo.open_write(&on_disk).expect("reopen encrypted file");
+            w.write(&bytes).expect("rewrite tampered ciphertext");
+            w.close().expect("close tampered file");
+        }
+
+        match verify_inner(&cfg_encrypted(stanza, user_pass), &repo) {
+            Ok(report) => {
+                assert!(
+                    !report.problems.iter().any(|p| matches!(p, VerifyProblem::MissingFile { .. })),
+                    "tampered ciphertext must NOT surface as MissingFile: {:?}",
+                    report.problems
+                );
+                assert!(
+                    !report.problems.is_empty(),
+                    "tampered ciphertext must be detected as a problem: {:?}",
+                    report.problems
+                );
+            }
+            Err(err) => {
+                // A decrypt failure surfacing as a CommandError is also a valid
+                // detection: the corruption did not slip through.
+                assert!(!err.to_string().is_empty(), "a decrypt failure should carry a message");
+            }
+        }
     }
 }

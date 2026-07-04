@@ -46,11 +46,10 @@
 //!   first segment (everything before the first `_`). Its `backup.info` entry
 //!   records `backup-type: "incr"` plus `backup-reference: [<prior label>]`.
 //!
-//! Deliberately out of scope for this slice (follow-ups):
-//!
-//! - **Symlink target resolution.** The `Storage` trait has no link-target
-//!   accessor yet, so [`ManifestLink`] entries are recorded with an empty
-//!   `destination`. See the `// TODO: resolve link target` note in [`walk`].
+//! Symlink targets are resolved via [`Storage::read_link`]; on filesystem
+//! backends each [`ManifestLink`] records the link's real `destination`. Backends
+//! without link-target support (remote/object stores) still record an empty
+//! destination, which remains a follow-up for remote tablespace backups.
 //!
 //! The real work lives in [`backup_inner_typed`], which takes the backup type,
 //! label, and start timestamp as parameters so tests can pin them;
@@ -69,7 +68,7 @@ use pgbr_postgres::control::read_pg_control_data;
 use pgbr_postgres::lsn::{lsn_text_to_wal_segment, parse_lsn, wal_segment_range};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
-use pgbr_storage::{Storage, StorageInfo, StorageKind};
+use pgbr_storage::{Storage, StorageError, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
@@ -527,6 +526,52 @@ fn is_user_excluded(rel_path: &str, excludes: &[String]) -> bool {
 /// validated one `PAGE_SIZE` slice at a time.
 const PAGE_SIZE: usize = pgbr_postgres::page::BLCKSZ;
 
+/// Number of pages in one relation segment file.
+///
+/// `PostgreSQL` splits a relation into 1 GiB segments (`RELSEG_SIZE` pages of
+/// `BLCKSZ` bytes each — `1 GiB / 8 KiB = 131072` for the default build). The
+/// first segment is `<node>` (block numbers `0 .. RELSEG_SIZE`), the second is
+/// `<node>.1` (block numbers `RELSEG_SIZE .. 2*RELSEG_SIZE`), and so on. The
+/// `pd_checksum` a page carries is computed over the page's **absolute** block
+/// number, so validating a `<node>.k` segment requires offsetting the per-file
+/// page index by `k * RELSEG_SIZE`.
+///
+/// Computed entirely in `u32` arithmetic (no narrowing cast): `1 GiB`
+/// (`1 << 30`) divided by the `8192`-byte page size. A `const` assertion below
+/// ties this to [`PAGE_SIZE`] so a future non-default `BLCKSZ` fails the build
+/// rather than silently mis-numbering segment blocks.
+const RELSEG_SIZE: u32 = (1u32 << 30) / 8192;
+
+/// Compile-time guard: [`RELSEG_SIZE`] is derived from a hardcoded `8192`-byte
+/// page, so it is only correct while [`PAGE_SIZE`] is that size. Break the build
+/// if the page size ever changes so this constant is revisited.
+const _: () = assert!(PAGE_SIZE == 8192, "RELSEG_SIZE assumes an 8192-byte page");
+
+/// Absolute first-block number of a relation segment file, from its basename.
+///
+/// A segment name is `<node>` (segment 0) or `<node>.k` (segment `k`); the
+/// suffix, when present, is the decimal segment index. The returned value is
+/// `k * RELSEG_SIZE` — the absolute block number of the segment's first page,
+/// used to thread the correct `block_no` into per-page checksum validation.
+///
+/// Non-relation paths, or a segment index that overflows `u32`, yield `0` (a
+/// safe fallback: segment 0's numbering, which is also correct for the common
+/// single-segment case). A fork suffix such as `_vm` / `_fsm` is not a numeric
+/// segment and is handled by [`is_relation_segment_name`] rejecting it upstream.
+fn relation_segment_base(rel: &str) -> u32 {
+    // Take the basename (last `/`-separated component); the path prefix carries
+    // no segment information.
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    match name.split_once('.') {
+        Some((_node, segment)) => segment
+            .parse::<u32>()
+            .ok()
+            .and_then(|k| k.checked_mul(RELSEG_SIZE))
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
 /// Whether a PG-data-relative path is a *relation file* eligible for
 /// page-checksum validation.
 ///
@@ -616,13 +661,18 @@ fn is_valid_page(page: &[u8], block_no: u32, check_header: bool) -> bool {
 ///
 /// `bytes` must already be confirmed page-aligned (a multiple of `PAGE_SIZE`)
 /// by the caller. `check_header` enables the per-page header validation
-/// (`page-header-check`) in addition to the checksum. Returns the (possibly
-/// empty) list of block numbers that did not validate, in ascending order. An
-/// all-empty (or empty-`bytes`) file yields an empty list.
-fn validate_relation_pages(bytes: &[u8], check_header: bool) -> Vec<u32> {
+/// (`page-header-check`) in addition to the checksum. `block_base` is the
+/// absolute block number of this file's first page — `0` for segment `<node>`,
+/// `k * RELSEG_SIZE` for `<node>.k` (see [`relation_segment_base`]) — so the
+/// `pd_checksum` of a page in a `>= 1` segment is verified against its true
+/// block number rather than a per-file index starting at 0. Returns the
+/// (possibly empty) list of **absolute** block numbers that did not validate,
+/// in ascending order. An all-empty (or empty-`bytes`) file yields an empty
+/// list.
+fn validate_relation_pages(bytes: &[u8], check_header: bool, block_base: u32) -> Vec<u32> {
     let mut invalid = Vec::new();
     for (idx, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
-        let block_no = u32::try_from(idx).unwrap_or(u32::MAX);
+        let block_no = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(block_base);
         if !is_valid_page(page, block_no, check_header) {
             invalid.push(block_no);
         }
@@ -2062,7 +2112,7 @@ fn transform_and_validate(job: &CopyJob, bytes: &[u8], transform: &RepoTransform
     // non-relation file, which is never flagged) is left unvalidated
     // (`checksum_page == None`).
     let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len().is_multiple_of(PAGE_SIZE) {
-        let invalid = validate_relation_pages(bytes, job.validate_page_header);
+        let invalid = validate_relation_pages(bytes, job.validate_page_header, relation_segment_base(&job.rel));
         Some(if invalid.is_empty() {
             ChecksumPage::Validated
         } else {
@@ -2296,7 +2346,7 @@ fn run_bundled_copy_serial(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>
 
         // Page-checksum + page-header validation, identical to the per-file path.
         let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-            let invalid = validate_relation_pages(&bytes, job.validate_page_header);
+            let invalid = validate_relation_pages(&bytes, job.validate_page_header, relation_segment_base(&skeleton.path));
             Some(if invalid.is_empty() {
                 ChecksumPage::Validated
             } else {
@@ -2701,7 +2751,7 @@ fn run_bundled_copy_parallel(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFil
             // the serial path). Block-incremental files include relation files, so
             // a `validate_pages` skeleton still validates here on the main thread.
             let checksum_page = if job.validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-                let invalid = validate_relation_pages(&bytes, job.validate_page_header);
+                let invalid = validate_relation_pages(&bytes, job.validate_page_header, relation_segment_base(&skeleton.path));
                 Some(if invalid.is_empty() {
                     ChecksumPage::Validated
                 } else {
@@ -2853,7 +2903,7 @@ fn run_bundled_copy_parallel(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFil
             // `transform_and_validate` contract). A block job carries
             // `validate_pages = false`, so this branch is dead for them.
             let checksum_page = if validate_pages && !bytes.is_empty() && bytes.len() % PAGE_SIZE == 0 {
-                let invalid = validate_relation_pages(&bytes, validate_page_header);
+                let invalid = validate_relation_pages(&bytes, validate_page_header, relation_segment_base(&request.cmd));
                 Some(if invalid.is_empty() {
                     ChecksumPage::Validated
                 } else {
@@ -3237,27 +3287,68 @@ fn build_block_map(
     })
 }
 
-/// Find the label of the latest full backup recorded in `backup.info`.
+/// Whether a `backup.info` entry belongs to the given `db-id` (PG history id).
+///
+/// A prior backup is only a valid base for a new diff/incr when it was taken
+/// against the **same** cluster history the new backup runs against; a backup
+/// from a prior `db-id` (e.g. after a `stanza-upgrade` bumped the history) is a
+/// different timeline and must not be referenced. C ref: backup.c only selects a
+/// prior whose `db-id` matches the current `pgData` history id.
+///
+/// A `[backup:current]` entry whose `db-id` is **absent** or **not parsable as
+/// an integer** is a sign of a corrupt `backup.info` (every well-formed entry
+/// carries a numeric `db-id`). We stay fail-safe — the entry simply does not
+/// match, so the caller falls back to a full backup rather than referencing a
+/// suspect prior — but we must not swallow the anomaly silently: a diff/incr
+/// silently promoted to full would otherwise hide the corruption. So we log a
+/// WARNING (keyed by `label`) to make the promotion / non-reuse observable,
+/// while still returning `false` instead of hard-erroring.
+fn entry_matches_db_id(label: &str, entry: &serde_json::Value, db_id: u32) -> bool {
+    entry.get("db-id").and_then(serde_json::Value::as_u64).map_or_else(
+        || {
+            log_warn(&format!(
+                "backup.info entry {label} has a missing or non-integer db-id; \
+                 treating it as ineligible for prior/resume reuse — a diff/incr may be \
+                 promoted to full. This is a sign of a corrupt backup.info."
+            ));
+            false
+        },
+        |entry_db_id| entry_db_id == u64::from(db_id),
+    )
+}
+
+/// Find the label of the latest full backup recorded in `backup.info` for the
+/// current `db-id`.
 ///
 /// "Latest" is the lexicographically-greatest label whose `backup-type` is
-/// `full` — pgBackRust full labels sort chronologically. Returns `None` when no
-/// full backup exists.
-fn latest_full_label(info: &InfoBackup) -> Option<String> {
+/// `full` **and** whose `db-id` matches `db_id` — pgBackRust full labels sort
+/// chronologically. A full from an older history id is skipped. Returns `None`
+/// when no such full backup exists.
+fn latest_full_label(info: &InfoBackup, db_id: u32) -> Option<String> {
     info.current
         .iter()
         .rev()
-        .find(|(_, entry)| entry.get("backup-type").and_then(serde_json::Value::as_str) == Some(BACKUP_TYPE_FULL))
+        .find(|(label, entry)| {
+            entry.get("backup-type").and_then(serde_json::Value::as_str) == Some(BACKUP_TYPE_FULL)
+                && entry_matches_db_id(label.as_str(), entry, db_id)
+        })
         .map(|(label, _)| label.clone())
 }
 
 /// Find the label of the latest backup of **any** type recorded in
-/// `backup.info` — the "prior" backup an incremental references.
+/// `backup.info` for the current `db-id` — the "prior" backup an incremental
+/// references.
 ///
 /// `info.current` is a `BTreeMap` keyed by label, so its keys iterate in
-/// ascending (chronological) order; the last key is the most recent backup.
-/// Returns `None` when no backup exists.
-fn latest_any_label(info: &InfoBackup) -> Option<String> {
-    info.current.keys().next_back().cloned()
+/// ascending (chronological) order; the most recent entry whose `db-id` matches
+/// `db_id` is the prior. A backup from an older history id is skipped. Returns
+/// `None` when no matching backup exists.
+fn latest_any_label(info: &InfoBackup, db_id: u32) -> Option<String> {
+    info.current
+        .iter()
+        .rev()
+        .find(|(label, entry)| entry_matches_db_id(label.as_str(), entry, db_id))
+        .map(|(label, _)| label.clone())
 }
 
 /// Convert a Unix timestamp (seconds, UTC) to `(year, month, day, hour, minute,
@@ -3579,10 +3670,9 @@ fn run_copy_jobs(
 /// re-copy of files whose checksum still matches.
 struct ResumeContext {
     /// The aborted prior run's manifest (its file entries are the reuse source).
+    /// Each candidate's repo object is checked for presence via the copy job's
+    /// `rel_dest` (the suffixed `<backup_root>/<path>` path) before reuse.
     manifest: Manifest,
-    /// Storage-relative backup root, used to check each candidate's repo object
-    /// is actually present before reusing it.
-    backup_root: String,
 }
 
 impl ResumeContext {
@@ -3600,10 +3690,7 @@ impl ResumeContext {
         // encrypted repo; load it keyed so resume can read it (`None` == the
         // plaintext load on an unencrypted repo).
         let manifest = Manifest::load_keyed(repo_storage, &manifest_path, sub_key).ok()?;
-        Some(Self {
-            manifest,
-            backup_root: backup_root.to_owned(),
-        })
+        Some(Self { manifest })
     }
 
     /// Move every job whose file the prior backup already holds out of
@@ -3617,6 +3704,7 @@ impl ResumeContext {
     /// just leaves the file on the copy path.
     fn split_resumable(
         &self,
+        repo_storage: &dyn Storage,
         pg_storage: &dyn Storage,
         skeletons: &mut Vec<ManifestFile>,
         jobs: &mut Vec<CopyJob>,
@@ -3627,7 +3715,7 @@ impl ResumeContext {
 
         // The two vectors are index-parallel: skeleton[i] corresponds to job[i].
         for (skeleton, job) in std::mem::take(skeletons).into_iter().zip(std::mem::take(jobs)) {
-            if let Some(reused_file) = self.try_reuse(pg_storage, &skeleton) {
+            if let Some(reused_file) = self.try_reuse(repo_storage, pg_storage, &skeleton, &job) {
                 reused.push(reused_file);
             } else {
                 kept_skeletons.push(skeleton);
@@ -3643,17 +3731,34 @@ impl ResumeContext {
     /// Try to reuse one planned file from the prior partial backup; `None` when
     /// it cannot be reused (no matching prior entry, size / checksum mismatch,
     /// repo object missing, or a read error).
-    fn try_reuse(&self, pg_storage: &dyn Storage, skeleton: &ManifestFile) -> Option<ManifestFile> {
+    fn try_reuse(
+        &self,
+        repo_storage: &dyn Storage,
+        pg_storage: &dyn Storage,
+        skeleton: &ManifestFile,
+        job: &CopyJob,
+    ) -> Option<ManifestFile> {
         let prior = self.manifest.file(&skeleton.path)?;
         if prior.size != skeleton.size {
             return None;
         }
         let prior_checksum = prior.checksum.as_deref()?;
 
-        // The prior entry's repo object must still be present to reuse it. The
-        // repo filename carries the compression suffix; a referenced (not copied)
-        // prior entry has no standalone object and is not reusable here.
+        // A referenced (not copied) prior entry has no standalone object in this
+        // backup root and is not reusable here.
         if prior.reference.is_some() {
+            return None;
+        }
+
+        // The prior entry's repo object must actually be present to reuse it —
+        // the partial manifest can list a file whose bytes never finished being
+        // written (a crash mid-copy), in which case reusing the manifest entry
+        // would reference a missing/torn object. `job.rel_dest` is the
+        // repo-relative path *with* the compression suffix
+        // (`<backup_root>/<path><suffix>`), i.e. exactly the object the prior run
+        // would have written. A missing object (or an `exists` I/O error) falls
+        // back to the copy path.
+        if !repo_storage.exists(&PathBuf::from(&job.rel_dest)).unwrap_or(false) {
             return None;
         }
 
@@ -3668,7 +3773,6 @@ impl ResumeContext {
         // The reused file keeps the prior entry's checksum/page result but is a
         // standalone copied file in *this* backup (reference stays None): its
         // bytes already live at `<backup_root>/<path><suffix>` from the prior run.
-        let _ = &self.backup_root;
         Some(ManifestFile {
             checksum: Some(checksum),
             checksum_page: prior.checksum_page.clone(),
@@ -3911,11 +4015,23 @@ fn plan_backup(
             },
             StorageKind::Path => plan.paths.push(ManifestPath { path: entry.rel }),
             StorageKind::Link => {
-                // TODO: resolve link target once `Storage` exposes a
-                // link-target accessor; record an empty destination for now.
+                // Record the link's real target. Filesystem backends resolve it
+                // via `read_link`; backends without link-target support (the
+                // remote/object stores) return `StorageError::Unsupported`, in
+                // which case we fall back to an empty destination — the same
+                // known-limitation behaviour as before, kept out of the restore
+                // path's hard error only for those backends. A genuine local I/O
+                // failure maps to `Backend`/`Io`, NOT `Unsupported`, so it
+                // propagates and fails the backup loudly instead of silently
+                // recording an empty (unrestorable) symlink target.
+                let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
+                    Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(StorageError::Unsupported { .. }) => String::new(),
+                    Err(err) => return Err(err.into()),
+                };
                 plan.links.push(ManifestLink {
                     path: entry.rel,
-                    destination: String::new(),
+                    destination,
                 });
             }
             // Sockets / FIFOs / devices are not part of a base backup.
@@ -3950,11 +4066,11 @@ fn resolve_prior(
         BackupType::Full => return Ok((None, None)),
         // No prior full (diff) / no prior backup at all (incr) → no base to
         // reference; signal the caller (run_backup) to promote this to a full.
-        BackupType::Diff => match latest_full_label(info) {
+        BackupType::Diff => match latest_full_label(info, info.db_id) {
             Some(label) => label,
             None => return Ok((None, None)),
         },
-        BackupType::Incr => match latest_any_label(info) {
+        BackupType::Incr => match latest_any_label(info, info.db_id) {
             Some(label) => label,
             None => return Ok((None, None)),
         },
@@ -3998,7 +4114,8 @@ fn resolve_prior(
 ///    (compress then encrypt), write the transformed bytes to
 ///    `backup/<stanza>/<label>/<relpath><suffix>`, and record `reference: None`.
 /// 5. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
-///    (with an empty destination — see module docs).
+///    (with the link target resolved via [`Storage::read_link`] where the
+///    backend supports it — see module docs).
 /// 6. Save `backup.manifest`, then add a `[backup:current]` entry to
 ///    `backup.info` — including the applied compress-type, encrypted flag, and
 ///    (for a diff/incr) the `backup-reference` chain — and save it.
@@ -4307,7 +4424,7 @@ fn run_backup(
     // no resume context every job stays a copy, byte-for-byte the prior behaviour.
     let mut referenced = std::mem::take(&mut plan.referenced);
     if let Some(resume_ctx) = resume_ctx.as_ref() {
-        let resumed = resume_ctx.split_resumable(pg_storage, &mut plan.copy_skeletons, &mut plan.copy_jobs);
+        let resumed = resume_ctx.split_resumable(repo_storage, pg_storage, &mut plan.copy_skeletons, &mut plan.copy_jobs);
         if !resumed.is_empty() {
             log_info(&format!("resume: reused {} already-copied file(s)", resumed.len()));
             referenced.extend(resumed);
@@ -4319,7 +4436,17 @@ fn run_backup(
     // the small files are packed into shared bundle objects and large eligible
     // files may be block-split — a serial pass since a bundle object is appended
     // to in order.
-    let (mut files, repo_size) = if policy.dry_run {
+    //
+    // Run the copy under a guard: `pg_backup_start` has already opened an online
+    // backup on the cluster (when a control connection is present), so a copy
+    // failure must still call `pg_backup_stop` to release that backup state —
+    // otherwise the cluster is left with a dangling running backup the next
+    // `pg_backup_start` refuses (and, pre-`stop-auto`, a manual `stop_running_backup`
+    // is needed to clear). The `?` on the copy result is deferred: on error we
+    // best-effort close the online backup, log any *stop* failure WITHOUT masking
+    // the original copy error, then propagate the copy error unchanged. C ref:
+    // backup.c wraps the copy in TRY … FINALLY that always reaches dbBackupStop().
+    let copy_result = if policy.dry_run {
         // dry-run: report what WOULD be copied and skip every repository write.
         // The per-file plaintext checksum the workers would compute is not taken
         // (no bytes are read for copy), so each skeleton is recorded without a
@@ -4329,7 +4456,7 @@ fn run_backup(
         }
         let mut files: Vec<ManifestFile> = referenced;
         files.extend(plan.copy_skeletons);
-        (files, 0u64)
+        Ok((files, 0u64))
     } else if features.bundle {
         run_bundled_copy(BundledCopyCtx {
             repo_storage,
@@ -4347,7 +4474,7 @@ fn run_backup(
             job_retry,
             timestamp_start,
             process_max,
-        })?
+        })
     } else {
         run_unbundled_copy(UnbundledCopyCtx {
             repo_storage,
@@ -4367,12 +4494,28 @@ fn run_backup(
             job_retry,
             timestamp_start,
             manifest_save_threshold: policy.manifest_save_threshold,
-        })?
+        })
+    };
+    let (mut files, repo_size) = match copy_result {
+        Ok(ok) => ok,
+        Err(copy_err) => {
+            // Close the online backup the copy left open (control present + a
+            // start LSN was captured). A stop failure here is logged but never
+            // replaces `copy_err` — the operator needs the real cause of the
+            // failed backup, not a secondary stop error.
+            if let (Some(control), Some(_)) = (control.as_mut(), start_lsn.as_ref())
+                && let Err(stop_err) = control.backup_stop()
+            {
+                log_warn(&format!(
+                    "failed to stop the online backup after a copy error (backup still failed on: {copy_err}): {stop_err}"
+                ));
+            }
+            return Err(copy_err);
+        }
     };
     let mut paths = plan.paths;
     let mut links = plan.links;
 
-    let timestamp_stop = timestamp_start;
     let mut repo_size = repo_size;
 
     // Close the online backup (on the same session) and assemble the bracket.
@@ -4390,6 +4533,17 @@ fn run_backup(
         }
         _ => None,
     };
+
+    // backup-timestamp-stop: the wall-clock time the backup bracket actually
+    // closed, captured now (after `pg_backup_stop` and the copy have finished)
+    // rather than reused from `timestamp_start`. The two coincided only because
+    // the stop time was never sampled; a real backup spans the whole copy, so
+    // the recorded stop must reflect that. C ref: backup.c records
+    // `backup-timestamp-stop` from a `time()` call taken after the copy.
+    let stop_secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // Never let the recorded stop precede the recorded start (a backward clock
+    // step): clamp to `timestamp_start`, which is always a valid lower bound.
+    let timestamp_stop = i64::try_from(stop_secs).unwrap_or(i64::MAX).max(timestamp_start);
 
     // archive-check: verify the WAL segments needed to make this backup
     // consistent (archive-start..archive-stop) are present in the repo archive,
@@ -4515,11 +4669,35 @@ fn run_backup(
         entry["backup-archive-start"] = json!(bracket.archive_start);
         entry["backup-archive-stop"] = json!(bracket.archive_stop);
     }
-    // A diff/incr records the chain of backups its files depend on. The prior
-    // backup is the head of that chain (the latest full for a diff, the latest
-    // backup of any type for an incr).
+    // A diff/incr records the FULL TRANSITIVE chain of backups its files depend
+    // on, not just the immediate prior: the prior's own `backup-reference` list
+    // (the backups *it* depended on — e.g. the base full behind a diff an incr
+    // sits on) followed by the prior label itself, deduplicated with first-seen
+    // order preserved. Recording only the immediate parent would hide the base
+    // full from a diff that references an incr's parent, so `expire`'s diff
+    // retention could drop a full still needed to restore this backup. This
+    // mirrors upstream pgBackRest, which builds `backup-reference` from the
+    // prior manifest's reference list plus the prior label. C ref:
+    // manifestBackupReferenceList() / the `backup-reference` assembly in
+    // backup.c / info.c.
     if let Some(prior_label) = prior_label.as_ref() {
-        entry["backup-reference"] = json!([prior_label]);
+        // Build the ordered, deduplicated chain: the prior's inherited
+        // references first (ancestors before the prior, matching restore's
+        // oldest-to-newest apply order), then the immediate prior itself.
+        let mut ref_chain: Vec<String> = Vec::new();
+        if let Some(prior_entry) = info.current.get(prior_label.as_str())
+            && let Some(prior_refs) = prior_entry.get("backup-reference").and_then(serde_json::Value::as_array)
+        {
+            for reference in prior_refs.iter().filter_map(serde_json::Value::as_str) {
+                if !ref_chain.iter().any(|existing| existing == reference) {
+                    ref_chain.push(reference.to_owned());
+                }
+            }
+        }
+        if !ref_chain.iter().any(|existing| existing.as_str() == prior_label.as_str()) {
+            ref_chain.push((*prior_label).clone());
+        }
+        entry["backup-reference"] = json!(ref_chain);
     }
     info.current.insert(label.clone(), entry);
     // Re-save backup.info, re-encrypting under the user passphrase and
@@ -4973,6 +5151,105 @@ mod tests {
         let mut sink = Vec::new();
         sha1.process(bytes, &mut sink).unwrap();
         sha1.digest_hex()
+    }
+
+    /// Build a bare [`InfoBackup`] with the given `db-id` and a set of
+    /// `(label, backup-type, db-id)` current entries, for the prior-resolution
+    /// filter tests.
+    fn info_backup_with_entries(db_id: u32, entries: &[(&str, &str, u32)]) -> InfoBackup {
+        let mut current = BTreeMap::new();
+        for (label, backup_type, entry_db_id) in entries {
+            current.insert(
+                (*label).to_owned(),
+                json!({ "backup-type": backup_type, "db-id": entry_db_id }),
+            );
+        }
+        InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn latest_labels_filter_by_db_id() {
+        // db-id 1 holds an older full; a stanza-upgrade bumped the history to
+        // db-id 2, under which a new full + incr were taken. The current db-id
+        // is 2, so the prior for a new diff/incr must be a db-id-2 backup — a
+        // db-id-1 backup is a different cluster history and must be ignored.
+        let info = info_backup_with_entries(
+            2,
+            &[
+                ("20240101-120000F", BACKUP_TYPE_FULL, 1),
+                ("20240102-120000F", BACKUP_TYPE_FULL, 2),
+                ("20240102-120000F_20240103-120000I", "incr", 2),
+            ],
+        );
+        // Latest full for the current db-id is the db-id-2 full, not the newer-
+        // sorting… actually older-sorting db-id-1 full.
+        assert_eq!(latest_full_label(&info, 2).as_deref(), Some("20240102-120000F"));
+        // Latest backup of any type for db-id 2 is the incr.
+        assert_eq!(
+            latest_any_label(&info, 2).as_deref(),
+            Some("20240102-120000F_20240103-120000I")
+        );
+        // Under db-id 1 the only matching backup is its single full.
+        assert_eq!(latest_full_label(&info, 1).as_deref(), Some("20240101-120000F"));
+        assert_eq!(latest_any_label(&info, 1).as_deref(), Some("20240101-120000F"));
+        // A db-id with no backups yields no prior (→ caller promotes to full).
+        assert_eq!(latest_full_label(&info, 3), None);
+        assert_eq!(latest_any_label(&info, 3), None);
+    }
+
+    /// A `[backup:current]` entry whose `db-id` is missing or non-integer is a
+    /// corruption signal. `entry_matches_db_id` must treat it as ineligible
+    /// (fail-safe: the caller falls back to a full backup) — it must never be
+    /// silently reused as a prior/resume base. Here we assert the filter does
+    /// not accidentally treat such an entry as matching; the accompanying
+    /// `log_warn` makes the event observable (see the function's doc comment).
+    #[test]
+    fn corrupt_db_id_entry_is_never_selected_as_prior() {
+        let mut current = BTreeMap::new();
+        // A well-formed full for db-id 2 — the only legitimate prior.
+        current.insert(
+            "20240102-120000F".to_owned(),
+            json!({ "backup-type": BACKUP_TYPE_FULL, "db-id": 2 }),
+        );
+        // Corrupt: db-id entirely absent (sorts newer, would win if not filtered).
+        current.insert("20240103-120000F".to_owned(), json!({ "backup-type": BACKUP_TYPE_FULL }));
+        // Corrupt: db-id present but non-integer (a string).
+        current.insert(
+            "20240104-120000F_20240104-130000I".to_owned(),
+            json!({ "backup-type": "incr", "db-id": "not-a-number" }),
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 2,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history: BTreeMap::new(),
+        };
+
+        // Despite the two corrupt entries sorting newer, the only prior selected
+        // is the well-formed db-id-2 full — the corrupt ones are skipped, not
+        // silently reused.
+        assert_eq!(latest_full_label(&info, 2).as_deref(), Some("20240102-120000F"));
+        assert_eq!(latest_any_label(&info, 2).as_deref(), Some("20240102-120000F"));
+
+        // With no well-formed entry for db-id 5, every entry is either a db-id
+        // mismatch or corrupt, so no prior is found (→ caller promotes to full).
+        assert_eq!(latest_full_label(&info, 5), None);
+        assert_eq!(latest_any_label(&info, 5), None);
     }
 
     #[test]
@@ -5852,11 +6129,17 @@ mod tests {
         .expect("incr backup");
         assert_eq!(incr.label, format!("{LABEL}_20240103-120000I"));
 
-        // backup.info records type=incr and the prior (the diff) as the chain head.
+        // backup.info records type=incr and the FULL TRANSITIVE chain: the full
+        // (inherited from the diff's own backup-reference) then the diff (the
+        // immediate prior), in oldest-to-newest order. Recording only the diff
+        // would hide the base full from expire's diff-retention pass.
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let entry = info.current.get(&incr.label).expect("incr entry in backup.info");
         assert_eq!(entry["backup-type"], json!("incr"));
-        assert_eq!(entry["backup-reference"], json!([format!("{LABEL}_20240102-120000D")]));
+        assert_eq!(
+            entry["backup-reference"],
+            json!([LABEL.to_owned(), format!("{LABEL}_20240102-120000D")])
+        );
     }
 
     #[test]
@@ -7691,14 +7974,51 @@ mod tests {
         let bytes = corrupt_header_page(0);
         // Checksum-only: the page passes (the checksum is valid).
         assert!(
-            validate_relation_pages(&bytes, false).is_empty(),
+            validate_relation_pages(&bytes, false, 0).is_empty(),
             "checksum-only must not flag a checksum-valid page"
         );
         // Header check on: the broken pd_lower is caught.
         assert_eq!(
-            validate_relation_pages(&bytes, true),
+            validate_relation_pages(&bytes, true, 0),
             vec![0],
             "header check must flag the broken header"
+        );
+    }
+
+    #[test]
+    fn relation_segment_base_extracts_segment_offset() {
+        // Segment 0 (no suffix) starts at block 0.
+        assert_eq!(relation_segment_base("base/1/1259"), 0);
+        // Segment 1 starts at block RELSEG_SIZE.
+        assert_eq!(relation_segment_base("base/1/1259.1"), RELSEG_SIZE);
+        // Segment 3 starts at block 3 * RELSEG_SIZE.
+        assert_eq!(relation_segment_base("base/1/1259.3"), 3 * RELSEG_SIZE);
+        // A bare basename (no path prefix) resolves the same way.
+        assert_eq!(relation_segment_base("1259.2"), 2 * RELSEG_SIZE);
+        // A wildly-out-of-range segment index falls back to 0 rather than
+        // overflowing.
+        assert_eq!(relation_segment_base("base/1/1259.999999999"), 0);
+    }
+
+    #[test]
+    fn validate_relation_pages_offsets_segment_block_numbers() {
+        // A page whose stored pd_checksum is computed for its *absolute* block
+        // number in segment 1 (block RELSEG_SIZE) must validate when the
+        // segment base is threaded in — and must fail when it is not (the old
+        // per-file-index-from-0 bug).
+        let block_no = RELSEG_SIZE; // first block of segment ".1"
+        let page = valid_page(block_no, 0x33);
+        // With the correct segment base the page's checksum matches.
+        assert!(
+            validate_relation_pages(&page, false, relation_segment_base("base/1/1259.1")).is_empty(),
+            "segment 1's page must validate against its absolute block number"
+        );
+        // Without the offset (base 0) the same page fails — proving the offset
+        // is load-bearing.
+        assert_eq!(
+            validate_relation_pages(&page, false, 0),
+            vec![0],
+            "checking segment 1's page as block 0 must (wrongly) flag it"
         );
     }
 
