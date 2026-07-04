@@ -232,6 +232,27 @@ pub trait Storage: Send + Sync {
         })
     }
 
+    /// Read the target path of the symbolic link at `path`.
+    ///
+    /// Like [`Storage::create_symlink`], link targets only make sense on a real
+    /// filesystem, so this has a default implementation returning a
+    /// [`StorageError::Backend`] "not supported" error. Filesystem backends
+    /// (e.g. [`Posix`]) override it; callers that walk a data directory to build
+    /// a manifest use it to record each symlink's destination and should treat
+    /// the default "not supported" error as "target unknown on this backend".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] from the default implementation.
+    /// Overriding backends return [`StorageError::NotFound`] if `path` is not a
+    /// symlink, or other variants for permission / backend failures.
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        Err(StorageError::Backend {
+            path: path.to_path_buf(),
+            message: "read_link not supported by this backend".to_owned(),
+        })
+    }
+
     /// Whether files on this backend live on the local filesystem and may be
     /// written via `std::fs` directly (the parallel-copy fast path), as opposed
     /// to backends whose writes must go through [`Storage::open_write`]

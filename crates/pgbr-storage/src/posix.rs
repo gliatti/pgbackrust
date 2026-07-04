@@ -288,6 +288,15 @@ impl Storage for Posix {
         let resolved = self.resolve(link_path);
         std::os::unix::fs::symlink(target, &resolved).map_err(|err| map_io(&err, &resolved))
     }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        // `path` is resolved against the configured root; the returned target is
+        // whatever the link stores verbatim (typically an absolute path), which
+        // is exactly what a backup records in the manifest and what a restore
+        // hands back to `create_symlink`.
+        let resolved = self.resolve(path);
+        fs::read_link(&resolved).map_err(|err| map_io(&err, &resolved))
+    }
 }
 
 /// Adapter that exposes a `std::fs::File` as a [`pgbr_io::IoRead`].

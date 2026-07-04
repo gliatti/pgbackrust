@@ -46,11 +46,10 @@
 //!   first segment (everything before the first `_`). Its `backup.info` entry
 //!   records `backup-type: "incr"` plus `backup-reference: [<prior label>]`.
 //!
-//! Deliberately out of scope for this slice (follow-ups):
-//!
-//! - **Symlink target resolution.** The `Storage` trait has no link-target
-//!   accessor yet, so [`ManifestLink`] entries are recorded with an empty
-//!   `destination`. See the `// TODO: resolve link target` note in [`walk`].
+//! Symlink targets are resolved via [`Storage::read_link`]; on filesystem
+//! backends each [`ManifestLink`] records the link's real `destination`. Backends
+//! without link-target support (remote/object stores) still record an empty
+//! destination, which remains a follow-up for remote tablespace backups.
 //!
 //! The real work lives in [`backup_inner_typed`], which takes the backup type,
 //! label, and start timestamp as parameters so tests can pin them;
@@ -69,7 +68,7 @@ use pgbr_postgres::control::read_pg_control_data;
 use pgbr_postgres::lsn::{lsn_text_to_wal_segment, parse_lsn, wal_segment_range};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
-use pgbr_storage::{Storage, StorageInfo, StorageKind};
+use pgbr_storage::{Storage, StorageError, StorageInfo, StorageKind};
 use serde_json::json;
 
 use crate::CommandError;
@@ -3997,11 +3996,20 @@ fn plan_backup(
             },
             StorageKind::Path => plan.paths.push(ManifestPath { path: entry.rel }),
             StorageKind::Link => {
-                // TODO: resolve link target once `Storage` exposes a
-                // link-target accessor; record an empty destination for now.
+                // Record the link's real target. Filesystem backends resolve it
+                // via `read_link`; backends without link-target support (the
+                // remote/object stores) return a `Backend` error, in which case
+                // we fall back to an empty destination — the same
+                // known-limitation behaviour as before, kept out of the restore
+                // path's hard error only for those backends.
+                let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
+                    Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(StorageError::Backend { .. }) => String::new(),
+                    Err(err) => return Err(err.into()),
+                };
                 plan.links.push(ManifestLink {
                     path: entry.rel,
-                    destination: String::new(),
+                    destination,
                 });
             }
             // Sockets / FIFOs / devices are not part of a base backup.
@@ -4084,7 +4092,8 @@ fn resolve_prior(
 ///    (compress then encrypt), write the transformed bytes to
 ///    `backup/<stanza>/<label>/<relpath><suffix>`, and record `reference: None`.
 /// 5. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
-///    (with an empty destination — see module docs).
+///    (with the link target resolved via [`Storage::read_link`] where the
+///    backend supports it — see module docs).
 /// 6. Save `backup.manifest`, then add a `[backup:current]` entry to
 ///    `backup.info` — including the applied compress-type, encrypted flag, and
 ///    (for a diff/incr) the `backup-reference` chain — and save it.
