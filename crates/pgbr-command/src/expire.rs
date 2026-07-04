@@ -40,8 +40,10 @@
 //!   is removed. This mirrors the C `ArchiveRange` list logic.
 //! - An archive-id with no surviving backup is removed entirely — unless it
 //!   is the *current* cluster, which is always kept.
-//! - History files (`<timeline>.history`) older than the retention backup's
-//!   start timeline are expired.
+//! - History files (`<timeline>.history`) are never expired (aligning with
+//!   upstream pgBackRest): they are tiny and losing one breaks PITR across a
+//!   timeline switch, so every timeline-history file lives for the life of the
+//!   archive-id. Only a wholesale archive-id drop removes them.
 //!
 //! The keep/remove decision is factored into the pure, unit-tested
 //! [`compute_archive_plan`] (per-archive-id ranges + drop flag) and
@@ -52,9 +54,12 @@
 //! - The legacy flat `archive/<stanza>/<segment>` layout produced by the
 //!   current [`crate::archive`] push path (no per-archive-id subdirectory)
 //!   is still handled: loose WAL files directly under `archive/<stanza>/`
-//!   are expired against the global cutoff (the oldest retained anchor
-//!   backup's `archive-start`). Once `archive` writes the per-archive-id
-//!   layout this fallback becomes dead but harmless.
+//!   are expired against the same keep-ranges that [`compute_archive_plan`]
+//!   builds (see [`flat_keep_ranges`]) — the retention backup contributes an
+//!   open-ended range and every older retained anchor its closed
+//!   `[archive-start, archive-stop]`, so no segment inside a retained backup's
+//!   range is dropped. Once `archive` writes the per-archive-id layout this
+//!   fallback becomes dead but harmless.
 //! - Major-path (`<timeline+LSN-prefix>` directory) vs. individual-segment
 //!   handling is unified here: this port lists WAL leaf names recursively
 //!   per archive-id and filters them by range, rather than the C tree's
@@ -451,6 +456,20 @@ fn remove_backups(
         return Ok(());
     }
 
+    // Crash-safety ordering: rewrite `backup.info` to drop every expiring label
+    // FIRST, then delete the physical backup directories. `InfoBackup::save` is
+    // atomic (write-tmp + rename), so at no point does `backup.info` reference a
+    // backup whose files have already been removed. If a crash lands between the
+    // save and the deletes, the worst case is orphaned directories that the next
+    // expire pass reclaims — never a backup.info that points at a deleted set.
+    // (The inverse ordering — delete then save — would, on a crash, leave
+    // backup.info referencing backups that no longer exist on disk, which
+    // restore/verify would treat as corruption.)
+    for label in labels {
+        info.current.remove(label);
+    }
+    save_backup_info(repo, stanza, info, user_pass, recorded_sub)?;
+
     if repo.is_local()
         && workers > 1
         && let Some(local_root) = local_repo_root(config, repo_index)
@@ -463,9 +482,6 @@ fn remove_backups(
             })
             .collect();
         parallel_remove_dirs(workers, jobs)?;
-        for label in labels {
-            info.current.remove(label);
-        }
     } else {
         for label in labels {
             let path = PathBuf::from(format!("backup/{stanza}/{label}"));
@@ -473,11 +489,9 @@ fn remove_backups(
                 Ok(()) | Err(StorageError::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
-            info.current.remove(label);
         }
     }
 
-    save_backup_info(repo, stanza, info, user_pass, recorded_sub)?;
     Ok(())
 }
 
@@ -734,7 +748,25 @@ fn full_retention_keep(
                     last_full_ts = Some(last_full_ts.map_or(ts, |c| c.min(ts)));
                 }
             }
-            // Always keep at least the most recent full.
+            // Boundary full: also keep the most recent full whose stop is BEFORE
+            // the cutoff. Without it, a recovery target that lands early in the
+            // retention window (after `cutoff` but before the first full inside
+            // it) has no base backup to restore from — the window is only fully
+            // recoverable if the full straddling its lower edge survives. This
+            // mirrors upstream `expireTimeBasedBackup`, which keeps the newest
+            // full at or before the retention period so every point in the
+            // window remains restorable. `full_idxs` is oldest-first, so scan
+            // from the newest end for the first full below the cutoff.
+            if let Some(&boundary) = full_idxs.iter().rev().find(|&&idx| timestamp_stop(&entries[idx].1) < cutoff)
+                && !keep_label[boundary]
+            {
+                keep_label[boundary] = true;
+                let ts = timestamp_stop(&entries[boundary].1);
+                last_full_ts = Some(last_full_ts.map_or(ts, |c| c.min(ts)));
+            }
+            // Always keep at least the most recent full (covers the case where
+            // every full is inside — or there is no full below — the window and
+            // none was selected above).
             if last_full_ts.is_none()
                 && let Some(&newest) = full_idxs.last()
             {
@@ -763,26 +795,28 @@ fn apply_diff_retention(entries: &[(String, serde_json::Value)], keep_label: &mu
     if kept_diffs.len() <= keep_diff as usize {
         return;
     }
-    // Diffs beyond the retention count are expired, along with their dependent
-    // incrs (an incr depends on a diff if the diff is in its reference chain).
-    let drop_diff_labels: std::collections::BTreeSet<&str> = kept_diffs[keep_diff as usize..]
+    // Diffs beyond the retention count are expired, along with every backup
+    // that depends on them — TRANSITIVELY. An incr may chain off another incr
+    // (its `backup-reference` naming the parent incr rather than the diff
+    // directly); a first-level "references a dropped diff" check would keep such
+    // a grandchild incr while its ancestors are removed, leaving it unrestorable.
+    // Seed the drop set with the over-retention diffs and expand it with
+    // [`dependent_closure`], which walks the reference graph to a fixpoint.
+    let drop_diff_seed: Vec<String> = kept_diffs[keep_diff as usize..]
         .iter()
-        .map(|&i| entries[i].0.as_str())
+        .map(|&i| entries[i].0.clone())
         .collect();
+    // Build the label -> entry map the closure walks over. Restricting it to the
+    // still-kept backups is sound: anything already dropped by full retention is
+    // irrelevant here, and confining the closure to kept labels keeps the
+    // `keep_label` write below a straightforward membership test.
+    let current: std::collections::BTreeMap<String, serde_json::Value> = (0..entries.len())
+        .filter(|&i| keep_label[i])
+        .map(|i| (entries[i].0.clone(), entries[i].1.clone()))
+        .collect();
+    let drop_set: std::collections::BTreeSet<String> = dependent_closure(&current, &drop_diff_seed).into_iter().collect();
     for i in 0..entries.len() {
-        if !keep_label[i] {
-            continue;
-        }
-        let label = entries[i].0.as_str();
-        let ty = backup_type(&entries[i].1);
-        // A diff beyond the retention count, or an incr that depends on one,
-        // is dropped.
-        let dropped_diff = ty == "diff" && drop_diff_labels.contains(label);
-        let dependent_incr = ty == "incr"
-            && backup_references(&entries[i].1)
-                .iter()
-                .any(|r| drop_diff_labels.contains(r.as_str()));
-        if dropped_diff || dependent_incr {
+        if keep_label[i] && drop_set.contains(entries[i].0.as_str()) {
             keep_label[i] = false;
         }
     }
@@ -936,8 +970,10 @@ pub struct ArchiveIdPlan {
     /// `true` when an anchoring backup was found but recorded no archive
     /// range, so WAL expiry must be skipped for safety.
     pub skip_expiry: bool,
-    /// Timeline (`[0:8]` of the retention backup's `archive-start`) below
-    /// which `.history` files are expired. `None` when expiry is skipped.
+    /// Timeline (`[0:8]` of the retention backup's `archive-start`). Retained
+    /// for diagnostics only: `.history` files are never expired (see the module
+    /// docs), so this no longer gates any deletion. `None` when expiry is
+    /// skipped.
     pub history_timeline: Option<String>,
 }
 
@@ -1287,9 +1323,9 @@ fn expire_archive(
     Ok(removed)
 }
 
-/// Flat-layout (legacy) WAL expiry: walk `loose_files`, drop everything whose
-/// base name sorts before the global flat cutoff, and append the removed base
-/// names to `removed`. The parallel branch (`local_root = Some`, `workers > 1`)
+/// Flat-layout (legacy) WAL expiry: walk `loose_files`, drop every segment that
+/// falls outside the retained keep-ranges (see [`flat_keep_ranges`]), and append
+/// the removed base names to `removed`. The parallel branch (`local_root = Some`, `workers > 1`)
 /// fans the `std::fs::remove_file` calls across worker threads via
 /// [`parallel_remove_files`]; the dry-run and remote branches stay on the
 /// existing single-threaded paths. Mirrors the per-archive-id parallelisation
@@ -1309,13 +1345,20 @@ fn expire_flat_layout(
     if loose_files.is_empty() {
         return Ok(());
     }
-    let Some(cutoff) = flat_cutoff(keep_archive, kept_anchor_oldest_first) else {
+    let Some(ranges) = flat_keep_ranges(keep_archive, kept_anchor_oldest_first) else {
         return Ok(());
     };
 
+    // A loose WAL file is removed only when it falls outside EVERY kept range.
+    // Mirroring `compute_archive_plan`, the retained anchor backups older than
+    // the retention backup each contribute their closed [archive-start,
+    // archive-stop] range so they stay individually consistent, and the
+    // retention backup contributes an open-ended range from its archive-start.
+    // A plain `< cutoff` cut would purge those older backups' ranges, leaving
+    // them non-recoverable even though the backup itself is retained.
     let to_remove: Vec<&String> = loose_files
         .iter()
-        .filter(|file_name| strip_compress_suffix(file_name) < cutoff.as_str())
+        .filter(|file_name| !segment_in_ranges(strip_compress_suffix(file_name), &ranges))
         .collect();
 
     if to_remove.is_empty() {
@@ -1360,21 +1403,48 @@ fn expire_flat_layout(
     Ok(())
 }
 
-/// The flat-layout cutoff: the `backup-archive-start` of the Nth-most-recent
-/// retained anchor backup (N = `keep_archive`). `None` (keep everything)
-/// when too few anchors survive or the anchor recorded no WAL range.
-fn flat_cutoff(keep_archive: u32, kept_anchor_oldest_first: &[serde_json::Value]) -> Option<String> {
+/// The flat-layout keep-ranges. The retention backup is the Nth-most-recent
+/// retained anchor (N = `keep_archive`, at index `len - keep_archive`); it
+/// contributes an open-ended range from its `backup-archive-start`. Every
+/// retained anchor OLDER than it (lower index) contributes its closed
+/// `[archive-start, archive-stop]` range so that backup stays individually
+/// consistent. Returns `None` (keep everything) when too few anchors survive
+/// or the retention backup recorded no WAL start.
+///
+/// This is the flat-layout analogue of the per-archive-id range construction in
+/// [`compute_archive_plan`]; both feed [`segment_in_ranges`].
+fn flat_keep_ranges(keep_archive: u32, kept_anchor_oldest_first: &[serde_json::Value]) -> Option<Vec<ArchiveRange>> {
     let keep_archive = keep_archive as usize;
     if kept_anchor_oldest_first.len() < keep_archive || keep_archive == 0 {
         return None;
     }
     let cutoff_index = kept_anchor_oldest_first.len() - keep_archive;
-    backup_archive_start(&kept_anchor_oldest_first[cutoff_index]).map(str::to_owned)
+    // The retention backup must record an archive-start, or we cannot bound
+    // expiry safely — keep everything.
+    backup_archive_start(&kept_anchor_oldest_first[cutoff_index])?;
+
+    let mut ranges: Vec<ArchiveRange> = Vec::new();
+    for (idx, value) in kept_anchor_oldest_first.iter().enumerate().take(cutoff_index + 1) {
+        let Some(start) = backup_archive_start(value) else {
+            continue;
+        };
+        let stop = if idx == cutoff_index {
+            // Retention backup: open-ended for PITR.
+            None
+        } else {
+            backup_archive_stop(value).map(str::to_owned)
+        };
+        ranges.push(ArchiveRange {
+            start: start.to_owned(),
+            stop,
+        });
+    }
+    Some(ranges)
 }
 
 /// Recursively list WAL leaf files under an archive-id directory and remove
-/// every segment not covered by `plan.ranges`. History (`.history`) files
-/// are expired by timeline against `plan.history_timeline`. Appends removed
+/// every segment not covered by `plan.ranges`. History (`.history`) files are
+/// never removed (aligned with upstream — see the module docs). Appends removed
 /// base segment names to `removed`.
 ///
 /// On a local repository (`local_root = Some(_)`, set by [`expire_archive`]
@@ -1395,9 +1465,8 @@ fn remove_wal_under(
     let mut leaves: Vec<PathBuf> = Vec::new();
     collect_files(repo, id_dir, &mut leaves)?;
 
-    // Filter the listed leaves into the actual delete set, mirroring the serial
-    // logic verbatim: history files below the retention timeline plus WAL
-    // segments outside any kept range.
+    // Filter the listed leaves into the actual delete set: WAL segments outside
+    // every kept range. `.history` files are skipped unconditionally.
     let mut victims: Vec<(PathBuf, String)> = Vec::new();
     for leaf in leaves {
         let Some(name) = leaf.file_name().and_then(|n| n.to_str()) else {
@@ -1405,13 +1474,13 @@ fn remove_wal_under(
         };
         let base = strip_compress_suffix(name);
 
-        if let Some(timeline) = base.strip_suffix(".history") {
-            if let Some(keep_below) = plan.history_timeline.as_deref()
-                && timeline.len() >= 8
-                && &timeline[0..8] < keep_below
-            {
-                victims.push((leaf.clone(), base.to_owned()));
-            }
+        // `.history` files are never expired. Upstream pgBackRest keeps every
+        // timeline-history file for the life of the archive-id (they are tiny
+        // and losing one breaks PITR across a timeline switch), so we skip them
+        // unconditionally rather than pruning below the retention timeline.
+        // `plan.history_timeline` is retained for context but no longer drives
+        // deletion here.
+        if base.ends_with(".history") {
             continue;
         }
 
@@ -2252,6 +2321,63 @@ mod tests {
     }
 
     #[test]
+    fn retention_diff_expires_chained_incr_transitively() {
+        let (_dir, repo) = empty_repo();
+        // Chained incr: I2 references only its parent incr I1 (not the diff D1
+        // directly), and I1 references D1. When D1 is dropped by retention-diff,
+        // BOTH I1 and the grandchild I2 must go — a first-level "references a
+        // dropped diff" check would keep I2, orphaning it. This is the Finding-1
+        // transitivity bug.
+        seed_backup_info_refs(
+            &repo,
+            "demo",
+            &[
+                ("20260101F", 100, "full", &[]),
+                ("20260101F_20260102D", 200, "diff", &["20260101F"]),
+                ("20260101F_20260102D_I1", 250, "incr", &["20260101F", "20260101F_20260102D"]),
+                // I2 chains off I1 only; its reference list does NOT name D1.
+                ("20260101F_20260102D_I2", 260, "incr", &["20260101F_20260102D_I1"]),
+                ("20260101F_20260103D", 300, "diff", &["20260101F"]),
+                ("20260101F_20260104D", 400, "diff", &["20260101F"]),
+            ],
+        );
+        let summary = expire_inner(&cfg_diff(Some("demo"), 1, 2), &repo).expect("expire chained incr");
+        assert_eq!(
+            summary.expired_labels,
+            vec![
+                "20260101F_20260102D".to_owned(),
+                "20260101F_20260102D_I1".to_owned(),
+                "20260101F_20260102D_I2".to_owned(),
+            ],
+            "the grandchild incr I2 is expired transitively with its ancestors"
+        );
+        assert!(summary.kept_labels.contains(&"20260101F".to_owned()));
+        assert!(summary.kept_labels.contains(&"20260101F_20260103D".to_owned()));
+        assert!(summary.kept_labels.contains(&"20260101F_20260104D".to_owned()));
+    }
+
+    #[test]
+    fn apply_diff_retention_drops_chained_incr_transitively() {
+        // Pure-function form of the transitivity check. D0 (oldest kept diff) is
+        // dropped by keep_diff=1; I1 references D0, I2 references I1 (not D0).
+        // Both incrs must be dropped.
+        let entries = vec![
+            ("F".to_owned(), entry_json("F", 100, "full", &[])),
+            ("D0".to_owned(), entry_json("D0", 200, "diff", &["F"])),
+            ("I1".to_owned(), entry_json("I1", 210, "incr", &["D0"])),
+            ("I2".to_owned(), entry_json("I2", 220, "incr", &["I1"])),
+            ("D1".to_owned(), entry_json("D1", 300, "diff", &["F"])),
+        ];
+        let mut keep = vec![true, true, true, true, true];
+        apply_diff_retention(&entries, &mut keep, 1);
+        assert_eq!(
+            keep,
+            vec![true, false, false, false, true],
+            "D0 + its transitive incr chain (I1, I2) dropped; F and newest diff D1 kept"
+        );
+    }
+
+    #[test]
     fn full_retention_keep_count_keeps_newest_two() {
         // Oldest-first: F1(100) F2(200) F3(300). Count=2 keeps F2, F3.
         let entries = vec![
@@ -2272,16 +2398,41 @@ mod tests {
             ("Fold".to_owned(), entry_json("Fold", now - 10 * 86_400, "full", &[])),
             ("Fnew".to_owned(), entry_json("Fnew", now - 1, "full", &[])),
         ];
+        // Fnew is inside the window; Fold is the boundary full (the newest full
+        // whose stop is BEFORE the cutoff) and must also be kept so any recovery
+        // target early in the window still has a base backup (Finding 4).
         let (keep, _cutoff) = full_retention_keep(&entries, 1, RetentionFullType::Time, now);
-        assert_eq!(keep, vec![false, true], "only the full within 1 day is kept");
+        assert_eq!(keep, vec![true, true], "in-window full + boundary full both kept");
 
-        // When ALL fulls are older than the window, the newest is still retained.
+        // When ALL fulls are older than the window, the newest is still retained
+        // (it is both the "always keep newest" fallback and the boundary full).
         let entries2 = vec![
             ("Fa".to_owned(), entry_json("Fa", now - 30 * 86_400, "full", &[])),
             ("Fb".to_owned(), entry_json("Fb", now - 20 * 86_400, "full", &[])),
         ];
         let (keep2, _c2) = full_retention_keep(&entries2, 1, RetentionFullType::Time, now);
         assert_eq!(keep2, vec![false, true], "newest full always kept");
+    }
+
+    #[test]
+    fn full_retention_keep_time_boundary_full_is_only_the_newest_below_cutoff() {
+        // Two fulls below the cutoff (Fa, Fb) and one inside (Fc). Only the
+        // newest full below the cutoff (Fb) is the boundary; the still-older Fa
+        // expires. Fc is inside the window.
+        let now = 1_000_000;
+        let entries = vec![
+            ("Fa".to_owned(), entry_json("Fa", now - 30 * 86_400, "full", &[])),
+            ("Fb".to_owned(), entry_json("Fb", now - 10 * 86_400, "full", &[])),
+            ("Fc".to_owned(), entry_json("Fc", now - 1, "full", &[])),
+        ];
+        let (keep, cutoff) = full_retention_keep(&entries, 1, RetentionFullType::Time, now);
+        assert_eq!(
+            keep,
+            vec![false, true, true],
+            "oldest full below cutoff expires; boundary full (Fb) + in-window full (Fc) kept"
+        );
+        // The oldest retained full is the boundary full Fb.
+        assert_eq!(cutoff, Some(now - 10 * 86_400));
     }
 
     #[test]
@@ -2685,10 +2836,14 @@ mod tests {
     #[test]
     fn archive_retention_removes_segments_before_retained_backup() {
         let (dir, repo) = empty_repo();
-        // Three fulls; keep all backups (retention-full=3) but retain WAL
-        // for only the newest backup (retention-archive=1). The cutoff is
-        // the newest backup's archive-start (...0009): segments before it
-        // are removed, segments from it on are kept.
+        // Three fulls; keep all backups (retention-full=3) but archive-retain
+        // only the newest backup (retention-archive=1). The retention backup is
+        // the newest (...0009, open-ended). Every OLDER retained backup still
+        // contributes its closed [archive-start, archive-stop] range, so its own
+        // WAL stays consistent: ...0001 ([...0001,...0002]) and ...0005
+        // ([...0005,...0006]) are preserved. Only WAL that falls in NO kept
+        // range — e.g. ...0008, between the ...0005..0006 range and the
+        // ...0009-open range — is removed.
         seed_backup_info_wal(
             &repo,
             "demo",
@@ -2716,9 +2871,9 @@ mod tests {
                 ),
             ],
         );
-        // WAL spanning before, at, and after the cutoff. The ...0008 file
-        // carries a `.gz` suffix to prove the suffix is stripped before
-        // the string comparison.
+        // WAL spanning the kept ranges, the gaps between them, and past the
+        // open end. The ...0008 file carries a `.gz` suffix to prove the suffix
+        // is stripped before the range comparison.
         seed_archive_segment(&repo, "demo", "000000010000000000000001", "");
         seed_archive_segment(&repo, "demo", "000000010000000000000005", "");
         seed_archive_segment(&repo, "demo", "000000010000000000000008", ".gz");
@@ -2729,23 +2884,27 @@ mod tests {
 
         assert_eq!(
             summary.expired_archive_segments,
-            vec![
-                "000000010000000000000001".to_owned(),
-                "000000010000000000000005".to_owned(),
-                "000000010000000000000008".to_owned(),
-            ],
-            "segments strictly before the cutoff archive-start are removed"
+            vec!["000000010000000000000008".to_owned()],
+            "only WAL outside every retained backup's range is removed"
         );
-        assert!(!dir.path().join("archive/demo/000000010000000000000001").exists());
-        assert!(!dir.path().join("archive/demo/000000010000000000000005").exists());
+        // ...0001 and ...0005 fall inside the closed ranges of the retained
+        // older backups, so they survive.
+        assert!(
+            dir.path().join("archive/demo/000000010000000000000001").exists(),
+            "an older retained backup's own WAL range is preserved"
+        );
+        assert!(
+            dir.path().join("archive/demo/000000010000000000000005").exists(),
+            "an older retained backup's own WAL range is preserved"
+        );
         assert!(!dir.path().join("archive/demo/000000010000000000000008.gz").exists());
         assert!(
             dir.path().join("archive/demo/000000010000000000000009").exists(),
-            "the cutoff segment itself is kept"
+            "the retention backup's open range is kept"
         );
         assert!(
             dir.path().join("archive/demo/00000001000000000000000A").exists(),
-            "segments after the cutoff are kept"
+            "segments after the retention start are kept"
         );
     }
 
@@ -3217,11 +3376,12 @@ mod tests {
     }
 
     #[test]
-    fn e2e_per_archive_id_history_files_expired_by_timeline() {
+    fn e2e_per_archive_id_history_files_are_never_expired() {
         let (dir, repo) = empty_repo();
-        // Retention backup on timeline 00000002 (its archive-start). A
-        // 00000001.history file (older timeline) is expired; a
-        // 00000002.history (same timeline) is kept.
+        // Retention backup on timeline 00000002. Even a 00000001.history file on
+        // an OLDER timeline must survive: aligning with upstream, `.history`
+        // files are never expired (losing one breaks PITR across a timeline
+        // switch). Only the WAL segment outside the kept ranges is removed.
         seed_backup_info_full(
             &repo,
             "demo",
@@ -3254,22 +3414,28 @@ mod tests {
             w.write(b"h").expect("write history");
             w.close().expect("close history");
         }
-        // Plus a WAL segment so the directory is also exercised for WAL.
-        seed_archive_id_segment(&repo, "demo", "14-1", "000000020000000000000009", "");
+        // A WAL segment between the older backup's closed range and the
+        // retention backup's open range, so it (and only it) expires.
+        seed_archive_id_segment(&repo, "demo", "14-1", "000000020000000000000005", "");
 
         let summary = expire_inner(&cfg_archive(Some("demo"), Some(2), Some(1)), &repo).expect("expire_inner");
 
         assert!(
-            summary.expired_archive_segments.contains(&"00000001.history".to_owned()),
-            "older-timeline history file is expired"
+            !summary.expired_archive_segments.iter().any(|s| s.ends_with(".history")),
+            "no history file is ever expired"
+        );
+        assert_eq!(
+            summary.expired_archive_segments,
+            vec!["000000020000000000000005".to_owned()],
+            "only the out-of-range WAL segment is removed"
         );
         assert!(
-            !dir.path().join(format!("{id_dir}/00000001.history")).exists(),
-            "00000001.history removed (timeline < retention timeline 00000002)"
+            dir.path().join(format!("{id_dir}/00000001.history")).exists(),
+            "00000001.history kept (history is never expired)"
         );
         assert!(
             dir.path().join(format!("{id_dir}/00000002.history")).exists(),
-            "00000002.history kept (same timeline as retention backup)"
+            "00000002.history kept"
         );
     }
 
@@ -3414,23 +3580,30 @@ mod tests {
             ],
         );
         seed_archive_segment(&repo, "demo", "000000010000000000000001", "");
+        // ...0005 falls between the older backup's closed range and the
+        // retention backup's open range, so it is the segment that WOULD expire.
+        seed_archive_segment(&repo, "demo", "000000010000000000000005", "");
         seed_archive_segment(&repo, "demo", "000000010000000000000009", "");
 
         let summary = expire_inner(&cfg_dry_run(Some("demo"), Some(2), Some(1)), &repo).expect("dry-run archive expire");
 
         assert_eq!(
             summary.expired_archive_segments,
-            vec!["000000010000000000000001".to_owned()],
+            vec!["000000010000000000000005".to_owned()],
             "dry-run still reports the WAL it WOULD remove"
         );
-        // Both segments must remain on disk.
+        // Every segment must remain on disk (dry-run removes nothing).
+        assert!(
+            dir.path().join("archive/demo/000000010000000000000005").exists(),
+            "dry-run must not remove the out-of-range WAL segment"
+        );
         assert!(
             dir.path().join("archive/demo/000000010000000000000001").exists(),
-            "dry-run must not remove the pre-cutoff WAL segment"
+            "an older retained backup's own range is kept regardless"
         );
         assert!(
             dir.path().join("archive/demo/000000010000000000000009").exists(),
-            "the retained segment is kept (as always)"
+            "the retention backup's segment is kept (as always)"
         );
     }
 

@@ -1662,9 +1662,19 @@ mod tests {
     fn set_missing_manifest_degrades_with_note() {
         let label = "20260101-100000F";
         let (_dir, storage) = initialized_demo_with_manifest(label);
+        // Remove both the primary manifest and its `.copy` mirror: with only the
+        // primary gone `Manifest::load_keyed` recovers via the `.copy` and no
+        // degradation note is produced, so both must be absent to exercise the
+        // `Unavailable` path.
         storage
             .remove(std::path::Path::new(&format!("backup/demo/{label}/backup.manifest")), false)
             .expect("remove manifest");
+        storage
+            .remove(
+                std::path::Path::new(&format!("backup/demo/{label}/backup.manifest.copy")),
+                false,
+            )
+            .expect("remove manifest copy");
 
         let cfg = fake_config_set(Some("demo"), label, None);
         let text = render_set(&cfg, &storage, label).expect("render_set text degrade");

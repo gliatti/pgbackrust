@@ -261,8 +261,16 @@ impl CheckDb for ConnCheckDb<'_> {
     }
 
     fn archive_settings(&mut self) -> Result<(String, String), CommandError> {
-        let mode = self.scalar(sql::ARCHIVE_MODE).unwrap_or_default();
-        let command = self.scalar(sql::ARCHIVE_COMMAND).unwrap_or_default();
+        // Propagate a query failure rather than swallowing it: a backend error
+        // reading `archive_mode` / `archive_command` (dropped connection, denied
+        // permission, etc.) is an infrastructure fault, not a misconfigured
+        // cluster. `unwrap_or_default()` would coerce the failure to an empty
+        // string and then surface downstream as "archive_mode must be enabled
+        // (is '')", presenting an outage as a bad archiving config. The settings
+        // always exist as GUCs, so an *empty* value is a genuine mis-setting and
+        // is still reported as such by the caller.
+        let mode = self.scalar(sql::ARCHIVE_MODE)?;
+        let command = self.scalar(sql::ARCHIVE_COMMAND)?;
         Ok((mode.trim().to_owned(), command.trim().to_owned()))
     }
 
@@ -327,8 +335,12 @@ impl<R: IoRead, W: IoWrite> CheckDb for RemoteCheckDb<'_, R, W> {
     }
 
     fn archive_settings(&mut self) -> Result<(String, String), CommandError> {
-        let mode = self.scalar(sql::ARCHIVE_MODE).unwrap_or_default();
-        let command = self.scalar(sql::ARCHIVE_COMMAND).unwrap_or_default();
+        // Propagate a query failure rather than swallowing it (see the
+        // `ConnCheckDb` impl for the rationale): a worker/backend error must not
+        // be coerced to an empty string and mis-reported as a disabled
+        // `archive_mode`.
+        let mode = self.scalar(sql::ARCHIVE_MODE)?;
+        let command = self.scalar(sql::ARCHIVE_COMMAND)?;
         Ok((mode.trim().to_owned(), command.trim().to_owned()))
     }
 
@@ -718,10 +730,41 @@ fn pg_version_label_from_num(server_version_num: u32) -> Option<&'static str> {
     pgbr_postgres::version::by_label(&label).map(|v| v.label)
 }
 
+/// A per-invocation probe token, `<pid>-<random-hex>`, used to name the
+/// throwaway write/archive probe objects.
+///
+/// The PID alone is not collision-safe: a crashed `check` can leave a stale
+/// probe behind, and once the OS recycles that PID a later `check` (possibly on
+/// another host writing to the same shared repo) would compute the identical
+/// name and could read back a leftover it did not write, mis-reporting the
+/// round trip. Appending a 64-bit random component makes the name effectively
+/// unique per invocation regardless of PID reuse.
+///
+/// The component is derived from `RandomState` — which the standard library
+/// seeds from the OS RNG, freshly and independently per instance — combined with
+/// the wall-clock and monotonic clocks. `RandomState`'s per-instance seed alone
+/// defeats a recycled-PID collision (two processes never share it); the two
+/// clocks additionally separate repeated calls within one process. Using the
+/// std primitive keeps the crate dependency-free of an extra RNG.
+fn probe_token() -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::time::{Instant, SystemTime};
+
+    let pid = std::process::id();
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    pid.hash(&mut hasher);
+    SystemTime::now().hash(&mut hasher);
+    Instant::now().hash(&mut hasher);
+    let random = hasher.finish();
+
+    format!("{pid}-{random:016x}")
+}
+
 /// Write a small probe file under `<stanza>/`, read it back, compare, then
 /// remove it. Returns `Ok(true)` only when the round trip matched.
 fn probe_repo_writable(repo_storage: &dyn Storage, stanza: &str) -> Result<bool, CommandError> {
-    let probe_path = PathBuf::from(format!("{stanza}/check-{}", std::process::id()));
+    let probe_path = PathBuf::from(format!("{stanza}/check-{}", probe_token()));
     let payload = format!("pgbackrust check probe for stanza '{stanza}'").into_bytes();
 
     // Ensure the stanza directory exists so the probe write does not fail merely
@@ -767,12 +810,24 @@ fn probe_repo_writable(repo_storage: &dyn Storage, stanza: &str) -> Result<bool,
 /// live cluster to push a WAL segment and waiting for the async archiver, it
 /// directly exercises the repository's `archive/<stanza>/<archive-id>/` subtree
 /// — the same path WAL segments land in — to confirm the archive store is
-/// readable and writable. The test object is named `<archive-id>.check-<pid>`
-/// so it cannot collide with a real WAL segment (which is a hex name) and is
-/// cleaned up even on read/compare failure.
+/// readable and writable. The test object is named
+/// `<archive-id>.check-<pid>-<random>` so it cannot collide with a real WAL
+/// segment (which is a hex name), cannot collide with a leftover from a
+/// recycled PID (see [`probe_token`]), and is cleaned up even on read/compare
+/// failure.
+///
+/// # Scope (what this does NOT verify)
+///
+/// This is a *write/read/compare of a freshly-written throwaway object* — it
+/// proves the archive directory is currently reachable and round-trips bytes
+/// faithfully. It deliberately does **not** inspect, read back, or checksum any
+/// **pre-existing** WAL segments already in the repo, so it cannot detect a
+/// corrupted or truncated archived segment. Integrity of the existing archive
+/// is the job of the `verify` command (which recomputes each segment's
+/// checksum); `check` only confirms the archive path is functional here and now.
 fn probe_archive_round_trip(repo_storage: &dyn Storage, stanza: &str, archive_id: &str) -> Result<bool, CommandError> {
     let archive_dir = format!("archive/{stanza}/{archive_id}");
-    let test_name = format!("{archive_id}.check-{}", std::process::id());
+    let test_name = format!("{archive_id}.check-{}", probe_token());
     let test_path = PathBuf::from(format!("{archive_dir}/{test_name}"));
     let payload = format!("pgbackrust archive check for stanza '{stanza}' archive-id '{archive_id}'").into_bytes();
 
@@ -1049,6 +1104,7 @@ mod tests {
     };
 
     /// In-memory [`CheckDb`] driving the live-PG flow without a real server.
+    #[allow(clippy::struct_excessive_bools)]
     struct FakeDb {
         server_version_num: u32,
         system_id: u64,
@@ -1060,6 +1116,7 @@ mod tests {
         restore_point: Option<String>,
         switched: bool,
         fail_version: bool,
+        fail_archive_settings: bool,
     }
 
     impl Default for FakeDb {
@@ -1075,6 +1132,7 @@ mod tests {
                 restore_point: None,
                 switched: false,
                 fail_version: false,
+                fail_archive_settings: false,
             }
         }
     }
@@ -1093,6 +1151,9 @@ mod tests {
             Ok(self.in_recovery)
         }
         fn archive_settings(&mut self) -> Result<(String, String), CommandError> {
+            if self.fail_archive_settings {
+                return Err(CommandError::Other("simulated archive_settings query failure".to_owned()));
+            }
             Ok((self.archive_mode.clone(), self.archive_command.clone()))
         }
         fn create_restore_point(&mut self, name: &str) -> Result<(), CommandError> {
@@ -1257,12 +1318,10 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "probe file(s) left behind: {leftover:?}");
 
-        // The probe file itself must be gone.
-        let probe = Path::new("demo").join(format!("check-{}", std::process::id()));
-        assert!(
-            matches!(storage.exists(&probe), Ok(false)),
-            "probe file should not exist after check"
-        );
+        // The probe name carries a random component (see `probe_token`) so it
+        // cannot be reconstructed; the leftover-glob assertion above already
+        // proves no `check-*` object survives under the stanza directory, which
+        // is the property we care about.
     }
 
     #[test]
@@ -1292,12 +1351,9 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "archive test object(s) left behind: {leftover:?}");
 
-        // The test object itself must be gone.
-        let test_obj = archive_id_dir.join(format!("15-1.check-{}", std::process::id()));
-        assert!(
-            matches!(storage.exists(&test_obj), Ok(false)),
-            "archive test object should not exist after check"
-        );
+        // The test-object name carries a random component (see `probe_token`) so
+        // it cannot be reconstructed; the leftover-glob assertion above already
+        // proves no `.check-*` object survives in the archive-id directory.
     }
 
     #[test]
@@ -1691,6 +1747,56 @@ mod tests {
             CommandError::Other(msg) => assert!(msg.contains("connect failure"), "message was {msg:?}"),
             other => panic!("expected Other(connect failure), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_pg_propagates_archive_settings_query_failure() {
+        // A backend failure reading archive_mode / archive_command must surface
+        // as the underlying query error, NOT be coerced (via `unwrap_or_default`)
+        // into an empty string and mis-reported as a disabled archive_mode. The
+        // archive_mode 'on' below would pass validation, so if the error were
+        // swallowed the check would proceed instead of failing here.
+        let (_dir, storage) = posix();
+        let archive = archive_info(6_873_049_345_984_568_091, "16");
+        let mut db = FakeDb {
+            fail_archive_settings: true,
+            ..FakeDb::default()
+        };
+        let err = check_pg(
+            &mut db,
+            &archive,
+            "16-1",
+            "demo",
+            &storage,
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            true,
+        )
+        .expect_err("archive_settings query failure must propagate");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("archive_settings query failure"),
+                "underlying query error must surface, got {msg:?}"
+            ),
+            other => panic!("expected the propagated query error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_token_is_unique_across_calls() {
+        // Two consecutive tokens must differ despite sharing the PID, so a probe
+        // name cannot collide with a leftover from a recycled PID.
+        let a = super::probe_token();
+        let b = super::probe_token();
+        assert_ne!(a, b, "probe tokens must not collide: {a} == {b}");
+        // Shape: `<pid>-<16 hex chars>`.
+        let (pid, rand) = a.split_once('-').expect("token has a '-' separator");
+        assert_eq!(pid, std::process::id().to_string(), "token must start with the pid");
+        assert_eq!(rand.len(), 16, "random component is 16 hex chars: {rand:?}");
+        assert!(
+            rand.chars().all(|c| c.is_ascii_hexdigit()),
+            "random component is hex: {rand:?}"
+        );
     }
 
     #[test]

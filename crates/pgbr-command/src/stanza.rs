@@ -321,7 +321,15 @@ fn cluster_identity_from_remote(config: &LoadedConfig, host: &str, index: u32) -
 
     let version_rows = remote.query(SQL_SERVER_VERSION_NUM)?;
     let control_rows = remote.query(SQL_PG_CONTROL_SYSTEM)?;
-    let _ = remote.close();
+    // Closing the worker connection is best-effort — the identity queries have
+    // already run and the worker is reaped on drop regardless. Still, a close
+    // failure can signal a broken transport or a worker that died mid-session,
+    // so surface it as a WARN instead of discarding it silently.
+    if let Err(err) = remote.close() {
+        crate::control::log_warn(&format!(
+            "failed to close PG-host worker connection for pg{index} on '{host}' after identity probe: {err}"
+        ));
+    }
 
     let version_value = version_rows.rows.first().and_then(|r| r.first()).and_then(Clone::clone);
     let control_row = control_rows.rows.first();
@@ -624,9 +632,28 @@ fn backup_info_path(stanza: &str) -> PathBuf {
 
 /// `stanza-delete` — wipe an existing stanza's repository state.
 ///
-/// Recursively removes `archive/<stanza>` and `backup/<stanza>` from the
-/// repository. Both removals tolerate a missing directory
+/// Recursively removes `backup/<stanza>` and `archive/<stanza>` from the
+/// repository, **in that order**. Both removals tolerate a missing directory
 /// (`error_on_missing = false`) so the command is idempotent.
+///
+/// ## Removal order
+///
+/// The backup subtree is removed *before* the archive subtree. A backup is only
+/// useful together with the WAL needed to make it consistent, so if the second
+/// removal fails the surviving state is the more benign one: orphaned WAL with
+/// no backups referencing it (recoverable — just re-run the delete, or expire
+/// the WAL), rather than backups whose required WAL has already been deleted
+/// (which would look restorable but silently isn't). This matches the intent of
+/// stock pgBackRust's delete ordering.
+///
+/// ## Atomicity
+///
+/// This operation is **not atomic**, neither within a single repository (the two
+/// subtree removals are distinct storage calls) nor across repositories (each
+/// configured repo is wiped in turn). A failure partway through leaves the
+/// already-processed repos / subtrees deleted; the command is idempotent, so
+/// re-running it after resolving the underlying storage fault completes the
+/// wipe.
 ///
 /// # Errors
 ///
@@ -651,9 +678,12 @@ pub fn delete(config: &LoadedConfig, repo_storages: &[(u32, &dyn Storage)]) -> R
     let backup: PathBuf = format!("backup/{stanza}").into();
 
     // Remove the stanza from every configured repository (idempotent per repo).
+    // Delete backup BEFORE archive so a failure of the second removal leaves the
+    // more recoverable state (orphan WAL, not backups missing their WAL). This is
+    // not atomic — see the fn doc comment.
     for (_, repo_storage) in repo_storages {
-        remove_subtree(*repo_storage, &archive)?;
         remove_subtree(*repo_storage, &backup)?;
+        remove_subtree(*repo_storage, &archive)?;
     }
     Ok(())
 }

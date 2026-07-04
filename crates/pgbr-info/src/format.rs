@@ -85,6 +85,22 @@ pub enum InfoFormatError {
     },
     /// The file did not contain a `[backrest].backrest-checksum` entry at all.
     MissingChecksum,
+    /// A section name or key would corrupt the INI envelope if rendered verbatim
+    /// (it contains a newline / carriage-return / `=`, or begins with a character
+    /// that would make the emitted line parse as a section header, comment, or be
+    /// silently trimmed — i.e. `[`, `#`, `;`, or leading whitespace).
+    ///
+    /// This is the guard against INI injection through attacker-controlled keys:
+    /// manifest entry keys are `PGDATA`-relative file paths, so a file named
+    /// `x\n[target:link]\n...` must be rejected at write time rather than smuggled
+    /// into the rendered document (where the SHA-1, being computed *after* render,
+    /// would happily bless the injected sections).
+    UnsafeName {
+        /// Whether the offending token was a `section` header or a `key`.
+        kind: &'static str,
+        /// The offending token itself.
+        name: String,
+    },
 }
 
 impl fmt::Display for InfoFormatError {
@@ -100,6 +116,9 @@ impl fmt::Display for InfoFormatError {
                 write!(f, "invalid checksum, actual '{actual}' but expected '{expected}'")
             }
             Self::MissingChecksum => f.write_str("missing backrest-checksum entry"),
+            Self::UnsafeName { kind, name } => {
+                write!(f, "unsafe {kind} name would corrupt the info file: {name:?}")
+            }
         }
     }
 }
@@ -184,6 +203,62 @@ pub fn render(file: &InfoFile) -> String {
     out
 }
 
+/// Reject a section name or key that, rendered verbatim, would break out of its
+/// intended INI position.
+///
+/// A name is rejected when it:
+/// - contains a `\n` or `\r` (would inject additional lines),
+/// - contains an `=` (a key with `=` would be mis-split on parse; also lets a key
+///   masquerade as `key=value` boundary manipulation), or
+/// - begins with `[`, `#`, `;`, or an ASCII space / tab (the parser treats these
+///   as a section header, a comment, or trims leading whitespace — any of which
+///   changes how the round-tripped line is interpreted).
+///
+/// # Errors
+///
+/// Returns [`InfoFormatError::UnsafeName`] describing the offending token.
+pub fn validate_name(kind: &'static str, name: &str) -> Result<(), InfoFormatError> {
+    let unsafe_first = matches!(name.as_bytes().first().copied(), Some(b'[' | b'#' | b';' | b' ' | b'\t'));
+    if name.contains(['\n', '\r', '=']) || unsafe_first {
+        return Err(InfoFormatError::UnsafeName {
+            kind,
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate every section name and key in `file` via [`validate_name`]. Shared
+/// by the checked render entry points.
+///
+/// # Errors
+///
+/// Returns [`InfoFormatError::UnsafeName`] for the first offending token.
+fn validate_all(file: &InfoFile) -> Result<(), InfoFormatError> {
+    for (section, entries) in &file.sections {
+        validate_name("section", section)?;
+        for key in entries.keys() {
+            validate_name("key", key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Like [`render`] but first validates every section name and key so that no
+/// attacker-controlled token can inject INI structure into the rendered file.
+///
+/// The infallible [`render`] remains for the round-trip test fixtures whose keys
+/// are trusted constants; the *write* paths use [`checksumed_render_checked`].
+///
+/// # Errors
+///
+/// Returns [`InfoFormatError::UnsafeName`] for the first section or key that
+/// would corrupt the envelope. See [`validate_name`].
+pub fn render_checked(file: &InfoFile) -> Result<String, InfoFormatError> {
+    validate_all(file)?;
+    Ok(render(file))
+}
+
 /// Compute the SHA-1 (lowercase hex) of `content`. The caller is responsible for handing
 /// in the file text *with the `backrest-checksum=...` line already removed*.
 #[must_use]
@@ -266,6 +341,25 @@ pub fn checksumed_render(file: &InfoFile) -> String {
     clone.set(BACKREST_SECTION, CHECKSUM_KEY, format!("\"{digest}\""));
 
     render(&clone)
+}
+
+/// Like [`checksumed_render`] but validates every section name and key first.
+///
+/// This way no attacker-controlled token (e.g. a hostile manifest file path)
+/// can inject INI structure before the checksum is taken over the rendered
+/// text. The checksum is computed *after* render, so validation here is what
+/// stops a crafted key from producing a document that both parses and passes
+/// its own checksum.
+///
+/// # Errors
+///
+/// Returns [`InfoFormatError::UnsafeName`] for the first unsafe section / key.
+pub fn checksumed_render_checked(file: &InfoFile) -> Result<String, InfoFormatError> {
+    // Validate against the original document (the checksum key added by
+    // `checksumed_render` is a trusted constant, so validating up-front is
+    // equivalent and keeps the error surface obvious).
+    validate_all(file)?;
+    Ok(checksumed_render(file))
 }
 
 #[cfg(test)]
@@ -368,6 +462,40 @@ mod tests {
         assert!(!rendered.contains("deadbeef"));
         // And the freshly rendered file must round-trip through `checksumed_load`.
         assert!(checksumed_load(&rendered).is_ok());
+    }
+
+    #[test]
+    fn checksumed_render_checked_rejects_injected_key() {
+        // A hostile key embedding a newline + a bogus section must be rejected at
+        // render time rather than smuggled into the checksumed document.
+        let mut file = InfoFile::new();
+        file.set(BACKREST_SECTION, "backrest-format", "5");
+        file.set("target:file", "x\n[target:link]\npg_data/pg_wal", "{}");
+
+        let err = checksumed_render_checked(&file).unwrap_err();
+        assert!(matches!(err, InfoFormatError::UnsafeName { kind: "key", .. }));
+    }
+
+    #[test]
+    fn validate_name_flags_the_hostile_shapes() {
+        // Structural characters and leading tokens the parser would reinterpret.
+        assert!(validate_name("key", "has\nnewline").is_err());
+        assert!(validate_name("key", "has\rcarriage").is_err());
+        assert!(validate_name("key", "has=equals").is_err());
+        assert!(validate_name("key", "[section-like").is_err());
+        assert!(validate_name("key", "#comment-like").is_err());
+        assert!(validate_name("key", ";comment-like").is_err());
+        assert!(validate_name("key", " leading-space").is_err());
+        assert!(validate_name("key", "\tleading-tab").is_err());
+        // A normal PGDATA-relative path is accepted.
+        assert!(validate_name("key", "pg_data/base/1/1259").is_ok());
+    }
+
+    #[test]
+    fn render_checked_matches_render_for_safe_input() {
+        let text = sample_archive_info();
+        let file = parse(&text).unwrap();
+        assert_eq!(render_checked(&file).unwrap(), render(&file));
     }
 
     #[test]

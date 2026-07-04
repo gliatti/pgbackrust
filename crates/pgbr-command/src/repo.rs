@@ -11,6 +11,18 @@
 //! readable by the rest of the toolchain (and vice versa). When the transform
 //! is the identity (`compress-type=none`, no cipher) both commands fall back to
 //! the prior raw byte-copy path: no filename suffix, bytes stored verbatim.
+//!
+//! # Encryption
+//!
+//! Both commands use the **keyed** (SHA-1 KDF) cipher chain
+//! (`RepoTransform::apply_forward_keyed` / `apply_reverse_keyed`), not the
+//! legacy MD5 chain, so their on-disk cipher format matches what `backup` /
+//! `restore` / `archive` write. The key is resolved through `pgbr_info`'s
+//! `RepoKeys` (see `resolve_repo_key`): the repository **sub-key** for a stanza
+//! (which decrypts backup file data, WAL segments and manifests), falling back
+//! to the user passphrase for a stanza-less `repo-get` of an `archive.info` /
+//! `backup.info` file. This is what lets `repo-get` read an encrypted backup
+//! file back out of the repository.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -388,7 +400,8 @@ pub fn get_to<W: Write>(config: &LoadedConfig, repo_storage: &dyn Storage, out: 
         return stream_exact(repo_storage, path, ignore_missing, out);
     }
 
-    let transform = RepoTransform::from_options(config);
+    let cipher_key = resolve_repo_key(config, repo_storage)?;
+    let transform = RepoTransform::from_options_with_key(config, cipher_key);
 
     // Identity transform: no compression, no cipher, no internal filter
     // buffering. Stream straight from storage to `out` so a multi-GB
@@ -405,7 +418,10 @@ pub fn get_to<W: Write>(config: &LoadedConfig, repo_storage: &dyn Storage, out: 
     let Some(stored) = read_repo_bytes(repo_storage, path, &transform, ignore_missing)? else {
         return Ok(());
     };
-    let plaintext = transform.apply_reverse(&stored)?;
+    // Reverse the *keyed* (SHA-1 KDF) chain — the same one `backup` / `restore`
+    // / `archive` write, so a `repo-get` of an encrypted backup / WAL / info
+    // file decrypts correctly under the resolved repository sub-key.
+    let plaintext = transform.apply_reverse_keyed(&stored)?;
     out.write_all(&plaintext)
         .map_err(|err| CommandError::Other(format!("write output: {err}")))?;
     Ok(())
@@ -510,7 +526,8 @@ pub fn put_from<R: Read>(config: &LoadedConfig, repo_storage: &dyn Storage, inpu
         return stream_to(repo_storage, path, input);
     }
 
-    let transform = RepoTransform::from_options(config);
+    let cipher_key = resolve_repo_key(config, repo_storage)?;
+    let transform = RepoTransform::from_options_with_key(config, cipher_key);
     let target = format!("{path}{}", transform.repo_suffix());
 
     // Identity transform: no compress / cipher filter so there is nothing to
@@ -527,7 +544,10 @@ pub fn put_from<R: Read>(config: &LoadedConfig, repo_storage: &dyn Storage, inpu
     input
         .read_to_end(&mut plaintext)
         .map_err(|err| CommandError::Other(format!("read input: {err}")))?;
-    let repo_bytes = transform.apply_forward(&plaintext)?;
+    // Apply the *keyed* (SHA-1 KDF) chain so `repo-put` writes bytes that
+    // `backup` / `restore` / `archive` (and `repo-get`) can read back under the
+    // resolved repository sub-key — the same on-disk cipher format.
+    let repo_bytes = transform.apply_forward_keyed(&plaintext)?;
 
     let mut writer = repo_storage.open_write(Path::new(&target))?;
     writer.write(&repo_bytes)?;
@@ -610,6 +630,48 @@ fn remove_any(storage: &dyn Storage, path: &Path, recurse: bool) -> Result<(), C
     }
 }
 
+/// Resolve the repository cipher key `repo-get` / `repo-put` should feed to the
+/// **keyed** (SHA-1 KDF) transform, matching the on-disk cipher format that
+/// `backup` / `restore` / `archive` use.
+///
+/// - Unencrypted repository (`repo-cipher-type` unset / `none`): `Ok(None)`,
+///   so the transform is compression-only / identity and existing plaintext
+///   round trips unchanged.
+/// - Encrypted repository **with a stanza**: the repository **sub-key**
+///   recovered from the stanza's `archive.info` (via
+///   [`crate::cipher::active_sub_key`]). This is the key that decrypts backup
+///   file data, WAL segments and manifests, so a `repo-get` of any of those
+///   works. If the stanza is not yet initialised (no `archive.info`) the
+///   sub-key cannot be recovered, so fall back to the user passphrase — the key
+///   under which the `archive.info` / `backup.info` files themselves are
+///   encrypted.
+/// - Encrypted repository **without a stanza** (e.g. a bare `repo-get` of an
+///   info file): the user passphrase (`repo-cipher-pass`).
+///
+/// # Errors
+///
+/// Propagates [`crate::cipher::active_sub_key`] / [`crate::cipher::active_user_pass`]
+/// failures — notably [`CommandError::MissingOption`] (`"repo-cipher-pass"`)
+/// when the repository is encrypted but no passphrase is configured.
+fn resolve_repo_key(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Option<String>, CommandError> {
+    let index = crate::cipher::active_repo_index(config);
+    if !crate::cipher::cipher_type(config, index).is_encrypted() {
+        return Ok(None);
+    }
+
+    if let Some(stanza) = config.stanza.as_deref() {
+        // Prefer the repository sub-key (decrypts backup / WAL / manifest data).
+        // A not-yet-initialised stanza has no `archive.info`, so `active_sub_key`
+        // returns `None`; fall back to the user passphrase, which is what the
+        // info files themselves are encrypted under.
+        if let Some(sub_key) = crate::cipher::active_sub_key(repo_storage, config, stanza)? {
+            return Ok(Some(sub_key));
+        }
+    }
+
+    crate::cipher::active_user_pass(config)
+}
+
 /// Read the `--output` option (default [`OutputFormat::Text`]).
 fn output_format_opt(config: &LoadedConfig) -> OutputFormat {
     string_id_opt(config, "output").map_or(OutputFormat::Text, OutputFormat::from_str_id)
@@ -677,6 +739,21 @@ mod tests {
         let mut cfg = fake_config(command, params);
         for (name, value) in options {
             cfg.options.insert((name.to_owned(), None), value);
+        }
+        cfg
+    }
+
+    /// Like [`fake_config_with`] but the options carry an explicit group index,
+    /// so `repo`-group options (`repo-cipher-type`, `repo-cipher-pass`) can be
+    /// set at `repo1-*`.
+    fn fake_config_with_groups(
+        command: &str,
+        params: Vec<String>,
+        options: Vec<((&str, Option<u32>), OptionValue)>,
+    ) -> LoadedConfig {
+        let mut cfg = fake_config(command, params);
+        for ((name, idx), value) in options {
+            cfg.options.insert((name.to_owned(), idx), value);
         }
         cfg
     }
@@ -825,13 +902,16 @@ mod tests {
         let (repo, storage) = posix_repo();
         let payload = b"secret payload that must be encrypted at rest";
 
-        // Put with cipher-pass set (cipher-type=aes-256-cbc enables it).
-        let put_cfg = fake_config_with(
+        // Put on an encrypted repository (repo-cipher-type=aes-256-cbc +
+        // repo-cipher-pass). With no stanza the key resolves to the user
+        // passphrase, and `repo-put` writes the *keyed* (SHA-1 KDF) cipher
+        // format — the same one backup / restore use.
+        let put_cfg = fake_config_with_groups(
             "repo-put",
             vec!["secret.bin".to_owned()],
             vec![
-                ("cipher-type", OptionValue::StringId("aes-256-cbc".to_owned())),
-                ("cipher-pass", OptionValue::String("secret".to_owned())),
+                (("repo-cipher-type", Some(1)), OptionValue::StringId("aes-256-cbc".to_owned())),
+                (("repo-cipher-pass", Some(1)), OptionValue::String("secret".to_owned())),
             ],
         );
         let mut input = Cursor::new(payload.to_vec());
@@ -846,14 +926,21 @@ mod tests {
         );
         let stored = std::fs::read(repo.path().join("secret.bin")).expect("read back ciphertext");
         assert_ne!(stored.as_slice(), payload.as_slice(), "cipher put must encrypt the bytes");
+        // The keyed chain uses the pgBackRust `Salted__` OpenSSL header (SHA-1
+        // KDF), matching what backup / restore write.
+        assert!(
+            stored.starts_with(b"Salted__"),
+            "keyed cipher output must carry the OpenSSL salt header"
+        );
 
-        // Get with the same password recovers the plaintext.
-        let get_cfg = fake_config_with(
+        // Get with the same password recovers the plaintext through the keyed
+        // reverse chain.
+        let get_cfg = fake_config_with_groups(
             "repo-get",
             vec!["secret.bin".to_owned()],
             vec![
-                ("cipher-type", OptionValue::StringId("aes-256-cbc".to_owned())),
-                ("cipher-pass", OptionValue::String("secret".to_owned())),
+                (("repo-cipher-type", Some(1)), OptionValue::StringId("aes-256-cbc".to_owned())),
+                (("repo-cipher-pass", Some(1)), OptionValue::String("secret".to_owned())),
             ],
         );
         let mut buf: Vec<u8> = Vec::new();

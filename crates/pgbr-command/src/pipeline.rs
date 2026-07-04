@@ -35,6 +35,8 @@ use pgbr_config::{LoadedConfig, OptionValue};
 use pgbr_io::FilterChain;
 use pgbr_io::filter::{Cipher, CipherDigest, CipherMode};
 
+use crate::CommandError;
+
 /// Compression codec applied to a repo file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressType {
@@ -54,6 +56,13 @@ impl CompressType {
     /// Parse a `compress-type` string-id (`none` / `gz` / `bz2` / `lz4` /
     /// `zst`). Anything unrecognised falls back to [`CompressType::None`] so a
     /// malformed option degrades to a raw copy rather than failing the backup.
+    ///
+    /// This lossy form is kept for the *backup / suffix-parsing* side, where a
+    /// stray value can only ever mean "not compressed". On the **restore** side
+    /// use [`CompressType::try_from_str_id`] instead: reversing a backup with a
+    /// codec we do not understand must be a hard error, never a silent raw copy
+    /// of what is actually compressed data (which would corrupt the restored
+    /// file).
     #[must_use]
     pub fn from_str_id(value: &str) -> Self {
         match value {
@@ -63,6 +72,31 @@ impl CompressType {
             "zst" => Self::Zst,
             // "none" and any unrecognised value.
             _ => Self::None,
+        }
+    }
+
+    /// Strict parse of a `compress-type` string-id: unlike
+    /// [`CompressType::from_str_id`] an unrecognised codec is a hard error
+    /// rather than a silent degrade to [`CompressType::None`].
+    ///
+    /// Used on the restore path ([`RepoTransform::from_metadata_checked`]):
+    /// a `backup.info` that records a codec this build cannot decode must abort
+    /// the restore, because decompressing with the wrong (or no) codec would
+    /// hand back corrupt bytes that still pass no check.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::Other`] naming the unknown `compress-type` value.
+    pub fn try_from_str_id(value: &str) -> Result<Self, CommandError> {
+        match value {
+            "none" => Ok(Self::None),
+            "gz" => Ok(Self::Gz),
+            "bz2" => Ok(Self::Bz2),
+            "lz4" => Ok(Self::Lz4),
+            "zst" => Ok(Self::Zst),
+            other => Err(CommandError::Other(format!(
+                "unknown compress-type `{other}` recorded in backup.info; cannot reverse the repo transform"
+            ))),
         }
     }
 
@@ -214,15 +248,95 @@ impl RepoTransform {
         Self::with_key(base.compress_type, base.compress_level, sub_key)
     }
 
+    /// `true` when a backup's recorded `backup.info` `[backup:current]` `entry`
+    /// says its repo bytes are encrypted. When the flag is absent (older
+    /// metadata) it falls back to "encrypted iff the options resolve a cipher".
+    fn metadata_is_encrypted(entry: &serde_json::Value, config: &LoadedConfig) -> bool {
+        entry
+            .get(metadata_encrypted_key())
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| Self::from_options(config).cipher_pass.is_some())
+    }
+
+    /// Reconstruct the transform from the values recorded in a backup's
+    /// `backup.info` `[backup:current]` entry (see
+    /// [`metadata_compress_type_key`] / [`metadata_encrypted_key`]), overriding
+    /// the cipher key with the caller-resolved `sub_key`, and **failing loudly**
+    /// on anything that would otherwise corrupt the restored bytes.
+    ///
+    /// This is the correct restore-side constructor. Compared with the lossy
+    /// [`from_metadata`](Self::from_metadata) it fixes two silent hazards:
+    ///
+    /// - **Unknown codec.** A recorded `compress-type` this build cannot decode
+    ///   is a hard error ([`CompressType::try_from_str_id`]) rather than a silent
+    ///   degrade to [`CompressType::None`], which would hand back still-compressed
+    ///   bytes as if they were plaintext.
+    /// - **Missing key.** If the backup is marked encrypted but the caller could
+    ///   not resolve a decryption key (`sub_key == None`), it errors instead of
+    ///   building a reverse chain with no decrypt filter (which would "restore"
+    ///   the ciphertext verbatim). The key is the resolved repository / backup
+    ///   **sub-key** (`repo-cipher-pass` → `[cipher]` sub-key), never the raw
+    ///   user passphrase — passing the wrong key level here cannot decrypt.
+    ///
+    /// `compress_level` is taken from the options (it does not affect the reverse
+    /// chain). For an unencrypted repo pass `sub_key = None`.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::Other`] for an unknown recorded `compress-type`;
+    /// [`CommandError::MissingOption`] (`"repo-cipher-pass"`) when the backup is
+    /// encrypted but no `sub_key` was resolved.
+    pub fn from_metadata_checked(
+        entry: &serde_json::Value,
+        config: &LoadedConfig,
+        sub_key: Option<&str>,
+    ) -> Result<Self, CommandError> {
+        let from_opts = Self::from_options(config);
+
+        // A recorded codec must be understood; anything else aborts the restore
+        // rather than silently degrading to a raw copy of compressed data.
+        let compress_type = match entry.get(metadata_compress_type_key()).and_then(serde_json::Value::as_str) {
+            Some(recorded) => CompressType::try_from_str_id(recorded)?,
+            None => from_opts.compress_type,
+        };
+
+        let cipher_pass = if Self::metadata_is_encrypted(entry, config) {
+            // Encrypted backup: the ONLY valid key is the resolved sub-key. If
+            // the caller has none, refuse — do not build a decrypt-less chain
+            // (silent ciphertext restore) and do not fall back to the raw user
+            // passphrase (wrong key level, cannot decrypt).
+            let key = sub_key.ok_or_else(|| CommandError::MissingOption {
+                option: "repo-cipher-pass".to_owned(),
+            })?;
+            Some(key.to_owned())
+        } else {
+            None
+        };
+
+        Ok(Self {
+            compress_type,
+            compress_level: from_opts.compress_level,
+            cipher_pass,
+        })
+    }
+
     /// Reconstruct the transform from the values recorded in a backup's
     /// `backup.info` `[backup:current]` entry (see
     /// [`metadata_compress_type_key`] / [`metadata_encrypted_key`]), falling
     /// back to the resolved options for anything the metadata does not pin.
     ///
-    /// This is what restore uses: a backup is reversed using the transform it
-    /// was *written* with, not whatever compress/cipher options happen to be
-    /// on the restore command line. The cipher password, however, is never
-    /// stored in `backup.info`, so the password always comes from the options.
+    /// # Lossy — prefer [`from_metadata_checked`](Self::from_metadata_checked)
+    ///
+    /// This constructor cannot resolve the repository sub-key (it has no storage
+    /// handle) and cannot fail, so it is only safe when the caller **injects the
+    /// resolved key afterwards** via [`with_key`](Self::with_key) (as restore
+    /// does) or when the repo is unencrypted. It leaves `cipher_pass` empty for
+    /// an encrypted backup — a reverse chain built directly from the result
+    /// would skip decryption. New code should use
+    /// [`from_metadata_checked`](Self::from_metadata_checked), which errors in
+    /// that case instead. An unknown recorded `compress-type` still degrades to
+    /// [`CompressType::None`] here for backwards compatibility; the checked form
+    /// rejects it.
     #[must_use]
     pub fn from_metadata(entry: &serde_json::Value, config: &LoadedConfig) -> Self {
         let from_opts = Self::from_options(config);
@@ -232,27 +346,16 @@ impl RepoTransform {
             .and_then(serde_json::Value::as_str)
             .map_or(from_opts.compress_type, CompressType::from_str_id);
 
-        // Whether the repo bytes are encrypted is recorded; the password is
-        // not, so it is sourced from the options. If the backup says it is
-        // encrypted but no password is available, leave `cipher_pass` empty —
-        // the decrypt filter will then surface a clear error downstream.
-        let encrypted = entry
-            .get(metadata_encrypted_key())
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or_else(|| from_opts.cipher_pass.is_some());
-        let cipher_pass = if encrypted {
-            from_opts
-                .cipher_pass
-                .clone()
-                .or_else(|| string_opt(config, "cipher-pass").map(str::to_owned))
-        } else {
-            None
-        };
-
+        // The repository sub-key is not resolvable here, so callers must inject
+        // it via `with_key` (restore does exactly that). We deliberately do NOT
+        // fall back to the raw user passphrase: that is the wrong key level and
+        // would never decrypt a real pgBackRust repo. `cipher_pass` is therefore
+        // left empty; `from_metadata_checked` is the constructor that turns a
+        // missing key into a hard error.
         Self {
             compress_type,
             compress_level: from_opts.compress_level,
-            cipher_pass,
+            cipher_pass: None,
         }
     }
 
@@ -270,8 +373,17 @@ impl RepoTransform {
     }
 
     /// Build the forward (backup-side) filter chain: compress **then** encrypt,
-    /// using the legacy MD5 KDF (`openssl enc` default). Preserved byte-for-byte
-    /// for callers built the old way.
+    /// using the legacy MD5 KDF (`openssl enc` default).
+    ///
+    /// # Legacy — no production caller
+    ///
+    /// Nothing in the command layer uses the MD5 chain any more: `backup`,
+    /// `restore`, `archive` **and** `repo-get` / `repo-put` all go through the
+    /// keyed SHA-1 chain ([`forward_chain_keyed`](Self::forward_chain_keyed) /
+    /// [`reverse_chain_keyed`](Self::reverse_chain_keyed)) so their on-disk
+    /// bytes are byte-compatible with a pgBackRust C repository. This method is
+    /// retained only so the cross-KDF invariant stays under test (an MD5 chain
+    /// must never decrypt SHA-1 ciphertext). Do not add new production callers.
     ///
     /// An empty chain (no compression, no cipher) passes bytes through
     /// unchanged, preserving the raw-copy behaviour.
@@ -282,7 +394,8 @@ impl RepoTransform {
 
     /// Build the reverse (restore-side) filter chain: decrypt **then**
     /// decompress — the exact inverse of [`RepoTransform::forward_chain`]
-    /// (legacy MD5 KDF).
+    /// (legacy MD5 KDF). See [`forward_chain`](Self::forward_chain): legacy,
+    /// no production caller.
     #[must_use]
     pub fn reverse_chain(&self) -> FilterChain {
         self.reverse_chain_with_digest(CipherDigest::Md5)
@@ -570,8 +683,13 @@ mod tests {
             CompressType::Zst,
             "recorded compress-type must win over the restore CLI"
         );
-        assert!(transform.is_encrypted());
-        assert_eq!(transform.cipher_pass.as_deref(), Some("pw"), "password sourced from options");
+        // The lossy constructor never sources the cipher key from options
+        // (the raw user passphrase is the wrong key level). Callers inject the
+        // resolved sub-key via `with_key` (restore) instead.
+        assert!(
+            transform.cipher_pass.is_none(),
+            "from_metadata must not seed the key from the raw passphrase"
+        );
     }
 
     #[test]
@@ -585,12 +703,72 @@ mod tests {
     }
 
     #[test]
+    fn from_metadata_checked_uses_recorded_compress_type_and_sub_key() {
+        // Backup recorded zst + encrypted; the resolved sub-key drives the
+        // decrypt filter (not the raw restore-CLI passphrase).
+        let entry = serde_json::json!({
+            metadata_compress_type_key(): "zst",
+            metadata_encrypted_key(): true,
+        });
+        let restore_cfg = cfg(vec![(("cipher-pass", None), OptionValue::String("user-pass".to_owned()))]);
+        let transform = RepoTransform::from_metadata_checked(&entry, &restore_cfg, Some("theRepoSubKey==")).unwrap();
+        assert_eq!(transform.compress_type, CompressType::Zst);
+        assert!(transform.is_encrypted());
+        assert_eq!(
+            transform.cipher_pass.as_deref(),
+            Some("theRepoSubKey=="),
+            "checked constructor keys off the resolved sub-key, not the passphrase"
+        );
+    }
+
+    #[test]
+    fn from_metadata_checked_errors_when_encrypted_and_no_sub_key() {
+        // Encrypted backup but no resolvable key -> hard error, never a
+        // decrypt-less chain that would restore ciphertext verbatim.
+        let entry = serde_json::json!({
+            metadata_encrypted_key(): true,
+        });
+        let err = RepoTransform::from_metadata_checked(&entry, &cfg(Vec::new()), None).unwrap_err();
+        match err {
+            CommandError::MissingOption { option } => assert_eq!(option, "repo-cipher-pass"),
+            other => panic!("expected MissingOption(repo-cipher-pass), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_metadata_checked_errors_on_unknown_compress_type() {
+        // A codec this build cannot decode must abort the restore, not degrade
+        // to a raw copy of what is really compressed data.
+        let entry = serde_json::json!({
+            metadata_compress_type_key(): "xz",
+        });
+        let err = RepoTransform::from_metadata_checked(&entry, &cfg(Vec::new()), None).unwrap_err();
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("xz"), "message was {msg:?}"),
+            other => panic!("expected Other(unknown compress-type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_metadata_checked_unencrypted_is_identity_when_no_metadata() {
+        // Unencrypted, nothing recorded -> plain decompress/identity, no key.
+        let entry = serde_json::json!({});
+        let transform = RepoTransform::from_metadata_checked(&entry, &cfg(Vec::new()), None).unwrap();
+        assert_eq!(transform.compress_type, CompressType::None);
+        assert!(!transform.is_encrypted());
+    }
+
+    #[test]
     fn str_id_round_trips_through_compress_type() {
         for id in ["none", "gz", "bz2", "lz4", "zst"] {
             assert_eq!(CompressType::from_str_id(id).as_str_id(), id);
+            // The strict parser accepts every known codec too.
+            assert_eq!(CompressType::try_from_str_id(id).unwrap().as_str_id(), id);
         }
-        // Unrecognised degrades to none.
+        // Unrecognised degrades to none on the lossy path...
         assert_eq!(CompressType::from_str_id("xz"), CompressType::None);
+        // ...but is a hard error on the strict path.
+        assert!(CompressType::try_from_str_id("xz").is_err());
     }
 
     #[test]

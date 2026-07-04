@@ -480,16 +480,30 @@ struct ListEntry {
     modified: Option<i64>,
 }
 
-/// Parse a GCS XML API list response body into its `<Contents>` entries.
+/// One parsed page of a GCS XML API list response: the `<Contents>` entries
+/// plus the pagination state (`<IsTruncated>` / `<NextMarker>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ListPage {
+    entries: Vec<ListEntry>,
+    /// `true` when the result was truncated and a further request is required.
+    is_truncated: bool,
+    /// The `<NextMarker>` value to re-inject as `marker=` on the next request.
+    /// Present only when the server supplied it; a truncated page without one
+    /// falls back to the last entry's key (handled by the caller).
+    next_marker: Option<String>,
+}
+
+/// Parse a GCS XML API list response body into one [`ListPage`].
 ///
 /// The GCS XML API returns an S3-compatible `ListBucketResult` document:
-/// `<ListBucketResult><Contents><Key>..</Key><Size>..</Size>`
+/// `<ListBucketResult><IsTruncated>..</IsTruncated><NextMarker>..</NextMarker>`
+/// `<Contents><Key>..</Key><Size>..</Size>`
 /// `<LastModified>..</LastModified></Contents>…</ListBucketResult>`.
-fn parse_list_objects(xml: &str) -> Result<Vec<ListEntry>, String> {
+fn parse_list_objects(xml: &str) -> Result<ListPage, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut entries = Vec::new();
+    let mut page = ListPage::default();
     let mut in_contents = false;
     let mut cur_tag: Option<String> = None;
     let mut key = String::new();
@@ -510,15 +524,26 @@ fn parse_list_objects(xml: &str) -> Result<Vec<ListEntry>, String> {
                 cur_tag = Some(name);
             }
             Ok(Event::Text(e)) => {
-                if !in_contents {
-                    continue;
-                }
                 let text = e.xml_content().map_err(|err| err.to_string())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("Key") => key = text,
-                    Some("Size") => size = text.trim().parse().unwrap_or(0),
-                    Some("LastModified") => modified = parse_rfc3339_secs(&text),
-                    _ => {}
+                if in_contents {
+                    match cur_tag.as_deref() {
+                        Some("Key") => key = text,
+                        Some("Size") => size = text.trim().parse().unwrap_or(0),
+                        Some("LastModified") => modified = parse_rfc3339_secs(&text),
+                        _ => {}
+                    }
+                } else {
+                    // Top-level pagination markers live outside <Contents>.
+                    match cur_tag.as_deref() {
+                        Some("IsTruncated") => page.is_truncated = text.trim().eq_ignore_ascii_case("true"),
+                        Some("NextMarker") => {
+                            let marker = text.trim();
+                            if !marker.is_empty() {
+                                page.next_marker = Some(marker.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -526,7 +551,7 @@ fn parse_list_objects(xml: &str) -> Result<Vec<ListEntry>, String> {
                 let name = String::from_utf8_lossy(name.as_ref()).into_owned();
                 if name == "Contents" {
                     in_contents = false;
-                    entries.push(ListEntry {
+                    page.entries.push(ListEntry {
                         key: std::mem::take(&mut key),
                         size,
                         modified,
@@ -540,7 +565,7 @@ fn parse_list_objects(xml: &str) -> Result<Vec<ListEntry>, String> {
         }
     }
 
-    Ok(entries)
+    Ok(page)
 }
 
 /// Parse an RFC-3339 / ISO-8601 timestamp (e.g. `2009-10-12T17:50:30.000Z`)
@@ -746,37 +771,63 @@ impl Storage for Gcs {
 
         let url = self.bucket_url();
         let (auth_name, auth_value) = self.auth_header()?;
-        let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
-        for (name, value) in self.common_headers() {
-            req = req.set(&name, &value);
-        }
-        if !prefix.is_empty() {
-            // ureq percent-encodes the query value for the wire request.
-            req = req.query("prefix", &prefix);
-        }
+        let mut entries: Vec<StorageInfo> = Vec::new();
+        // Follow the S3-compatible pagination markers until the listing is
+        // exhausted, re-injecting the continuation as `marker=`, so a bucket
+        // with more objects than the per-response cap (1000) is returned in
+        // full rather than silently truncated to the first page.
+        let mut marker: Option<String> = None;
 
-        let body = match req.call() {
-            Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+        loop {
+            // ureq requests are consumed by `.call()`, so rebuild per page.
+            let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
+            for (name, value) in self.common_headers() {
+                req = req.set(&name, &value);
+            }
+            if !prefix.is_empty() {
+                // ureq percent-encodes the query value for the wire request.
+                req = req.query("prefix", &prefix);
+            }
+            if let Some(marker) = &marker {
+                req = req.query("marker", marker);
+            }
+
+            let body = match req.call() {
+                Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                })?,
+                Err(err) => return Err(map_ureq_error(err, &prefix)),
+            };
+
+            let page = parse_list_objects(&body).map_err(|message| StorageError::Backend {
                 path: path.to_path_buf(),
-                message: err.to_string(),
-            })?,
-            Err(err) => return Err(map_ureq_error(err, &prefix)),
-        };
+                message,
+            })?;
 
-        let parsed = parse_list_objects(&body).map_err(|message| StorageError::Backend {
-            path: path.to_path_buf(),
-            message,
-        })?;
+            // The XML API returns `<NextMarker>` only when a delimiter is set;
+            // for a flat listing the caller must re-request with `marker=` set
+            // to the last returned key. Capture it before consuming `entries`.
+            let last_key = page.entries.last().map(|e| e.key.clone());
 
-        let mut entries: Vec<StorageInfo> = parsed
-            .into_iter()
-            .map(|e| StorageInfo {
+            entries.extend(page.entries.into_iter().map(|e| StorageInfo {
                 path: PathBuf::from(e.key),
                 kind: StorageKind::File,
                 size: e.size,
                 modified: e.modified,
-            })
-            .collect();
+            }));
+
+            if !page.is_truncated {
+                break;
+            }
+            match page.next_marker.or(last_key) {
+                // A truncated page with neither a NextMarker nor any entry to
+                // resume from would loop forever; stop rather than spin.
+                Some(next) => marker = Some(next),
+                None => break,
+            }
+        }
+
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -989,7 +1040,8 @@ mod tests {
     </Contents>
 </ListBucketResult>"#;
 
-        let entries = parse_list_objects(xml).unwrap();
+        let page = parse_list_objects(xml).unwrap();
+        let entries = &page.entries;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].key, "archive/000000010000000000000001");
         assert_eq!(entries[0].size, 16_777_216);
@@ -998,6 +1050,9 @@ mod tests {
 
         // 2009-10-12T17:50:30Z == 1255369830 epoch seconds.
         assert_eq!(entries[0].modified, Some(1_255_369_830));
+
+        assert!(!page.is_truncated);
+        assert_eq!(page.next_marker, None);
     }
 
     #[test]
@@ -1007,7 +1062,72 @@ mod tests {
     <Name>examplebucket</Name>
     <IsTruncated>false</IsTruncated>
 </ListBucketResult>"#;
-        assert!(parse_list_objects(xml).unwrap().is_empty());
+        assert!(parse_list_objects(xml).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn list_parses_truncated_page_then_final_page() {
+        // First page: truncated with an explicit <NextMarker> continuation.
+        let page1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+    <Name>examplebucket</Name>
+    <Prefix>archive/</Prefix>
+    <IsTruncated>true</IsTruncated>
+    <NextMarker>archive/000000010000000000000001</NextMarker>
+    <Contents>
+        <Key>archive/000000010000000000000001</Key>
+        <LastModified>2009-10-12T17:50:30.000Z</LastModified>
+        <Size>16</Size>
+    </Contents>
+</ListBucketResult>"#;
+        let parsed1 = parse_list_objects(page1).unwrap();
+        assert_eq!(parsed1.entries.len(), 1);
+        assert_eq!(parsed1.entries[0].key, "archive/000000010000000000000001");
+        assert!(parsed1.is_truncated);
+        assert_eq!(parsed1.next_marker.as_deref(), Some("archive/000000010000000000000001"));
+
+        // Second page: not truncated — the loop terminates.
+        let page2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+    <Name>examplebucket</Name>
+    <Prefix>archive/</Prefix>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>archive/000000010000000000000002</Key>
+        <LastModified>2009-10-12T17:51:00.000Z</LastModified>
+        <Size>42</Size>
+    </Contents>
+</ListBucketResult>"#;
+        let parsed2 = parse_list_objects(page2).unwrap();
+        assert_eq!(parsed2.entries.len(), 1);
+        assert_eq!(parsed2.entries[0].key, "archive/000000010000000000000002");
+        assert!(!parsed2.is_truncated);
+        assert_eq!(parsed2.next_marker, None);
+    }
+
+    #[test]
+    fn list_truncated_without_next_marker_falls_back_to_last_key() {
+        // A flat listing (no delimiter) may be truncated without a NextMarker;
+        // the caller must resume from the last key. Verify the parser reports
+        // truncation and no marker, leaving the fallback to `list()`.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+    <Name>examplebucket</Name>
+    <Prefix>archive/</Prefix>
+    <IsTruncated>true</IsTruncated>
+    <Contents>
+        <Key>archive/000000010000000000000001</Key>
+        <LastModified>2009-10-12T17:50:30.000Z</LastModified>
+        <Size>16</Size>
+    </Contents>
+</ListBucketResult>"#;
+        let parsed = parse_list_objects(xml).unwrap();
+        assert!(parsed.is_truncated);
+        assert_eq!(parsed.next_marker, None);
+        assert_eq!(
+            parsed.entries.last().map(|e| e.key.as_str()),
+            Some("archive/000000010000000000000001")
+        );
     }
 
     #[test]

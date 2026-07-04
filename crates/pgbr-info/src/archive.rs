@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use pgbr_io::{IoRead, IoWrite};
+use pgbr_io::IoRead;
 use pgbr_storage::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -78,9 +78,14 @@ impl InfoArchive {
     }
 
     /// Render this `InfoArchive` to text, with the `backrest-checksum` recomputed.
-    #[must_use]
-    pub fn to_text(&self) -> String {
-        format::checksumed_render(&self.to_file())
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Json`] if a `[db:history]` row fails to serialise (in practice
+    /// unreachable for these plain structs, but the error is propagated rather
+    /// than masked).
+    pub fn to_text(&self) -> Result<String, InfoError> {
+        Ok(format::checksumed_render(&self.to_file()?))
     }
 
     /// Read `archive.info` from `path` via `storage`. Streams through `IoRead::read_all`
@@ -94,19 +99,20 @@ impl InfoArchive {
         Self::load_keyed(storage, path, None).map(|(archive, _)| archive)
     }
 
-    /// Write `archive.info` to `path` via `storage`. Truncates / creates the file as
-    /// dictated by [`Storage::open_write`].
+    /// Write `archive.info` to `path` via `storage`.
+    ///
+    /// Routes through the same crash-safe path as [`InfoArchive::save_keyed`]:
+    /// the `.copy` mirror and the primary are each written via
+    /// [`Storage::write_atomic_path`] (temp + rename), the `.copy` first, so a
+    /// crash never leaves a torn primary that the load-side fallback cannot
+    /// recover. This is the unencrypted (`passphrase = None`, no `[cipher]`
+    /// section) special case of `save_keyed`.
     ///
     /// # Errors
     ///
     /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`].
     pub fn save(&self, storage: &dyn Storage, path: &Path) -> Result<(), InfoError> {
-        let text = self.to_text();
-        let mut writer: Box<dyn IoWrite> = storage.open_write(path)?;
-        writer.write(text.as_bytes())?;
-        writer.flush()?;
-        writer.close()?;
-        Ok(())
+        self.save_keyed(storage, path, None, None)
     }
 
     /// Decode an `archive.info` document that may be encrypted under the user
@@ -137,7 +143,7 @@ impl InfoArchive {
     ///
     /// [`InfoError::Io`] if the cipher filter fails.
     pub fn to_bytes_keyed(&self, passphrase: Option<&str>, cipher_pass: Option<&str>) -> Result<Vec<u8>, InfoError> {
-        let text = format::checksumed_render(&self.to_file_with_cipher(cipher_pass));
+        let text = format::checksumed_render_checked(&self.to_file_with_cipher(cipher_pass)?)?;
         encode_maybe_encrypted(text.as_bytes(), passphrase)
     }
 
@@ -225,14 +231,18 @@ impl InfoArchive {
         })
     }
 
-    fn to_file(&self) -> InfoFile {
+    fn to_file(&self) -> Result<InfoFile, InfoError> {
         self.to_file_with_cipher(None)
     }
 
     /// Build the [`InfoFile`], optionally injecting the repository sub-key into
     /// a `[cipher]` section. The cipher section is placed right after
     /// `[backrest]`, matching pgBackRust's `infoSave`.
-    fn to_file_with_cipher(&self, cipher_pass: Option<&str>) -> InfoFile {
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Json`] if a `[db:history]` row fails to serialise.
+    fn to_file_with_cipher(&self, cipher_pass: Option<&str>) -> Result<InfoFile, InfoError> {
         let mut file = InfoFile::new();
 
         // [backrest]
@@ -255,11 +265,14 @@ impl InfoArchive {
         for (id, entry) in &self.history {
             // The C side serialises history rows as a single-line JSON object. Use the
             // same encoding so cross-compat tools see what they expect.
-            let json = serde_json::to_string(entry).unwrap_or_else(|_| String::from("{}"));
+            let json = serde_json::to_string(entry).map_err(|err| InfoError::Json {
+                context: format!("[{DB_HISTORY_SECTION}].{id}"),
+                error: err,
+            })?;
             file.set(DB_HISTORY_SECTION, &id.to_string(), json);
         }
 
-        file
+        Ok(file)
     }
 }
 
@@ -383,21 +396,25 @@ pub(crate) fn parse_required_string(file: &InfoFile, section: &'static str, key:
 
 pub(crate) fn parse_required_u32(file: &InfoFile, section: &'static str, key: &'static str) -> Result<u32, InfoError> {
     let raw = file.get(section, key).ok_or(InfoError::MissingField { section, key })?;
-    raw.trim()
-        .parse::<u32>()
-        .map_err(|_| InfoError::MissingField { section, key })
+    raw.trim().parse::<u32>().map_err(|_| InfoError::InvalidValue {
+        context: format!("[{section}].{key}"),
+        value: raw.to_owned(),
+    })
 }
 
 pub(crate) fn parse_required_u64(file: &InfoFile, section: &'static str, key: &'static str) -> Result<u64, InfoError> {
     let raw = file.get(section, key).ok_or(InfoError::MissingField { section, key })?;
-    raw.trim()
-        .parse::<u64>()
-        .map_err(|_| InfoError::MissingField { section, key })
+    raw.trim().parse::<u64>().map_err(|_| InfoError::InvalidValue {
+        context: format!("[{section}].{key}"),
+        value: raw.to_owned(),
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use pgbr_io::IoWrite;
+
     use super::*;
 
     fn sample() -> InfoArchive {
@@ -422,7 +439,7 @@ mod tests {
     #[test]
     fn round_trips_via_text() {
         let archive = sample();
-        let text = archive.to_text();
+        let text = archive.to_text().unwrap();
         let parsed = InfoArchive::from_text(&text).unwrap();
         assert_eq!(parsed, archive);
     }
@@ -440,7 +457,7 @@ mod tests {
     #[test]
     fn flipping_byte_in_loaded_archive_is_detected() {
         let archive = sample();
-        let mut text = archive.to_text();
+        let mut text = archive.to_text().unwrap();
         // Flip the first '1' that appears in the body. Whichever value it lands on, the
         // checksum no longer matches.
         let pos = text.find("db-id=1").unwrap() + "db-id=".len();

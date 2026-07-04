@@ -738,13 +738,27 @@ fn json_err(err: &serde_json::Error) -> StorageError {
 }
 
 /// Extract the `index`-th param as a path.
+///
+/// Every path arriving here comes from a *remote peer* over the storage
+/// protocol, so it is validated with [`crate::path_validate::validate_relative`]
+/// before it is returned: a peer may neither pass an absolute path
+/// (`/etc/passwd`) nor climb out of the worker's rooted backend with `..`
+/// components. Combined with the underlying rooted [`crate::Posix`] backend
+/// (whose `resolve` joins onto its root), this guarantees a peer can only reach
+/// files inside the configured repository / PG data root — closing the
+/// path-traversal hole in the worker. This is deliberately enforced here in the
+/// worker rather than in `Posix::resolve`, so that internal callers that
+/// legitimately hand already-rooted absolute paths to `Posix` keep working
+/// while every network-sourced path is still checked.
 fn param_path(req: &Request, index: usize) -> Result<PathBuf, StorageError> {
     let s = req
         .param
         .get(index)
         .and_then(Value::as_str)
         .ok_or_else(|| backend(Path::new(""), &format!("{}: missing path param #{index}", req.cmd)))?;
-    Ok(PathBuf::from(s))
+    let path = PathBuf::from(s);
+    crate::path_validate::validate_relative(&path)?;
+    Ok(path)
 }
 
 /// Extract the `index`-th param as a boolean.
@@ -955,6 +969,50 @@ mod tests {
         match resp {
             Response::Err(err) => assert!(err.message.contains("unknown storage command")),
             Response::Ok(_) => panic!("expected an error response for an unknown command"),
+        }
+    }
+
+    #[test]
+    fn worker_rejects_parent_dir_traversal() {
+        // A malicious peer must not be able to climb out of the worker's root
+        // with `..` components. The handler answers with an error response and
+        // never touches the underlying file.
+        let dir = TempDir::new().unwrap();
+        let mut handler = StorageRequestHandler::new(Posix::new(dir.path()));
+        for cmd in [command::EXISTS, command::INFO, command::READ_CHUNK, command::REMOVE] {
+            let resp = handler.handle(&Request {
+                cmd: cmd.to_owned(),
+                param: vec![json!("../../etc/passwd"), json!(0), json!(0)],
+            });
+            match resp {
+                Response::Err(err) => assert!(
+                    err.message.contains("path validation"),
+                    "cmd {cmd}: unexpected message {}",
+                    err.message
+                ),
+                Response::Ok(_) => panic!("cmd {cmd}: expected traversal path to be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn worker_rejects_absolute_path() {
+        // An absolute path from a peer would escape the rooted backend entirely.
+        let dir = TempDir::new().unwrap();
+        let mut handler = StorageRequestHandler::new(Posix::new(dir.path()));
+        // `/etc/passwd` on Unix, a drive-absolute path on Windows.
+        let abs = if cfg!(windows) {
+            r"C:\Windows\System32\config\SAM"
+        } else {
+            "/etc/passwd"
+        };
+        let resp = handler.handle(&Request {
+            cmd: command::EXISTS.to_owned(),
+            param: vec![json!(abs)],
+        });
+        match resp {
+            Response::Err(err) => assert!(err.message.contains("path validation")),
+            Response::Ok(_) => panic!("expected absolute path to be rejected"),
         }
     }
 

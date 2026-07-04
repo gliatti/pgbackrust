@@ -195,7 +195,7 @@ use pgbr_info::{InfoBackup, InfoError, Manifest, ManifestFile, ManifestLink};
 use pgbr_io::{Filter, Sha1};
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
-use pgbr_storage::{Storage, StorageError, StorageKind};
+use pgbr_storage::{Storage, StorageError, StorageKind, validate_relative};
 use serde_json::json;
 
 use crate::CommandError;
@@ -228,6 +228,84 @@ fn dry_run_enabled(config: &LoadedConfig) -> bool {
         config.options.get(&("dry-run".to_owned(), None)),
         Some(OptionValue::Boolean(true))
     )
+}
+
+/// Whether `--force` was supplied and set to `true`. `--force` lets a restore
+/// overwrite a non-empty `PGDATA` (the operator asserts the directory is safe to
+/// clobber), the same escape hatch pgBackRust's `restoreCheck` honours. C ref:
+/// `cfgOptForce`.
+fn force_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("force".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
+
+/// Validate a manifest-recorded relative path (a `[target:file]` /
+/// `[target:link]` / `[target:path]` key) before it is joined onto the PG target.
+///
+/// A restored path must stay inside `PGDATA`: a malicious or corrupt manifest
+/// must not be able to steer a write at an absolute path (`/etc/passwd`) or one
+/// that climbs out with `..` (`../../etc/cron.d/x`). This reuses the same guard
+/// the storage protocol applies to network-sourced paths
+/// ([`pgbr_storage::validate_relative`]): relative, no `..` component. An empty
+/// path is also rejected (a restore target must name something).
+///
+/// # Errors
+///
+/// [`CommandError::Other`] describing the offending path when it is empty,
+/// absolute, or contains a `..` component.
+fn validate_manifest_path(kind: &str, rel: &str) -> Result<(), CommandError> {
+    if rel.is_empty() {
+        return Err(CommandError::Other(format!("manifest {kind} has an empty path")));
+    }
+    validate_relative(Path::new(rel)).map_err(|err| CommandError::Other(format!("manifest {kind} path '{rel}' rejected: {err}")))
+}
+
+/// Pre-flight safety checks run **before any mutation** of the PG target.
+///
+/// Refuses to clobber a running or populated cluster:
+///
+/// - A `postmaster.pid` in the target means a live (or crashed-but-not-cleaned)
+///   `PostgreSQL` is using this data directory; overwriting it under it would
+///   corrupt the cluster. This is a hard error regardless of `--delta`/`--force`.
+/// - A non-empty `PGDATA` without `--delta` or `--force` is refused: a plain
+///   restore expects an empty target, and silently overwriting an existing
+///   cluster loses data. `--delta` (reconcile in place) or `--force` (operator
+///   override) opt out. Mirrors pgBackRust's `restoreCheck`. Skipped on dry-run
+///   (no mutation happens anyway).
+fn preflight_pgdata(pg: &dyn Storage, delta: bool, force: bool, dry_run: bool) -> Result<(), CommandError> {
+    if dry_run {
+        return Ok(());
+    }
+
+    // A live cluster is never safe to restore over, even with --delta/--force.
+    if pg.exists(Path::new("postmaster.pid"))? {
+        return Err(CommandError::Other(
+            "postmaster.pid exists in the PG data directory: refusing to restore over a running or unclean \
+             cluster (stop PostgreSQL and remove postmaster.pid first)"
+                .to_owned(),
+        ));
+    }
+
+    // A non-empty PGDATA requires an explicit opt-in.
+    if !delta && !force {
+        let non_empty = match pg.list(Path::new(".")) {
+            Ok(entries) => !entries.is_empty(),
+            // A missing target dir is empty; other errors surface.
+            Err(StorageError::NotFound { .. }) => false,
+            Err(err) => return Err(CommandError::Storage(err)),
+        };
+        if non_empty {
+            return Err(CommandError::Other(
+                "PG data directory is not empty: restore requires an empty target, or --delta to reconcile in \
+                 place, or --force to overwrite"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Result of a [`restore_inner`] pass.
@@ -487,6 +565,16 @@ fn recovery_type(config: &LoadedConfig) -> RecoveryType {
     }
 }
 
+/// Whether `--type=preserve` was requested. In that mode restore leaves any
+/// existing recovery configuration untouched, so the residual-signal cleanup
+/// (`recovery.signal` / `standby.signal` / `recovery.conf`) is skipped.
+fn recovery_preserve(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("type".to_owned(), None)),
+        Some(OptionValue::StringId(value) | OptionValue::String(value)) if value == "preserve"
+    )
+}
+
 /// Read a plain string option, preferring `--target` for the `time`/`name`/`lsn`/`xid`
 /// target value.
 fn string_option<'a>(config: &'a LoadedConfig, name: &str) -> Option<&'a str> {
@@ -598,6 +686,15 @@ fn user_overrides(recovery_options: &BTreeMap<String, String>, guc: &str) -> boo
     recovery_options.keys().any(|k| normalise_recovery_key(k) == guc)
 }
 
+/// Escape a value destined for a single-quoted `PostgreSQL` recovery-config string
+/// (`key = 'value'`). A literal apostrophe in the value would otherwise close the
+/// quote early and either break the config or inject an extra setting; `PostgreSQL`
+/// escapes an embedded single quote by doubling it (`''`). C ref: `strReplace` on
+/// the recovery-option value in `src/command/restore/config.c.inc`.
+fn escape_guc(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Render the recovery settings block (a `key = 'value'` line per setting) for the
 /// given PG major version, resolved recovery type, and recovery-target settings.
 /// The leading header line identifies the restore. Always emits `restore_command`
@@ -620,7 +717,7 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
     // (mirrors the C generator, which skips the built-in restore_command when the
     // user already supplied one). `write!` into a `String` is infallible.
     if !user_overrides(opts, "restore_command") {
-        let _ = writeln!(out, "restore_command = '{}'", restore_command(stanza));
+        let _ = writeln!(out, "restore_command = '{}'", escape_guc(&restore_command(stanza)));
     }
 
     match ty {
@@ -634,7 +731,7 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
         }
         RecoveryType::Target(kind) => {
             if let Some(value) = settings.target {
-                let _ = writeln!(out, "recovery_target_{} = '{value}'", kind.guc_suffix());
+                let _ = writeln!(out, "recovery_target_{} = '{}'", kind.guc_suffix(), escape_guc(value));
                 if settings.exclusive && kind.supports_inclusive() {
                     out.push_str("recovery_target_inclusive = 'false'\n");
                 }
@@ -649,7 +746,7 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
     // option's `depend` restricts when it can be set (immediate/lsn/name/time/xid),
     // so no extra type check is needed here.
     if settings.action != "pause" {
-        let _ = writeln!(out, "recovery_target_action = '{}'", settings.action);
+        let _ = writeln!(out, "recovery_target_action = '{}'", escape_guc(settings.action));
     }
 
     // recovery_target_timeline — when supplied, write it, except that on PG < 12 the
@@ -660,7 +757,7 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
     match settings.timeline {
         Some(value) => {
             if db_major >= PG_VERSION_RECOVERY_GUC || value != "current" {
-                let _ = writeln!(out, "recovery_target_timeline = '{value}'");
+                let _ = writeln!(out, "recovery_target_timeline = '{}'", escape_guc(value));
             }
         }
         None => {
@@ -686,25 +783,29 @@ fn recovery_block(db_major: u32, stanza: &str, ty: RecoveryType, settings: Recov
     // here makes the user value win. Values are single-quoted, matching the
     // recovery-conf `key = 'value'` format.
     for (key, value) in opts {
-        let _ = writeln!(out, "{} = '{value}'", normalise_recovery_key(key));
+        let _ = writeln!(out, "{} = '{}'", normalise_recovery_key(key), escape_guc(value));
     }
 
     out
 }
 
 /// Parse a `YYYY-MM-DD HH:MM:SS` (optionally `T`-separated, with an optional
-/// fractional second and trailing timezone) timestamp into Unix epoch seconds,
-/// interpreted as **UTC**. Returns `None` for anything that does not parse.
+/// fractional second and trailing timezone) timestamp into Unix epoch seconds.
+/// Returns `None` for anything that does not parse.
+///
+/// A trailing timezone designator (`Z`, `±HH`, `±HHMM`, or `±HH:MM`) is honoured:
+/// the wall-clock value is converted to UTC by subtracting the zone's offset east
+/// of UTC before the epoch is returned, so a `--target='2024-01-01 12:00:00+02'`
+/// compares correctly against a UTC `backup-timestamp-stop`. A value with no zone
+/// is interpreted as UTC, matching this fork's deterministic-UTC handling
+/// elsewhere (`format_timestamp` renders `+0000`).
 ///
 /// This is the inverse of [`crate::backup::unix_to_civil`] /
 /// `info::format_timestamp`'s civil-date algorithm (Howard Hinnant's
 /// `days_from_civil`). It is used only to compare a `--type=time` /
 /// `--repo-target-time` target against each backup's recorded
-/// `backup-timestamp-stop` for auto-selecting a backup set; it intentionally
-/// ignores any timezone suffix and treats the wall-clock value as UTC, matching
-/// this fork's deterministic-UTC handling elsewhere (`format_timestamp` renders
-/// `+0000`). C ref: the time-target backup-set search in
-/// `src/command/restore/restore.c` (`restoreBackupSet`).
+/// `backup-timestamp-stop` for auto-selecting a backup set. C ref: the time-target
+/// backup-set search in `src/command/restore/restore.c` (`restoreBackupSet`).
 fn parse_civil_time(raw: &str) -> Option<i64> {
     let trimmed = raw.trim();
     // Split date and time on the first space or `T`; a date-only value defaults
@@ -720,9 +821,15 @@ fn parse_civil_time(raw: &str) -> Option<i64> {
         return None;
     }
 
-    // Time: HH:MM[:SS]; strip any fractional second / timezone tail off the
-    // seconds field (it is ignored — values are treated as UTC).
-    let mut time_parts = time.split(':');
+    // Split off any timezone suffix BEFORE the `:`-split, because an offset like
+    // `+02:00` itself contains a colon. `tz_offset_secs` is the offset east of
+    // UTC in seconds (e.g. `+02:00` -> 7200, `-0500` -> -18000, `Z` -> 0); `None`
+    // means the value carried no explicit zone and is interpreted as UTC (matching
+    // this fork's deterministic-UTC handling).
+    let (time_body, tz_offset_secs) = split_timezone(time);
+
+    // Time: HH:MM[:SS]; strip any fractional second off the seconds field.
+    let mut time_parts = time_body.split(':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
     let second: i64 = time_parts.next().map_or(0, |sec| {
@@ -742,7 +849,50 @@ fn parse_civil_time(raw: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     let days = era * 146_097 + doe - 719_468;
 
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+    let local_epoch = days * 86_400 + hour * 3600 + minute * 60 + second;
+    // Convert the wall-clock value to UTC: an offset EAST of UTC means the local
+    // clock is ahead, so the UTC epoch is `local - offset`. No offset => already UTC.
+    Some(local_epoch - tz_offset_secs.unwrap_or(0))
+}
+
+/// Split a `HH:MM[:SS[.frac]]` time string into its `(body, tz_offset_secs)`,
+/// where the body has any trailing timezone designator removed and
+/// `tz_offset_secs` is the zone's offset east of UTC in seconds (`Some(0)` for
+/// `Z`), or `None` when no zone was present. Accepts `Z`, `±HH`, `±HHMM`, and
+/// `±HH:MM`. A malformed offset is treated as "no zone" so the value falls back
+/// to UTC rather than mis-parsing.
+fn split_timezone(time: &str) -> (&str, Option<i64>) {
+    let time = time.trim();
+    if let Some(body) = time.strip_suffix(['Z', 'z']) {
+        return (body, Some(0));
+    }
+
+    // Find the sign that introduces the offset. Scan from the end so a `-` inside
+    // the (colon-separated) time never matches — the offset sign is the last one.
+    if let Some(pos) = time.rfind(['+', '-']) {
+        let (body, tz) = time.split_at(pos);
+        let sign = if tz.starts_with('-') { -1 } else { 1 };
+        let digits: String = tz[1..].chars().filter(char::is_ascii_digit).collect();
+        let (oh, om): (i64, i64) = match digits.len() {
+            // `+HH`
+            1 | 2 => (digits.parse::<i64>().unwrap_or(-1), 0),
+            // `+HHMM` / `+HH:MM`
+            3 | 4 => {
+                let split = digits.len() - 2;
+                (
+                    digits[..split].parse::<i64>().unwrap_or(-1),
+                    digits[split..].parse::<i64>().unwrap_or(-1),
+                )
+            }
+            _ => (-1, -1),
+        };
+        if (0..=23).contains(&oh) && (0..=59).contains(&om) {
+            return (body, Some(sign * (oh * 3600 + om * 60)));
+        }
+        // Malformed offset: ignore it and treat the value as UTC.
+    }
+
+    (time, None)
 }
 
 /// The target timestamp (epoch seconds) used to auto-select a backup set, if the
@@ -1783,6 +1933,23 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// `fsync(2)` the directory containing `path` so a freshly renamed-in file's
+/// directory entry is itself durable across a power loss. On Unix opening a
+/// directory and calling `sync_all` flushes its metadata. A missing / unopenable
+/// parent is a best-effort no-op (the file write already succeeded). Clean no-op
+/// on non-Unix.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
+
 /// Write the recovered `plaintext` to the job's destination and verify it.
 ///
 /// Shared by [`restore_file`] (the local `std::fs` fast path) and
@@ -1791,25 +1958,41 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
 /// the repo bytes differs between paths), so the parent-dir creation, write,
 /// Unix-mode re-application, and the hard-fail plaintext SHA-1 check are written
 /// exactly once and produce identical results regardless of how the bytes were
-/// read. A checksum mismatch is a hard error so the failing job fails the whole
-/// restore.
+/// read.
+///
+/// # Durability + atomicity
+///
+/// The plaintext SHA-1 is checked **before** anything is written, so a corrupt
+/// file never touches the target. The bytes are then streamed to a sibling
+/// `<dst>.pgbr.tmp`, `fsync`'d (`sync_all`), and atomically `rename`'d onto the
+/// final path — a crash mid-restore can never leave a half-written or truncated
+/// data file at the real name. On any failure the temp file is removed
+/// (best-effort). A checksum mismatch is a hard error so the failing job fails
+/// the whole restore.
 fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), CommandError> {
-    if let Some(parent) = job.abs_dst.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+    // Write + fsync the temp file, then re-apply the recorded Unix mode to it
+    // (before the rename so the published name is never briefly world-readable
+    // at the default mode). Any failure removes the temp file. `write_temp`
+    // does the fallible steps; the caller cleans up on error.
+    fn write_temp(tmp_path: &Path, plaintext: &[u8], mode: Option<u32>) -> Result<(), CommandError> {
+        use std::io::Write as _;
+        let mut file =
+            std::fs::File::create(tmp_path).map_err(|err| CommandError::Other(format!("create {}: {err}", tmp_path.display())))?;
+        file.write_all(plaintext)
+            .map_err(|err| CommandError::Other(format!("write {}: {err}", tmp_path.display())))?;
+        // Durability: flush the data to stable storage before the rename.
+        file.sync_all()
+            .map_err(|err| CommandError::Other(format!("fsync {}: {err}", tmp_path.display())))?;
+        // Re-apply the recorded Unix file mode (if any). On non-Unix this is a
+        // no-op. uid/gid are recorded-only — re-applying owner needs privilege
+        // and is a documented follow-up. C ref: chmod in
+        // `src/command/restore/restore.c`.
+        apply_mode(tmp_path, mode)
     }
-    std::fs::write(&job.abs_dst, plaintext)
-        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dst.display())))?;
 
-    // Re-apply the recorded Unix file mode (if any). On non-Unix this is a no-op
-    // (no mode is ever recorded). uid/gid are recorded-only — re-applying owner
-    // needs privilege and is a documented follow-up. C ref: chmod in
-    // `src/command/restore/restore.c`.
-    apply_mode(&job.abs_dst, job.mode)?;
-
-    // Hard-fail SHA-1 check, per file. Zero-length files carry no checksum;
-    // nothing to compare.
+    // Hard-fail SHA-1 check, per file, BEFORE writing anything: a corrupt file
+    // must never be materialised (even transiently) at the target. Zero-length
+    // files carry no checksum; nothing to compare.
     let mut sha = Sha1::new();
     let mut sink = Vec::new();
     sha.process(plaintext, &mut sink)?;
@@ -1819,6 +2002,36 @@ fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), Comman
     {
         return Err(CommandError::Other(format!("restore checksum mismatch for {}", job.rel)));
     }
+
+    if let Some(parent) = job.abs_dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+    }
+
+    // Sibling temp path in the destination's own directory so the rename crosses
+    // no filesystem boundary (`rename(2)` is only atomic within one filesystem).
+    let mut tmp_name = job.abs_dst.as_os_str().to_os_string();
+    tmp_name.push(".pgbr.tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+
+    if let Err(err) = write_temp(&tmp_path, plaintext, job.mode) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    // Atomic publish. On failure the temp file is left/removed and the job fails.
+    if let Err(err) = std::fs::rename(&tmp_path, &job.abs_dst) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(CommandError::Other(format!(
+            "rename {} -> {}: {err}",
+            tmp_path.display(),
+            job.abs_dst.display()
+        )));
+    }
+
+    // Make the renamed-in directory entry durable (Unix; no-op elsewhere).
+    fsync_parent_dir(&job.abs_dst);
 
     Ok(())
 }
@@ -2135,6 +2348,129 @@ fn destination_absolute_path(storage: &dyn Storage, rel: &Path) -> Result<PathBu
     Ok(abs_parent.join(name))
 }
 
+/// Whether a [`StorageError`] is the "symlinks not supported by this backend"
+/// signal from the [`Storage::create_symlink`] trait default, as opposed to a
+/// genuine I/O failure. Only the former should be swallowed (counted as a
+/// skipped link); a real error must fail the restore.
+fn is_symlink_unsupported(err: &StorageError) -> bool {
+    matches!(err, StorageError::Backend { message, .. } if message.contains("symlinks not supported"))
+}
+
+/// Counts returned by [`materialize_links`].
+#[derive(Debug, Default, Clone, Copy)]
+struct LinkCounts {
+    created: usize,
+    skipped: usize,
+    as_dir: usize,
+}
+
+/// Materialise every `[target:link]` entry in the PG target.
+///
+/// Called **before** the file-copy pass so that `pg_tblspc/<oid>` (and other)
+/// symlinks — and the external tablespace target directories they point at —
+/// exist before any file is copied into them. Copying first would materialise
+/// `pg_tblspc/<oid>` as a real directory inside PGDATA and the tablespace would
+/// never be relocated.
+///
+/// Under the default `repo-symlink=y` each link becomes a real symlink at its
+/// (possibly remapped) destination. A backend that cannot create symlinks (the
+/// [`Storage::create_symlink`] trait default) leaves the link uncreated and
+/// counts it in `skipped`; a *genuine* I/O error creating a link is a hard
+/// failure. For a tablespace link the failure is always hard — a tablespace that
+/// silently did not relocate would corrupt the restore. Under `--no-repo-symlink`
+/// the entry is laid out as a plain directory inside PGDATA instead (counted in
+/// `as_dir`).
+fn materialize_links(
+    pg: &dyn Storage,
+    manifest: &Manifest,
+    want_repo_symlink: bool,
+    ts_map: &BTreeMap<String, String>,
+    ts_map_all: Option<&str>,
+    links_map: &BTreeMap<String, String>,
+    dry_run: bool,
+) -> Result<LinkCounts, CommandError> {
+    let mut counts = LinkCounts::default();
+    for link in &manifest.links {
+        let link_path = PathBuf::from(&link.path);
+        // Defensively create the link's parent directory (paths are created up
+        // front, but a link could sit in an unlisted path). Skipped on a dry run.
+        if !dry_run
+            && let Some(parent) = link_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            pg.create_path(parent, true)?;
+        }
+
+        let is_tablespace = tablespace_oid(link).is_some();
+        match link_plan(want_repo_symlink) {
+            LinkPlan::PlainDir => {
+                if dry_run {
+                    log_info(&format!("dry-run: would create directory {} (link as dir)", link.path));
+                } else {
+                    pg.create_path(&link_path, true)?;
+                }
+                counts.as_dir += 1;
+            }
+            LinkPlan::Symlink => {
+                let target = if is_tablespace {
+                    resolve_tablespace_target(link, ts_map, ts_map_all)
+                } else {
+                    PathBuf::from(resolve_link_target(
+                        link_relative_name(&link.path),
+                        &link.destination,
+                        links_map,
+                    ))
+                };
+                if dry_run {
+                    log_info(&format!(
+                        "dry-run: would create symlink {} -> {}",
+                        link.path,
+                        target.display()
+                    ));
+                    counts.created += 1;
+                    continue;
+                }
+
+                // For a TABLESPACE link, ensure the (possibly external) target
+                // directory exists so files copied through `pg_tblspc/<oid>` land
+                // in the real location; a missing tablespace target would make the
+                // copy fail or, worse, materialise the OID as a plain dir. Generic
+                // links (e.g. `pg_wal`) point at operator-managed directories that
+                // restore must not fabricate, so their target is left untouched
+                // (PostgreSQL / the operator owns it) — a dangling generic link is
+                // acceptable and matches pgBackRust.
+                if is_tablespace && let Err(err) = std::fs::create_dir_all(&target) {
+                    return Err(CommandError::Other(format!(
+                        "create tablespace target {}: {err}",
+                        target.display()
+                    )));
+                }
+
+                match pg.create_symlink(&link_path, &target) {
+                    Ok(()) => counts.created += 1,
+                    Err(ref err) if is_symlink_unsupported(err) && !is_tablespace => {
+                        // Backend genuinely cannot make symlinks and this is not a
+                        // tablespace — skip it (the restored bytes still land, just
+                        // not behind a link).
+                        counts.skipped += 1;
+                    }
+                    Err(err) => {
+                        // A tablespace link that could not be created, or a real
+                        // I/O error, fails the restore: silently swallowing it
+                        // would corrupt the cluster layout.
+                        return Err(CommandError::Other(format!(
+                            "create symlink {} -> {}: {err}",
+                            link.path,
+                            target.display()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
 /// Core restore pass. The thin [`restore`] entry point prints the outcome;
 /// tests assert against the returned [`RestoreOutcome`] directly.
 ///
@@ -2152,10 +2488,16 @@ fn destination_absolute_path(storage: &dyn Storage, rel: &Path) -> Result<PathBu
 pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage) -> Result<RestoreOutcome, CommandError> {
     let stanza = require_stanza(config)?;
     let delta = delta_enabled(config);
+    let force = force_enabled(config);
     let dry_run = dry_run_enabled(config);
     if dry_run {
         log_info("dry-run: no files will be restored and PGDATA will not be modified");
     }
+
+    // Pre-flight safety: refuse to restore over a running cluster (postmaster.pid)
+    // and refuse a non-empty PGDATA without --delta/--force. Run BEFORE any
+    // mutation so a refused restore leaves the target untouched.
+    preflight_pgdata(pg, delta, force, dry_run)?;
 
     // Selective-restore filters. `--db-include` and `--db-exclude` are mutually
     // exclusive: a database cannot be both kept-only and dropped.
@@ -2206,6 +2548,30 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         other => CommandError::Other(other.to_string()),
     })?;
 
+    // Validate every manifest-recorded relative path (paths, files, links) before
+    // any of them is joined onto the PG target. A corrupt or malicious manifest
+    // must not be able to steer a create/write/symlink at an absolute path or one
+    // that escapes PGDATA with `..`. Done up front so a bad entry fails the whole
+    // restore before any mutation.
+    for path in &manifest.paths {
+        validate_manifest_path("target:path", &path.path)?;
+    }
+    for file in &manifest.files {
+        validate_manifest_path("target:file", &file.path)?;
+    }
+    for link in &manifest.links {
+        validate_manifest_path("target:link", &link.path)?;
+        // The link *destination* is where the symlink points and may legitimately
+        // be an absolute external path (e.g. a tablespace location), so it is not
+        // validated as relative; but an empty destination is never valid.
+        if link.destination.is_empty() {
+            return Err(CommandError::Other(format!(
+                "manifest target:link '{}' has an empty destination",
+                link.path
+            )));
+        }
+    }
+
     // 1. Re-create every directory recorded in the manifest. A dry-run counts the
     //    directories it would create but makes none.
     let mut paths_created = 0;
@@ -2232,6 +2598,21 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             pg.create_path(Path::new(dir), true)?;
         }
     }
+
+    // 1c. Materialise `[target:link]` symlinks (and their external tablespace
+    //     target directories) BEFORE the copy pass. If the copy ran first it
+    //     would create `pg_tblspc/<oid>` as a real directory inside PGDATA and
+    //     the tablespace would never relocate. A tablespace link that cannot be
+    //     created is a hard error (see `materialize_links`).
+    let link_counts = materialize_links(
+        pg,
+        &manifest,
+        want_repo_symlink,
+        &ts_map,
+        ts_map_all.as_deref(),
+        &links_map,
+        dry_run,
+    )?;
 
     // 2. Plan every file copy on the main thread — reference resolution,
     //    db-include/exclude filtering, delta matching, and source-backup /
@@ -2381,98 +2762,68 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         0
     };
 
-    // 4. Materialise every `[target:link]` entry in the PG target. Under the
-    //    default `repo-symlink=y` this re-creates a real symlink at the link's
-    //    (possibly remapped) destination; a backend that cannot create symlinks
-    //    (the trait default) leaves the link uncreated and counted in
-    //    `skipped_links`. Under `--no-repo-symlink` the entry is laid out as a
-    //    plain directory inside PGDATA instead (counted in `links_as_dir`), so its
-    //    restored contents live in-place — no symlink is created.
-    let mut links_created = 0;
-    let mut skipped_links = 0;
-    let mut links_as_dir = 0;
-    for link in &manifest.links {
-        let link_path = PathBuf::from(&link.path);
-        // Defensively create the link's parent directory (paths are created up
-        // front, but a link could sit in an unlisted path). Skipped on a dry run.
-        if !dry_run
-            && let Some(parent) = link_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            pg.create_path(parent, true)?;
+    // 4. `[target:link]` symlinks were materialised in step 1c (before the copy
+    //    pass); reuse those counts.
+    let links_created = link_counts.created;
+    let skipped_links = link_counts.skipped;
+    let links_as_dir = link_counts.as_dir;
+
+    // 4b. Restore the backup's `backup_label` into the PGDATA root. pgBackRust
+    //     stores it at the backup root — it is written by `pg_backup_stop`, not
+    //     captured by the PGDATA walk — so the manifest's `[target:file]` set does
+    //     not list it and the copy loop never restores it. Without `backup_label`
+    //     present in PGDATA the restored cluster reads `pg_control` instead of the
+    //     backup's start checkpoint and recovery aborts with "could not locate a
+    //     valid checkpoint record". A DB-free (control-file-only) backup writes no
+    //     label, so a missing file is expected and not an error.
+    //
+    //     The backup's `tablespace_map` is deliberately NOT restored to the
+    //     PGDATA root as `tablespace_map`: it records the ORIGINAL tablespace
+    //     locations, which restore may have remapped (`--tablespace-map`), so
+    //     replaying it verbatim would make PostgreSQL create tablespace symlinks
+    //     at the stale locations and fight the ones restore just created. It is
+    //     instead written as `tablespace_map.old` for operator reference. C ref:
+    //     pgBackRust omits `tablespace_map` from the restored PGDATA.
+    if !dry_run {
+        // backup_label — restored verbatim as `backup_label`.
+        let label_src = PathBuf::from(format!("backup/{stanza}/{label}/backup_label"));
+        match repo.open_read(&label_src) {
+            Ok(mut reader) => {
+                let bytes = reader.read_all()?;
+                // Atomic + fsync'd on local backends (write_atomic_path).
+                pg.write_atomic_path(Path::new("backup_label"), &bytes)?;
+                log_info(&format!("restore: wrote backup_label ({} bytes) into PGDATA", bytes.len()));
+            }
+            Err(StorageError::NotFound { .. }) => {}
+            Err(err) => return Err(CommandError::Storage(err)),
         }
 
-        let is_tablespace = tablespace_oid(link).is_some();
-        match link_plan(want_repo_symlink) {
-            LinkPlan::PlainDir => {
-                // `--no-repo-symlink`: create the link's path as a real directory
-                // inside PGDATA so its restored contents land in-place. A dry run
-                // only counts it.
-                if dry_run {
-                    log_info(&format!("dry-run: would create directory {} (link as dir)", link.path));
-                } else {
-                    pg.create_path(&link_path, true)?;
-                }
-                links_as_dir += 1;
+        // tablespace_map — preserved as `tablespace_map.old` only (never as the
+        // live `tablespace_map`, see above).
+        let ts_src = PathBuf::from(format!("backup/{stanza}/{label}/tablespace_map"));
+        match repo.open_read(&ts_src) {
+            Ok(mut reader) => {
+                let bytes = reader.read_all()?;
+                pg.write_atomic_path(Path::new("tablespace_map.old"), &bytes)?;
+                log_info(&format!(
+                    "restore: wrote tablespace_map.old ({} bytes) into PGDATA (not restored as live tablespace_map)",
+                    bytes.len()
+                ));
             }
-            LinkPlan::Symlink => {
-                // Tablespace links (`pg_tblspc/<oid>`) may be redirected by
-                // `--tablespace-map` / `--tablespace-map-all`; non-tablespace links
-                // may be redirected by `--link-map` (keyed on the link's
-                // PG-data-relative name). A tablespace link is never subject to
-                // `--link-map` (the C generator errors on that), so only
-                // non-tablespace links consult it.
-                let target = if is_tablespace {
-                    resolve_tablespace_target(link, &ts_map, ts_map_all.as_deref())
-                } else {
-                    PathBuf::from(resolve_link_target(
-                        link_relative_name(&link.path),
-                        &link.destination,
-                        &links_map,
-                    ))
-                };
-                if dry_run {
-                    // No symlink is created; report the intended link and count it
-                    // as a would-be creation.
-                    log_info(&format!(
-                        "dry-run: would create symlink {} -> {}",
-                        link.path,
-                        target.display()
-                    ));
-                    links_created += 1;
-                } else {
-                    match pg.create_symlink(&link_path, &target) {
-                        Ok(()) => links_created += 1,
-                        Err(_) => skipped_links += 1,
-                    }
-                }
-            }
+            Err(StorageError::NotFound { .. }) => {}
+            Err(err) => return Err(CommandError::Storage(err)),
         }
     }
 
-    // 4b. Restore the backup's `backup_label` (and `tablespace_map`) into the
-    //     PGDATA root. pgBackRust stores these at the backup root — they are
-    //     written by `pg_backup_stop`, not captured by the PGDATA walk — so the
-    //     manifest's `[target:file]` set does not list them and the copy loop
-    //     above never restores them. Without `backup_label` present in PGDATA the
-    //     restored cluster reads `pg_control` instead of the backup's start
-    //     checkpoint and recovery aborts with "could not locate a valid
-    //     checkpoint record". A DB-free (control-file-only) backup writes no
-    //     label, so a missing file is expected and not an error.
-    if !dry_run {
-        for name in ["backup_label", "tablespace_map"] {
-            let src = PathBuf::from(format!("backup/{stanza}/{label}/{name}"));
-            match repo.open_read(&src) {
-                Ok(mut reader) => {
-                    let bytes = reader.read_all()?;
-                    let mut writer = pg.open_write(Path::new(name))?;
-                    writer.write(&bytes)?;
-                    writer.flush()?;
-                    log_info(&format!("restore: wrote {name} ({} bytes) into PGDATA", bytes.len()));
-                }
-                Err(StorageError::NotFound { .. }) => {}
-                Err(err) => return Err(CommandError::Storage(err)),
-            }
+    // 4c. Remove any residual recovery-signal / recovery-config files from a
+    //     previous cluster life before writing fresh ones, so a stale
+    //     `recovery.signal` / `standby.signal` / `recovery.conf` cannot survive a
+    //     `--delta`/`--force` restore and drive the wrong recovery mode. Skipped
+    //     for `--type=preserve` (the operator asked to keep the existing recovery
+    //     configuration) and on dry-run.
+    if !dry_run && !recovery_preserve(config) {
+        for name in ["recovery.signal", "standby.signal", "recovery.conf"] {
+            pg.remove(Path::new(name), false)?;
         }
     }
 
@@ -2707,6 +3058,14 @@ mod tests {
             options,
             params: Vec::new(),
         }
+    }
+
+    /// Set `--force` on a config so the non-empty-`PGDATA` pre-flight guard is
+    /// bypassed (used by tests that intentionally pre-seed the restore target
+    /// before a non-delta restore).
+    fn with_force(mut config: LoadedConfig) -> LoadedConfig {
+        config.options.insert(("force".to_owned(), None), OptionValue::Boolean(true));
+        config
     }
 
     /// A paired (repo, pg-target) of `Posix` storages, each over its own tempdir.
@@ -3237,7 +3596,9 @@ mod tests {
             b"# existing setting\nshared_buffers = '128MB'\n",
         );
 
-        let outcome = restore_inner(&cfg_recovery(stanza, None, None, false), &repo_s, &pg_s).expect("restore");
+        // Pre-seeding the target makes PGDATA non-empty; --force lets the
+        // non-delta restore proceed past the pre-flight guard.
+        let outcome = restore_inner(&with_force(cfg_recovery(stanza, None, None, false)), &repo_s, &pg_s).expect("restore");
         assert_eq!(
             outcome.recovery_files_written,
             vec!["postgresql.auto.conf".to_owned(), "recovery.signal".to_owned()]
@@ -3808,7 +4169,8 @@ mod tests {
         // A stray file that delta would remove but a normal restore leaves alone.
         seed_pg_file(&pg_s, "pg_data/stray.txt", b"untouched without delta");
 
-        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        // Non-empty target + non-delta => --force is required past the pre-flight guard.
+        let outcome = restore_inner(&with_force(cfg(Some(stanza), None)), &repo_s, &pg_s).expect("restore");
         assert_eq!(outcome.files_restored, 1, "matching file is still restored without --delta");
         assert_eq!(outcome.files_skipped, 0);
         assert_eq!(outcome.files_removed, 0);
@@ -6545,6 +6907,124 @@ mod tests {
         assert!(
             !super::target_matches(&pg_serial, Path::new("pg_data/sized.txt"), &file),
             "size mismatch must short-circuit target_matches on the serial path"
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_running_cluster() {
+        // A postmaster.pid in the target is a hard error regardless of --delta/--force.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["pg_data"], &[]);
+        seed_pg_file(&pg_s, "postmaster.pid", b"12345\n/pgdata\n");
+
+        // Even --delta + --force must not restore over a live cluster.
+        let cfg = with_force(cfg_delta(Some(stanza), None, true));
+        let err = restore_inner(&cfg, &repo_s, &pg_s).expect_err("postmaster.pid must fail restore");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("postmaster.pid"), "unexpected error: {msg}"),
+            other => panic!("expected Other(postmaster.pid), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_non_empty_pgdata_without_delta_or_force() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["pg_data"], &[]);
+        // Populate the target so it is non-empty.
+        seed_pg_file(&pg_s, "leftover.txt", b"stale");
+
+        // Plain restore refuses.
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("non-empty PGDATA must fail");
+        match err {
+            CommandError::Other(msg) => assert!(msg.contains("not empty"), "unexpected error: {msg}"),
+            other => panic!("expected Other(not empty), got {other:?}"),
+        }
+
+        // --force lets it proceed.
+        restore_inner(&with_force(cfg(Some(stanza), None)), &repo_s, &pg_s).expect("--force must bypass the guard");
+    }
+
+    #[test]
+    fn preflight_allows_empty_pgdata() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["pg_data"], &[]);
+        // Empty target: plain restore proceeds.
+        restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("empty PGDATA must restore");
+    }
+
+    #[test]
+    fn parse_civil_time_applies_timezone_offset() {
+        // 12:00:00 at +02:00 is 10:00:00 UTC.
+        let with_tz = super::parse_civil_time("2024-01-01 12:00:00+02:00").expect("parse +02:00");
+        let utc = super::parse_civil_time("2024-01-01 10:00:00").expect("parse utc");
+        assert_eq!(with_tz, utc, "an east offset must shift the value earlier in UTC");
+
+        // A west offset shifts the other way: 12:00:00-05 == 17:00:00 UTC.
+        let west = super::parse_civil_time("2024-01-01T12:00:00-05").expect("parse -05");
+        let west_utc = super::parse_civil_time("2024-01-01 17:00:00").expect("parse utc2");
+        assert_eq!(west, west_utc);
+
+        // `Z` is a zero offset.
+        let z = super::parse_civil_time("2024-01-01 08:30:00Z").expect("parse Z");
+        assert_eq!(z, super::parse_civil_time("2024-01-01 08:30:00").expect("parse no-tz"));
+
+        // Compact `±HHMM` form.
+        let compact = super::parse_civil_time("2024-01-01 12:00:00+0230").expect("parse +0230");
+        assert_eq!(compact, super::parse_civil_time("2024-01-01 09:30:00").expect("parse utc3"));
+    }
+
+    #[test]
+    fn escape_guc_doubles_apostrophes() {
+        assert_eq!(super::escape_guc("plain"), "plain");
+        assert_eq!(super::escape_guc("O'Brien"), "O''Brien");
+        assert_eq!(super::escape_guc("a'b'c"), "a''b''c");
+    }
+
+    #[test]
+    fn validate_manifest_path_rejects_escaping_paths() {
+        assert!(super::validate_manifest_path("target:file", "base/1/1259").is_ok());
+        assert!(super::validate_manifest_path("target:file", "").is_err());
+        assert!(super::validate_manifest_path("target:file", "../../etc/passwd").is_err());
+        assert!(super::validate_manifest_path("target:file", "base/../../secret").is_err());
+        assert!(super::validate_manifest_path("target:file", "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn restore_removes_residual_signal_files() {
+        // A pre-existing recovery.signal / standby.signal from a prior cluster
+        // life must be removed before fresh recovery files are written (PG >= 12).
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["pg_data"], &[]);
+        // Residual files + something to make the target non-empty (needs --force).
+        seed_pg_file(&pg_s, "standby.signal", b"");
+        seed_pg_file(&pg_s, "recovery.conf", b"restore_command = 'old'\n");
+
+        // Default (non-standby) PG 14 restore writes recovery.signal, so the stale
+        // standby.signal and recovery.conf must be gone.
+        restore_inner(&with_force(cfg_recovery(stanza, None, None, false)), &repo_s, &pg_s).expect("restore");
+        assert!(
+            !pg_s.exists(Path::new("standby.signal")).unwrap(),
+            "stale standby.signal must be removed"
+        );
+        assert!(
+            !pg_s.exists(Path::new("recovery.conf")).unwrap(),
+            "stale recovery.conf must be removed"
+        );
+        assert!(
+            pg_s.exists(Path::new("recovery.signal")).unwrap(),
+            "fresh recovery.signal must be written"
         );
     }
 }
