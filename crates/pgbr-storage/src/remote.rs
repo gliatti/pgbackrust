@@ -102,6 +102,9 @@ pub mod command {
     pub const REMOVE_PATH: &str = "storage-remove-path";
     /// `Storage::create_symlink` — params: `[link_path, target]`; out: `{}`.
     pub const CREATE_SYMLINK: &str = "storage-create-symlink";
+    /// `Storage::read_link` — params: `[path]`; out: `{ "target": string }`
+    /// carrying the symlink's target as a UTF-8(-lossy) string.
+    pub const READ_LINK: &str = "storage-read-link";
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +334,15 @@ impl<R: IoRead + Send + 'static, W: IoWrite + Send + 'static> Storage for Remote
             vec![path_param(link_path), path_param(target)],
         )?;
         Ok(())
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        let out = self.execute(path, command::READ_LINK, vec![path_param(path)])?;
+        let target = out
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| backend(path, "storage-read-link: missing 'target' field in response"))?;
+        Ok(PathBuf::from(target))
     }
 }
 
@@ -679,6 +691,11 @@ impl<S: Storage> StorageRequestHandler<S> {
                 let target = param_path(req, 1)?;
                 self.storage.create_symlink(&link_path, &target)?;
                 Ok(ok_empty())
+            }
+            command::READ_LINK => {
+                let path = param_path(req, 0)?;
+                let target = self.storage.read_link(&path)?;
+                Ok(ok(json!({ "target": target.to_string_lossy() })))
             }
             other => Err(backend(Path::new(""), &format!("unknown storage command: {other}"))),
         }
@@ -1110,6 +1127,45 @@ mod tests {
 
         remote.close().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn read_link_reaches_dispatch_and_returns_target() {
+        // A symlink under the worker's root must round-trip through the
+        // `storage-read-link` command: the client sends the request, the handler
+        // resolves it against the backing Posix, and the recorded target comes
+        // back verbatim. This is what a remote-PGDATA backup relies on to record
+        // tablespace symlink targets (an empty target would make them
+        // unrestorable).
+        let (remote, server, _dir, posix) = wire();
+
+        // Seed a symlink via the backing Posix directly so we exercise the
+        // read-link path alone (the target is written into the link verbatim,
+        // exactly as a manifest records it).
+        let target = Path::new("/mnt/tablespace/ts1");
+        posix.create_symlink(Path::new("pg_tblspc_link"), target).unwrap();
+
+        let got = remote.read_link(Path::new("pg_tblspc_link")).unwrap();
+        assert_eq!(got, target, "storage-read-link must return the recorded symlink target");
+
+        remote.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn read_link_rejects_parent_dir_traversal() {
+        // The read-link param goes through the same path validator as every
+        // other command: a peer must not read a link outside the worker's root.
+        let dir = TempDir::new().unwrap();
+        let mut handler = StorageRequestHandler::new(Posix::new(dir.path()));
+        let resp = handler.handle(&Request {
+            cmd: command::READ_LINK.to_owned(),
+            param: vec![json!("../../etc/passwd")],
+        });
+        match resp {
+            Response::Err(err) => assert!(err.message.contains("path validation"), "unexpected message {}", err.message),
+            Response::Ok(_) => panic!("expected traversal path to be rejected"),
+        }
     }
 
     #[test]

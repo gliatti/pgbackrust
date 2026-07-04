@@ -224,37 +224,19 @@ fn transform_segment(transform: &RepoTransform, bytes: &[u8]) -> Result<Vec<u8>,
 /// Crash-safe local write for the parallel drain/prefetch workers, which run on
 /// absolute host paths outside the [`Storage`] trait.
 ///
-/// Writes `bytes` to a sibling `<path>.pgbackrust.tmp`, fsyncs it, then
-/// atomically renames it onto `path` — the same temp+fsync+rename+parent-dir-fsync guarantee
+/// A thin adapter over the shared [`pgbr_storage::atomic_write_file`] primitive
+/// (temp + fsync + atomic rename + parent-directory fsync) — the same guarantee
 /// [`Storage::write_atomic_path`] gives the serial path, so a crashed worker
-/// never leaves a torn WAL segment in the repository. A best-effort cleanup
-/// removes the temp on a failed rename.
-fn write_atomic_std(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp_name = path
-        .file_name()
-        .map_or_else(|| std::ffi::OsString::from("pgbackrust"), std::ffi::OsString::from);
-    tmp_name.push(".pgbackrust.tmp");
-    let tmp = parent.map_or_else(|| PathBuf::from(&tmp_name), |parent| parent.join(&tmp_name));
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    // Durability of the rename itself: fsync the parent directory so the
-    // published name survives a power loss, matching Storage::write_atomic_path
-    // (Posix write_atomic_local). Unix only; a clean no-op on Windows.
-    #[cfg(unix)]
-    {
-        let dir = parent.unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+/// never leaves a torn WAL segment in the repository. The temp/rename mechanics
+/// live in one place (`pgbr-storage`) so this path and the `Posix` backend can
+/// never drift.
+///
+/// # Errors
+///
+/// Surfaces any [`pgbr_storage::StorageError`] from the underlying write (create,
+/// `write_all`, `sync_all`, rename, or parent-directory fsync).
+fn write_atomic_std(path: &Path, bytes: &[u8]) -> Result<(), pgbr_storage::StorageError> {
+    pgbr_storage::atomic_write_file(path, bytes)
 }
 
 /// Run `bytes` through `filter` (process + finish) and return the transformed
@@ -294,6 +276,13 @@ enum PushIdempotency {
     /// A file already exists and its plaintext content matches the segment
     /// being pushed — nothing to do (an idempotent re-push).
     Identical,
+    /// A file already exists but could NOT be decoded (torn / truncated /
+    /// corrupt — the residue of a crash mid-write). It is self-healed by
+    /// overwriting: an undecodable object carries no trustworthy content to
+    /// preserve, so re-writing the fresh segment is strictly safer than failing
+    /// the push forever. Distinct from a *decodable-but-different* object, which
+    /// is a genuine name collision and still a hard error.
+    Overwrite,
 }
 
 /// Decide whether pushing the plaintext `plain` segment to `dst_path` in `dst`
@@ -304,19 +293,28 @@ enum PushIdempotency {
 /// archiver for the same segment after a crash / retry, so a segment that is
 /// already present must succeed silently rather than be blindly overwritten —
 /// but only when the stored content is the *same* WAL. A segment already present
-/// with **different** content is corruption (two different WAL records claiming
-/// the same segment name) and must fail loudly, never be clobbered. Because an
-/// encrypted repo stores non-deterministic ciphertext (`Salted__` + random
-/// salt), the comparison is on the reversed *plaintext*, not the raw stored
-/// bytes: the existing file is decoded through `transform` before comparing to
-/// `plain`. C ref: `archivePushFile()` in `src/command/archive/push/push.c`,
-/// which compares checksums and treats a mismatch as an error.
+/// with **different** (decodable) content is corruption (two different WAL
+/// records claiming the same segment name) and must fail loudly, never be
+/// clobbered. Because an encrypted repo stores non-deterministic ciphertext
+/// (`Salted__` + random salt), the comparison is on the reversed *plaintext*,
+/// not the raw stored bytes: the existing file is decoded through `transform`
+/// before comparing to `plain`. C ref: `archivePushFile()` in
+/// `src/command/archive/push/push.c`, which compares checksums and treats a
+/// mismatch as an error.
+///
+/// Self-heal: if the existing object cannot be *decoded* at all (torn /
+/// truncated / corrupt ciphertext left by a crash mid-write, or a bad
+/// decompress stream), it carries no trustworthy content to preserve. Rather
+/// than fail the push forever against that undecodable residue, treat it as
+/// [`PushIdempotency::Overwrite`] and re-write the fresh segment. The
+/// decodable-but-different case is still a hard error — the distinction is
+/// exactly *undecodable ⇒ overwrite* vs *decodable-but-different ⇒ error*.
 ///
 /// # Errors
 ///
-/// [`CommandError::Other`] when a file already exists whose plaintext differs
-/// from `plain`. [`CommandError::Storage`] / [`CommandError::Io`] on a storage
-/// read or a decode failure.
+/// [`CommandError::Other`] when a file already exists whose plaintext decodes
+/// but differs from `plain`. [`CommandError::Storage`] / [`CommandError::Io`] on
+/// a storage read failure.
 fn probe_push_idempotency(
     dst: &dyn Storage,
     dst_path: &Path,
@@ -328,7 +326,11 @@ fn probe_push_idempotency(
         return Ok(PushIdempotency::Absent);
     }
     let stored = read_segment(dst, dst_path)?;
-    let existing = transform.apply_reverse_keyed(&stored).map_err(CommandError::from)?;
+    // Decode failure ⇒ the existing object is torn/corrupt (crash residue).
+    // Self-heal by overwriting rather than failing durably.
+    let Ok(existing) = transform.apply_reverse_keyed(&stored) else {
+        return Ok(PushIdempotency::Overwrite);
+    };
     if existing == plain {
         Ok(PushIdempotency::Identical)
     } else {
@@ -1051,12 +1053,13 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     let dest = repo_segment_path(stanza, &archive_id, &format!("{segment}{}", compress_suffix(config)));
     for (repo, transform) in repo_storages.iter().zip(transforms.iter()) {
         // Idempotency guard: a crash/retry may re-push a segment already in the
-        // repo. Identical content ⇒ success without re-writing; different
-        // content ⇒ hard error (never clobber a distinct WAL under the same
-        // name). Mirrors upstream archivePushFile.
+        // repo. Identical content ⇒ success without re-writing; decodable-but-
+        // different content ⇒ hard error (never clobber a distinct WAL under the
+        // same name); undecodable (torn/corrupt) content ⇒ overwrite to
+        // self-heal a crash-time residue. Mirrors upstream archivePushFile.
         match probe_push_idempotency(*repo, &dest, &bytes, transform, segment)? {
             PushIdempotency::Identical => continue,
-            PushIdempotency::Absent => {}
+            PushIdempotency::Absent | PushIdempotency::Overwrite => {}
         }
         let stored = transform_segment(transform, &bytes)?;
         write_segment(&stored, *repo, &dest)?;
@@ -1516,18 +1519,21 @@ fn drain_out_spool_parallel(
             let dest = dir.join(format!("{segment}{}", transform.repo_suffix()));
             // Idempotency guard (parallel path): if the segment is already at
             // `dest`, compare on the reversed plaintext — identical ⇒ skip the
-            // re-write, different ⇒ a hard error. Then write crash-safely.
+            // re-write, decodable-but-different ⇒ a hard error, undecodable
+            // (torn/corrupt crash residue) ⇒ fall through and overwrite to
+            // self-heal. Then write crash-safely.
             if let Ok(existing_stored) = std::fs::read(&dest) {
-                let existing = transform
-                    .apply_reverse_keyed(&existing_stored)
-                    .map_err(|err| err.to_string())?;
-                if existing == bytes {
-                    continue;
+                match transform.apply_reverse_keyed(&existing_stored) {
+                    Ok(existing) if existing == bytes => continue,
+                    Ok(_) => {
+                        return Err(format!(
+                            "WAL segment already exists with different content: {}",
+                            dest.display()
+                        ));
+                    }
+                    // Undecodable existing object: self-heal by overwriting.
+                    Err(_) => {}
                 }
-                return Err(format!(
-                    "WAL segment already exists with different content: {}",
-                    dest.display()
-                ));
             }
             let stored = transform.apply_forward_keyed(&bytes).map_err(|err| err.to_string())?;
             write_atomic_std(&dest, &stored).map_err(|err| format!("write {}: {err}", dest.display()))?;
@@ -1605,11 +1611,12 @@ fn drain_one_to_targets(
         );
         // Idempotency guard: a crash mid-drain re-runs this fan-out. If the
         // segment is already in this target with identical plaintext, skip it;
-        // if it differs, fail loudly rather than clobber. Mirrors upstream
-        // archivePushFile.
+        // if it decodes but differs, fail loudly rather than clobber; if it is
+        // undecodable (torn/corrupt crash residue), overwrite to self-heal.
+        // Mirrors upstream archivePushFile.
         match probe_push_idempotency(target.repo, &dest, &bytes, target.transform, segment)? {
             PushIdempotency::Identical => continue,
-            PushIdempotency::Absent => {}
+            PushIdempotency::Absent | PushIdempotency::Overwrite => {}
         }
         let stored = transform_segment(target.transform, &bytes)?;
         write_segment(&stored, target.repo, &dest)?;
@@ -1681,17 +1688,21 @@ fn drain_one_to_targets_parallel(
             .ok_or_else(|| format!("drain-target: no transform for index {idx_usize}"))?;
         // Idempotency guard (parallel path): a crash mid-drain re-runs this
         // fan-out. If the destination already holds this segment, compare on
-        // the reversed plaintext — identical ⇒ skip the re-write, different ⇒
-        // a distinct WAL under the same name, a hard error. Mirrors the serial
-        // path's `probe_push_idempotency`.
+        // the reversed plaintext — identical ⇒ skip the re-write, decodable-but-
+        // different ⇒ a distinct WAL under the same name, a hard error;
+        // undecodable (torn/corrupt crash residue) ⇒ fall through and overwrite
+        // to self-heal. Mirrors the serial path's `probe_push_idempotency`.
         if let Ok(existing_stored) = std::fs::read(dest_abs) {
-            let existing = transform
-                .apply_reverse_keyed(&existing_stored)
-                .map_err(|err| err.to_string())?;
-            if existing == *closure_bytes {
-                return Ok(Response::Ok(OkResponse { out: None }));
+            match transform.apply_reverse_keyed(&existing_stored) {
+                Ok(existing) if existing == *closure_bytes => {
+                    return Ok(Response::Ok(OkResponse { out: None }));
+                }
+                Ok(_) => {
+                    return Err(format!("WAL segment already exists with different content: {dest_abs}"));
+                }
+                // Undecodable existing object: self-heal by overwriting.
+                Err(_) => {}
             }
-            return Err(format!("WAL segment already exists with different content: {dest_abs}"));
         }
         let stored = transform.apply_forward_keyed(&closure_bytes).map_err(|err| err.to_string())?;
         write_atomic_std(Path::new(dest_abs), &stored).map_err(|err| format!("write {dest_abs}: {err}"))?;
@@ -3776,6 +3787,42 @@ mod tests {
         put(&repo_s, &dest, b"a-completely-different-wal-segment");
         let err = push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect_err("conflicting re-push must error");
         assert!(matches!(err, CommandError::Other(msg) if msg.contains("already exists with different content")));
+    }
+
+    #[test]
+    fn archive_push_self_heals_undecodable_existing_object() {
+        // A crash mid-write can leave a torn / corrupt object at the
+        // destination that no longer decodes. The idempotency probe must treat
+        // an UNDECODABLE existing object as absent and overwrite it (self-heal)
+        // rather than fail the push forever. A `.gz` repo makes the distinction
+        // sharp: garbage bytes at `<segment>.gz` are not a valid gzip stream, so
+        // the reverse transform errors — which must resolve to an overwrite, not
+        // an "already exists with different content" error.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config_compress(Some("demo"), vec![wal_source], "gz");
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+
+        // Seed the destination with undecodable garbage (not a gzip stream),
+        // simulating a torn object left by a crash mid-write.
+        let dest = format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}.gz");
+        put(&repo_s, &dest, b"\x00\x01\x02-not-a-gzip-stream-torn-residue");
+
+        // The push must succeed by overwriting the torn object rather than
+        // erroring on "different content".
+        push(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("push self-heals a torn existing object");
+
+        // The stored object now decodes back to the fresh WAL body.
+        let stored = read(&repo_s, &dest);
+        let transform = RepoTransform::with_key(CompressType::Gz, 3, None);
+        let recovered = transform
+            .apply_reverse_keyed(&stored)
+            .expect("healed object decodes as valid gzip");
+        assert_eq!(recovered, WAL_BODY, "torn object was overwritten with the fresh segment");
     }
 
     // -----------------------------------------------------------------------

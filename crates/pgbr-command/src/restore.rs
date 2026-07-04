@@ -859,12 +859,19 @@ fn parse_civil_time(raw: &str) -> Option<i64> {
 /// where the body has any trailing timezone designator removed and
 /// `tz_offset_secs` is the zone's offset east of UTC in seconds (`Some(0)` for
 /// `Z`), or `None` when no zone was present. Accepts `Z`, `±HH`, `±HHMM`, and
-/// `±HH:MM`. A malformed offset is treated as "no zone" so the value falls back
-/// to UTC rather than mis-parsing.
+/// `±HH:MM`, each optionally separated from the time by whitespace (e.g.
+/// `12:00:00 +02:00`). A malformed offset is treated as "no zone" so the value
+/// falls back to UTC rather than mis-parsing.
+///
+/// The returned body is always trimmed of the whitespace that may separate the
+/// time from the zone, so an offset written as `HH:MM:SS +ZZ:ZZ` never leaves a
+/// stray space clinging to the seconds (or minutes) field for the caller's
+/// `:`-split to choke on.
 fn split_timezone(time: &str) -> (&str, Option<i64>) {
     let time = time.trim();
     if let Some(body) = time.strip_suffix(['Z', 'z']) {
-        return (body, Some(0));
+        // Trim any space that separated the time body from a `Z`/`z` designator.
+        return (body.trim_end(), Some(0));
     }
 
     // Find the sign that introduces the offset. Scan from the end so a `-` inside
@@ -887,7 +894,10 @@ fn split_timezone(time: &str) -> (&str, Option<i64>) {
             _ => (-1, -1),
         };
         if (0..=23).contains(&oh) && (0..=59).contains(&om) {
-            return (body, Some(sign * (oh * 3600 + om * 60)));
+            // Trim the optional whitespace that separated the time from the
+            // offset (e.g. `12:00:00 +02:00`) so the caller's `:`-split sees a
+            // clean `HH:MM[:SS]` body.
+            return (body.trim_end(), Some(sign * (oh * 3600 + om * 60)));
         }
         // Malformed offset: ignore it and treat the value as UTC.
     }
@@ -1933,23 +1943,6 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// `fsync(2)` the directory containing `path` so a freshly renamed-in file's
-/// directory entry is itself durable across a power loss. On Unix opening a
-/// directory and calling `sync_all` flushes its metadata. A missing / unopenable
-/// parent is a best-effort no-op (the file write already succeeded). Clean no-op
-/// on non-Unix.
-#[cfg(unix)]
-fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) {}
-
 /// Write the recovered `plaintext` to the job's destination and verify it.
 ///
 /// Shared by [`restore_file`] (the local `std::fs` fast path) and
@@ -1963,36 +1956,20 @@ fn fsync_parent_dir(_path: &Path) {}
 /// # Durability + atomicity
 ///
 /// The plaintext SHA-1 is checked **before** anything is written, so a corrupt
-/// file never touches the target. The bytes are then streamed to a sibling
-/// `<dst>.pgbr.tmp`, `fsync`'d (`sync_all`), and atomically `rename`'d onto the
-/// final path — a crash mid-restore can never leave a half-written or truncated
-/// data file at the real name. On any failure the temp file is removed
-/// (best-effort). A checksum mismatch is a hard error so the failing job fails
-/// the whole restore.
+/// file never touches the target. Publication (temp write + `fsync` + atomic
+/// `rename` + parent-directory `fsync`) is delegated to the shared
+/// [`pgbr_storage::atomic_write_file`] primitive — a crash mid-restore can never
+/// leave a half-written or truncated data file at the real name. The
+/// restore-specific steps kept here are the plaintext-SHA-1 pre-check (a
+/// mismatch is a hard error that fails the whole restore before anything is
+/// written) and re-applying the manifest-recorded Unix mode to the published
+/// file.
 fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), CommandError> {
-    // Write + fsync the temp file, then re-apply the recorded Unix mode to it
-    // (before the rename so the published name is never briefly world-readable
-    // at the default mode). Any failure removes the temp file. `write_temp`
-    // does the fallible steps; the caller cleans up on error.
-    fn write_temp(tmp_path: &Path, plaintext: &[u8], mode: Option<u32>) -> Result<(), CommandError> {
-        use std::io::Write as _;
-        let mut file =
-            std::fs::File::create(tmp_path).map_err(|err| CommandError::Other(format!("create {}: {err}", tmp_path.display())))?;
-        file.write_all(plaintext)
-            .map_err(|err| CommandError::Other(format!("write {}: {err}", tmp_path.display())))?;
-        // Durability: flush the data to stable storage before the rename.
-        file.sync_all()
-            .map_err(|err| CommandError::Other(format!("fsync {}: {err}", tmp_path.display())))?;
-        // Re-apply the recorded Unix file mode (if any). On non-Unix this is a
-        // no-op. uid/gid are recorded-only — re-applying owner needs privilege
-        // and is a documented follow-up. C ref: chmod in
-        // `src/command/restore/restore.c`.
-        apply_mode(tmp_path, mode)
-    }
-
     // Hard-fail SHA-1 check, per file, BEFORE writing anything: a corrupt file
     // must never be materialised (even transiently) at the target. Zero-length
-    // files carry no checksum; nothing to compare.
+    // files carry no checksum; nothing to compare. This is the "suppression sur
+    // mismatch" guarantee — the file is never written, so there is nothing to
+    // remove.
     let mut sha = Sha1::new();
     let mut sink = Vec::new();
     sha.process(plaintext, &mut sink)?;
@@ -2009,29 +1986,16 @@ fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), Comman
         std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
     }
 
-    // Sibling temp path in the destination's own directory so the rename crosses
-    // no filesystem boundary (`rename(2)` is only atomic within one filesystem).
-    let mut tmp_name = job.abs_dst.as_os_str().to_os_string();
-    tmp_name.push(".pgbr.tmp");
-    let tmp_path = PathBuf::from(tmp_name);
+    // Atomic publish: temp write + fsync + rename + parent-dir fsync, all handled
+    // by the shared primitive (identical logic to the Posix backend). On failure
+    // the primitive leaves no primary at the target name.
+    pgbr_storage::atomic_write_file(&job.abs_dst, plaintext).map_err(CommandError::Storage)?;
 
-    if let Err(err) = write_temp(&tmp_path, plaintext, job.mode) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-
-    // Atomic publish. On failure the temp file is left/removed and the job fails.
-    if let Err(err) = std::fs::rename(&tmp_path, &job.abs_dst) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(CommandError::Other(format!(
-            "rename {} -> {}: {err}",
-            tmp_path.display(),
-            job.abs_dst.display()
-        )));
-    }
-
-    // Make the renamed-in directory entry durable (Unix; no-op elsewhere).
-    fsync_parent_dir(&job.abs_dst);
+    // Re-apply the recorded Unix file mode (if any) to the published file. On
+    // non-Unix this is a no-op. uid/gid are recorded-only — re-applying owner
+    // needs privilege and is a documented follow-up. C ref: chmod in
+    // `src/command/restore/restore.c`.
+    apply_mode(&job.abs_dst, job.mode)?;
 
     Ok(())
 }
@@ -6982,6 +6946,32 @@ mod tests {
         // Compact `±HHMM` form.
         let compact = super::parse_civil_time("2024-01-01 12:00:00+0230").expect("parse +0230");
         assert_eq!(compact, super::parse_civil_time("2024-01-01 09:30:00").expect("parse utc3"));
+    }
+
+    #[test]
+    fn parse_civil_time_handles_space_before_offset() {
+        // A `--target` with a space between the time and the zone offset (e.g.
+        // `2024-01-01 12:00:00 +02:00`) must parse identically to the compact
+        // form and apply the offset — not silently drop the whole target.
+        let spaced = super::parse_civil_time("2024-01-01 12:00:00 +02:00").expect("parse spaced +02:00");
+        let compact = super::parse_civil_time("2024-01-01 12:00:00+02:00").expect("parse compact +02:00");
+        let utc = super::parse_civil_time("2024-01-01 10:00:00").expect("parse utc");
+        assert_eq!(spaced, compact, "a space before the offset must not change the parse");
+        assert_eq!(spaced, utc, "the east offset must still shift the value earlier in UTC");
+
+        // The seconds-less body must survive the trailing space too:
+        // `12:00 +02:00` == `10:00 UTC`.
+        let spaced_no_secs = super::parse_civil_time("2024-01-01 12:00 +02:00").expect("parse spaced no-secs");
+        assert_eq!(spaced_no_secs, utc, "trailing space must not corrupt the minute field");
+
+        // A `T` separator with a spaced offset works as well, as does a spaced `Z`.
+        let t_spaced = super::parse_civil_time("2024-01-01T12:00:00 -05").expect("parse T spaced -05");
+        assert_eq!(
+            t_spaced,
+            super::parse_civil_time("2024-01-01 17:00:00").expect("parse utc west")
+        );
+        let z_spaced = super::parse_civil_time("2024-01-01 08:30:00 Z").expect("parse spaced Z");
+        assert_eq!(z_spaced, super::parse_civil_time("2024-01-01 08:30:00").expect("parse no-tz"));
     }
 
     #[test]

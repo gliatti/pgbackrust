@@ -788,19 +788,18 @@ impl Storage for S3 {
         }
 
         let canonical_uri = self.bucket_canonical_uri();
-        let mut entries: Vec<StorageInfo> = Vec::new();
-        // Follow `IsTruncated` / `NextContinuationToken` until the listing is
-        // exhausted, so a listing larger than the per-response cap (1000 keys)
-        // is returned in full rather than silently truncated to the first page.
-        let mut continuation_token: Option<String> = None;
 
-        loop {
+        // Follow `IsTruncated` / `NextContinuationToken` until the listing is
+        // exhausted (via the shared paginate driver), so a listing larger than
+        // the per-response cap (1000 keys) is returned in full rather than
+        // silently truncated to the first page.
+        let mut entries = crate::pagination::paginate(|marker: Option<&str>| {
             let timestamp = Self::now_timestamp();
             // Canonical query string: params sorted by name, both name and value
             // percent-encoded (slashes too). `continuation-token` sorts before
             // both `list-type` and `prefix`.
             let mut query = String::new();
-            if let Some(token) = &continuation_token {
+            if let Some(token) = marker {
                 query.push_str("continuation-token=");
                 query.push_str(&uri_encode(token, true));
                 query.push('&');
@@ -833,20 +832,25 @@ impl Storage for S3 {
                 message,
             })?;
 
-            entries.extend(page.entries.into_iter().map(|e| StorageInfo {
-                path: PathBuf::from(e.key),
-                kind: StorageKind::File,
-                size: e.size,
-                modified: e.modified,
-            }));
+            let mapped: Vec<StorageInfo> = page
+                .entries
+                .into_iter()
+                .map(|e| StorageInfo {
+                    path: PathBuf::from(e.key),
+                    kind: StorageKind::File,
+                    size: e.size,
+                    modified: e.modified,
+                })
+                .collect();
 
-            // A truncated response without a usable token would loop forever;
-            // stop rather than spin.
-            match (page.is_truncated, page.next_continuation_token) {
-                (true, Some(token)) => continuation_token = Some(token),
-                _ => break,
-            }
-        }
+            // A truncated response with a usable token continues the walk; any
+            // other case (not truncated, or truncated without a token) ends it.
+            let next = match (page.is_truncated, page.next_continuation_token) {
+                (true, Some(token)) => Some(token),
+                _ => None,
+            };
+            Ok((mapped, next))
+        })?;
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)

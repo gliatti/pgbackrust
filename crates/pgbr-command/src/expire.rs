@@ -376,16 +376,26 @@ fn log_info(message: &str) {
 /// references (directly or transitively) any label in `seed`, plus the seed
 /// labels themselves. Expiring `seed` therefore requires expiring all of these,
 /// since their files live in — or chain through — a backup being removed.
-fn dependent_closure(current: &std::collections::BTreeMap<String, serde_json::Value>, seed: &[String]) -> Vec<String> {
+///
+/// Generic over the key/value borrow so it accepts both the owned
+/// `BTreeMap<String, Value>` of `info.current` and a borrow-only
+/// `BTreeMap<&str, &Value>` view — the latter lets callers ([`apply_diff_retention`])
+/// build the closure input without deep-cloning every retained backup's JSON.
+fn dependent_closure<K, V>(current: &std::collections::BTreeMap<K, V>, seed: &[String]) -> Vec<String>
+where
+    K: std::borrow::Borrow<str> + Ord,
+    V: std::borrow::Borrow<serde_json::Value>,
+{
     let mut expire: std::collections::BTreeSet<String> = seed.iter().cloned().collect();
     loop {
         let mut grew = false;
         for (label, value) in current {
+            let label = label.borrow();
             if expire.contains(label) {
                 continue;
             }
-            if backup_references(value).iter().any(|r| expire.contains(r)) {
-                expire.insert(label.clone());
+            if backup_references(value.borrow()).iter().any(|r| expire.contains(r)) {
+                expire.insert(label.to_owned());
                 grew = true;
             }
         }
@@ -397,11 +407,15 @@ fn dependent_closure(current: &std::collections::BTreeMap<String, serde_json::Va
 }
 
 /// Count the full backups in `current` that are NOT in `expire`.
-fn remaining_full_count(current: &std::collections::BTreeMap<String, serde_json::Value>, expire: &[String]) -> usize {
-    let expire_set: std::collections::BTreeSet<&String> = expire.iter().collect();
+fn remaining_full_count<K, V>(current: &std::collections::BTreeMap<K, V>, expire: &[String]) -> usize
+where
+    K: std::borrow::Borrow<str> + Ord,
+    V: std::borrow::Borrow<serde_json::Value>,
+{
+    let expire_set: std::collections::BTreeSet<&str> = expire.iter().map(String::as_str).collect();
     current
         .iter()
-        .filter(|(label, value)| !expire_set.contains(label) && backup_type(value) == "full")
+        .filter(|(label, value)| !expire_set.contains(label.borrow()) && backup_type(value.borrow()) == "full")
         .count()
 }
 
@@ -809,10 +823,13 @@ fn apply_diff_retention(entries: &[(String, serde_json::Value)], keep_label: &mu
     // Build the label -> entry map the closure walks over. Restricting it to the
     // still-kept backups is sound: anything already dropped by full retention is
     // irrelevant here, and confining the closure to kept labels keeps the
-    // `keep_label` write below a straightforward membership test.
-    let current: std::collections::BTreeMap<String, serde_json::Value> = (0..entries.len())
+    // `keep_label` write below a straightforward membership test. The map holds
+    // borrows into `entries` (which outlives this call) — `dependent_closure`
+    // only reads each entry's `backup-reference` array, so there is no need to
+    // deep-clone the retained backups' JSON values.
+    let current: std::collections::BTreeMap<&str, &serde_json::Value> = (0..entries.len())
         .filter(|&i| keep_label[i])
-        .map(|i| (entries[i].0.clone(), entries[i].1.clone()))
+        .map(|i| (entries[i].0.as_str(), &entries[i].1))
         .collect();
     let drop_set: std::collections::BTreeSet<String> = dependent_closure(&current, &drop_diff_seed).into_iter().collect();
     for i in 0..entries.len() {

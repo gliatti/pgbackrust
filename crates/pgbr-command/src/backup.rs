@@ -3294,8 +3294,27 @@ fn build_block_map(
 /// from a prior `db-id` (e.g. after a `stanza-upgrade` bumped the history) is a
 /// different timeline and must not be referenced. C ref: backup.c only selects a
 /// prior whose `db-id` matches the current `pgData` history id.
-fn entry_matches_db_id(entry: &serde_json::Value, db_id: u32) -> bool {
-    entry.get("db-id").and_then(serde_json::Value::as_u64) == Some(u64::from(db_id))
+///
+/// A `[backup:current]` entry whose `db-id` is **absent** or **not parsable as
+/// an integer** is a sign of a corrupt `backup.info` (every well-formed entry
+/// carries a numeric `db-id`). We stay fail-safe — the entry simply does not
+/// match, so the caller falls back to a full backup rather than referencing a
+/// suspect prior — but we must not swallow the anomaly silently: a diff/incr
+/// silently promoted to full would otherwise hide the corruption. So we log a
+/// WARNING (keyed by `label`) to make the promotion / non-reuse observable,
+/// while still returning `false` instead of hard-erroring.
+fn entry_matches_db_id(label: &str, entry: &serde_json::Value, db_id: u32) -> bool {
+    entry.get("db-id").and_then(serde_json::Value::as_u64).map_or_else(
+        || {
+            log_warn(&format!(
+                "backup.info entry {label} has a missing or non-integer db-id; \
+                 treating it as ineligible for prior/resume reuse — a diff/incr may be \
+                 promoted to full. This is a sign of a corrupt backup.info."
+            ));
+            false
+        },
+        |entry_db_id| entry_db_id == u64::from(db_id),
+    )
 }
 
 /// Find the label of the latest full backup recorded in `backup.info` for the
@@ -3309,9 +3328,9 @@ fn latest_full_label(info: &InfoBackup, db_id: u32) -> Option<String> {
     info.current
         .iter()
         .rev()
-        .find(|(_, entry)| {
+        .find(|(label, entry)| {
             entry.get("backup-type").and_then(serde_json::Value::as_str) == Some(BACKUP_TYPE_FULL)
-                && entry_matches_db_id(entry, db_id)
+                && entry_matches_db_id(label.as_str(), entry, db_id)
         })
         .map(|(label, _)| label.clone())
 }
@@ -3328,7 +3347,7 @@ fn latest_any_label(info: &InfoBackup, db_id: u32) -> Option<String> {
     info.current
         .iter()
         .rev()
-        .find(|(_, entry)| entry_matches_db_id(entry, db_id))
+        .find(|(label, entry)| entry_matches_db_id(label.as_str(), entry, db_id))
         .map(|(label, _)| label.clone())
 }
 
@@ -5186,6 +5205,51 @@ mod tests {
         // A db-id with no backups yields no prior (→ caller promotes to full).
         assert_eq!(latest_full_label(&info, 3), None);
         assert_eq!(latest_any_label(&info, 3), None);
+    }
+
+    /// A `[backup:current]` entry whose `db-id` is missing or non-integer is a
+    /// corruption signal. `entry_matches_db_id` must treat it as ineligible
+    /// (fail-safe: the caller falls back to a full backup) — it must never be
+    /// silently reused as a prior/resume base. Here we assert the filter does
+    /// not accidentally treat such an entry as matching; the accompanying
+    /// `log_warn` makes the event observable (see the function's doc comment).
+    #[test]
+    fn corrupt_db_id_entry_is_never_selected_as_prior() {
+        let mut current = BTreeMap::new();
+        // A well-formed full for db-id 2 — the only legitimate prior.
+        current.insert(
+            "20240102-120000F".to_owned(),
+            json!({ "backup-type": BACKUP_TYPE_FULL, "db-id": 2 }),
+        );
+        // Corrupt: db-id entirely absent (sorts newer, would win if not filtered).
+        current.insert("20240103-120000F".to_owned(), json!({ "backup-type": BACKUP_TYPE_FULL }));
+        // Corrupt: db-id present but non-integer (a string).
+        current.insert(
+            "20240104-120000F_20240104-130000I".to_owned(),
+            json!({ "backup-type": "incr", "db-id": "not-a-number" }),
+        );
+        let info = InfoBackup {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 2,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "14".to_owned(),
+            db_catalog_version: 202_107_181,
+            db_control_version: 1300,
+            current,
+            history: BTreeMap::new(),
+        };
+
+        // Despite the two corrupt entries sorting newer, the only prior selected
+        // is the well-formed db-id-2 full — the corrupt ones are skipped, not
+        // silently reused.
+        assert_eq!(latest_full_label(&info, 2).as_deref(), Some("20240102-120000F"));
+        assert_eq!(latest_any_label(&info, 2).as_deref(), Some("20240102-120000F"));
+
+        // With no well-formed entry for db-id 5, every entry is either a db-id
+        // mismatch or corrupt, so no prior is found (→ caller promotes to full).
+        assert_eq!(latest_full_label(&info, 5), None);
+        assert_eq!(latest_any_label(&info, 5), None);
     }
 
     #[test]

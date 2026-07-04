@@ -770,15 +770,18 @@ impl Storage for Gcs {
         }
 
         let url = self.bucket_url();
-        let (auth_name, auth_value) = self.auth_header()?;
-        let mut entries: Vec<StorageInfo> = Vec::new();
         // Follow the S3-compatible pagination markers until the listing is
-        // exhausted, re-injecting the continuation as `marker=`, so a bucket
-        // with more objects than the per-response cap (1000) is returned in
-        // full rather than silently truncated to the first page.
-        let mut marker: Option<String> = None;
+        // exhausted (via the shared paginate driver), re-injecting the
+        // continuation as `marker=`, so a bucket with more objects than the
+        // per-response cap (1000) is returned in full rather than silently
+        // truncated to the first page.
+        let mut entries = crate::pagination::paginate(|marker: Option<&str>| {
+            // Resolve the bearer token per page (not once before the loop): a
+            // service-account access token can expire mid-listing on a very long
+            // walk, and `auth_header` caches/refreshes internally so a still-valid
+            // token incurs no extra JWT round trip.
+            let (auth_name, auth_value) = self.auth_header()?;
 
-        loop {
             // ureq requests are consumed by `.call()`, so rebuild per page.
             let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
             for (name, value) in self.common_headers() {
@@ -788,7 +791,7 @@ impl Storage for Gcs {
                 // ureq percent-encodes the query value for the wire request.
                 req = req.query("prefix", &prefix);
             }
-            if let Some(marker) = &marker {
+            if let Some(marker) = marker {
                 req = req.query("marker", marker);
             }
 
@@ -810,23 +813,26 @@ impl Storage for Gcs {
             // to the last returned key. Capture it before consuming `entries`.
             let last_key = page.entries.last().map(|e| e.key.clone());
 
-            entries.extend(page.entries.into_iter().map(|e| StorageInfo {
-                path: PathBuf::from(e.key),
-                kind: StorageKind::File,
-                size: e.size,
-                modified: e.modified,
-            }));
+            let is_truncated = page.is_truncated;
+            let next_marker = page.next_marker.clone();
 
-            if !page.is_truncated {
-                break;
-            }
-            match page.next_marker.or(last_key) {
-                // A truncated page with neither a NextMarker nor any entry to
-                // resume from would loop forever; stop rather than spin.
-                Some(next) => marker = Some(next),
-                None => break,
-            }
-        }
+            let mapped: Vec<StorageInfo> = page
+                .entries
+                .into_iter()
+                .map(|e| StorageInfo {
+                    path: PathBuf::from(e.key),
+                    kind: StorageKind::File,
+                    size: e.size,
+                    modified: e.modified,
+                })
+                .collect();
+
+            // Only continue while the page is truncated; a truncated page falls
+            // back to the last entry's key when the server omits a NextMarker.
+            // (A truncated page with neither is terminated by the driver.)
+            let next = if is_truncated { next_marker.or(last_key) } else { None };
+            Ok((mapped, next))
+        })?;
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)

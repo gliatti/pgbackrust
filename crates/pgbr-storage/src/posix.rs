@@ -146,7 +146,7 @@ pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8]) -> Result<(), Storag
 /// power loss. No-op on platforms (Windows) where directories cannot be opened
 /// as a file handle for `sync_all`.
 #[cfg(unix)]
-fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
     // A resolved target always has a parent (it lives under `root`); fall back
     // to "." defensively so we never index past the start of the path.
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -156,7 +156,7 @@ fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) -> Result<(), StorageError> {
+pub(crate) fn fsync_parent_dir(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 

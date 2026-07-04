@@ -653,13 +653,15 @@ impl Storage for Azure {
             prefix.push('/');
         }
 
-        let mut entries: Vec<StorageInfo> = Vec::new();
-        // Follow `<NextMarker>` (re-injected as `marker=`) until it is empty, so
-        // a container with more blobs than the per-response cap (5000) is
-        // returned in full rather than silently truncated to the first page.
-        let mut marker: Option<String> = None;
-
-        loop {
+        // Follow `<NextMarker>` (re-injected as `marker=`) until it is empty (via
+        // the shared paginate driver, which also guards against a marker that
+        // fails to advance), so a container with more blobs than the per-response
+        // cap (5000) is returned in full rather than silently truncated to the
+        // first page. Azure's only termination signal is an empty NextMarker, so
+        // the driver's anti-loop guard is what stops an endpoint that echoes the
+        // same non-empty marker (S3 also cross-checks IsTruncated; Azure has no
+        // such flag).
+        let mut entries = crate::pagination::paginate(|marker: Option<&str>| {
             let ms_headers = Self::ms_base_headers();
             // Query params that participate in the canonicalized resource. The
             // List Blobs operation is keyed on the container (empty blob name).
@@ -667,8 +669,8 @@ impl Storage for Azure {
                 ("comp".to_string(), "list".to_string()),
                 ("restype".to_string(), "container".to_string()),
             ];
-            if let Some(marker) = &marker {
-                query.push(("marker".to_string(), marker.clone()));
+            if let Some(marker) = marker {
+                query.push(("marker".to_string(), marker.to_string()));
             }
             if !prefix.is_empty() {
                 query.push(("prefix".to_string(), prefix.clone()));
@@ -681,7 +683,7 @@ impl Storage for Azure {
             // prefix/marker values are percent-encoded the same way ureq's
             // `.query()` would.
             let mut base_url = format!("{}/{}?restype=container&comp=list", self.endpoint, self.container);
-            if let Some(marker) = &marker {
+            if let Some(marker) = marker {
                 base_url.push_str("&marker=");
                 base_url.push_str(&percent_encode_query(marker));
             }
@@ -711,23 +713,19 @@ impl Storage for Azure {
                 message,
             })?;
 
-            entries.extend(page.entries.into_iter().map(|e| StorageInfo {
-                path: PathBuf::from(e.name),
-                kind: StorageKind::File,
-                size: e.size,
-                modified: e.modified,
-            }));
+            let mapped: Vec<StorageInfo> = page
+                .entries
+                .into_iter()
+                .map(|e| StorageInfo {
+                    path: PathBuf::from(e.name),
+                    kind: StorageKind::File,
+                    size: e.size,
+                    modified: e.modified,
+                })
+                .collect();
 
-            match page.next_marker {
-                // Stop if the marker does not advance. Azure's only termination
-                // signal is an empty NextMarker, so an endpoint that echoes the
-                // same non-empty marker would otherwise loop forever,
-                // accumulating duplicate entries. (S3 also cross-checks
-                // IsTruncated; Azure has no such flag.)
-                Some(next) if Some(&next) != marker.as_ref() => marker = Some(next),
-                _ => break,
-            }
-        }
+            Ok((mapped, page.next_marker))
+        })?;
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
