@@ -15,10 +15,9 @@ use std::path::{Path, PathBuf};
 
 use pgbr_config::LoadedConfig;
 use pgbr_info::{InfoBackup, Manifest};
-use pgbr_io::IoWrite;
 use pgbr_storage::{Storage, StorageInfo};
 
-use super::{SyncKind, SyncOutcome};
+use super::{SyncKind, SyncOutcome, copy_object};
 use crate::CommandError;
 
 /// Sync a single backup `label` (and its ancestors) to one destination repo.
@@ -28,14 +27,24 @@ use crate::CommandError;
 /// repository, then merges the backup's `backup.info` entry verbatim into the
 /// destination.
 ///
-/// Idempotent: a backup whose `backup.manifest` already exists in the
-/// destination is skipped (its bytes are assumed complete — a prior sync wrote
-/// the manifest last, see the copy ordering below). Ancestors of a diff/incr
-/// backup are recursively synced first so the dependency chain is never broken.
+/// Idempotency contract: a backup whose `backup.manifest` already exists in the
+/// destination has its data bytes assumed complete — a prior sync wrote the
+/// manifest last (see the copy ordering below) and every data object is
+/// size-checked against the source on copy, so the sentinel implies a whole
+/// backup. The `backup.info` merge is nonetheless ALWAYS reconciled: the
+/// sentinel early-return still loads the destination `backup.info`, inserts the
+/// entry and any missing db-history rows, and saves only when something was
+/// actually missing. This repairs the state where a prior run copied the
+/// manifest but crashed before (or failed at) the info save, which would
+/// otherwise leave the backup permanently invisible in `info --repo=N`.
+/// Ancestors of a diff/incr backup are recursively synced first so the
+/// dependency chain is never broken.
 ///
 /// The destination is required to be an already-initialised stanza: repo-sync
 /// mirrors objects, it does not create stanzas. A missing destination
-/// `backup.info` is a hard error.
+/// `backup.info` is a hard error, checked FIRST — before any copying — so an
+/// uninitialised destination is rejected without leaving a partially-copied
+/// backup (including its sentinel) behind.
 ///
 /// For an encrypted repository the **source** sub-key is resolved once and used
 /// as the destination passphrase for the manifest read (source) and embedded in
@@ -65,28 +74,58 @@ pub fn sync_backup_to_repo(
 
     // Load the source backup.info (keyed under the source user passphrase). This
     // both proves the label exists and yields the verbatim entry to merge.
+    // Resolve the entry ONCE here (its absence is an error) and reuse it below,
+    // rather than re-looking it up at merge time with an unreachable arm.
     let src_user_pass = crate::cipher::repo_user_pass(config, src_index)?;
     let (src_info, _src_recorded_sub) = InfoBackup::load_keyed(src, &backup_info_path(stanza), src_user_pass.as_deref())
         .map_err(|err| CommandError::Other(err.to_string()))?;
-    if !src_info.current.contains_key(label) {
-        return Err(CommandError::Other(format!(
+    let entry = src_info.current.get(label).cloned().ok_or_else(|| {
+        CommandError::Other(format!(
             "repo-sync: backup {label} not present in source repo{src_index} backup.info"
+        ))
+    })?;
+
+    // Destination-initialised check FIRST, before the sentinel check and before
+    // any copying: repo-sync mirrors objects into an existing stanza, it never
+    // creates one. Rejecting an uninitialised destination up front avoids copying
+    // the backup (including its manifest sentinel) only to error afterwards — a
+    // half-mirrored backup whose sentinel returns 0 items would then be sealed
+    // and permanently invisible on a re-run.
+    let dst_user_pass = crate::cipher::repo_user_pass(config, dst_index)?;
+    let info_path = backup_info_path(stanza);
+    if !dst.exists(&info_path)? {
+        return Err(CommandError::Other(format!(
+            "repo-sync: destination stanza not initialized; run stanza-create on repo{dst_index} first"
         )));
     }
 
-    // Idempotent skip: the manifest is the completion sentinel (written last).
+    // Resolve the source repository sub-key once. It decrypts the source
+    // manifest and is the key the destination must share for the raw-copied bytes
+    // to decrypt. `None` for an unencrypted repository. Resolved before the
+    // sentinel early-return because the merge helper embeds it in the
+    // destination's [cipher] section on every reconciliation.
+    let src_sub_key = crate::cipher::repo_sub_key(src, config, src_index, stanza)?;
+
+    // Idempotent skip of the DATA copy: the manifest is the completion sentinel
+    // (written last), so its presence implies every size-checked data object is
+    // already mirrored. The info merge is still reconciled — a prior run may have
+    // written the sentinel but not saved backup.info — but nothing is re-copied.
     if dst.exists(&manifest_path(stanza, label))? {
+        merge_backup_info(
+            dst,
+            &info_path,
+            &src_info,
+            label,
+            &entry,
+            dst_user_pass.as_deref(),
+            src_sub_key.as_deref(),
+        )?;
         return Ok(SyncOutcome {
             kind: SyncKind::Backup,
             items: 0,
             bytes: 0,
         });
     }
-
-    // Resolve the source repository sub-key once. It decrypts the source
-    // manifest and is the key the destination must share for the raw-copied
-    // bytes to decrypt. `None` for an unencrypted repository.
-    let src_sub_key = crate::cipher::repo_sub_key(src, config, src_index, stanza)?;
 
     // Compute the ancestor set from the manifest's references (file references +
     // block references), then recursively sync each missing ancestor FIRST so
@@ -116,61 +155,111 @@ pub fn sync_backup_to_repo(
             // Manifest objects are copied last; skip them in the data pass.
             continue;
         }
-        if let Some(copied) = copy_object(src, dst, &info.path)? {
+        // The listing carries each source object's size; hand it to copy_object
+        // as the completeness oracle (skip on equal size, repair a torn copy,
+        // error on a mid-copy size change).
+        if let Some(copied) = copy_object(src, dst, &info.path, info.size)? {
             bytes += copied;
             items += 1;
         }
     }
 
     // Manifest last (primary then .copy), so the completion sentinel is durable
-    // only after every data object exists in the destination.
+    // only after every data object exists in the destination. The manifest
+    // objects are not in `files` (skipped above), so probe each for its size.
     for path in [&manifest_primary, &manifest_copy] {
-        if src.exists(path)?
-            && let Some(copied) = copy_object(src, dst, path)?
-        {
-            bytes += copied;
-            items += 1;
+        if src.exists(path)? {
+            let src_size = src.info(path)?.size;
+            if let Some(copied) = copy_object(src, dst, path, src_size)? {
+                bytes += copied;
+                items += 1;
+            }
         }
     }
 
-    // Merge the backup's metadata into the destination backup.info.
-    let dst_user_pass = crate::cipher::repo_user_pass(config, dst_index)?;
-    let info_path = backup_info_path(stanza);
-    if !dst.exists(&info_path)? {
-        return Err(CommandError::Other(format!(
-            "repo-sync: destination stanza not initialized; run stanza-create on repo{dst_index} first"
-        )));
-    }
-    let (mut dst_info, _dst_recorded_sub) =
-        InfoBackup::load_keyed(dst, &info_path, dst_user_pass.as_deref()).map_err(|err| CommandError::Other(err.to_string()))?;
-
-    // Verbatim entry insert — preserve the source JSON unchanged (sizes,
-    // dependency chain, backup-cipher-pass, …). Never overwrite a backup the
-    // destination already tracks under a different identity: insert is keyed by
-    // label, which is globally unique, so this only adds the synced backup. The
-    // entry's presence was validated at the top of the function, so the absent
-    // arm is unreachable in practice.
-    if let Some(entry) = src_info.current.get(label) {
-        dst_info.current.insert(label.to_owned(), entry.clone());
-    }
-
-    // Copy any db-history rows the destination is missing; never overwrite.
-    for (id, hist) in &src_info.history {
-        dst_info.history.entry(*id).or_insert_with(|| hist.clone());
-    }
-
-    // Save LAST, embedding the SOURCE sub-key in the destination's [cipher]
-    // section so the raw-copied bytes decrypt under the now-shared sub-key. For
-    // an unencrypted repo both passphrases are None → plaintext, unchanged.
-    dst_info
-        .save_keyed(dst, &info_path, dst_user_pass.as_deref(), src_sub_key.as_deref())
-        .map_err(|err| CommandError::Other(err.to_string()))?;
+    // Merge the backup's metadata into the destination backup.info (entry +
+    // missing db-history), embedding the source sub-key. Same reconciliation the
+    // sentinel early-return performs, factored into one helper.
+    merge_backup_info(
+        dst,
+        &info_path,
+        &src_info,
+        label,
+        &entry,
+        dst_user_pass.as_deref(),
+        src_sub_key.as_deref(),
+    )?;
 
     Ok(SyncOutcome {
         kind: SyncKind::Backup,
         items,
         bytes,
     })
+}
+
+/// Reconcile the synced backup's metadata into the destination `backup.info`,
+/// saving only when something was actually missing.
+///
+/// Loads the destination `backup.info` (keyed under `dst_user_pass`), inserts
+/// `entry` for `label` when absent, and adds any db-history rows from `src_info`
+/// the destination lacks (never overwriting). If neither the entry nor any
+/// history row was missing the file is left untouched — a no-op re-sync must not
+/// rewrite `backup.info` on every run.
+///
+/// When a save is needed it embeds `src_sub_key` in the destination's `[cipher]`
+/// section so the raw-copied bytes decrypt under the now-shared sub-key. For an
+/// unencrypted repository `src_sub_key` is `None` → plaintext, unchanged.
+///
+/// Shared by the main copy path and the sentinel early-return so the info merge
+/// is ALWAYS reconciled even when the data bytes were already present (a prior
+/// run wrote the sentinel but crashed before saving `backup.info`).
+///
+/// The verbatim `entry` preserves the source JSON unchanged (sizes, dependency
+/// chain, backup-cipher-pass, …); insert is keyed by the globally-unique label,
+/// so it only adds the synced backup and never rewrites one the destination
+/// already tracks.
+///
+/// # Errors
+///
+/// Propagates destination `backup.info` load / save failures as
+/// [`CommandError::Other`].
+fn merge_backup_info(
+    dst: &dyn Storage,
+    info_path: &Path,
+    src_info: &InfoBackup,
+    label: &str,
+    entry: &serde_json::Value,
+    dst_user_pass: Option<&str>,
+    src_sub_key: Option<&str>,
+) -> Result<(), CommandError> {
+    let (mut dst_info, _dst_recorded_sub) =
+        InfoBackup::load_keyed(dst, info_path, dst_user_pass).map_err(|err| CommandError::Other(err.to_string()))?;
+
+    // Track whether anything actually changed so a no-op re-sync leaves the file
+    // (and its .copy mirror) untouched. Seeded from the entry insert, then OR-ed
+    // with any db-history backfill below.
+    let mut changed = if dst_info.current.contains_key(label) {
+        false
+    } else {
+        dst_info.current.insert(label.to_owned(), entry.clone());
+        true
+    };
+
+    // Copy any db-history rows the destination is missing; never overwrite.
+    for (id, hist) in &src_info.history {
+        if !dst_info.history.contains_key(id) {
+            dst_info.history.insert(*id, hist.clone());
+            changed = true;
+        }
+    }
+
+    if changed {
+        dst_info
+            .save_keyed(dst, info_path, dst_user_pass, src_sub_key)
+            .map_err(|err| CommandError::Other(err.to_string()))?;
+    }
+
+    Ok(())
 }
 
 /// The distinct set of backup labels `label` depends on, derived from its
@@ -195,28 +284,6 @@ fn ancestor_labels(manifest: &Manifest, label: &str) -> BTreeSet<String> {
         }
     }
     set
-}
-
-/// Raw-copy one stored object at storage-rooted `path` from `src` to the same
-/// path in `dst`, creating the destination's parent directory first. Skips
-/// (returns `Ok(None)`) when the object already exists in the destination.
-/// Otherwise returns `Ok(Some(bytes_copied))`.
-///
-/// RAW bytes only — never decode / decrypt / decompress. The stored objects are
-/// byte-identical across mirror repositories.
-fn copy_object(src: &dyn Storage, dst: &dyn Storage, path: &Path) -> Result<Option<u64>, CommandError> {
-    if dst.exists(path)? {
-        return Ok(None);
-    }
-    if let Some(parent) = path.parent() {
-        dst.create_path(parent, true)?;
-    }
-    let mut reader = src.open_read(path)?;
-    let mut writer = dst.open_write(path)?;
-    let copied = pgbr_io::copy(&mut reader, &mut writer)?;
-    writer.flush()?;
-    writer.close()?;
-    Ok(Some(copied))
 }
 
 /// `backup/<stanza>/backup.info`.
@@ -250,7 +317,7 @@ mod tests {
     use pgbr_info::{
         ChecksumPage, DbHistoryEntry, InfoArchive, InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath, cipher_pass_gen,
     };
-    use pgbr_io::IoRead;
+    use pgbr_io::{IoRead, IoWrite};
     use pgbr_storage::Posix;
     use serde_json::json;
 
@@ -781,5 +848,100 @@ mod tests {
             }
             other => panic!("expected Other(cipher), got {other:?}"),
         }
+    }
+
+    /// Overwrite a storage-rooted object with `bytes` verbatim (creating parents),
+    /// used to simulate a torn destination copy left by an interrupted sync.
+    fn write_object(repo: &Posix, path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            repo.create_path(parent, true).unwrap();
+        }
+        let mut writer = repo.open_write(path).unwrap();
+        writer.write(bytes).unwrap();
+        writer.flush().unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn truncated_destination_object_is_repaired() {
+        // A sync killed mid-copy leaves a truncated data object at the final path
+        // (the posix backend writes in place, no temp+rename). The next sync must
+        // detect the size mismatch and re-copy so the destination bytes equal the
+        // source bytes — never skip on bare existence and later seal it.
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        let dst = Posix::new(dst_dir.path());
+        let stanza = "demo";
+        let label = "20260101-100000F";
+        let data = b"the full, complete data object bytes";
+
+        seed_archive_info(&src, stanza, None, None);
+        seed_backup_info(&src, stanza, None, None);
+        seed_backup(&src, stanza, label, "full", None, None, data);
+        register_backup(&src, stanza, label, "full", None, None, None);
+
+        seed_archive_info(&dst, stanza, None, None);
+        seed_backup_info(&dst, stanza, None, None);
+
+        // Pre-seed the destination data object as a SHORT prefix of the source —
+        // the torn state a mid-copy interruption leaves behind. The manifest
+        // sentinel is intentionally absent, so the data pass runs.
+        let object = backup_dir(stanza, label).join("pg_data/base/1/1259");
+        write_object(&dst, &object, b"the full, comp");
+        assert_ne!(read_all(&dst, &object), data);
+
+        let config = cfg(Vec::new());
+        sync_backup_to_repo(&config, stanza, label, &src, 1, &dst, 2).unwrap();
+
+        // The torn object was repaired: destination bytes now equal the source.
+        assert_eq!(read_all(&dst, &object), data);
+    }
+
+    #[test]
+    fn sentinel_present_but_info_missing_is_reconciled() {
+        // A prior run copied the manifest sentinel (and data) but crashed before
+        // saving backup.info. The label is therefore absent from the destination
+        // backup.info even though the manifest exists. A re-sync must reconcile
+        // the info entry rather than skip it (which would leave the backup
+        // permanently invisible in `info --repo=N`).
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        let dst = Posix::new(dst_dir.path());
+        let stanza = "demo";
+        let label = "20260101-100000F";
+        let data = b"raw full backup bytes";
+
+        seed_archive_info(&src, stanza, None, None);
+        seed_backup_info(&src, stanza, None, None);
+        seed_backup(&src, stanza, label, "full", None, None, data);
+        register_backup(&src, stanza, label, "full", None, None, None);
+
+        seed_archive_info(&dst, stanza, None, None);
+        seed_backup_info(&dst, stanza, None, None);
+
+        // Simulate the crashed-mid-save state: copy the manifest (the sentinel)
+        // and the data object into the destination, but leave its backup.info
+        // WITHOUT the entry.
+        let manifest = manifest_with(label, "full", None);
+        let dir = backup_dir(stanza, label);
+        dst.create_path(&dir, true).unwrap();
+        write_object(&dst, &dir.join("pg_data/base/1/1259"), data);
+        manifest.save_keyed(&dst, &manifest_path(stanza, label), None).unwrap();
+        assert!(dst.exists(&manifest_path(stanza, label)).unwrap());
+        let (before, _) = InfoBackup::load_keyed(&dst, &backup_info_path(stanza), None).unwrap();
+        assert!(!before.current.contains_key(label));
+
+        let config = cfg(Vec::new());
+        // The sentinel is present, so the data pass is skipped (items == 0), but
+        // the info merge is still reconciled.
+        let outcome = sync_backup_to_repo(&config, stanza, label, &src, 1, &dst, 2).unwrap();
+        assert_eq!(outcome.items, 0);
+        assert_eq!(outcome.bytes, 0);
+
+        // The backup.info entry was repaired.
+        let (after, _) = InfoBackup::load_keyed(&dst, &backup_info_path(stanza), None).unwrap();
+        assert!(after.current.contains_key(label));
     }
 }

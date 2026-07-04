@@ -8,45 +8,51 @@
 //! byte-identical mirrors (global compression; identical bundling / block /
 //! cipher sub-key), the copy is a pure [`pgbr_io::copy`] of the stored bytes:
 //! no decompress, no decrypt, no recompute. The archive-id directory name
-//! (`<db-version>-<db-id>`) is resolved from the source `archive.info` via
-//! [`crate::archive::load_archive_info`].
+//! (`<db-version>-<db-id>`) is resolved from the source `archive.info`, loaded
+//! and decrypted under the SOURCE repository's own cipher passphrase (keyed by
+//! the active `--repo` index, not the lowest configured one).
 //!
 //! Idempotent: a WAL segment already present in the destination in any stored
-//! form (plaintext or a compression suffix) is skipped via
-//! [`crate::archive::repo_has_segment`]; non-segment objects are skipped on a
-//! plain [`Storage::exists`]. `archive.info` itself is never touched — it is
-//! per-repo metadata seeded by `stanza-create`, and the destination is required
-//! to be an already-initialised stanza sharing the source cipher sub-key.
+//! form (plaintext or a compression suffix) is skipped; non-segment objects are
+//! re-copied only when the destination copy is absent or torn (size mismatch).
+//! `archive.info` itself is never touched — it is per-repo metadata seeded by
+//! `stanza-create`, and the destination is required to be an already-initialised
+//! stanza sharing the source cipher sub-key.
+//!
+//! The destination archive-id directory is listed ONCE up front into a
+//! basename → size map (and a set of stored segment bases). Every idempotency
+//! decision is then answered from that snapshot rather than per-object
+//! [`Storage::exists`] probes, so re-syncing a large archive that copies nothing
+//! costs one destination listing instead of one signed HEAD (or several, across
+//! compression suffixes) per source segment — decisive on S3 / Azure / GCS.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use pgbr_config::LoadedConfig;
+use pgbr_info::InfoArchive;
 use pgbr_postgres::lsn::parse_wal_segment;
 use pgbr_storage::Storage;
 
 use super::{SyncKind, SyncOutcome};
 use crate::CommandError;
 
-/// File extensions a stored WAL object may carry, in the same order the
-/// `archive-get` path probes them. Stripped from a listed object's basename to
-/// recover the bare segment name for the idempotent
-/// [`crate::archive::repo_has_segment`] probe. Mirrors `archive.rs`'s private
-/// `COMPRESS_SUFFIXES` (kept local so sync does not depend on that constant's
-/// visibility).
-const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
-
 /// Mirror every WAL object for a stanza to one destination repository.
 ///
 /// Performs a raw byte copy of every WAL object under
 /// `archive/<stanza>/<archive-id>/` from the source repository to one
 /// destination. The archive-id (`<db-version>-<db-id>`) comes from the source
-/// `archive.info`. Idempotent: a segment already present in the destination (in
-/// any stored form) is skipped, as is any non-segment object whose exact path
-/// already exists.
+/// `archive.info`, loaded under the SOURCE repository's own cipher passphrase.
+/// Idempotent: a segment already present in the destination (in any stored form)
+/// is skipped; any other object is re-copied only when the destination copy is
+/// absent or a torn (wrong-size) leftover.
 ///
-/// `src_index` / `dst_index` are the configured repository group indexes (used
-/// only for log/diagnostic context here; the cipher sub-key is shared, so the
-/// raw bytes are valid in either repository unchanged).
+/// `src_index` is the configured repository group index of the source; it
+/// selects the cipher passphrase the source `archive.info` is decrypted under.
+/// This must be the ACTIVE `--repo`, not the lowest configured index — with two
+/// encrypted repositories under different `repo-cipher-pass` values (a supported
+/// configuration: only `cipher-type` and the shared sub-key are validated equal)
+/// the wrong passphrase would fail to decrypt the source `archive.info`.
 ///
 /// # Errors
 ///
@@ -58,19 +64,14 @@ pub fn sync_archive_to_repo(
     src: &dyn Storage,
     src_index: u32,
     dst: &dyn Storage,
-    dst_index: u32,
 ) -> Result<SyncOutcome, CommandError> {
-    // The source/destination indexes are not needed for the raw copy itself
-    // (paths and bytes are identical across mirrors); they exist on the
-    // signature for symmetry with the backup engine and future diagnostics.
-    let _ = (src_index, dst_index);
-
-    // Resolve the archive-id directory from the SOURCE archive.info. A
-    // one-element slice puts the source at position 0 so load_archive_info
-    // resolves the cipher passphrase at the first configured index (the active
-    // --repo, i.e. the source). No archive.info → nothing has been archived
-    // yet, so there is nothing to mirror.
-    let Some(info) = crate::archive::load_archive_info(config, &[src], stanza)? else {
+    // Resolve the archive-id directory from the SOURCE archive.info, decrypted
+    // under the source repository's own cipher passphrase (`None` when the source
+    // is unencrypted). Loading it via the source index — not a slice whose
+    // position 0 maps to the lowest configured index — is what makes this correct
+    // when repo1 and repo2 are encrypted under different user passphrases. No
+    // archive.info → nothing has been archived yet, so there is nothing to mirror.
+    let Some(info) = load_source_archive_info(config, src, src_index, stanza)? else {
         return Ok(SyncOutcome {
             kind: SyncKind::Wal,
             items: 0,
@@ -86,9 +87,34 @@ pub fn sync_archive_to_repo(
     let mut files = Vec::new();
     super::list_recursive(src, &aid_dir, &mut files)?;
 
+    // List the DESTINATION archive-id directory ONCE and answer the segment
+    // idempotency decision from the snapshot: `dst_bases` holds every stored
+    // WAL-segment base (suffix stripped) so a segment present in ANY compressed
+    // form counts as already mirrored. This replaces the per-segment
+    // `repo_has_segment` HEAD storm — one listing versus up to five signed HEADs
+    // per source segment on the cloud backends. Non-segment objects fall through
+    // to `copy_object`, whose own size-checked probe both skips a complete copy
+    // and repairs a torn one.
+    let mut dst_files = Vec::new();
+    super::list_recursive(dst, &aid_dir, &mut dst_files)?;
+    let mut dst_bases: BTreeSet<String> = BTreeSet::new();
+    for entry in &dst_files {
+        let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(base) = segment_base(name) {
+            dst_bases.insert(base.to_owned());
+        }
+    }
+
+    // Create the destination archive-id directory once, before the copy loop,
+    // rather than per object. `copy_object` re-creates parents defensively, but
+    // doing it here keeps that cost off every segment.
+    dst.create_path(&aid_dir, true)?;
+
     let mut items = 0usize;
     let mut bytes = 0u64;
-    for entry in files {
+    for entry in &files {
         let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -98,20 +124,22 @@ pub fn sync_archive_to_repo(
             continue;
         }
 
-        // For a real WAL segment (24-hex base, possibly with a compression
-        // suffix) the destination may already hold a differently-suffixed form,
-        // so short-circuit with repo_has_segment (which probes plaintext + every
-        // compression suffix). For non-segment objects (.history, .backup) the
-        // stored form is unambiguous, so sync_one_segment's plain exists() skip
-        // is sufficient.
+        // For a real WAL segment the destination may already hold a
+        // differently-suffixed form, so any stored base counts as present —
+        // matching the old `repo_has_segment` semantics from the pre-listed set.
+        // Non-segment objects (.history, .backup) fall through to the size-checked
+        // copy below.
         if let Some(base) = segment_base(name)
-            && crate::archive::repo_has_segment(dst, stanza, &aid, base)?
+            && dst_bases.contains(base)
         {
             continue;
         }
 
-        let n = sync_one_segment(src, dst, stanza, &aid, name)?;
-        if n > 0 {
+        // Raw byte copy with torn-write repair: `copy_object` skips when the
+        // destination already holds the exact name at the source's size, and
+        // re-copies over a wrong-size (partial) leftover. The source size comes
+        // from the listing that enumerated the object.
+        if let Some(n) = super::copy_object(src, dst, &entry.path, entry.size)? {
             items += 1;
             bytes += n;
         }
@@ -124,6 +152,36 @@ pub fn sync_archive_to_repo(
     })
 }
 
+/// Load the SOURCE repository's `archive.info` for `stanza`, decrypted under its
+/// own cipher passphrase (resolved from `src_index`; `None` for an unencrypted
+/// repo). Returns `Ok(None)` when the source has no `archive.info` yet — an
+/// uninitialised stanza with nothing to mirror.
+///
+/// Mirrors [`crate::archive::load_archive_info`]'s per-repo cipher resolution but
+/// keys off the explicit `src_index` (the active `--repo`) rather than slice
+/// position, and returns `Option` instead of erroring when the file is absent.
+///
+/// # Errors
+///
+/// [`CommandError::MissingOption`] when the source is encrypted but has no
+/// `repo-cipher-pass`; [`CommandError::Other`] when the file cannot be loaded /
+/// decrypted; [`CommandError::Storage`] on an underlying storage error.
+fn load_source_archive_info(
+    config: &LoadedConfig,
+    src: &dyn Storage,
+    src_index: u32,
+    stanza: &str,
+) -> Result<Option<InfoArchive>, CommandError> {
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    if !src.exists(&info_path)? {
+        return Ok(None);
+    }
+    let user_pass = crate::cipher::repo_user_pass(config, src_index)?;
+    let (info, _) =
+        InfoArchive::load_keyed(src, &info_path, user_pass.as_deref()).map_err(|err| CommandError::Other(err.to_string()))?;
+    Ok(Some(info))
+}
+
 /// The bare WAL-segment name for a stored object `name`, or `None` when `name`
 /// is not a WAL segment (e.g. a `.history` or `.backup` file).
 ///
@@ -133,46 +191,11 @@ pub fn sync_archive_to_repo(
 /// segment; partial segments (`….partial`) and non-segment objects return
 /// `None` so the caller falls back to an exact-path idempotency check.
 fn segment_base(name: &str) -> Option<&str> {
-    let base = COMPRESS_SUFFIXES
+    let base = crate::archive::COMPRESS_SUFFIXES
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
         .unwrap_or(name);
     if parse_wal_segment(base).is_some() { Some(base) } else { None }
-}
-
-/// Raw-copy one stored WAL object `name` (the basename, including any
-/// compression suffix, e.g. `…01.gz`) from the source archive-id directory to
-/// the same path in the destination, skipping if already present. Returns the
-/// bytes copied (`0` on skip).
-///
-/// The bytes are copied verbatim — no decompress / decrypt / recompute — because
-/// the repositories are byte-identical mirrors.
-///
-/// # Errors
-///
-/// Propagates storage / I/O failures from the open / copy / create-path calls.
-fn sync_one_segment(src: &dyn Storage, dst: &dyn Storage, stanza: &str, archive_id: &str, name: &str) -> Result<u64, CommandError> {
-    let src_path = crate::archive::repo_segment_path(stanza, archive_id, name);
-    let dst_path = src_path.clone(); // identical layout across mirrors
-    if dst.exists(&dst_path)? {
-        return Ok(0);
-    }
-    if let Some(parent) = dst_path.parent() {
-        dst.create_path(parent, true)?;
-    }
-    let mut reader = src.open_read(&src_path)?;
-    let mut writer = dst.open_write(&dst_path)?;
-    let n = pgbr_io::copy(&mut reader, &mut writer)?;
-    writer.flush()?;
-    writer.close()?;
-    Ok(n)
-}
-
-/// Storage-rooted path of a stored WAL object, mirroring
-/// [`crate::archive::repo_segment_path`] for the test fixtures.
-#[cfg(test)]
-fn test_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
-    PathBuf::from(format!("archive/{stanza}/{archive_id}/{name}"))
 }
 
 #[cfg(test)]
@@ -186,7 +209,7 @@ mod tests {
     use pgbr_storage::{Posix, Storage};
     use tempfile::TempDir;
 
-    use super::{SyncKind, sync_archive_to_repo, sync_one_segment, test_segment_path};
+    use super::{SyncKind, sync_archive_to_repo};
 
     const STANZA: &str = "demo";
     const ARCHIVE_ID: &str = "16-1";
@@ -227,7 +250,7 @@ mod tests {
     /// Write `bytes` to a stored WAL object `name` under the source archive-id
     /// directory.
     fn put_segment(repo: &Posix, name: &str, bytes: &[u8]) {
-        let path = test_segment_path(STANZA, ARCHIVE_ID, name);
+        let path = crate::archive::repo_segment_path(STANZA, ARCHIVE_ID, name);
         if let Some(parent) = path.parent() {
             repo.create_path(parent, true).expect("create parent");
         }
@@ -239,7 +262,7 @@ mod tests {
     /// Read every byte of a stored WAL object `name` from `repo`, or `None` when
     /// it is absent.
     fn read_segment(repo: &Posix, name: &str) -> Option<Vec<u8>> {
-        let path = test_segment_path(STANZA, ARCHIVE_ID, name);
+        let path = crate::archive::repo_segment_path(STANZA, ARCHIVE_ID, name);
         if !repo.exists(&path).expect("exists") {
             return None;
         }
@@ -263,7 +286,7 @@ mod tests {
         put_segment(&src_s, SEGMENT_2, WAL_BODY_2);
 
         let cfg = config();
-        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("sync");
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
 
         assert_eq!(outcome.kind, SyncKind::Wal);
         assert_eq!(outcome.items, 2);
@@ -279,12 +302,12 @@ mod tests {
         put_segment(&src_s, SEGMENT, WAL_BODY);
 
         let cfg = config();
-        let first = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("first sync");
+        let first = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("first sync");
         assert_eq!(first.items, 1);
         assert_eq!(first.bytes, WAL_BODY.len() as u64);
 
         // Second run: everything is already present, so nothing is copied.
-        let second = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("second sync");
+        let second = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("second sync");
         assert_eq!(second.items, 0);
         assert_eq!(second.bytes, 0);
         assert_eq!(read_segment(&dst_s, SEGMENT).as_deref(), Some(WAL_BODY));
@@ -300,7 +323,7 @@ mod tests {
         put_segment(&dst_s, SEGMENT, WAL_BODY);
 
         let cfg = config();
-        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("sync");
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
 
         assert_eq!(outcome.items, 1);
         assert_eq!(outcome.bytes, WAL_BODY_2.len() as u64);
@@ -312,12 +335,12 @@ mod tests {
         let (_src, _dst, src_s, dst_s) = repo_pair();
         seed_archive_info(&src_s);
         put_segment(&src_s, SEGMENT, WAL_BODY);
-        // Destination holds the segment under a .gz suffix — repo_has_segment
-        // probes every suffix, so the plaintext source form must be skipped.
+        // Destination holds the segment under a .gz suffix — the pre-listed base
+        // set records the stripped base, so the plaintext source form is skipped.
         put_segment(&dst_s, &format!("{SEGMENT}.gz"), b"already-compressed");
 
         let cfg = config();
-        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("sync");
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
 
         assert_eq!(outcome.items, 0);
         assert_eq!(outcome.bytes, 0);
@@ -336,7 +359,7 @@ mod tests {
         put_segment(&src_s, backup_history, b"backup-history-body");
 
         let cfg = config();
-        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("sync");
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
 
         assert_eq!(outcome.items, 3);
         assert_eq!(read_segment(&dst_s, history).as_deref(), Some(&b"timeline-history-body"[..]));
@@ -351,23 +374,116 @@ mod tests {
         let (_src, _dst, src_s, dst_s) = repo_pair();
         // No archive.info seeded on the source: nothing has been archived.
         let cfg = config();
-        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s, 2).expect("sync");
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
         assert_eq!(outcome.kind, SyncKind::Wal);
         assert_eq!(outcome.items, 0);
         assert_eq!(outcome.bytes, 0);
     }
 
     #[test]
-    fn sync_one_segment_copies_then_skips() {
+    fn truncated_destination_segment_is_recopied() {
+        // A prior sync was killed mid-write, leaving a short (torn) copy of a
+        // non-segment object at the exact destination path. `copy_object`'s
+        // size-checked probe must detect the wrong length and re-copy so the
+        // destination bytes equal the source. Use a non-segment name so the copy
+        // path (not the base-set skip) is exercised.
         let (_src, _dst, src_s, dst_s) = repo_pair();
+        seed_archive_info(&src_s);
+        let history = "00000002.history";
+        put_segment(&src_s, history, b"full-history-body-contents");
+        // Seed a short leftover at the same path in the destination.
+        put_segment(&dst_s, history, b"trunc");
+
+        let cfg = config();
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 1, &dst_s).expect("sync");
+
+        // The torn object was repaired: exactly one object copied, dst == src.
+        assert_eq!(outcome.items, 1);
+        assert_eq!(outcome.bytes, b"full-history-body-contents".len() as u64);
+        assert_eq!(
+            read_segment(&dst_s, history).as_deref(),
+            Some(&b"full-history-body-contents"[..])
+        );
+    }
+
+    /// A `LoadedConfig` whose repo1 and repo2 are BOTH `aes-256-cbc` but under
+    /// DIFFERENT user passphrases — a supported mirror config (only cipher-type
+    /// and the shared sub-key are validated equal). Used to prove the source
+    /// `archive.info` is decrypted under the active `--repo`'s own passphrase.
+    fn encrypted_config(repo1_pass: &str, repo2_pass: &str) -> LoadedConfig {
+        use pgbr_config::OptionValue;
+
+        let mut options: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        options.insert(
+            ("repo-cipher-pass".to_owned(), Some(1)),
+            OptionValue::String(repo1_pass.to_owned()),
+        );
+        options.insert(
+            ("repo-cipher-type".to_owned(), Some(2)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        options.insert(
+            ("repo-cipher-pass".to_owned(), Some(2)),
+            OptionValue::String(repo2_pass.to_owned()),
+        );
+        LoadedConfig {
+            command: "repo-sync".to_owned(),
+            command_role: ConfigCommandRole::Main,
+            stanza: Some(STANZA.to_owned()),
+            options,
+            params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn encrypted_source_at_index_two_decrypts_under_its_own_pass() {
+        // Regression for the wrong-passphrase-index bug: with repo1 and repo2
+        // encrypted under DIFFERENT user passphrases, a `repo-sync --repo=2` must
+        // decrypt the SOURCE archive.info under repo2's passphrase (src_index=2),
+        // not repo1's. Seeding archive.info encrypted under repo2's pass and
+        // syncing with src_index=2 must resolve and copy; a wrong-index load would
+        // fail to decrypt and error.
+        let repo1_pass = "1111111111111111111111111111111111111111111111111111111111111111";
+        let repo2_pass = "2222222222222222222222222222222222222222222222222222222222222222";
+        let sub_key = "3333333333333333333333333333333333333333333333333333333333333333";
+
+        let (_src, _dst, src_s, dst_s) = repo_pair();
+
+        // Seed the SOURCE archive.info encrypted under repo2's user passphrase.
+        src_s
+            .create_path(Path::new(&format!("archive/{STANZA}")), true)
+            .expect("create archive dir");
+        InfoArchive {
+            backrest_format: 5,
+            backrest_version: "2.58".to_owned(),
+            db_id: 1,
+            db_system_id: 6_873_049_345_984_568_091,
+            db_version: "16".to_owned(),
+            history: BTreeMap::new(),
+        }
+        .save_keyed(
+            &src_s,
+            Path::new(&format!("archive/{STANZA}/archive.info")),
+            Some(repo2_pass),
+            Some(sub_key),
+        )
+        .expect("save encrypted archive.info");
+
+        // A stored (already repo-encrypted) WAL object; repo-sync copies its bytes
+        // verbatim, so the body need not be valid ciphertext for this test.
         put_segment(&src_s, SEGMENT, WAL_BODY);
 
-        let copied = sync_one_segment(&src_s, &dst_s, STANZA, ARCHIVE_ID, SEGMENT).expect("first copy");
-        assert_eq!(copied, WAL_BODY.len() as u64);
-        assert_eq!(read_segment(&dst_s, SEGMENT).as_deref(), Some(WAL_BODY));
+        let cfg = encrypted_config(repo1_pass, repo2_pass);
+        // src_index = 2 → the active --repo=2; archive.info must load under repo2's
+        // pass. Passing 1 here would decrypt with repo1's pass and error.
+        let outcome = sync_archive_to_repo(&cfg, STANZA, &src_s, 2, &dst_s).expect("sync must resolve under repo2's pass");
 
-        // Already present → skip, zero bytes.
-        let again = sync_one_segment(&src_s, &dst_s, STANZA, ARCHIVE_ID, SEGMENT).expect("second copy");
-        assert_eq!(again, 0);
+        assert_eq!(outcome.items, 1);
+        assert_eq!(outcome.bytes, WAL_BODY.len() as u64);
+        assert_eq!(read_segment(&dst_s, SEGMENT).as_deref(), Some(WAL_BODY));
     }
 }

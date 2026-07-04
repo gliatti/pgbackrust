@@ -75,7 +75,11 @@ use crate::pipeline::{CompressType, RepoTransform};
 /// once the plaintext form is found absent. Each maps to the compress codec
 /// that produced it. `pgbackrust` names archived WAL with the codec's
 /// extension, so a recovering client must try every suffix.
-const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
+///
+/// Shared with the sync engine (`sync::archive`), which probes the same
+/// suffix set when mirroring WAL between repositories; this is the single
+/// source of truth so both paths stay in lockstep.
+pub(crate) const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
 
 /// Resolve the `compress-type` option to its file-name suffix. Returns
 /// `""` for `none` (or when the option is unset), and `.gz`/`.bz2`/`.lz4`/

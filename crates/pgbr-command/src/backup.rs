@@ -895,14 +895,25 @@ pub fn backup(
     // repo-sync: mirror the just-completed backup to every other configured
     // repository, byte-for-byte. Skipped on a dry run (nothing was written to
     // sync) and when --repo-sync is off or only one repo exists.
-    if repo_sync_enabled(config) && !policy.dry_run {
-        sync_to_other_repos(config, stanza, &outcome.label, repo_storage, repo_storages)?;
-    }
+    //
+    // The mirror is a *post-success* side effect: the backup itself has already
+    // completed, so a mirror failure must not abort the command before retention
+    // runs. Capture the error WITHOUT `?`, always fall through to expire-auto,
+    // then surface the mirror error at the very end so monitoring still sees a
+    // non-zero exit while retention has already been applied.
+    let sync_error: Option<CommandError> = if repo_sync_enabled(config) && !policy.dry_run {
+        sync_to_other_repos(config, stanza, &outcome.label, repo_storage, repo_storages).err()
+    } else {
+        None
+    };
 
     // expire-auto (default on): apply retention right after a successful backup,
     // unless this was a dry run (nothing was added to expire against) or the user
     // disabled it. Calls the expire engine directly. C ref: backup.c runs
     // cmdExpire() at the end of a successful backup when expire-auto is set.
+    //
+    // Runs regardless of a repo-sync failure above so retention never silently
+    // stops while a mirror target is down.
     if expire_auto_enabled(config) && !policy.dry_run {
         log_info("expire-auto: applying retention");
         let summary = crate::expire::expire_inner(config, repo_storage)?;
@@ -912,13 +923,22 @@ pub fn backup(
             summary.kept_labels.len()
         ));
     }
-    Ok(())
+
+    // Surface a deferred repo-sync failure only after retention has been applied.
+    sync_error.map_or(Ok(()), Err)
 }
 
 /// Mirror a just-completed backup `label` to every configured repository other
 /// than the active (source) one, byte-for-byte (C ref: the post-backup
 /// repo-sync step). The active repository is excluded from the target set; an
 /// empty target set (single-repo configuration) is a logged no-op.
+///
+/// Error policy: best-effort per target, mirroring the standalone `repo-sync`
+/// command ([`crate::sync::run`]). A failure against one target is logged at
+/// `WARN`, the first such error is remembered, and the remaining targets are
+/// still attempted so one unreachable repository does not strand the others.
+/// The first error is returned only after every target has been attempted;
+/// `Ok(())` when all targets succeeded (or none were configured).
 fn sync_to_other_repos(
     config: &LoadedConfig,
     stanza: &str,
@@ -936,14 +956,26 @@ fn sync_to_other_repos(
         "repo-sync: mirroring backup {label} to {} repositor(y/ies)",
         targets.len()
     ));
+
+    // Best-effort: keep going past a single failure so one unreachable target
+    // does not strand the others, but remember the first error to fail the
+    // command afterwards.
+    let mut first_error: Option<CommandError> = None;
+
     for (dst_index, dst) in targets {
-        let synced = crate::sync::backup::sync_backup_to_repo(config, stanza, label, repo_storage, src_index, dst, dst_index)?;
-        log_info(&format!(
-            "repo-sync: repo{dst_index} <- backup {label}: {} object(s), {} byte(s)",
-            synced.items, synced.bytes
-        ));
+        match crate::sync::backup::sync_backup_to_repo(config, stanza, label, repo_storage, src_index, dst, dst_index) {
+            Ok(synced) => log_info(&format!(
+                "repo-sync: repo{dst_index} <- backup {label}: {} object(s), {} byte(s)",
+                synced.items, synced.bytes
+            )),
+            Err(err) => {
+                log_warn(&format!("repo-sync: repo{dst_index} backup {label} sync failed: {err}"));
+                first_error.get_or_insert(err);
+            }
+        }
     }
-    Ok(())
+
+    first_error.map_or(Ok(()), Err)
 }
 
 /// The backup-control connections resolved per the `backup-standby` policy.
@@ -9416,6 +9448,131 @@ mod tests {
         assert_eq!(
             bundle_a, bundle_b,
             "two parallel runs must produce byte-identical bundle objects"
+        );
+    }
+
+    /// Build a `LoadedConfig` for the `backup` command from `(name, group-index)`
+    /// keyed option overrides (mirrors the sync module's `cfg` helper).
+    fn cfg(options: Vec<((&str, Option<u32>), OptionValue)>) -> LoadedConfig {
+        let mut map: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        for ((name, idx), value) in options {
+            map.insert((name.to_owned(), idx), value);
+        }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: map,
+            params: Vec::new(),
+        }
+    }
+
+    /// Seed a source repository with an initialised stanza plus a single full
+    /// backup `label` (its `backup.info` entry and a `backup.manifest` with no
+    /// ancestor references) so `sync_to_other_repos` can mirror it verbatim.
+    fn seed_source_backup(repo: &Posix, stanza: &str, label: &str) {
+        init_stanza(repo, stanza);
+        let (mut info, _) = InfoBackup::load_keyed(repo, &backup_info_path(stanza), None).unwrap();
+        info.current.insert(
+            label.to_owned(),
+            json!({
+                "backup-info-size": 123,
+                "backup-label": label,
+                "backup-type": "full",
+            }),
+        );
+        info.save_keyed(repo, &backup_info_path(stanza), None, None).unwrap();
+
+        let manifest = Manifest {
+            backup_label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: Vec::new(),
+            option_checksum_page: None,
+            paths: vec![ManifestPath {
+                path: "pg_data".to_owned(),
+            }],
+            links: Vec::new(),
+        };
+        let manifest_rel = PathBuf::from(format!("backup/{stanza}/{label}/backup.manifest"));
+        repo.create_path(manifest_rel.parent().unwrap(), true).unwrap();
+        manifest.save_keyed(repo, &manifest_rel, None).unwrap();
+    }
+
+    /// `sync_to_other_repos` is best-effort per target: a failing destination is
+    /// logged and skipped, the remaining destinations are still mirrored, and the
+    /// first error is returned only after every target has been attempted. This
+    /// guards the post-backup mirror against the fail-fast `?` regression where an
+    /// early target failure stranded the later ones (and pre-empted expire-auto).
+    #[test]
+    fn sync_to_other_repos_is_best_effort_across_targets() {
+        let stanza = "demo";
+        let label = "20260101-100000F";
+
+        // Source (repo1) holds the backup to mirror.
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        seed_source_backup(&src, stanza, label);
+
+        // repo2 fails first (uninitialised stanza → no backup.info); repo3 is
+        // initialised and must still receive the backup despite repo2's failure.
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad = Posix::new(bad_dir.path());
+        let good_dir = tempfile::tempdir().unwrap();
+        let good = Posix::new(good_dir.path());
+        init_stanza(&good, stanza);
+
+        let config = cfg(Vec::new());
+        let storages: Vec<(u32, &dyn Storage)> = vec![(1, &src), (2, &bad), (3, &good)];
+
+        let err = sync_to_other_repos(&config, stanza, label, &src, &storages)
+            .expect_err("a failing target must surface after all targets are attempted");
+        match err {
+            CommandError::Other(msg) => {
+                assert!(msg.contains("not initialized"), "first error should be repo2's: {msg}");
+            }
+            other => panic!("expected Other(not initialized), got {other:?}"),
+        }
+
+        // The good target (repo3) was still mirrored: its manifest sentinel exists.
+        assert!(
+            good.exists(Path::new(&format!("backup/{stanza}/{label}/backup.manifest")))
+                .unwrap(),
+            "repo3 must be mirrored even though repo2 failed first"
+        );
+        // repo3's backup.info now advertises the synced backup.
+        let (good_info, _) = InfoBackup::load_keyed(&good, &backup_info_path(stanza), None).unwrap();
+        assert!(
+            good_info.current.contains_key(label),
+            "repo3 backup.info must list the synced label"
+        );
+    }
+
+    /// All targets healthy → `sync_to_other_repos` mirrors each and returns
+    /// `Ok(())`.
+    #[test]
+    fn sync_to_other_repos_ok_when_all_targets_succeed() {
+        let stanza = "demo";
+        let label = "20260101-100000F";
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        seed_source_backup(&src, stanza, label);
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = Posix::new(dst_dir.path());
+        init_stanza(&dst, stanza);
+
+        let config = cfg(Vec::new());
+        let storages: Vec<(u32, &dyn Storage)> = vec![(1, &src), (2, &dst)];
+
+        sync_to_other_repos(&config, stanza, label, &src, &storages).expect("all-healthy mirror is Ok");
+        assert!(
+            dst.exists(Path::new(&format!("backup/{stanza}/{label}/backup.manifest")))
+                .unwrap()
         );
     }
 }
