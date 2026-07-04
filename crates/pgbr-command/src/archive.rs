@@ -75,7 +75,11 @@ use crate::pipeline::{CompressType, RepoTransform};
 /// once the plaintext form is found absent. Each maps to the compress codec
 /// that produced it. `pgbackrust` names archived WAL with the codec's
 /// extension, so a recovering client must try every suffix.
-const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
+///
+/// Shared with the sync engine (`sync::archive`), which probes the same
+/// suffix set when mirroring WAL between repositories; this is the single
+/// source of truth so both paths stay in lockstep.
+pub(crate) const COMPRESS_SUFFIXES: &[&str] = &[".gz", ".zst", ".bz2", ".lz4"];
 
 /// Resolve the `compress-type` option to its file-name suffix. Returns
 /// `""` for `none` (or when the option is unset), and `.gz`/`.bz2`/`.lz4`/
@@ -288,7 +292,7 @@ fn write_segment_to_dest_arg(bytes: &[u8], dest_arg: &Path) -> Result<(), Comman
 /// `archive_id` is `<db-version>-<db-id>` from the stanza's `archive.info`
 /// (see [`archive_id`]), matching pgBackRust's per-cluster archive directory
 /// and the layout the `check` command polls.
-fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
+pub(crate) fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
     PathBuf::from(format!("archive/{stanza}/{archive_id}/{name}"))
 }
 
@@ -296,7 +300,7 @@ fn repo_segment_path(stanza: &str, archive_id: &str, name: &str) -> PathBuf {
 /// `<db-version>-<db-id>` (e.g. `"16-1"`). This is the per-cluster
 /// subdirectory archived WAL is stored under, matching the C implementation
 /// and the `check` command.
-fn archive_id(info: &InfoArchive) -> String {
+pub(crate) fn archive_id(info: &InfoArchive) -> String {
     format!("{}-{}", info.db_version, info.db_id)
 }
 
@@ -617,7 +621,7 @@ fn is_checkable_wal_segment(name: &str) -> bool {
 /// [`CommandError::MissingOption`] when an encrypted repo has no
 /// `repo-cipher-pass`; [`CommandError::Other`] when the info file cannot be
 /// loaded / decrypted; [`CommandError::Storage`] on an underlying storage error.
-fn load_archive_info(
+pub(crate) fn load_archive_info(
     config: &LoadedConfig,
     repo_storages: &[&dyn Storage],
     stanza: &str,
@@ -1590,7 +1594,7 @@ fn fetch_segment_with_retry(
 /// Whether `repo` holds `segment` for `stanza` in any stored form (plaintext or
 /// a compressed suffix). Used by [`get`] to pick the first repository that has
 /// the segment.
-fn repo_has_segment(repo: &dyn Storage, stanza: &str, archive_id: &str, segment: &str) -> Result<bool, CommandError> {
+pub(crate) fn repo_has_segment(repo: &dyn Storage, stanza: &str, archive_id: &str, segment: &str) -> Result<bool, CommandError> {
     if repo.exists(&repo_segment_path(stanza, archive_id, segment))? {
         return Ok(true);
     }

@@ -5206,7 +5206,13 @@ mod tests {
         seed_pg_file(&pg_src_s, "base/1/1260", b);
         seed_pg_file(&pg_src_s, "base/1/1261", &big);
 
-        crate::backup::backup(&backup_cfg(stanza, "full", false, Some(100)), &repo_s, &pg_src_s).expect("bundled backup");
+        crate::backup::backup(
+            &backup_cfg(stanza, "full", false, Some(100)),
+            &repo_s,
+            &[(1, &repo_s)],
+            &pg_src_s,
+        )
+        .expect("bundled backup");
         let label = latest_label(&repo_s, stanza);
 
         let outcome = restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
@@ -5236,7 +5242,7 @@ mod tests {
         let mut bcfg = backup_cfg(stanza, "full", false, None);
         bcfg.options
             .insert(("compress-type".to_owned(), None), OptionValue::StringId("gz".to_owned()));
-        crate::backup::backup(&bcfg, &repo_s, &pg_src_s).expect("bundled gz backup");
+        crate::backup::backup(&bcfg, &repo_s, &[(1, &repo_s)], &pg_src_s).expect("bundled gz backup");
         let label = latest_label(&repo_s, stanza);
 
         restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
@@ -5257,7 +5263,7 @@ mod tests {
         seed_pg_file(&pg_src_s, "PG_VERSION", b"14\n");
         seed_pg_file(&pg_src_s, "base/1/1259", &big);
 
-        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &pg_src_s).expect("block backup");
+        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &[(1, &repo_s)], &pg_src_s).expect("block backup");
         let label = latest_label(&repo_s, stanza);
 
         restore_inner(&cfg(Some(stanza), Some(&label)), &repo_s, &pg_dst_s).expect("restore");
@@ -5281,7 +5287,8 @@ mod tests {
 
         let original: Vec<u8> = (0..300 * 1024u32).map(|n| (n % 251) as u8).collect();
         seed_pg_file(&pg_src_s, "base/1/1259", &original);
-        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &pg_src_s).expect("full block backup");
+        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_s, &[(1, &repo_s)], &pg_src_s)
+            .expect("full block backup");
         let full_label = latest_label(&repo_s, stanza);
 
         // Mutate the first 8 KiB only, then take a diff. `original` is not used
@@ -5291,7 +5298,8 @@ mod tests {
             *byte = byte.wrapping_add(1);
         }
         seed_pg_file(&pg_src_s, "base/1/1259", &modified);
-        crate::backup::backup(&backup_cfg(stanza, "diff", true, None), &repo_s, &pg_src_s).expect("diff block backup");
+        crate::backup::backup(&backup_cfg(stanza, "diff", true, None), &repo_s, &[(1, &repo_s)], &pg_src_s)
+            .expect("diff block backup");
         let diff_label = latest_label(&repo_s, stanza);
         assert_ne!(diff_label, full_label, "diff produced a new label");
 
@@ -5469,7 +5477,13 @@ mod tests {
         seed_pg_file(&pg_src_s, "base/1/1260", b);
         seed_pg_file(&pg_src_s, "base/1/1261", &big);
 
-        crate::backup::backup(&backup_cfg(stanza, "full", false, Some(100)), &repo_inner, &pg_src_s).expect("bundled backup");
+        crate::backup::backup(
+            &backup_cfg(stanza, "full", false, Some(100)),
+            &repo_inner,
+            &[(1, &repo_inner)],
+            &pg_src_s,
+        )
+        .expect("bundled backup");
         let label = latest_label(&repo_inner, stanza);
 
         let repo_s = RecordingRepo::new(repo_inner);
@@ -5515,7 +5529,13 @@ mod tests {
 
         let original: Vec<u8> = (0..300 * 1024u32).map(|n| (n % 251) as u8).collect();
         seed_pg_file(&pg_src_s, "base/1/1259", &original);
-        crate::backup::backup(&backup_cfg(stanza, "full", true, None), &repo_inner, &pg_src_s).expect("full block backup");
+        crate::backup::backup(
+            &backup_cfg(stanza, "full", true, None),
+            &repo_inner,
+            &[(1, &repo_inner)],
+            &pg_src_s,
+        )
+        .expect("full block backup");
         let full_label = latest_label(&repo_inner, stanza);
 
         let mut modified = original;
@@ -5523,7 +5543,13 @@ mod tests {
             *byte = byte.wrapping_add(1);
         }
         seed_pg_file(&pg_src_s, "base/1/1259", &modified);
-        crate::backup::backup(&backup_cfg(stanza, "diff", true, None), &repo_inner, &pg_src_s).expect("diff block backup");
+        crate::backup::backup(
+            &backup_cfg(stanza, "diff", true, None),
+            &repo_inner,
+            &[(1, &repo_inner)],
+            &pg_src_s,
+        )
+        .expect("diff block backup");
         let diff_label = latest_label(&repo_inner, stanza);
         assert_ne!(diff_label, full_label, "diff produced a new label");
 
@@ -5574,12 +5600,12 @@ mod tests {
         // incremental can reference whole.
         let kept = b"a relation that does not change between the full and the incr".as_slice();
         seed_pg_file(&pg_src_s, "base/1/1259", kept);
-        crate::backup::backup(&backup_cfg_plain(stanza, "full"), &repo_inner, &pg_src_s).expect("full backup");
+        crate::backup::backup(&backup_cfg_plain(stanza, "full"), &repo_inner, &[(1, &repo_inner)], &pg_src_s).expect("full backup");
         let full_label = latest_label(&repo_inner, stanza);
 
         // Take an incremental without touching the file: it should reference the
         // full for the unchanged file.
-        crate::backup::backup(&backup_cfg_plain(stanza, "incr"), &repo_inner, &pg_src_s).expect("incr backup");
+        crate::backup::backup(&backup_cfg_plain(stanza, "incr"), &repo_inner, &[(1, &repo_inner)], &pg_src_s).expect("incr backup");
         let incr_label = latest_label(&repo_inner, stanza);
         assert_ne!(incr_label, full_label, "incr produced a new label");
 
@@ -6331,7 +6357,13 @@ mod tests {
         for (rel, bytes) in files {
             seed_pg_file(&pg_src_s, rel, bytes);
         }
-        crate::backup::backup(&backup_cfg(stanza, "full", false, Some(1024)), &repo_inner, &pg_src_s).expect("bundled backup");
+        crate::backup::backup(
+            &backup_cfg(stanza, "full", false, Some(1024)),
+            &repo_inner,
+            &[(1, &repo_inner)],
+            &pg_src_s,
+        )
+        .expect("bundled backup");
         let label = latest_label(&repo_inner, stanza);
 
         // Sanity: a single bundle object was produced.

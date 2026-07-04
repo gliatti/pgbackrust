@@ -328,10 +328,39 @@ fn worker_loaded_config(resolved: &ResolvedCli) -> LoadedConfig {
 const MULTI_REPO_COMMANDS: &[&str] = &[
     "archive-push",
     "archive-get",
+    "repo-sync",
     "stanza-create",
     "stanza-delete",
     "stanza-upgrade",
 ];
+
+/// Whether `loaded` must build one backend per configured repository.
+///
+/// The commands in [`MULTI_REPO_COMMANDS`] are unconditionally multi-repo.
+/// `backup` is the one exception: it only needs every backend when the resolved
+/// `repo-sync` boolean is on, because in that case a successful backup is
+/// mirrored to the other repositories immediately afterwards (see
+/// `pgbr_command::backup`'s `repo_sync_enabled`). With `repo-sync` off — the
+/// default — building all backends is wasted and actively harmful: it would
+/// connect every SFTP repo, spawn every `repoN-host` SSH worker and fail
+/// construction on any partially configured cloud repo, so a plain `backup`
+/// against a config with an extra unreachable repo would error before the
+/// backup even starts. Constructing all backends is only justified when the
+/// backup will mirror, so gate it on `repo-sync`.
+fn needs_all_repo_storages(loaded: &LoadedConfig) -> bool {
+    MULTI_REPO_COMMANDS.contains(&loaded.command.as_str()) || (loaded.command == "backup" && repo_sync_enabled(loaded))
+}
+
+/// Whether the resolved `--repo-sync` boolean is enabled (default **false**).
+///
+/// Mirrors `pgbr_command::backup`'s reader so the CLI and the command agree on
+/// when a backup fans out to every repository.
+fn repo_sync_enabled(loaded: &LoadedConfig) -> bool {
+    matches!(
+        loaded.options.get(&("repo-sync".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
+}
 
 /// Build storage (as needed) and dispatch `loaded` to its command, mapping the
 /// outcome to a process exit code.
@@ -360,7 +389,7 @@ fn dispatch_loaded(loaded: &LoadedConfig) -> Result<i32, CliRunError> {
     // `--repo`) is the one whose index matches `repo` — or the first configured
     // when the active index has no backend in the set (it always does, since
     // `configured_repo_indexes` includes the active index).
-    if MULTI_REPO_COMMANDS.contains(&loaded.command.as_str()) {
+    if needs_all_repo_storages(loaded) {
         let all = storage_helper::build_all_repo_storages(loaded)?;
         let active = storage_helper::active_repo_index(loaded);
         let active_storage = all
@@ -1610,6 +1639,44 @@ option:
         // `assert` has no string-id, and garbage is rejected.
         assert_eq!(log_level_from_id("assert"), None);
         assert_eq!(log_level_from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn backup_needs_all_repos_only_when_repo_sync_on() {
+        use super::needs_all_repo_storages;
+
+        // Plain backup with `repo-sync` unset takes the single-repo path: it
+        // must NOT build every configured backend, so a config with an extra
+        // unreachable repo does not fail before the backup starts.
+        let plain = loaded("backup", Some("demo"), &[]);
+        assert!(!needs_all_repo_storages(&plain));
+
+        // Backup with `repo-sync` explicitly off is likewise single-repo.
+        let off = loaded("backup", Some("demo"), &[("repo-sync", None, OptionValue::Boolean(false))]);
+        assert!(!needs_all_repo_storages(&off));
+
+        // Backup with `repo-sync` on must fan out to every repository, since it
+        // mirrors the completed backup to the others.
+        let on = loaded("backup", Some("demo"), &[("repo-sync", None, OptionValue::Boolean(true))]);
+        assert!(needs_all_repo_storages(&on));
+    }
+
+    #[test]
+    fn declared_multi_repo_commands_are_always_multi_repo() {
+        use super::{MULTI_REPO_COMMANDS, needs_all_repo_storages};
+
+        // Every command in the unconditional list fans out regardless of
+        // `repo-sync`. `repo-sync` (the command) in particular is always
+        // multi-repo.
+        for command in MULTI_REPO_COMMANDS {
+            let loaded_cfg = loaded(command, Some("demo"), &[]);
+            assert!(needs_all_repo_storages(&loaded_cfg), "{command} must be multi-repo");
+        }
+
+        // A non-multi command with `repo-sync` on stays single-repo: the gate is
+        // scoped to `backup` alone, not "any command with repo-sync set".
+        let restore = loaded("restore", Some("demo"), &[("repo-sync", None, OptionValue::Boolean(true))]);
+        assert!(!needs_all_repo_storages(&restore));
     }
 
     #[test]

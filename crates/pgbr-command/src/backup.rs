@@ -740,7 +740,12 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
 ///
 /// See [`run_backup`]; plus connection failures and `backup-standby=y` with no
 /// reachable standby.
-pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dyn Storage) -> Result<(), CommandError> {
+pub fn backup(
+    config: &LoadedConfig,
+    repo_storage: &dyn Storage,
+    repo_storages: &[(u32, &dyn Storage)],
+    pg_storage: &dyn Storage,
+) -> Result<(), CommandError> {
     let stanza = require_stanza(config)?;
     // Refuse to run when the operator has called `stop` for this stanza (or
     // `stop --force` which writes `all.stop` and blocks every stanza). The
@@ -887,10 +892,28 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
         outcome.label, outcome.file_count, outcome.total_size
     ));
 
+    // repo-sync: mirror the just-completed backup to every other configured
+    // repository, byte-for-byte. Skipped on a dry run (nothing was written to
+    // sync) and when --repo-sync is off or only one repo exists.
+    //
+    // The mirror is a *post-success* side effect: the backup itself has already
+    // completed, so a mirror failure must not abort the command before retention
+    // runs. Capture the error WITHOUT `?`, always fall through to expire-auto,
+    // then surface the mirror error at the very end so monitoring still sees a
+    // non-zero exit while retention has already been applied.
+    let sync_error: Option<CommandError> = if repo_sync_enabled(config) && !policy.dry_run {
+        sync_to_other_repos(config, stanza, &outcome.label, repo_storage, repo_storages).err()
+    } else {
+        None
+    };
+
     // expire-auto (default on): apply retention right after a successful backup,
     // unless this was a dry run (nothing was added to expire against) or the user
     // disabled it. Calls the expire engine directly. C ref: backup.c runs
     // cmdExpire() at the end of a successful backup when expire-auto is set.
+    //
+    // Runs regardless of a repo-sync failure above so retention never silently
+    // stops while a mirror target is down.
     if expire_auto_enabled(config) && !policy.dry_run {
         log_info("expire-auto: applying retention");
         let summary = crate::expire::expire_inner(config, repo_storage)?;
@@ -900,7 +923,59 @@ pub fn backup(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &dy
             summary.kept_labels.len()
         ));
     }
-    Ok(())
+
+    // Surface a deferred repo-sync failure only after retention has been applied.
+    sync_error.map_or(Ok(()), Err)
+}
+
+/// Mirror a just-completed backup `label` to every configured repository other
+/// than the active (source) one, byte-for-byte (C ref: the post-backup
+/// repo-sync step). The active repository is excluded from the target set; an
+/// empty target set (single-repo configuration) is a logged no-op.
+///
+/// Error policy: best-effort per target, mirroring the standalone `repo-sync`
+/// command ([`crate::sync::run`]). A failure against one target is logged at
+/// `WARN`, the first such error is remembered, and the remaining targets are
+/// still attempted so one unreachable repository does not strand the others.
+/// The first error is returned only after every target has been attempted;
+/// `Ok(())` when all targets succeeded (or none were configured).
+fn sync_to_other_repos(
+    config: &LoadedConfig,
+    stanza: &str,
+    label: &str,
+    repo_storage: &dyn Storage,
+    repo_storages: &[(u32, &dyn Storage)],
+) -> Result<(), CommandError> {
+    let src_index = crate::cipher::active_repo_index(config);
+    let targets: Vec<(u32, &dyn Storage)> = repo_storages.iter().copied().filter(|(idx, _)| *idx != src_index).collect();
+    if targets.is_empty() {
+        log_info("repo-sync: no other repositories configured; nothing to mirror");
+        return Ok(());
+    }
+    log_info(&format!(
+        "repo-sync: mirroring backup {label} to {} repositor(y/ies)",
+        targets.len()
+    ));
+
+    // Best-effort: keep going past a single failure so one unreachable target
+    // does not strand the others, but remember the first error to fail the
+    // command afterwards.
+    let mut first_error: Option<CommandError> = None;
+
+    for (dst_index, dst) in targets {
+        match crate::sync::backup::sync_backup_to_repo(config, stanza, label, repo_storage, src_index, dst, dst_index) {
+            Ok(synced) => log_info(&format!(
+                "repo-sync: repo{dst_index} <- backup {label}: {} object(s), {} byte(s)",
+                synced.items, synced.bytes
+            )),
+            Err(err) => {
+                log_warn(&format!("repo-sync: repo{dst_index} backup {label} sync failed: {err}"));
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 /// The backup-control connections resolved per the `backup-standby` policy.
@@ -1175,6 +1250,16 @@ fn stop_auto_enabled(config: &LoadedConfig) -> bool {
 /// resolves to `true`; only an explicit `false` suppresses the auto-expire.
 fn expire_auto_enabled(config: &LoadedConfig) -> bool {
     boolean_default_true(config, "expire-auto")
+}
+
+/// Whether the inline `--repo-sync` option is enabled (default **false**). When
+/// on, a successful backup is mirrored to every other configured repository
+/// immediately after completion. C ref: the post-backup repo-sync hook.
+fn repo_sync_enabled(config: &LoadedConfig) -> bool {
+    matches!(
+        config.options.get(&("repo-sync".to_owned(), None)),
+        Some(OptionValue::Boolean(true))
+    )
 }
 
 /// Default `manifest-save-threshold` (1 GiB) when the option is absent, matching
@@ -5031,7 +5116,7 @@ mod tests {
             options: BTreeMap::new(),
             params: Vec::new(),
         };
-        let err = backup(&cfg, &repo_s, &pg_s).expect_err("backup requires a stanza");
+        let err = backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect_err("backup requires a stanza");
         match err {
             CommandError::MissingOption { option } => assert_eq!(option, "stanza"),
             other => panic!("expected MissingOption, got {other:?}"),
@@ -5220,7 +5305,7 @@ mod tests {
             params: Vec::new(),
         };
 
-        backup(&cfg, &repo_s, &pg_s).expect("backup");
+        backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -5260,7 +5345,7 @@ mod tests {
         seed_file(&pg_s, "backup_label.old", b"obsolete label");
         seed_file(&pg_s, "postmaster.opts", b"opts");
 
-        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+        backup(&typed_cfg("demo", "full"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -5304,7 +5389,7 @@ mod tests {
         // The `logging_collector` pointer file (rotation state).
         seed_file(&pg_s, "current_logfiles", b"log/postgresql.log");
 
-        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+        backup(&typed_cfg("demo", "full"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -5346,7 +5431,7 @@ mod tests {
         // A second excluded runtime dir, also with content.
         seed_file(&pg_s, "pg_subtrans/0000", b"transient subtrans slru");
 
-        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+        backup(&typed_cfg("demo", "full"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -5497,7 +5582,7 @@ mod tests {
         let held = crate::lock::lock_acquire(lock_dir.path(), "demo", LockType::Backup).expect("pre-acquire backup lock");
         assert!(expected_lock.exists(), "lock file must appear while held");
 
-        let err = backup(&cfg, &repo_s, &pg_s).expect_err("backup must fail while the backup lock is held");
+        let err = backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect_err("backup must fail while the backup lock is held");
         assert!(
             err.to_string().contains("another backup is running"),
             "unexpected error: {err}"
@@ -5506,7 +5591,7 @@ mod tests {
         // Releasing the concurrent lock lets a backup run to completion; the
         // handle drops at return so the stale lock file is cleaned up.
         drop(held);
-        backup(&cfg, &repo_s, &pg_s).expect("backup succeeds once the lock is free");
+        backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect("backup succeeds once the lock is free");
         assert!(
             !expected_lock.exists(),
             "lock file must be removed after the command releases it"
@@ -5529,7 +5614,7 @@ mod tests {
         // Seed the stop file for the demo stanza.
         std::fs::write(lock_dir.path().join("demo.stop"), b"").expect("seed stop file");
 
-        let err = backup(&cfg, &repo_s, &pg_s).expect_err("backup must refuse when stopped");
+        let err = backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect_err("backup must refuse when stopped");
         let msg = err.to_string();
         assert!(msg.contains("stop file exists for stanza demo"), "unexpected error: {msg}");
 
@@ -5869,7 +5954,7 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_cluster(&pg_s);
 
-        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("full backup");
+        backup(&typed_cfg("demo", "full"), &repo_s, &[(1, &repo_s)], &pg_s).expect("full backup");
 
         // The full label is timestamp-derived; find the single backup recorded.
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
@@ -6269,7 +6354,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1259", &relation);
         seed_file(&pg_s, "PG_VERSION", b"14\n");
 
-        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&checksum_page_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -6299,7 +6384,7 @@ mod tests {
         relation[BLCKSZ + 8] ^= 0x01;
         seed_file(&pg_s, "base/1/1259", &relation);
 
-        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&checksum_page_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -6325,7 +6410,7 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_file(&pg_s, "base/1/1259", &valid_relation(2));
 
-        backup(&typed_cfg("demo", "full"), &repo_s, &pg_s).expect("backup");
+        backup(&typed_cfg("demo", "full"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -6347,7 +6432,7 @@ mod tests {
             b"not page aligned content of arbitrary length here .....",
         );
 
-        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&checksum_page_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -6367,7 +6452,7 @@ mod tests {
         init_stanza(&repo_s, "demo");
         seed_file(&pg_s, "base/1/1259", &vec![0u8; BLCKSZ * 2]);
 
-        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&checksum_page_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -6515,7 +6600,7 @@ mod tests {
         relation[8] ^= 0x01; // bit-flip in block 0's stored pd_checksum
         seed_file(&pg_s, "base/1/16384", &relation);
 
-        backup(&default_full_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&default_full_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes utf-8");
         pgbr_core::log::capture::uninstall();
@@ -6563,7 +6648,7 @@ mod tests {
         seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(1));
         seed_file(&pg_s, "base/1/16384", &valid_relation(2));
 
-        backup(&default_full_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&default_full_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let captured = String::from_utf8(pgbr_core::log::capture::drain()).expect("captured bytes utf-8");
         pgbr_core::log::capture::uninstall();
@@ -7504,7 +7589,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1260", b"small relation two, slightly bigger");
         seed_file(&pg_s, "PG_VERSION", b"14\n");
 
-        backup(&bundle_cfg("demo", false, None), &repo_s, &pg_s).expect("bundled backup");
+        backup(&bundle_cfg("demo", false, None), &repo_s, &[(1, &repo_s)], &pg_s).expect("bundled backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -7535,7 +7620,7 @@ mod tests {
 
         // Limit of 100 bytes: the 4096-byte file exceeds it and stays standalone;
         // PG_VERSION is bundled. repo-block off so the big file is not split.
-        backup(&bundle_cfg("demo", false, Some(100)), &repo_s, &pg_s).expect("bundled backup");
+        backup(&bundle_cfg("demo", false, Some(100)), &repo_s, &[(1, &repo_s)], &pg_s).expect("bundled backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -7563,7 +7648,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1259", &big);
         seed_file(&pg_s, "PG_VERSION", b"14\n");
 
-        backup(&bundle_cfg("demo", true, None), &repo_s, &pg_s).expect("block backup");
+        backup(&bundle_cfg("demo", true, None), &repo_s, &[(1, &repo_s)], &pg_s).expect("block backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -7641,7 +7726,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1259", &relation);
 
         // checksum_page_cfg leaves page-header-check unset -> defaults true.
-        backup(&checksum_page_cfg("demo"), &repo_s, &pg_s).expect("backup");
+        backup(&checksum_page_cfg("demo"), &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -7666,7 +7751,7 @@ mod tests {
         let mut cfg = checksum_page_cfg("demo");
         cfg.options
             .insert(("page-header-check".to_owned(), None), OptionValue::Boolean(false));
-        backup(&cfg, &repo_s, &pg_s).expect("backup");
+        backup(&cfg, &repo_s, &[(1, &repo_s)], &pg_s).expect("backup");
 
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
         let (label, _) = info.current.iter().next().expect("one backup");
@@ -8172,7 +8257,7 @@ mod tests {
             params: Vec::new(),
         };
 
-        backup(&config, &repo_s, &pg_s).expect("backup with expire-auto");
+        backup(&config, &repo_s, &[(1, &repo_s)], &pg_s).expect("backup with expire-auto");
 
         // After expire-auto with retention=1, only the single newest full survives.
         let info = InfoBackup::load(&repo_s, &backup_info_path("demo")).expect("reload backup.info");
@@ -9363,6 +9448,131 @@ mod tests {
         assert_eq!(
             bundle_a, bundle_b,
             "two parallel runs must produce byte-identical bundle objects"
+        );
+    }
+
+    /// Build a `LoadedConfig` for the `backup` command from `(name, group-index)`
+    /// keyed option overrides (mirrors the sync module's `cfg` helper).
+    fn cfg(options: Vec<((&str, Option<u32>), OptionValue)>) -> LoadedConfig {
+        let mut map: BTreeMap<(String, Option<u32>), OptionValue> = BTreeMap::new();
+        for ((name, idx), value) in options {
+            map.insert((name.to_owned(), idx), value);
+        }
+        LoadedConfig {
+            command: "backup".to_owned(),
+            command_role: pgbr_config::ConfigCommandRole::Main,
+            stanza: Some("demo".to_owned()),
+            options: map,
+            params: Vec::new(),
+        }
+    }
+
+    /// Seed a source repository with an initialised stanza plus a single full
+    /// backup `label` (its `backup.info` entry and a `backup.manifest` with no
+    /// ancestor references) so `sync_to_other_repos` can mirror it verbatim.
+    fn seed_source_backup(repo: &Posix, stanza: &str, label: &str) {
+        init_stanza(repo, stanza);
+        let (mut info, _) = InfoBackup::load_keyed(repo, &backup_info_path(stanza), None).unwrap();
+        info.current.insert(
+            label.to_owned(),
+            json!({
+                "backup-info-size": 123,
+                "backup-label": label,
+                "backup-type": "full",
+            }),
+        );
+        info.save_keyed(repo, &backup_info_path(stanza), None, None).unwrap();
+
+        let manifest = Manifest {
+            backup_label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            timestamp_start: 1_704_110_400,
+            timestamp_stop: 1_704_110_410,
+            db_version: "14".to_owned(),
+            db_system_id: 6_873_049_345_984_568_091,
+            files: Vec::new(),
+            option_checksum_page: None,
+            paths: vec![ManifestPath {
+                path: "pg_data".to_owned(),
+            }],
+            links: Vec::new(),
+        };
+        let manifest_rel = PathBuf::from(format!("backup/{stanza}/{label}/backup.manifest"));
+        repo.create_path(manifest_rel.parent().unwrap(), true).unwrap();
+        manifest.save_keyed(repo, &manifest_rel, None).unwrap();
+    }
+
+    /// `sync_to_other_repos` is best-effort per target: a failing destination is
+    /// logged and skipped, the remaining destinations are still mirrored, and the
+    /// first error is returned only after every target has been attempted. This
+    /// guards the post-backup mirror against the fail-fast `?` regression where an
+    /// early target failure stranded the later ones (and pre-empted expire-auto).
+    #[test]
+    fn sync_to_other_repos_is_best_effort_across_targets() {
+        let stanza = "demo";
+        let label = "20260101-100000F";
+
+        // Source (repo1) holds the backup to mirror.
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        seed_source_backup(&src, stanza, label);
+
+        // repo2 fails first (uninitialised stanza → no backup.info); repo3 is
+        // initialised and must still receive the backup despite repo2's failure.
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad = Posix::new(bad_dir.path());
+        let good_dir = tempfile::tempdir().unwrap();
+        let good = Posix::new(good_dir.path());
+        init_stanza(&good, stanza);
+
+        let config = cfg(Vec::new());
+        let storages: Vec<(u32, &dyn Storage)> = vec![(1, &src), (2, &bad), (3, &good)];
+
+        let err = sync_to_other_repos(&config, stanza, label, &src, &storages)
+            .expect_err("a failing target must surface after all targets are attempted");
+        match err {
+            CommandError::Other(msg) => {
+                assert!(msg.contains("not initialized"), "first error should be repo2's: {msg}");
+            }
+            other => panic!("expected Other(not initialized), got {other:?}"),
+        }
+
+        // The good target (repo3) was still mirrored: its manifest sentinel exists.
+        assert!(
+            good.exists(Path::new(&format!("backup/{stanza}/{label}/backup.manifest")))
+                .unwrap(),
+            "repo3 must be mirrored even though repo2 failed first"
+        );
+        // repo3's backup.info now advertises the synced backup.
+        let (good_info, _) = InfoBackup::load_keyed(&good, &backup_info_path(stanza), None).unwrap();
+        assert!(
+            good_info.current.contains_key(label),
+            "repo3 backup.info must list the synced label"
+        );
+    }
+
+    /// All targets healthy → `sync_to_other_repos` mirrors each and returns
+    /// `Ok(())`.
+    #[test]
+    fn sync_to_other_repos_ok_when_all_targets_succeed() {
+        let stanza = "demo";
+        let label = "20260101-100000F";
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Posix::new(src_dir.path());
+        seed_source_backup(&src, stanza, label);
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = Posix::new(dst_dir.path());
+        init_stanza(&dst, stanza);
+
+        let config = cfg(Vec::new());
+        let storages: Vec<(u32, &dyn Storage)> = vec![(1, &src), (2, &dst)];
+
+        sync_to_other_repos(&config, stanza, label, &src, &storages).expect("all-healthy mirror is Ok");
+        assert!(
+            dst.exists(Path::new(&format!("backup/{stanza}/{label}/backup.manifest")))
+                .unwrap()
         );
     }
 }
