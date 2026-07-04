@@ -1345,7 +1345,7 @@ mod tests {
     <KeyCount>1</KeyCount>
     <MaxKeys>1</MaxKeys>
     <IsTruncated>true</IsTruncated>
-    <NextContinuationToken>1ueGcxLPRx1Tr/XY7zn+1n</NextContinuationToken>
+    <NextContinuationToken>example-next-page-token</NextContinuationToken>
     <Contents>
         <Key>archive/000000010000000000000001</Key>
         <LastModified>2009-10-12T17:50:30.000Z</LastModified>
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(parsed1.entries.len(), 1);
         assert_eq!(parsed1.entries[0].key, "archive/000000010000000000000001");
         assert!(parsed1.is_truncated);
-        assert_eq!(parsed1.next_continuation_token.as_deref(), Some("1ueGcxLPRx1Tr/XY7zn+1n"));
+        assert_eq!(parsed1.next_continuation_token.as_deref(), Some("example-next-page-token"));
 
         // Second page: not truncated, no further token — the loop terminates.
         let page2 = r#"<?xml version="1.0" encoding="UTF-8"?>

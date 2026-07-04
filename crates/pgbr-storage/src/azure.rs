@@ -1292,12 +1292,12 @@ mod tests {
             </Properties>
         </Blob>
     </Blobs>
-    <NextMarker>2!72!MDAwMDI1IQ==</NextMarker>
+    <NextMarker>example-next-marker</NextMarker>
 </EnumerationResults>"#;
         let parsed1 = parse_list_blobs(page1).unwrap();
         assert_eq!(parsed1.entries.len(), 1);
         assert_eq!(parsed1.entries[0].name, "archive/000000010000000000000001");
-        assert_eq!(parsed1.next_marker.as_deref(), Some("2!72!MDAwMDI1IQ=="));
+        assert_eq!(parsed1.next_marker.as_deref(), Some("example-next-marker"));
 
         // Second page: empty <NextMarker> — the loop terminates.
         let page2 = r#"<?xml version="1.0" encoding="utf-8"?>
