@@ -84,6 +84,12 @@ pub enum StorageError {
     PermissionDenied { path: PathBuf },
     /// Wrapped error from the backend (filesystem, HTTP, …) that doesn't map to a category above.
     Backend { path: PathBuf, message: String },
+    /// The backend does not support this operation at all (e.g. symlink
+    /// creation or link-target reads on an object store). Distinct from
+    /// [`Self::Backend`] so callers can treat "not supported here" as a typed
+    /// condition instead of matching on the message text, and so a genuine I/O
+    /// failure (which maps to `Backend`) is never mistaken for it.
+    Unsupported { path: PathBuf, message: String },
     /// Raised by the [`IoRead`] / [`IoWrite`] layer when used through this backend.
     Io(IoError),
 }
@@ -95,6 +101,7 @@ impl fmt::Display for StorageError {
             Self::AlreadyExists { path } => write!(f, "already exists: {}", path.display()),
             Self::PermissionDenied { path } => write!(f, "permission denied: {}", path.display()),
             Self::Backend { path, message } => write!(f, "backend error at {}: {message}", path.display()),
+            Self::Unsupported { path, message } => write!(f, "unsupported at {}: {message}", path.display()),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -226,7 +233,7 @@ pub trait Storage: Send + Sync {
     /// backends return [`StorageError`] variants for permission / backend failures or
     /// [`StorageError::AlreadyExists`] when `link_path` already exists.
     fn create_symlink(&self, link_path: &Path, _target: &Path) -> Result<(), StorageError> {
-        Err(StorageError::Backend {
+        Err(StorageError::Unsupported {
             path: link_path.to_path_buf(),
             message: "symlinks not supported by this backend".to_owned(),
         })
@@ -247,7 +254,7 @@ pub trait Storage: Send + Sync {
     /// Overriding backends return [`StorageError::NotFound`] if `path` is not a
     /// symlink, or other variants for permission / backend failures.
     fn read_link(&self, path: &Path) -> Result<PathBuf, StorageError> {
-        Err(StorageError::Backend {
+        Err(StorageError::Unsupported {
             path: path.to_path_buf(),
             message: "read_link not supported by this backend".to_owned(),
         })

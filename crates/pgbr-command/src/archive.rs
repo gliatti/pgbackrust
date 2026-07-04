@@ -225,7 +225,7 @@ fn transform_segment(transform: &RepoTransform, bytes: &[u8]) -> Result<Vec<u8>,
 /// absolute host paths outside the [`Storage`] trait.
 ///
 /// Writes `bytes` to a sibling `<path>.pgbackrust.tmp`, fsyncs it, then
-/// atomically renames it onto `path` — the same temp+fsync+rename guarantee
+/// atomically renames it onto `path` — the same temp+fsync+rename+parent-dir-fsync guarantee
 /// [`Storage::write_atomic_path`] gives the serial path, so a crashed worker
 /// never leaves a torn WAL segment in the repository. A best-effort cleanup
 /// removes the temp on a failed rename.
@@ -245,6 +245,14 @@ fn write_atomic_std(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
+    }
+    // Durability of the rename itself: fsync the parent directory so the
+    // published name survives a power loss, matching Storage::write_atomic_path
+    // (Posix write_atomic_local). Unix only; a clean no-op on Windows.
+    #[cfg(unix)]
+    {
+        let dir = parent.unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
 }
@@ -2327,7 +2335,7 @@ pub(crate) fn read_archived_segment(
     let bytes = decode_stored_segment(&stored, suffix, sub_key)?;
 
     // Lenient integrity gate: when the recovered bytes parse as a genuine WAL
-    // long-header page, cross-check the declared segment size and timeline so a
+    // long-header page, cross-check the declared segment size so a
     // torn store or a mis-decrypt of real WAL is caught before the caller
     // (backup archive-copy) trusts it. Bytes that do not carry a WAL header
     // (non-segment companion files, or the transform-round-trip test fixtures)

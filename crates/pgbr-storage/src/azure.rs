@@ -719,8 +719,13 @@ impl Storage for Azure {
             }));
 
             match page.next_marker {
-                Some(next) => marker = Some(next),
-                None => break,
+                // Stop if the marker does not advance. Azure's only termination
+                // signal is an empty NextMarker, so an endpoint that echoes the
+                // same non-empty marker would otherwise loop forever,
+                // accumulating duplicate entries. (S3 also cross-checks
+                // IsTruncated; Azure has no such flag.)
+                Some(next) if Some(&next) != marker.as_ref() => marker = Some(next),
+                _ => break,
             }
         }
 
@@ -1320,6 +1325,45 @@ mod tests {
         assert_eq!(parsed2.entries.len(), 1);
         assert_eq!(parsed2.entries[0].name, "archive/000000010000000000000002");
         assert_eq!(parsed2.next_marker, None);
+    }
+
+    #[test]
+    fn list_pagination_no_progress_guard_terminates() {
+        // Reproduces the `list()` loop-tail decision in isolation: a hostile or
+        // buggy endpoint that keeps echoing the same non-empty NextMarker must
+        // terminate the loop instead of advancing forever. Azure has no
+        // IsTruncated flag, so the only defence is "did the marker advance?".
+        //
+        // `advance` mirrors the guard: it returns the marker to use for the next
+        // request, or `None` to break out of the loop.
+        fn advance(marker: Option<&String>, next_marker: Option<String>) -> Option<String> {
+            match next_marker {
+                Some(next) if Some(&next) != marker => Some(next),
+                _ => None,
+            }
+        }
+
+        // A genuinely new marker keeps the loop going.
+        let marker: Option<String> = Some("page-1".to_string());
+        assert_eq!(
+            advance(marker.as_ref(), Some("page-2".to_string())),
+            Some("page-2".to_string())
+        );
+
+        // The same non-empty marker echoed back stops the loop.
+        let marker: Option<String> = Some("stuck".to_string());
+        assert_eq!(advance(marker.as_ref(), Some("stuck".to_string())), None);
+
+        // First page (no marker yet) followed by a non-empty marker advances.
+        let marker: Option<String> = None;
+        assert_eq!(
+            advance(marker.as_ref(), Some("page-1".to_string())),
+            Some("page-1".to_string())
+        );
+
+        // Empty NextMarker always stops the loop (the normal completion path).
+        let marker: Option<String> = Some("page-1".to_string());
+        assert_eq!(advance(marker.as_ref(), None), None);
     }
 
     #[test]

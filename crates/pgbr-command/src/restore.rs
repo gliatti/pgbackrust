@@ -2348,12 +2348,14 @@ fn destination_absolute_path(storage: &dyn Storage, rel: &Path) -> Result<PathBu
     Ok(abs_parent.join(name))
 }
 
-/// Whether a [`StorageError`] is the "symlinks not supported by this backend"
-/// signal from the [`Storage::create_symlink`] trait default, as opposed to a
-/// genuine I/O failure. Only the former should be swallowed (counted as a
-/// skipped link); a real error must fail the restore.
-fn is_symlink_unsupported(err: &StorageError) -> bool {
-    matches!(err, StorageError::Backend { message, .. } if message.contains("symlinks not supported"))
+/// Whether a [`StorageError`] is the "backend does not support symlinks" signal
+/// from the [`Storage::create_symlink`] trait default, as opposed to a genuine
+/// I/O failure. Only the former should be swallowed (counted as a skipped
+/// link); a real error must fail the restore. Matched on the typed
+/// [`StorageError::Unsupported`] variant rather than the message text so a
+/// reworded message can never flip a real failure into a silent skip.
+const fn is_symlink_unsupported(err: &StorageError) -> bool {
+    matches!(err, StorageError::Unsupported { .. })
 }
 
 /// Counts returned by [`materialize_links`].

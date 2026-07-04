@@ -3998,13 +3998,16 @@ fn plan_backup(
             StorageKind::Link => {
                 // Record the link's real target. Filesystem backends resolve it
                 // via `read_link`; backends without link-target support (the
-                // remote/object stores) return a `Backend` error, in which case
-                // we fall back to an empty destination — the same
+                // remote/object stores) return `StorageError::Unsupported`, in
+                // which case we fall back to an empty destination — the same
                 // known-limitation behaviour as before, kept out of the restore
-                // path's hard error only for those backends.
+                // path's hard error only for those backends. A genuine local I/O
+                // failure maps to `Backend`/`Io`, NOT `Unsupported`, so it
+                // propagates and fails the backup loudly instead of silently
+                // recording an empty (unrestorable) symlink target.
                 let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
                     Ok(target) => target.to_string_lossy().into_owned(),
-                    Err(StorageError::Backend { .. }) => String::new(),
+                    Err(StorageError::Unsupported { .. }) => String::new(),
                     Err(err) => return Err(err.into()),
                 };
                 plan.links.push(ManifestLink {
