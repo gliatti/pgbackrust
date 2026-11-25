@@ -40,8 +40,8 @@ sed -i 's/#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config || true
 install -d -o postgres -g postgres -m 0750 /srv/depot 2>/dev/null || true
 
 # A freshly created named volume mounts its data-dir mountpoint as root:root
-# (the custom path /var/lib/postgresql/16/<node> does not exist in the
-# postgres:16 image, so Docker creates it as root rather than copying postgres
+# (the custom path /var/lib/postgresql/<major>/<node> does not exist in the
+# postgres:<major> image, so Docker creates it as root rather than copying postgres
 # ownership). The scenarios run `initdb` as the postgres user, which then fails
 # to chmod the data dir with "could not change permissions ... Operation not
 # permitted". Hand the PG data-dir mountpoints to postgres on every boot so

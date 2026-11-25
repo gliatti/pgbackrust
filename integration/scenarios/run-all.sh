@@ -3,6 +3,7 @@
 #
 #   ./integration/scenarios/run-all.sh            # all scenarios
 #   ./integration/scenarios/run-all.sh 01 03      # only matching scenarios
+#   PGBR_PG_VERSION=19 ./integration/scenarios/run-all.sh   # against PG 19 (default 16)
 #
 # Steps: build the binary if missing, mint the shared SSH key, build the node
 # image, then for EACH scenario reset the topology (down -v / up) so it runs in
@@ -17,7 +18,7 @@ cd "$ROOT"
 
 # Docker Desktop's buildx "bake" path builds all compose services in parallel
 # and races when several of them export the SAME image tag — the three nodes
-# share pgbr-node:latest — failing with `image ... already exists`. Default to
+# share pgbr-node:pg<major> — failing with `image ... already exists`. Default to
 # the classic sequential builder so a plain run works out of the box; callers
 # can still override (e.g. COMPOSE_BAKE=true) on engines without the race.
 export COMPOSE_BAKE="${COMPOSE_BAKE:-false}"

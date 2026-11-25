@@ -8,6 +8,10 @@
 #   docker compose -f integration/docker/docker-compose.yml up -d
 #   ./integration/scenarios/run-all.sh
 #
+# PostgreSQL major: PGBR_PG_VERSION selects the postgres:<major> base image, the
+# image tag (pgbr-node:pg<major>) and the data-dir paths; it defaults to 16.
+#   PGBR_PG_VERSION=19 ./integration/scenarios/run-all.sh
+#
 # Each node shares a key from integration/artifacts/ssh (created by run-all.sh)
 # so the postgres user can SSH between nodes for the pull/remote scenarios.
 
@@ -21,7 +25,9 @@ x-node: &node
   build:
     context: ../..
     dockerfile: integration/docker/Dockerfile.node
-  image: pgbr-node:latest
+    args:
+      PG_MAJOR: ${PGBR_PG_VERSION:-16}
+  image: pgbr-node:pg${PGBR_PG_VERSION:-16}
   volumes:
     - ../artifacts/ssh:/shared-ssh:ro
     - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
@@ -50,7 +56,7 @@ services:
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
       - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
-      - principal-data:/var/lib/postgresql/16/principal
+      - principal-data:/var/lib/postgresql/${PGBR_PG_VERSION:-16}/principal
 
   secondaire:
     <<: *node
@@ -61,7 +67,7 @@ services:
     volumes:
       - ../artifacts/ssh:/shared-ssh:ro
       - ../artifacts/pgbackrust:/usr/bin/pgbackrust:ro
-      - secondaire-data:/var/lib/postgresql/16/secondaire
+      - secondaire-data:/var/lib/postgresql/${PGBR_PG_VERSION:-16}/secondaire
 
   # S3-compatible object store for the KB "Sauvegarde vers un dépôt S3"
   # scenario (repo1-type=s3). Bucket is created by scenario 11.

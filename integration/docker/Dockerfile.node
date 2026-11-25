@@ -1,9 +1,10 @@
 # A single image used for all three integration nodes (principal / secondaire /
-# depot). Extends the official postgres:16 (Debian bookworm) with openssh
-# (for the KB pull / remote scenarios) and the prebuilt Rust pgbackrust binary.
+# depot). Extends the official postgres:<PG_MAJOR> image (default 16; the compose
+# file passes PGBR_PG_VERSION) with openssh (for the KB pull / remote scenarios)
+# and the prebuilt Rust pgbackrust binary.
 #
 # Build context is the repo root so the binary artifact can be COPYed in:
-#   docker build -f integration/docker/Dockerfile.node -t pgbr-node .
+#   docker build -f integration/docker/Dockerfile.node -t pgbr-node:pg16 .
 ARG PG_MAJOR=16
 FROM postgres:${PG_MAJOR}
 
