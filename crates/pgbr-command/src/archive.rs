@@ -24,7 +24,11 @@
 //! a slice of repository [`Storage`] backends (one per configured repo, built by
 //! the CLI's `build_all_repo_storages`) and fans the copy out to each — if any
 //! repository write fails the whole command fails (the segment is not safely
-//! archived). [`get`] is the dual: it tries each repository in order and serves
+//! archived). Every configured repository must hold the stanza's `archive.info`
+//! before anything is pushed: a repository that was never initialised with
+//! `stanza-create` fails the command up front, and an encrypted repository whose
+//! cipher sub-key cannot be resolved is refused rather than written in
+//! cleartext. [`get`] is the dual: it tries each repository in order and serves
 //! the segment from the first that has it. C ref:
 //! `src/command/archive/push/push.c` (`archivePushFile` over `repoIdxList`) and
 //! `src/command/archive/get/get.c`.
@@ -170,9 +174,12 @@ fn active_repo_index(config: &LoadedConfig) -> u32 {
 /// pgBackRust's two-level scheme), not the user passphrase directly. The sub-key
 /// is stored, encrypted under the user passphrase, in the `[cipher]` section of
 /// that repository's `archive.info`; [`InfoArchive::load_keyed`] returns it. A
-/// repository with no `archive.info` yet (uninitialised) returns `Ok(None)` —
-/// there is nothing to push to an uninitialised, encrypted repo, but we degrade
-/// to a plaintext copy rather than fail here.
+/// repository with no `archive.info` yet (uninitialised) also returns
+/// `Ok(None)`, which is indistinguishable here from an unencrypted repository:
+/// callers that write WAL must NOT treat that `None` as "store plaintext" for an
+/// encrypted repo. [`per_repo_transforms`] refuses that case, and [`push`]
+/// rejects any repository lacking `archive.info` up front
+/// ([`require_archive_info_in_all_repos`]).
 ///
 /// # Errors
 ///
@@ -192,10 +199,15 @@ fn repo_sub_key(repo: &dyn Storage, config: &LoadedConfig, index: u32, stanza: &
 /// encrypted repo stores encrypted WAL while a plaintext repo in the same
 /// fan-out stores plaintext.
 ///
+/// An encrypted repository whose sub-key cannot be resolved (no `archive.info`)
+/// is an error, never a silent downgrade to a plaintext transform: WAL bound for
+/// an encrypted repository is either encrypted or not written at all.
+///
 /// # Errors
 ///
 /// Propagates [`repo_sub_key`] failures (missing passphrase, undecryptable
-/// recorded sub-key, storage errors).
+/// recorded sub-key, storage errors); [`CommandError::Other`] when a repository
+/// is configured encrypted but its sub-key could not be resolved.
 fn per_repo_transforms(
     config: &LoadedConfig,
     repo_storages: &[&dyn Storage],
@@ -210,6 +222,14 @@ fn per_repo_transforms(
         // indexes (defensive; the two are kept in lock-step by construction).
         let index = indexes.get(pos).copied().unwrap_or(1);
         let sub_key = repo_sub_key(*repo, config, index, stanza)?;
+        // `repo_sub_key` returns `None` both for an unencrypted repo and for an
+        // encrypted one with no `archive.info`; the latter must never fall
+        // through to a cipher-less transform (GHSA-8265-5345-wr5g).
+        if crate::cipher::cipher_type(config, index).is_encrypted() && sub_key.is_none() {
+            return Err(CommandError::Other(format!(
+                "archive-push: repository {index} is encrypted but its cipher sub-key could not be resolved (missing archive.info); refusing to store plaintext WAL"
+            )));
+        }
         transforms.push(RepoTransform::with_key(compress_type, compress_level, sub_key));
     }
     Ok(transforms)
@@ -896,6 +916,46 @@ fn load_drain_archive_id(
     Ok(archive_id(&info))
 }
 
+/// Refuse `archive-push` when a configured repository lacks the stanza's `archive.info`.
+///
+/// The archive-id is resolved from the FIRST repository holding `archive.info`
+/// ([`load_archive_info`]), so without this check a repository added to the
+/// configuration but never initialised with `stanza-create` would silently
+/// receive WAL under another repository's archive-id — and, when it is
+/// encrypted, with no cipher sub-key, i.e. in cleartext (GHSA-8265-5345-wr5g).
+/// Matches upstream, which requires every repository to be initialised before
+/// WAL is pushed to it. Repository positions map to group indexes through
+/// [`configured_repo_indexes`], as everywhere else in this module.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] naming the first repository index whose
+/// `archive/<stanza>/archive.info` is absent; [`CommandError::Storage`] when the
+/// existence probe itself fails.
+fn require_archive_info_in_all_repos(
+    config: &LoadedConfig,
+    repo_storages: &[&dyn Storage],
+    stanza: &str,
+) -> Result<(), CommandError> {
+    let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    let indexes = configured_repo_indexes(config);
+    for (pos, repo) in repo_storages.iter().enumerate() {
+        if repo.exists(&info_path)? {
+            continue;
+        }
+        // Defensive fallback (positions and indexes are kept in lock-step by
+        // construction): report the 1-based position rather than a wrong index.
+        let index = indexes
+            .get(pos)
+            .copied()
+            .unwrap_or_else(|| u32::try_from(pos).map_or(u32::MAX, |p| p.saturating_add(1)));
+        return Err(CommandError::Other(format!(
+            "archive-push: repository {index} has no archive.info for stanza {stanza} — run stanza-create first"
+        )));
+    }
+    Ok(())
+}
+
 /// `archive-push` — copy a completed WAL segment from the PG data directory
 /// into **every** configured repository.
 ///
@@ -921,6 +981,10 @@ fn load_drain_archive_id(
 ///   `None`, or `"<wal-source>"` if no positional source path was supplied.
 /// - [`CommandError::Other`] if the source path has no file-name component or
 ///   `repo_storages` is empty.
+/// - [`CommandError::Other`] if any configured repository has no
+///   `archive.info` for the stanza (not initialised by `stanza-create`), or an
+///   encrypted repository's cipher sub-key cannot be resolved — WAL is never
+///   stored in cleartext in an encrypted repository.
 /// - [`CommandError::Io`] if the configured compress filter fails.
 /// - [`CommandError::Storage`] / [`CommandError::Io`] if the read from PG or a
 ///   write into any repository fails.
@@ -983,6 +1047,10 @@ pub fn push(config: &LoadedConfig, repo_storages: &[&dyn Storage], pg_storage: &
     let archive_info = load_archive_info(config, repo_storages, stanza)?
         .ok_or_else(|| CommandError::Other("archive-push: unable to load archive.info — is the stanza created?".to_owned()))?;
     let archive_id = archive_id(&archive_info);
+    // Every configured repository must itself be initialised: refuse BEFORE the
+    // async and sync branches so nothing is staged-and-drained or written to a
+    // repository lacking `archive.info` (never cleartext into an encrypted repo).
+    require_archive_info_in_all_repos(config, repo_storages, stanza)?;
 
     // archive-header-check: validate the WAL segment's long-page header against
     // the stanza's archive.info before storing, rejecting a segment that belongs
@@ -3283,7 +3351,9 @@ mod tests {
         let repo1_s = Posix::new(repo1.path());
         let repo2_s = Posix::new(repo2.path());
         let pg_s = Posix::new(pg.path());
+        // Every repository must be initialised (archive.info present) to accept WAL.
         seed_archive_info_generic(&repo1_s, "demo");
+        seed_archive_info_generic(&repo2_s, "demo");
 
         let wal_source = format!("pg_wal/{SEGMENT}");
         put(&pg_s, &wal_source, WAL_BODY);
@@ -3408,6 +3478,8 @@ mod tests {
 
         // repo1 (index 1) is encrypted with a recorded sub-key.
         seed_encrypted_archive_info(&repo1_s, "demo", TEST_SYSTEM_ID, "14", "userpass1", "cmVwbzEtc3ViLWtleQ==");
+        // repo2 (index 2) is initialised too, with a plaintext archive.info.
+        seed_archive_info(&repo2_s, "demo", TEST_SYSTEM_ID, "14");
 
         let wal_source = format!("pg_wal/{SEGMENT}");
         // Use a WAL-header-valid body so archive-header-check (on for repo1)
@@ -3522,6 +3594,250 @@ mod tests {
         assert!(!transforms[1].is_encrypted(), "repo2 transform must be plaintext");
     }
 
+    // -----------------------------------------------------------------------
+    // GHSA-8265-5345-wr5g: never write cleartext WAL into an encrypted repo
+    // -----------------------------------------------------------------------
+
+    /// Every regular file under `root` (recursive); empty when `root` is absent.
+    fn files_under(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// Assert `err` is the "repository 2 has no archive.info" refusal.
+    fn assert_repo2_missing_archive_info(err: &CommandError) {
+        match err {
+            CommandError::Other(msg) => {
+                assert!(msg.contains("repository 2"), "msg must name repository 2: {msg}");
+                assert!(msg.contains("archive.info"), "msg must mention archive.info: {msg}");
+            }
+            other => panic!("expected Other(repository 2 ... archive.info), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_refuses_uninitialised_encrypted_repo() {
+        // The advisory reproduction: repo1 initialised + encrypted, repo2 added
+        // to the config with aes-256-cbc but never stanza-created. The push must
+        // fail, and NOTHING (least of all cleartext WAL) may land in repo2.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LXJlcG8xLWtleQ==",
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        let err = push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect_err("push to an uninitialised encrypted repo must fail");
+        assert_repo2_missing_archive_info(&err);
+        assert!(
+            files_under(&repo2.path().join("archive")).is_empty(),
+            "no file may be written under repo2/archive"
+        );
+        assert!(
+            !repo1_s
+                .exists(Path::new(&format!("archive/demo/14-1/{SEGMENT}")))
+                .expect("exists"),
+            "the refusal happens before any repository is written"
+        );
+    }
+
+    #[test]
+    fn push_refuses_uninitialised_plaintext_repo() {
+        // The refusal is not cipher-specific: an unencrypted repo2 without
+        // archive.info must not receive WAL under repo1's archive-id either.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LXBsYWluLWtleQ==",
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        cfg.options
+            .insert(("repo-path".to_owned(), Some(2)), OptionValue::Path("/repo2".to_owned()));
+
+        let err = push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect_err("push to an uninitialised plaintext repo must fail");
+        assert_repo2_missing_archive_info(&err);
+        assert!(
+            files_under(&repo2.path().join("archive")).is_empty(),
+            "no file may be written under repo2/archive"
+        );
+    }
+
+    #[test]
+    fn push_to_all_initialised_repos_still_succeeds() {
+        // Non-regression: with every repo initialised the gate is a no-op and
+        // the encrypted repo still stores ciphertext.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LW9rLXJlcG8xLWs=",
+        );
+        seed_encrypted_archive_info(
+            &repo2_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass2",
+            "Z2hzYS04MjY1LW9rLXJlcG8yLWs=",
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect("push to fully initialised repos must succeed");
+
+        let dest = format!("archive/demo/14-1/{SEGMENT}");
+        for (label, repo) in [("repo1", &repo1_s), ("repo2", &repo2_s)] {
+            let stored = read(repo, &dest);
+            assert_ne!(stored, WAL_BODY, "{label} must not store cleartext WAL");
+            assert_eq!(
+                &stored[..CIPHER_MAGIC.len()],
+                CIPHER_MAGIC,
+                "{label} must carry the cipher magic"
+            );
+        }
+    }
+
+    #[test]
+    fn per_repo_transforms_refuses_encrypted_repo_without_archive_info() {
+        // repo2 is configured encrypted but has no archive.info, so its sub-key
+        // resolves to None: that must be an error, never a cipher-less transform.
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LXRyYW5zZm9ybQ==",
+        );
+
+        let mut cfg = fake_config(Some("demo"), Vec::new());
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        let err = per_repo_transforms(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], "demo")
+            .expect_err("encrypted repo without a resolvable sub-key must error");
+        match err {
+            CommandError::Other(msg) => {
+                assert!(msg.contains("repository 2"), "msg must name repository 2: {msg}");
+                assert!(msg.contains("refusing to store plaintext WAL"), "msg was {msg}");
+            }
+            other => panic!("expected Other(refusing to store plaintext WAL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_push_refuses_uninitialised_encrypted_repo() {
+        // Async path: the refusal must fire before staging/draining, so nothing
+        // reaches repo2 (and nothing is left staged in the spool).
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LWFzeW5jLWtleQ==",
+        );
+        let (spool, spool_s) = spool_storage();
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config_async(Some("demo"), vec![wal_source], spool.path());
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        let err = push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect_err("async push to an uninitialised encrypted repo must fail");
+        assert_repo2_missing_archive_info(&err);
+        assert!(
+            files_under(&repo2.path().join("archive")).is_empty(),
+            "no file may be drained under repo2/archive"
+        );
+        assert!(
+            !spool_s
+                .exists(Path::new(&format!("archive/demo/out/{SEGMENT}")))
+                .expect("exists"),
+            "the refusal happens before the segment is staged"
+        );
+    }
+
     #[test]
     fn async_drain_keyed_encrypts_for_the_target_repo() {
         // The async drain into a single repo applies that repo's RepoTransform,
@@ -3600,9 +3916,11 @@ mod tests {
         let pg = tempfile::tempdir().expect("pg tempdir");
         let repo1_s = Posix::new(repo1.path());
         seed_archive_info_generic(&repo1_s, "demo");
-        // Block repo2 by placing a file where the `archive` directory must go.
-        std::fs::write(bad.path().join("archive"), b"not a dir").expect("write blocker");
+        // repo2 is initialised (so the archive.info gate passes) but blocked by a
+        // file where the archive-id directory must go, so the WAL write fails.
         let bad_s = Posix::new(bad.path());
+        seed_archive_info_generic(&bad_s, "demo");
+        std::fs::write(bad.path().join(format!("archive/demo/{ARCHIVE_ID}")), b"not a dir").expect("write blocker");
         let pg_s = Posix::new(pg.path());
 
         let wal_source = format!("pg_wal/{SEGMENT}");

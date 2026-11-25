@@ -948,6 +948,77 @@ mod tests {
         assert_eq!(buf, payload, "cipher round trip must recover the plaintext");
     }
 
+    /// Regression for GHSA-8265-5345-wr5g (CWE-311): `echo secret |
+    /// pgbackrust --repo=3 repo-put test.txt` against a repository whose cipher
+    /// is configured at `repo3-*` must encrypt the bytes. The cipher key is
+    /// resolved for the **active** repository index (`--repo`), not index 1.
+    #[test]
+    fn repo_put_cipher_respects_active_repo_index() {
+        let (repo, storage) = posix_repo();
+        let payload = b"secret";
+        let options = || {
+            vec![
+                (("repo", None), OptionValue::Integer(3)),
+                (("repo-cipher-type", Some(3)), OptionValue::StringId("aes-256-cbc".to_owned())),
+                (
+                    ("repo-cipher-pass", Some(3)),
+                    OptionValue::String("repo3-passphrase".to_owned()),
+                ),
+            ]
+        };
+
+        let put_cfg = fake_config_with_groups("repo-put", vec!["test.txt".to_owned()], options());
+        assert!(put_cfg.stanza.is_none(), "advisory repro runs without a stanza");
+        let mut input = Cursor::new(payload.to_vec());
+        put_from(&put_cfg, &storage, &mut input).expect("cipher put_from on repo3 should succeed");
+
+        let stored = std::fs::read(repo.path().join("test.txt")).expect("read back ciphertext");
+        assert!(
+            stored.starts_with(b"Salted__"),
+            "repo3 put must carry the OpenSSL salt header (encrypted at rest)"
+        );
+        assert!(
+            !stored.windows(payload.len()).any(|w| w == payload),
+            "repo3 put must not store the plaintext in the clear"
+        );
+
+        let get_cfg = fake_config_with_groups("repo-get", vec!["test.txt".to_owned()], options());
+        let mut buf: Vec<u8> = Vec::new();
+        get_to(&get_cfg, &storage, &mut buf).expect("cipher get_to on repo3 should succeed");
+        assert_eq!(buf, payload, "repo3 cipher round trip must recover the plaintext");
+    }
+
+    /// Counter-case documenting the per-repository cipher semantics: a cipher
+    /// configured at `repo1-*` does **not** apply when `--repo=3` selects a
+    /// repository with no cipher of its own, so the put is stored unencrypted.
+    #[test]
+    fn repo_put_cipher_of_other_repo_index_is_not_applied() {
+        let (repo, storage) = posix_repo();
+        let payload = b"secret";
+
+        let put_cfg = fake_config_with_groups(
+            "repo-put",
+            vec!["test.txt".to_owned()],
+            vec![
+                (("repo", None), OptionValue::Integer(3)),
+                (("repo-cipher-type", Some(1)), OptionValue::StringId("aes-256-cbc".to_owned())),
+                (
+                    ("repo-cipher-pass", Some(1)),
+                    OptionValue::String("repo1-passphrase".to_owned()),
+                ),
+            ],
+        );
+        let mut input = Cursor::new(payload.to_vec());
+        put_from(&put_cfg, &storage, &mut input).expect("plain put_from on repo3 should succeed");
+
+        let stored = std::fs::read(repo.path().join("test.txt")).expect("read back plaintext");
+        assert_eq!(
+            stored.as_slice(),
+            payload.as_slice(),
+            "repo3 has no cipher configured: the repo1 cipher must not leak onto it"
+        );
+    }
+
     // ----- repo-ls: rendering (pure) ------------------------------------
 
     fn file_entry(name: &str, size: u64, time: i64) -> LsEntry {

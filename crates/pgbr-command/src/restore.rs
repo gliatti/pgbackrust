@@ -221,6 +221,23 @@ fn log_info(message: &str) {
     );
 }
 
+/// Emit a warning line at `WARN` through the process-global logger.
+///
+/// Like [`log_info`], the write result is ignored — a logging failure must
+/// never fail the restore.
+fn log_warn(message: &str) {
+    let _ = pgbr_core::log::format::log_internal(
+        pgbr_core::log::LOG_LEVEL_WARN,
+        pgbr_core::log::LOG_LEVEL_MIN,
+        pgbr_core::log::LOG_LEVEL_MAX,
+        u32::MAX,
+        file!(),
+        "restore",
+        0,
+        message,
+    );
+}
+
 /// Whether `--dry-run` was supplied. A `Boolean` defaulting to `false`; only an
 /// explicit `true` enables the no-mutation planning mode. C ref: `cfgOptDryRun`.
 fn dry_run_enabled(config: &LoadedConfig) -> bool {
@@ -1714,6 +1731,69 @@ fn restore_transform(metadata: &serde_json::Value, config: &LoadedConfig, sub_ke
     RepoTransform::with_key(base.compress_type, base.compress_level, sub_key.map(str::to_owned))
 }
 
+/// Read `path` from `repo` in full, mapping a missing file to `Ok(None)`.
+fn read_repo_optional(repo: &dyn Storage, path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
+    match repo.open_read(path) {
+        Ok(mut reader) => Ok(Some(reader.read_all()?)),
+        Err(StorageError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(CommandError::Storage(err)),
+    }
+}
+
+/// Read a backup-root auxiliary file (`backup_label` / `tablespace_map`).
+///
+/// Backup stores these files through the backup's `transform` (the one its
+/// data files use): at `{backup_dir}/{base}{suffix}`, compressed and/or
+/// encrypted. This reverses that transform and returns the plaintext:
+///
+/// - identity `transform` — the bare `{backup_dir}/{base}` is read verbatim;
+/// - otherwise `{base}{suffix}` is tried first, then the bare `{base}`, and the
+///   bytes found go through [`RepoTransform::apply_reverse_keyed`]. When the
+///   bytes come from the bare path and the reverse fails, they are a legacy
+///   backup's cleartext copy (written before these files were transformed):
+///   they are returned verbatim with a warning.
+///
+/// Both paths absent is `Ok(None)` — a DB-free backup writes neither file.
+///
+/// # Errors
+///
+/// [`CommandError::Storage`] when a read fails for a reason other than a
+/// missing file; the reverse-transform error when the suffixed file cannot
+/// be decoded (wrong key or corrupt bytes).
+fn read_aux_backup_file(
+    repo: &dyn Storage,
+    backup_dir: &Path,
+    base: &str,
+    transform: &RepoTransform,
+) -> Result<Option<Vec<u8>>, CommandError> {
+    let bare_path = backup_dir.join(base);
+    let suffix = transform.repo_suffix();
+    if suffix.is_empty() && !transform.is_encrypted() {
+        return read_repo_optional(repo, &bare_path);
+    }
+
+    // The suffixed path coincides with the bare one for an encrypt-only
+    // transform; skip the duplicate lookup then.
+    if !suffix.is_empty()
+        && let Some(bytes) = read_repo_optional(repo, &backup_dir.join(format!("{base}{suffix}")))?
+    {
+        return Ok(Some(transform.apply_reverse_keyed(&bytes)?));
+    }
+
+    let Some(bytes) = read_repo_optional(repo, &bare_path)? else {
+        return Ok(None);
+    };
+    let decoded = transform.apply_reverse_keyed(&bytes);
+    Ok(Some(decoded.unwrap_or_else(|err| {
+        log_warn(&format!(
+            "restore: {base} in {} could not be decoded with the backup transform ({err}); \
+             restoring it verbatim as a legacy cleartext copy",
+            backup_dir.display()
+        ));
+        bytes
+    })))
+}
+
 /// Resolves each manifest file to a physical [`RestoreSource`], following a
 /// whole-file `reference` to the backup that holds the bytes and caching the
 /// referenced manifests + bundle layouts it loads.
@@ -2747,34 +2827,29 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     //     at the stale locations and fight the ones restore just created. It is
     //     instead written as `tablespace_map.old` for operator reference. C ref:
     //     pgBackRust omits `tablespace_map` from the restored PGDATA.
+    //
+    //     Both files are stored with the backup's `transform` (compressed and/or
+    //     encrypted, suffixed like the data files), so they are read back through
+    //     `read_aux_backup_file`, which reverses it — PGDATA always receives the
+    //     plaintext. Legacy backups that stored them in clear stay restorable.
     if !dry_run {
-        // backup_label — restored verbatim as `backup_label`.
-        let label_src = PathBuf::from(format!("backup/{stanza}/{label}/backup_label"));
-        match repo.open_read(&label_src) {
-            Ok(mut reader) => {
-                let bytes = reader.read_all()?;
-                // Atomic + fsync'd on local backends (write_atomic_path).
-                pg.write_atomic_path(Path::new("backup_label"), &bytes)?;
-                log_info(&format!("restore: wrote backup_label ({} bytes) into PGDATA", bytes.len()));
-            }
-            Err(StorageError::NotFound { .. }) => {}
-            Err(err) => return Err(CommandError::Storage(err)),
+        let backup_dir = PathBuf::from(format!("backup/{stanza}/{label}"));
+
+        // backup_label — restored (plaintext) as `backup_label`.
+        if let Some(bytes) = read_aux_backup_file(repo, &backup_dir, "backup_label", &transform)? {
+            // Atomic + fsync'd on local backends (write_atomic_path).
+            pg.write_atomic_path(Path::new("backup_label"), &bytes)?;
+            log_info(&format!("restore: wrote backup_label ({} bytes) into PGDATA", bytes.len()));
         }
 
         // tablespace_map — preserved as `tablespace_map.old` only (never as the
         // live `tablespace_map`, see above).
-        let ts_src = PathBuf::from(format!("backup/{stanza}/{label}/tablespace_map"));
-        match repo.open_read(&ts_src) {
-            Ok(mut reader) => {
-                let bytes = reader.read_all()?;
-                pg.write_atomic_path(Path::new("tablespace_map.old"), &bytes)?;
-                log_info(&format!(
-                    "restore: wrote tablespace_map.old ({} bytes) into PGDATA (not restored as live tablespace_map)",
-                    bytes.len()
-                ));
-            }
-            Err(StorageError::NotFound { .. }) => {}
-            Err(err) => return Err(CommandError::Storage(err)),
+        if let Some(bytes) = read_aux_backup_file(repo, &backup_dir, "tablespace_map", &transform)? {
+            pg.write_atomic_path(Path::new("tablespace_map.old"), &bytes)?;
+            log_info(&format!(
+                "restore: wrote tablespace_map.old ({} bytes) into PGDATA (not restored as live tablespace_map)",
+                bytes.len()
+            ));
         }
     }
 
@@ -4554,6 +4629,214 @@ mod tests {
 
         assert_eq!(pg_mode(&pg_s, "backup_label"), 0o600, "backup_label must be 0600");
         assert_eq!(pg_mode(&pg_s, "recovery.signal"), 0o600, "recovery.signal must be 0600");
+    }
+
+    // ---- backup-root aux files (backup_label / tablespace_map) -------------
+    //
+    // GHSA-8265-5345-wr5g: backup stores `backup_label` / `tablespace_map`
+    // through the backup's transform (Contract 1). Restore must reverse it and
+    // still accept a legacy backup that stored them in clear.
+
+    /// Plaintext `backup_label` used by the aux-file fixtures.
+    const AUX_LABEL: &[u8] = b"START WAL LOCATION: 0/2000028 (file 000000010000000000000002)\nLABEL: pgbr-test\n";
+    /// Plaintext `tablespace_map` used by the aux-file fixtures.
+    const AUX_TS_MAP: &[u8] = b"16385 /srv/pg/ts1\n";
+    /// User passphrase of the encrypted aux-file fixtures.
+    const AUX_USER_PASS: &str = "user-pass";
+    /// Repository sub-key of the encrypted aux-file fixtures.
+    const AUX_SUB_KEY: &str = "repo-sub-key-secret";
+
+    /// Write `bytes` verbatim at the repo-relative `rel` (no transform).
+    fn write_repo_raw(repo: &Posix, rel: &str, bytes: &[u8]) {
+        let mut w = repo.open_write(Path::new(rel)).expect("open repo file");
+        w.write(bytes).expect("write repo file");
+        w.close().expect("close repo file");
+    }
+
+    /// Run a real encrypted (no compression) backup of [`FILES`] into `repo`,
+    /// keyed with [`AUX_SUB_KEY`], and return the transform it used.
+    fn seed_encrypted_backup(repo: &Posix, stanza: &str, label: &str) -> RepoTransform {
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        init_stanza_encrypted(repo, stanza, AUX_USER_PASS, AUX_SUB_KEY);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+        let transform = RepoTransform::with_key(CompressType::None, 0, Some(AUX_SUB_KEY.to_owned()));
+        backup_inner_keyed(stanza, repo, &pg_src_s, label, 1_704_110_400, &transform, Some(AUX_USER_PASS))
+            .expect("encrypted backup");
+        transform
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_decrypts_encrypted_backup_label_0600() {
+        // An encrypted backup stores `backup_label` encrypted; restore must write
+        // the decrypted plaintext into PGDATA, still `0600`.
+        let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair_pg_modes();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let transform = seed_encrypted_backup(&repo_s, stanza, label);
+
+        let stored = transform.apply_forward_keyed(AUX_LABEL).expect("encrypt backup_label");
+        assert!(stored.starts_with(b"Salted__"), "fixture backup_label must be encrypted");
+        // Encryption adds no suffix: the transformed file lives at the bare name.
+        write_repo_raw(
+            &repo_s,
+            &format!("backup/{stanza}/{label}/backup_label{}", transform.repo_suffix()),
+            &stored,
+        );
+        let repo_bytes = std::fs::read(repo_dir.path().join(format!("backup/{stanza}/{label}/backup_label"))).unwrap();
+        assert!(
+            !repo_bytes.windows(b"START WAL".len()).any(|w| w == b"START WAL"),
+            "repo copy of backup_label must not be cleartext"
+        );
+
+        restore_inner(&restore_cfg(stanza, repo_cipher_opts(AUX_USER_PASS)), &repo_s, &pg_s).expect("restore");
+
+        assert_eq!(
+            std::fs::read(pg_dir.path().join("backup_label")).unwrap(),
+            AUX_LABEL,
+            "restored backup_label must be the decrypted plaintext"
+        );
+        assert_eq!(pg_mode(&pg_s, "backup_label"), 0o600, "backup_label must be 0600");
+    }
+
+    #[test]
+    fn restore_legacy_cleartext_backup_label_on_encrypted_repo() {
+        // A backup written before the fix stored `backup_label` in clear even on
+        // an encrypted repo. The decrypt fails on those bytes; restore must fall
+        // back to copying them verbatim instead of aborting.
+        let (_repo, pg_dir, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_encrypted_backup(&repo_s, stanza, label);
+        write_repo_raw(&repo_s, &format!("backup/{stanza}/{label}/backup_label"), AUX_LABEL);
+
+        restore_inner(&restore_cfg(stanza, repo_cipher_opts(AUX_USER_PASS)), &repo_s, &pg_s)
+            .expect("legacy cleartext backup_label must still restore");
+
+        assert_eq!(
+            std::fs::read(pg_dir.path().join("backup_label")).unwrap(),
+            AUX_LABEL,
+            "legacy backup_label must be restored verbatim"
+        );
+    }
+
+    #[test]
+    fn restore_decompresses_gz_backup_label() {
+        // A gz backup stores `backup_label.gz`; restore must write it decompressed
+        // as `backup_label`.
+        let (_repo, pg_dir, repo_s, pg_s) = posix_pair();
+        let pg_src = tempfile::tempdir().unwrap();
+        let pg_src_s = Posix::new(pg_src.path());
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        init_stanza(&repo_s, stanza);
+        for (rel, bytes) in FILES {
+            seed_pg_file(&pg_src_s, rel, bytes);
+        }
+        let transform = RepoTransform::with_key(CompressType::Gz, 6, None);
+        backup_inner(stanza, &repo_s, &pg_src_s, label, 1_704_110_400, &transform).expect("gz backup");
+
+        let stored = transform.apply_forward_keyed(AUX_LABEL).expect("compress backup_label");
+        assert_ne!(stored.as_slice(), AUX_LABEL, "fixture backup_label must be compressed");
+        write_repo_raw(&repo_s, &format!("backup/{stanza}/{label}/backup_label.gz"), &stored);
+
+        restore_inner(&restore_cfg(stanza, Vec::new()), &repo_s, &pg_s).expect("restore");
+
+        assert_eq!(
+            std::fs::read(pg_dir.path().join("backup_label")).unwrap(),
+            AUX_LABEL,
+            "restored backup_label must be decompressed"
+        );
+        assert!(
+            !pg_dir.path().join("backup_label.gz").exists(),
+            "the repo suffix must not leak into PGDATA"
+        );
+    }
+
+    #[test]
+    fn restore_encrypted_backup_without_aux_files_succeeds() {
+        // A DB-free backup writes neither aux file: restore on an encrypted repo
+        // must succeed and simply not create them.
+        let (_repo, pg_dir, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_encrypted_backup(&repo_s, stanza, label);
+        for name in ["backup_label", "tablespace_map"] {
+            assert!(
+                repo_s
+                    .open_read(Path::new(&format!("backup/{stanza}/{label}/{name}")))
+                    .is_err(),
+                "DB-free fixture must carry no {name}"
+            );
+        }
+
+        restore_inner(&restore_cfg(stanza, repo_cipher_opts(AUX_USER_PASS)), &repo_s, &pg_s).expect("restore");
+
+        assert!(!pg_dir.path().join("backup_label").exists());
+        assert!(!pg_dir.path().join("tablespace_map.old").exists());
+        assert!(!pg_dir.path().join("tablespace_map").exists());
+    }
+
+    #[test]
+    fn restore_decrypts_encrypted_tablespace_map_as_old() {
+        // An encrypted `tablespace_map` must land decrypted as
+        // `tablespace_map.old` (never as the live `tablespace_map`).
+        let (_repo, pg_dir, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let transform = seed_encrypted_backup(&repo_s, stanza, label);
+        let stored = transform.apply_forward_keyed(AUX_TS_MAP).expect("encrypt tablespace_map");
+        assert!(stored.starts_with(b"Salted__"), "fixture tablespace_map must be encrypted");
+        write_repo_raw(&repo_s, &format!("backup/{stanza}/{label}/tablespace_map"), &stored);
+
+        restore_inner(&restore_cfg(stanza, repo_cipher_opts(AUX_USER_PASS)), &repo_s, &pg_s).expect("restore");
+
+        assert_eq!(
+            std::fs::read(pg_dir.path().join("tablespace_map.old")).unwrap(),
+            AUX_TS_MAP,
+            "tablespace_map.old must be the decrypted plaintext"
+        );
+        assert!(
+            !pg_dir.path().join("tablespace_map").exists(),
+            "tablespace_map must never be restored live"
+        );
+    }
+
+    #[test]
+    fn read_aux_backup_file_rejects_corrupt_suffixed_file() {
+        // The suffixed (transformed) copy is authoritative: bytes there that do
+        // not decode are an error, never a silent verbatim copy.
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let dir = Path::new("backup/demo/20240101-120000F");
+        repo_s.create_path(dir, true).unwrap();
+        write_repo_raw(&repo_s, "backup/demo/20240101-120000F/backup_label.gz", b"not gzip at all");
+        let transform = RepoTransform::with_key(CompressType::Gz, 6, None);
+
+        let result = super::read_aux_backup_file(&repo_s, dir, "backup_label", &transform);
+        assert!(result.is_err(), "corrupt backup_label.gz must fail, got {result:?}");
+    }
+
+    #[test]
+    fn read_aux_backup_file_identity_reads_bare_and_absent_is_none() {
+        // Identity transform: the bare file is returned verbatim; nothing there is
+        // `Ok(None)`.
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let dir = Path::new("backup/demo/20240101-120000F");
+        repo_s.create_path(dir, true).unwrap();
+        let identity = RepoTransform::identity();
+
+        assert_eq!(
+            super::read_aux_backup_file(&repo_s, dir, "backup_label", &identity).unwrap(),
+            None
+        );
+        write_repo_raw(&repo_s, "backup/demo/20240101-120000F/backup_label", AUX_LABEL);
+        assert_eq!(
+            super::read_aux_backup_file(&repo_s, dir, "backup_label", &identity).unwrap(),
+            Some(AUX_LABEL.to_vec())
+        );
     }
 
     #[cfg(unix)]
