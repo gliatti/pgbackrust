@@ -171,10 +171,12 @@ pub fn atomic_write_file_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> R
     crate::posix::write_atomic_local(path, bytes, mode)
 }
 
-/// `create_dir_all` that gives every directory it creates the mode `mode`
-/// (`DirBuilderExt::mode`, still subject to the process umask). Directories
-/// that already exist are left untouched. On non-Unix platforms the mode is
-/// ignored and this is a plain `create_dir_all`.
+/// `create_dir_all` that gives every directory it creates the mode `mode`.
+///
+/// The mode is applied at creation time (`DirBuilderExt::mode`, still subject
+/// to the process umask). Directories that already exist are left untouched.
+/// On non-Unix platforms the mode is ignored and this is a plain
+/// `create_dir_all`.
 ///
 /// # Errors
 ///
