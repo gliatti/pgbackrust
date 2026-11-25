@@ -147,6 +147,10 @@ wait_for "principal up after restore from repo2" 30 1 \
   bash -c "$COMPOSE exec -T -u postgres principal $BIN/pg_isready -p 5433 -q"
 rows=$(psql_on principal 5433 -c "SELECT count(*) FROM m;")
 assert_contains "$rows" "2000" "restored row count from mirrored repo2"
+# pg_isready succeeds as soon as hot standby accepts read-only connections,
+# before archive recovery ends: wait for the promotion before writing.
+wait_for "principal promoted after restore from repo2" 30 1 \
+  bash -c "[ \"\$($COMPOSE exec -T -u postgres principal $BIN/psql -p 5433 -X -A -t -c 'SELECT pg_is_in_recovery();')\" = f ]"
 
 info "inline option: backup --repo-sync mirrors the just-completed backup to repo2 directly"
 psql_on principal 5433 -c "INSERT INTO m SELECT generate_series(2001,3000);"
