@@ -33,6 +33,15 @@ impl Cifs {
         Self { inner: Posix::new(root) }
     }
 
+    /// Build a `Cifs` backend rooted at `root` that creates files with
+    /// `file_mode` and directories with `path_mode` (see [`Posix::with_modes`]).
+    #[must_use]
+    pub fn with_modes(root: impl Into<PathBuf>, file_mode: u32, path_mode: u32) -> Self {
+        Self {
+            inner: Posix::with_modes(root, file_mode, path_mode),
+        }
+    }
+
     /// Configured root. Useful for diagnostics and tests.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -191,6 +200,32 @@ mod tests {
 
         // Missing path with `error_on_missing = false` is a no-op.
         storage.remove_path(Path::new("nest"), true, false).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cifs_modes_default_and_with_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for (storage, file_mode, path_mode) in [
+            (Cifs::new(tmp.path().join("default")), 0o640, 0o750),
+            (Cifs::with_modes(tmp.path().join("custom"), 0o600, 0o700), 0o600, 0o700),
+        ] {
+            storage.create_path(Path::new("dir"), true).unwrap();
+            let mut writer = storage.open_write(Path::new("dir/file")).unwrap();
+            writer.write(b"x").unwrap();
+            writer.close().unwrap();
+
+            let dir = storage.root().join("dir");
+            let file = dir.join("file");
+            // No bit beyond the requested mode; owner bits intact (umask-proof).
+            assert_eq!(mode_of(&dir) & !path_mode, 0);
+            assert_eq!(mode_of(&dir) & 0o700, path_mode & 0o700);
+            assert_eq!(mode_of(&file) & !file_mode, 0);
+            assert_eq!(mode_of(&file) & 0o700, file_mode & 0o700);
+        }
     }
 
     #[test]

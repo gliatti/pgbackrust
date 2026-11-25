@@ -367,3 +367,42 @@ fn server_resolves() {
         Err(other) => panic!("command `server` produced an unexpected resolution error: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression (GHSA-5qj2-9x5v-7c87): `neutral-umask` is documented in help.xml
+// as disableable with `--no-neutral-umask`, but the option lacked
+// `negate: true` in config.yaml so the CLI rejected the negation. It must now
+// resolve to `false`, while the default stays `true`.
+// ---------------------------------------------------------------------------
+
+/// Resolve `start --stanza=demo` plus `extra` (no dispatch: `resolve_only`)
+/// and return the resolved `neutral-umask` value. `start` is a command the
+/// option is valid for (`info` / `manifest` / `server*` exclude it).
+fn resolved_neutral_umask(extra: &[&str]) -> Option<pgbr_config::OptionValue> {
+    let mut args = vec![
+        "--config=/definitely/missing/pgbackrust.conf".to_owned(),
+        "start".to_owned(),
+        "--stanza=demo".to_owned(),
+    ];
+    args.extend(extra.iter().map(|a| (*a).to_owned()));
+    let loaded = resolve_only(args, &ctx()).expect("`start` must resolve");
+    loaded.options.get(&("neutral-umask".to_owned(), None)).cloned()
+}
+
+#[test]
+fn no_neutral_umask_is_accepted_and_resolves_false() {
+    assert_eq!(
+        resolved_neutral_umask(&["--no-neutral-umask"]),
+        Some(pgbr_config::OptionValue::Boolean(false)),
+        "`--no-neutral-umask` must be accepted and resolve to false"
+    );
+}
+
+#[test]
+fn neutral_umask_defaults_to_true() {
+    assert_eq!(
+        resolved_neutral_umask(&[]),
+        Some(pgbr_config::OptionValue::Boolean(true)),
+        "`neutral-umask` must default to true"
+    );
+}

@@ -40,6 +40,13 @@ pg_as principal pgbackrust --stanza=$STANZA check
 info "full backup"
 pg_as principal pgbackrust --stanza=$STANZA --type=full backup
 
+info "repository modes (GHSA-5qj2-9x5v-7c87: files 0640, dirs 0750)"
+assert_mode principal /srv/depot/pgbackrust/backup/$STANZA 750 "repo backup dir"
+assert_mode principal /srv/depot/pgbackrust/backup/$STANZA/backup.info 640 "backup.info"
+assert_mode principal /srv/depot/pgbackrust/archive/$STANZA 750 "repo archive dir"
+wal=$(node principal bash -c "find /srv/depot/pgbackrust/archive/$STANZA -type f ! -name 'archive.info*' | head -1")
+assert_mode principal "$wal" 640 "archived WAL file"
+
 info "generate WAL + incr backup"
 psql_on principal 5433 -c "CREATE TABLE IF NOT EXISTS t(i int); INSERT INTO t SELECT generate_series(1,1000);"
 psql_on principal 5433 -c "SELECT pg_switch_wal();" >/dev/null
@@ -54,6 +61,14 @@ assert_contains "$out" "incr backup" "info"
 info "restore --delta to original path after stop"
 pg_as principal bash -c "$BIN/pg_ctl -D $DATADIR -w stop" || true
 pg_as principal pgbackrust --stanza=$STANZA --delta restore
+
+info "restored modes (GHSA-5qj2-9x5v-7c87: new files 0600, dirs per manifest)"
+assert_mode principal $DATADIR/backup_label 600 "backup_label"
+assert_mode principal $DATADIR/base 700 "restored base dir"
+if node principal test -e $DATADIR/recovery.signal; then
+  assert_mode principal $DATADIR/recovery.signal 600 "recovery.signal"
+fi
+
 pg_as principal bash -c "$BIN/pg_ctl -D $DATADIR -l $DATADIR/server.log -w start"
 wait_for "principal accepts connections after restore" 30 1 \
   bash -c "$COMPOSE exec -T -u postgres principal $BIN/pg_isready -p 5433 -q"

@@ -1542,12 +1542,12 @@ struct RestoreCopyJob {
     abs_dst: PathBuf,
     /// Plaintext SHA-1 the manifest recorded, or `None` for a zero-length file.
     expected_checksum: Option<String>,
-    /// Unix file mode the manifest recorded, re-applied to the restored file via
-    /// `std::fs::set_permissions` on Unix. `None` when the manifest did not record
-    /// a mode (older backups, non-Unix source) — the restored file keeps its
-    /// freshly-created default mode. uid/gid are recorded-only (re-applying owner
-    /// needs privilege; documented follow-up). C ref: chmod in
-    /// `src/command/restore/restore.c`.
+    /// Unix file mode the manifest recorded, applied to the restored file at
+    /// creation (see [`write_and_verify`]). `None` when the manifest did not
+    /// record a mode (older backups, non-Unix source) — the restored file is then
+    /// created `0600` ([`pgbr_storage::PG_FILE_MODE`]). uid/gid are
+    /// recorded-only (re-applying owner needs privilege; documented follow-up).
+    /// C ref: chmod in `src/command/restore/restore.c`.
     mode: Option<u32>,
 }
 
@@ -1919,37 +1919,13 @@ impl<'a> SourceResolver<'a> {
     }
 }
 
-/// Re-apply a manifest-recorded Unix file mode to a restored file.
-///
-/// On Unix, when `mode` is `Some`, `std::fs::set_permissions` sets the file's
-/// permission bits to it (masked to `0o7777`, the permission + setuid/setgid/
-/// sticky bits the backup recorded). `None` leaves the file at its
-/// freshly-created default mode. uid/gid are NOT applied (re-applying owner needs
-/// privilege; recorded-only, documented follow-up).
-#[cfg(unix)]
-fn apply_mode(abs_dst: &Path, mode: Option<u32>) -> Result<(), CommandError> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
-        std::fs::set_permissions(abs_dst, std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(|err| CommandError::Other(format!("chmod {}: {err}", abs_dst.display())))?;
-    }
-    Ok(())
-}
-
-/// Non-Unix stub: file mode is not modelled, so this is a no-op (no mode is ever
-/// recorded on a non-Unix backup).
-#[cfg(not(unix))]
-fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
-    Ok(())
-}
-
 /// Write the recovered `plaintext` to the job's destination and verify it.
 ///
 /// Shared by [`restore_file`] (the local `std::fs` fast path) and
 /// [`restore_file_storage`] (the non-local `open_read` path): the destination is
 /// always the local PG data dir (always a `std::fs` write — only the *source* of
 /// the repo bytes differs between paths), so the parent-dir creation, write,
-/// Unix-mode re-application, and the hard-fail plaintext SHA-1 check are written
+/// Unix-mode selection, and the hard-fail plaintext SHA-1 check are written
 /// exactly once and produce identical results regardless of how the bytes were
 /// read.
 ///
@@ -1958,12 +1934,20 @@ fn apply_mode(_abs_dst: &Path, _mode: Option<u32>) -> Result<(), CommandError> {
 /// The plaintext SHA-1 is checked **before** anything is written, so a corrupt
 /// file never touches the target. Publication (temp write + `fsync` + atomic
 /// `rename` + parent-directory `fsync`) is delegated to the shared
-/// [`pgbr_storage::atomic_write_file`] primitive — a crash mid-restore can never
+/// [`pgbr_storage::atomic_write_file_mode`] primitive — a crash mid-restore can never
 /// leave a half-written or truncated data file at the real name. The
 /// restore-specific steps kept here are the plaintext-SHA-1 pre-check (a
 /// mismatch is a hard error that fails the whole restore before anything is
-/// written) and re-applying the manifest-recorded Unix mode to the published
-/// file.
+/// written) and the choice of the published file's Unix mode.
+///
+/// # Permissions
+///
+/// The file is created with its final mode from the start (the manifest-recorded
+/// mode, or [`pgbr_storage::PG_FILE_MODE`] `0600` when none was recorded), so it
+/// is never visible — not even transiently — with a umask-derived `0666`. A
+/// missing parent directory is created with [`pgbr_storage::PG_PATH_MODE`]
+/// `0700`. uid/gid are recorded-only (re-applying owner needs privilege;
+/// documented follow-up). C ref: chmod in `src/command/restore/restore.c`.
 fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), CommandError> {
     // Hard-fail SHA-1 check, per file, BEFORE writing anything: a corrupt file
     // must never be materialised (even transiently) at the target. Zero-length
@@ -1983,19 +1967,20 @@ fn write_and_verify(job: &RestoreCopyJob, plaintext: &[u8]) -> Result<(), Comman
     if let Some(parent) = job.abs_dst.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+        pgbr_storage::create_dir_all_mode(parent, pgbr_storage::PG_PATH_MODE).map_err(CommandError::Storage)?;
     }
 
-    // Atomic publish: temp write + fsync + rename + parent-dir fsync, all handled
-    // by the shared primitive (identical logic to the Posix backend). On failure
-    // the primitive leaves no primary at the target name.
-    pgbr_storage::atomic_write_file(&job.abs_dst, plaintext).map_err(CommandError::Storage)?;
+    // The recorded Unix file mode (masked to `0o7777`: permission + setuid/
+    // setgid/sticky bits), or PostgreSQL's `0600` when the manifest recorded
+    // none (older backups, non-Unix source). Applied at creation by the publish
+    // primitive, so there is no window where the file sits at `0666`.
+    let mode = job.mode.map_or(pgbr_storage::PG_FILE_MODE, |mode| mode & 0o7777);
 
-    // Re-apply the recorded Unix file mode (if any) to the published file. On
-    // non-Unix this is a no-op. uid/gid are recorded-only — re-applying owner
-    // needs privilege and is a documented follow-up. C ref: chmod in
-    // `src/command/restore/restore.c`.
-    apply_mode(&job.abs_dst, job.mode)?;
+    // Atomic publish: temp write (created with `mode`) + fsync + rename +
+    // parent-dir fsync, all handled by the shared primitive (identical logic to
+    // the Posix backend). On failure the primitive leaves no primary at the
+    // target name.
+    pgbr_storage::atomic_write_file_mode(&job.abs_dst, plaintext, Some(mode)).map_err(CommandError::Storage)?;
 
     Ok(())
 }
@@ -2405,7 +2390,7 @@ fn materialize_links(
                 // restore must not fabricate, so their target is left untouched
                 // (PostgreSQL / the operator owns it) — a dangling generic link is
                 // acceptable and matches pgBackRust.
-                if is_tablespace && let Err(err) = std::fs::create_dir_all(&target) {
+                if is_tablespace && let Err(err) = pgbr_storage::create_dir_all_mode(&target, pgbr_storage::PG_PATH_MODE) {
                     return Err(CommandError::Other(format!(
                         "create tablespace target {}: {err}",
                         target.display()
@@ -2540,10 +2525,22 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
 
     // 1. Re-create every directory recorded in the manifest. A dry-run counts the
     //    directories it would create but makes none.
+    //
+    //    A directory whose manifest entry recorded a Unix mode gets it back
+    //    (masked to `0o7777`) right after creation; one without a recorded mode
+    //    keeps the PG storage's directory mode (`0700` for the PGDATA storage).
+    //    The chmod goes through the absolute path `pg.info` resolves, so it is
+    //    applied only on a local PG target (a non-local backend's path is not a
+    //    local filesystem path). C ref: path mode in `src/command/restore/restore.c`.
+    let local_pg_paths = pg.is_local();
     let mut paths_created = 0;
     for path in &manifest.paths {
         if !dry_run {
-            pg.create_path(Path::new(&path.path), true)?;
+            let rel = Path::new(&path.path);
+            pg.create_path(rel, true)?;
+            if local_pg_paths && let Some(mode) = path.mode {
+                pgbr_storage::set_path_mode(&pg.info(rel)?.path, mode & 0o7777)?;
+            }
         }
         paths_created += 1;
     }
@@ -3137,7 +3134,7 @@ mod tests {
             db_system_id: 6_873_049_345_984_568_091,
             files: manifest_files,
             option_checksum_page: None,
-            paths: paths.iter().map(|p| ManifestPath { path: (*p).to_owned() }).collect(),
+            paths: paths.iter().map(|p| ManifestPath::new(*p)).collect(),
             links: links
                 .iter()
                 .map(|(p, d)| ManifestLink {
@@ -4438,6 +4435,159 @@ mod tests {
         let abs_dst = pg_dst_s.info(Path::new("base/1/1259")).expect("stat restored").path;
         let restored_mode = std::fs::metadata(&abs_dst).expect("restored metadata").permissions().mode() & 0o7777;
         assert_eq!(restored_mode, 0o640, "restored file must carry the recorded mode");
+    }
+
+    /// Permission bits (`& 0o7777`) of the entry at `rel` under the `pg` storage.
+    #[cfg(unix)]
+    fn pg_mode(pg: &Posix, rel: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        let abs = pg.info(Path::new(rel)).unwrap_or_else(|_| panic!("{rel} must exist")).path;
+        std::fs::metadata(&abs).expect("metadata").permissions().mode() & 0o7777
+    }
+
+    /// Stamp `mode` on the `[target:path]` entry `rel` of an already-seeded
+    /// `backup.manifest` (load, edit, save back), so a fixture can exercise
+    /// directory-mode restoration without widening the `seed_backup` signature.
+    #[cfg(unix)]
+    fn set_manifest_path_mode(repo: &Posix, stanza: &str, label: &str, rel: &str, mode: u32) {
+        let path = super::manifest_path(stanza, label);
+        let mut manifest = Manifest::load(repo, &path).expect("load manifest");
+        let entry = manifest
+            .paths
+            .iter_mut()
+            .find(|p| p.path == rel)
+            .unwrap_or_else(|| panic!("manifest path {rel} must be seeded"));
+        entry.mode = Some(mode);
+        manifest.save(repo, &path).expect("save manifest");
+    }
+
+    /// A (repo, pg-target) pair whose PG storage uses PostgreSQL's modes
+    /// (`0600` files / `0700` dirs), as the CLI builds the PGDATA storage.
+    #[cfg(unix)]
+    fn posix_pair_pg_modes() -> (TempDir, TempDir, Posix, Posix) {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo_storage = Posix::new(repo.path());
+        let pg_storage = Posix::with_modes(pg.path(), 0o600, 0o700);
+        (repo, pg, repo_storage, pg_storage)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_applies_manifest_directory_mode() {
+        // A directory whose manifest entry recorded a mode gets exactly that mode
+        // back; a directory without one inherits the PG storage's `0700`.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair_pg_modes();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let b = b"relation bytes".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("base/1/1259", b, Some(sha1_hex(b)))],
+            &["base", "base/1", "global"],
+            &[],
+        );
+        set_manifest_path_mode(&repo_s, stanza, label, "base/1", 0o705);
+
+        restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+
+        assert_eq!(pg_mode(&pg_s, "base/1"), 0o705, "recorded dir mode must be re-applied");
+        assert_eq!(pg_mode(&pg_s, "base"), 0o700, "dir without a recorded mode must be 0700");
+        assert_eq!(pg_mode(&pg_s, "global"), 0o700, "dir without a recorded mode must be 0700");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_file_without_manifest_mode_is_0600() {
+        // A file whose manifest entry recorded no mode (older backup / non-Unix
+        // source) must land `0600`, never a umask-derived `0666`.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair_pg_modes();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let a = b"14\n".as_slice();
+        let b = b"relation bytes".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("PG_VERSION", a, Some(sha1_hex(a))), ("base/1/1259", b, Some(sha1_hex(b)))],
+            &["base", "base/1"],
+            &[],
+        );
+
+        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.files_restored, 2);
+
+        assert_eq!(pg_mode(&pg_s, "PG_VERSION"), 0o600, "mode-less file must be 0600");
+        assert_eq!(pg_mode(&pg_s, "base/1/1259"), 0o600, "mode-less file must be 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_writes_backup_label_and_recovery_signal_0600() {
+        // `backup_label` (copied from the repo) and `recovery.signal` (generated)
+        // are written through the PG storage and must come out `0600`.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair_pg_modes();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup_ver(&repo_s, stanza, label, "14", &[], &["base"], &[]);
+        let mut w = repo_s
+            .open_write(Path::new(&format!("backup/{stanza}/{label}/backup_label")))
+            .expect("open backup_label");
+        w.write(b"START WAL LOCATION: 0/2000028 (file 000000010000000000000002)\n")
+            .expect("write backup_label");
+        w.close().expect("close backup_label");
+
+        let outcome = restore_inner(&cfg_recovery(stanza, None, None, false), &repo_s, &pg_s).expect("restore");
+        assert_eq!(
+            outcome.recovery_files_written,
+            vec!["postgresql.auto.conf".to_owned(), "recovery.signal".to_owned()]
+        );
+
+        assert_eq!(pg_mode(&pg_s, "backup_label"), 0o600, "backup_label must be 0600");
+        assert_eq!(pg_mode(&pg_s, "recovery.signal"), 0o600, "recovery.signal must be 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_creates_missing_data_dir_0700() {
+        // Restoring into a PGDATA that does not exist yet must create it `0700`:
+        // PostgreSQL refuses to start on a group/world-accessible data dir.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let parent = tempfile::tempdir().expect("pg parent tempdir");
+        let data_dir = parent.path().join("data");
+        let repo_s = Posix::new(repo.path());
+        let pg_s = Posix::with_modes(&data_dir, 0o600, 0o700);
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let a = b"14\n".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("PG_VERSION", a, Some(sha1_hex(a)))],
+            &["base"],
+            &[],
+        );
+
+        restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+
+        let data_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&data_dir).expect("data dir metadata").permissions().mode() & 0o7777
+        };
+        assert_eq!(data_mode, 0o700, "a data dir created by restore must be 0700");
+        assert_eq!(pg_mode(&pg_s, "PG_VERSION"), 0o600);
     }
 
     #[test]

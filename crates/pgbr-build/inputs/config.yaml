@@ -873,6 +873,7 @@ option:
     section: global
     type: boolean
     default: true
+    negate: true
     command:
       +role: any
       -command: info

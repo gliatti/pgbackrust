@@ -1,3 +1,8 @@
 # Classify all .h/c.inc files as C
 *.h linguist-language=C
 *.c.inc linguist-language=C
+
+# Shell scripts must stay LF: entrypoint.sh is COPYed into the Linux node
+# image and the scenarios run in Linux containers; a CRLF checkout
+# (core.autocrlf=true on Windows) breaks their shebangs (exit 127).
+*.sh text eol=lf

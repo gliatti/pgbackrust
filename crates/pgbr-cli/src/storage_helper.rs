@@ -40,7 +40,8 @@ use pgbr_protocol::PGBACKRUST_PROGRAM;
 use pgbr_storage::s3::{S3Encryption, S3UriStyle};
 use pgbr_storage::sftp::{HostKeyCheck, HostKeyHashType};
 use pgbr_storage::{
-    Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, HttpOptions, Posix, S3, S3Config, Sftp, SftpAuth, SftpConfig, Storage,
+    Azure, AzureConfig, Cifs, Gcs, GcsAuth, GcsConfig, HttpOptions, PG_FILE_MODE, PG_PATH_MODE, Posix, S3, S3Config, Sftp,
+    SftpAuth, SftpConfig, Storage,
 };
 
 use std::sync::Arc;
@@ -241,7 +242,10 @@ pub fn build_pg_storage(cfg: &LoadedConfig) -> Result<Box<dyn Storage>, CliRunEr
         return build_remote_host_storage(cfg, &host, "pg", "pg1-path", &root, PG_INDEX);
     }
 
-    Ok(Box::new(Posix::new(root)))
+    // The PG data directory is owned by the cluster: files are created 0600 and
+    // directories 0700 (PostgreSQL refuses a group/world-accessible PGDATA),
+    // unlike the repo stores which keep the 0640/0750 `Posix::new` defaults.
+    Ok(Box::new(Posix::with_modes(root, PG_FILE_MODE, PG_PATH_MODE)))
 }
 
 /// Whether the local backend is forced for `family` (`pg` / `repo`) at group

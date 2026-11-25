@@ -37,8 +37,13 @@ if [ ! -f integration/artifacts/ssh/id_ed25519 ]; then
 fi
 
 # 3. build image (topology is brought up fresh per-scenario below)
+#
+# All three nodes share the SAME image tag (pgbr-node:pg<major>), so build a
+# single service: `$COMPOSE build` would build/export the tag three times, and
+# on engines where COMPOSE_BAKE=false is not honoured the parallel exports race
+# with `image ... already exists`.
 info "building node image"
-$COMPOSE build
+$COMPOSE build principal
 trap '$COMPOSE down -v >/dev/null 2>&1 || true' EXIT
 
 # 4. run scenarios (filtered by optional args)

@@ -587,14 +587,14 @@ impl Storage for Sftp {
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
         let resolved = self.resolve(path);
-        // Create/truncate with sensible default mode (0o644), mirroring
-        // `std::fs::File::create` semantics used by the Posix backend.
+        // Create/truncate with the repository file mode (0o640), matching the
+        // Posix backend default — never world-readable (GHSA-5qj2-9x5v-7c87).
         let file = self
             .sftp
             .open_mode(
                 &resolved,
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
-                0o644,
+                0o640,
                 OpenType::File,
             )
             .map_err(|err| map_ssh_error(&err, &resolved))?;
@@ -635,7 +635,7 @@ impl Storage for Sftp {
             self.mkdir_recursive(&resolved)
         } else {
             self.sftp
-                .mkdir(&resolved, 0o755)
+                .mkdir(&resolved, 0o750)
                 .map_err(|err| map_ssh_error(&err, &resolved))
         }
     }
@@ -676,7 +676,7 @@ impl Sftp {
         {
             self.mkdir_recursive(parent)?;
         }
-        match self.sftp.mkdir(path, 0o755) {
+        match self.sftp.mkdir(path, 0o750) {
             Ok(()) => Ok(()),
             // Tolerate a race / pre-existing directory created by a parallel run.
             Err(err) => match map_ssh_error(&err, path) {

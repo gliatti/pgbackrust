@@ -364,8 +364,9 @@ fn write_segment_to_dest_arg(bytes: &[u8], dest_arg: &Path) -> Result<(), Comman
     let parent = resolved.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         // An empty parent (relative bare filename) is a no-op for create_dir_all,
-        // which is the correct behaviour: the caller's cwd already exists.
-        std::fs::create_dir_all(parent).map_err(|err| {
+        // which is the correct behaviour: the caller's cwd already exists. Any
+        // directory we do create lives under PGDATA, so it gets the PG 0700 mode.
+        pgbr_storage::create_dir_all_mode(parent, pgbr_storage::PG_PATH_MODE).map_err(|err| {
             CommandError::Other(format!(
                 "archive-get could not create destination parent '{}': {err}",
                 parent.display()
@@ -393,7 +394,16 @@ fn write_segment_to_dest_arg(bytes: &[u8], dest_arg: &Path) -> Result<(), Comman
     // rename on platforms that require it).
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp).map_err(|err| {
+        // `File::create` semantics (write + create + truncate), but on Unix the
+        // segment is created 0600 like every other PGDATA file instead of 0666.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(pgbr_storage::PG_FILE_MODE);
+        }
+        let mut file = options.open(&tmp).map_err(|err| {
             CommandError::Other(format!(
                 "archive-get could not create temp destination '{}': {err}",
                 tmp.display()
@@ -2627,6 +2637,46 @@ mod tests {
 
         assert!(dest_abs.exists(), "segment should land at the absolute dest");
         assert_eq!(std::fs::read(&dest_abs).expect("read dest"), WAL_BODY);
+    }
+
+    /// GHSA-5qj2-9x5v-7c87: the segment archive-get copies into `pg_wal` must be
+    /// created 0600 (not 0666), and a destination parent it has to create must
+    /// be 0700. The umask can only remove bits, so assert no group/world bits
+    /// and intact owner bits.
+    #[cfg(unix)]
+    #[test]
+    fn archive_get_writes_segment_with_pg_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        seed_archive_info_generic(&repo_s, "demo");
+        put(&repo_s, &format!("archive/demo/{ARCHIVE_ID}/{SEGMENT}"), WAL_BODY);
+
+        // Leave `pg_wal` absent so archive-get creates the parent itself.
+        let dest_dir = pg.path().join("pg_wal");
+        let dest_abs = dest_dir.join(SEGMENT);
+        let cfg = fake_config(
+            Some("demo"),
+            vec![SEGMENT.to_owned(), dest_abs.to_string_lossy().into_owned()],
+        );
+        get(&cfg, &[&repo_s as &dyn Storage], &pg_s).expect("get should succeed");
+        assert_eq!(std::fs::read(&dest_abs).expect("read dest"), WAL_BODY);
+
+        let file_mode = std::fs::metadata(&dest_abs).expect("dest metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode & !pgbr_storage::PG_FILE_MODE,
+            0,
+            "segment mode {file_mode:o} exceeds 0600"
+        );
+        assert_eq!(file_mode & 0o600, 0o600, "segment mode {file_mode:o} lost owner rw");
+
+        let dir_mode = std::fs::metadata(&dest_dir).expect("dest dir metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode & !pgbr_storage::PG_PATH_MODE,
+            0,
+            "pg_wal mode {dir_mode:o} exceeds 0700"
+        );
+        assert_eq!(dir_mode & 0o700, 0o700, "pg_wal mode {dir_mode:o} lost owner rwx");
     }
 
     /// Regression test for the PG-18 alt-restore bug: when PG's `restore_command`
