@@ -23,6 +23,11 @@ still linked).
 > but a few are simplified relative to upstream — see [Porting status](#porting-status).
 > Do not treat it as a drop-in replacement for production backups yet.
 
+## Documentation
+
+- [User Guide](doc/user-guide.md)
+- [Frequently Asked Questions](doc/faq.md)
+
 ## Workspace layout
 
 The build is driven entirely by Cargo. The `pgbackrust` binary is produced by

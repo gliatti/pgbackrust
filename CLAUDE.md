@@ -8,7 +8,7 @@ pgBackRust is **no longer being maintained** as of release 2.58.0 (see `README.m
 
 The original C tree (`src/`), the Meson build, the cbindgen FFI header generator, and the transitional `pgbr-ffi` shim crate have all been **removed**. The workspace is now **cargo-only**: `cargo build --workspace --release` produces the `pgbackrust` binary (from `crates/pgbr-cli`). There is no C left to build.
 
-The top-level docs (`README.md`, `CODING.md`, `CONTRIBUTING.md`) have all been rewritten for the Rust workspace, and the C-era `doc/` toolchain has been removed. What remains before the migration is fully "done" is end-to-end validation against live PostgreSQL — the job of the `integration/` harness (see **Integration testing** below) — plus a handful of subsystems still simplified relative to upstream (the local/remote protocol + parallel job dispatch, block-level incremental backup); see `README.md` "Porting status".
+The top-level docs (`README.md`, `CODING.md`, `CONTRIBUTING.md`) have all been rewritten for the Rust workspace, and the C-era `doc/` toolchain has been removed (`doc/` now holds the user guide and FAQ as plain Markdown). What remains before the migration is fully "done" is end-to-end validation against live PostgreSQL — the job of the `integration/` harness (see **Integration testing** below) — plus a handful of subsystems still simplified relative to upstream (the local/remote protocol + parallel job dispatch, block-level incremental backup); see `README.md` "Porting status".
 
 ## Docker dev environment (REQUIRED — Rust is not installed locally)
 
