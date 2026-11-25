@@ -27,16 +27,38 @@ use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 /// Local-filesystem storage backend rooted at `root`. Relative paths passed to the trait
 /// methods are joined onto `root`; absolute paths are accepted verbatim.
+///
+/// Every file and directory the backend creates gets an explicit mode
+/// (`file_mode` / `path_mode`, Unix only) instead of the process default: with
+/// `neutral-umask` the umask is `0000`, so relying on `std::fs` defaults would
+/// publish world-writable `0666` / `0777` entries (GHSA-5qj2-9x5v-7c87).
 #[derive(Debug, Clone)]
 pub struct Posix {
     root: PathBuf,
+    file_mode: u32,
+    path_mode: u32,
 }
 
 impl Posix {
-    /// Build a `Posix` backend rooted at `root`.
+    /// Build a `Posix` backend rooted at `root`, creating files with
+    /// [`crate::REPO_FILE_MODE`] (`0640`) and directories with
+    /// [`crate::REPO_PATH_MODE`] (`0750`).
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_modes(root, crate::REPO_FILE_MODE, crate::REPO_PATH_MODE)
+    }
+
+    /// Build a `Posix` backend rooted at `root` that creates files with
+    /// `file_mode` and directories with `path_mode` (e.g. `0600` / `0700` for a
+    /// PG data directory). The modes are applied at creation time on
+    /// Unix and ignored elsewhere.
+    #[must_use]
+    pub fn with_modes(root: impl Into<PathBuf>, file_mode: u32, path_mode: u32) -> Self {
+        Self {
+            root: root.into(),
+            file_mode,
+            path_mode,
+        }
     }
 
     /// Configured root. Useful for diagnostics and tests.
@@ -72,7 +94,7 @@ fn modified_secs(meta: &fs::Metadata) -> Option<i64> {
     Some(i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
 }
 
-fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
+pub(crate) fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
     match err.kind() {
         std::io::ErrorKind::NotFound => StorageError::NotFound {
             path: path.to_path_buf(),
@@ -90,6 +112,44 @@ fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
     }
 }
 
+/// Open `path` for writing, creating it if missing and truncating it otherwise
+/// (the `std::fs::File::create` semantics). When `mode` is `Some` the file is
+/// *created* with that mode on Unix (`open(2)` `O_CREAT` mode, still subject to
+/// the umask), so it is never briefly visible with a looser default; an
+/// existing file keeps its mode. `mode` is ignored on non-Unix platforms.
+pub(crate) fn open_create_truncate(path: &Path, mode: Option<u32>) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
+}
+
+/// Create the directory `path` (and, when `recursive`, every missing parent).
+/// On Unix each directory created gets `mode` (`mkdir(2)` mode, still subject
+/// to the umask); pre-existing directories are left untouched. On non-Unix
+/// platforms `mode` is ignored. Semantics otherwise match `fs::create_dir` /
+/// `fs::create_dir_all`.
+pub(crate) fn create_dir_with_mode(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    builder.create(path)
+}
+
 /// Crash-safe local write: stream `bytes` to `<path>.tmp`, `fsync(2)` the
 /// data, `rename(2)` onto `path`, then `fsync(2)` the parent directory.
 /// `rename(2)` is atomic on POSIX, so a concurrent reader (or a crash before
@@ -100,6 +160,11 @@ fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
 /// `path` must be the fully-resolved (root-joined) target path — this helper
 /// does no path resolution.
 ///
+/// When `mode` is `Some`, the temp file is *created* with that mode (Unix
+/// only; see [`open_create_truncate`]) and the rename publishes it as-is, so
+/// the primary never exists with a looser default mode. `None` keeps the
+/// historical `File::create` behaviour (`0666` minus the umask).
+///
 /// # Errors
 ///
 /// Surfaces any backend / I/O failure from `create`, `write_all`, `sync_all`,
@@ -107,7 +172,7 @@ fn map_io(err: &std::io::Error, path: &Path) -> StorageError {
 /// left in place (it carries the would-be-new content); callers should treat
 /// the write as failed and ignore the stale temp file (a subsequent
 /// successful write will replace it).
-pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), StorageError> {
     // Sibling temp path. We append `.tmp` to the file name (not a directory of
     // its own) so it lives in the same directory as `path` and the rename
     // crosses no filesystem boundary — `rename(2)` is only atomic within a
@@ -123,7 +188,7 @@ pub(crate) fn write_atomic_local(path: &Path, bytes: &[u8]) -> Result<(), Storag
 
     // Create + write + fsync.
     {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| map_io(&err, &tmp_path))?;
+        let mut file = open_create_truncate(&tmp_path, mode).map_err(|err| map_io(&err, &tmp_path))?;
         Write::write_all(&mut file, bytes).map_err(|err| map_io(&err, &tmp_path))?;
         file.sync_all().map_err(|err| map_io(&err, &tmp_path))?;
         // `file` is dropped here — closes the fd before the rename.
@@ -225,7 +290,7 @@ impl Storage for Posix {
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
         let resolved = self.resolve(path);
-        let file = fs::File::create(&resolved).map_err(|err| map_io(&err, &resolved))?;
+        let file = open_create_truncate(&resolved, Some(self.file_mode)).map_err(|err| map_io(&err, &resolved))?;
         Ok(Box::new(PosixWrite {
             file: Some(file),
             path: resolved,
@@ -239,7 +304,7 @@ impl Storage for Posix {
     /// never observes a half-written primary.
     fn write_atomic_path(&self, path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
         let resolved = self.resolve(path);
-        write_atomic_local(&resolved, bytes)
+        write_atomic_local(&resolved, bytes, Some(self.file_mode))
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
@@ -259,12 +324,7 @@ impl Storage for Posix {
 
     fn create_path(&self, path: &Path, recursive: bool) -> Result<(), StorageError> {
         let resolved = self.resolve(path);
-        let result = if recursive {
-            fs::create_dir_all(&resolved)
-        } else {
-            fs::create_dir(&resolved)
-        };
-        result.map_err(|err| map_io(&err, &resolved))
+        create_dir_with_mode(&resolved, self.path_mode, recursive).map_err(|err| map_io(&err, &resolved))
     }
 
     fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), StorageError> {
@@ -521,6 +581,165 @@ mod tests {
         assert_eq!(info.kind, StorageKind::Link, "created entry must be a symlink");
         let read = fs::read_link(tmp.path().join("pg_wal")).unwrap();
         assert_eq!(read, target, "symlink must point at the recorded target");
+    }
+
+    /// Permission bits (`& 0o777`) of `path`.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Assert `path` was created with `expected`: no bit beyond `expected` is
+    /// set, and the owner bits are intact. Written this way (rather than
+    /// `mode == expected`) so the check holds under any sane umask, while
+    /// still rejecting the historical `0666`/`0777`-minus-umask defaults.
+    #[cfg(unix)]
+    fn assert_created_with(path: &Path, expected: u32) {
+        let actual = mode_of(path);
+        assert_eq!(
+            actual & !expected,
+            0,
+            "{}: mode {actual:o} is looser than {expected:o}",
+            path.display()
+        );
+        assert_eq!(
+            actual & 0o700,
+            expected & 0o700,
+            "{}: owner bits of {actual:o} differ from {expected:o}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_open_write_creates_file_0640() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+
+        let mut writer = storage.open_write(Path::new("file.bin")).unwrap();
+        writer.write(b"x").unwrap();
+        writer.close().unwrap();
+
+        assert_created_with(&tmp.path().join("file.bin"), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_create_path_recursive_creates_every_level_0750() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_mode = mode_of(tmp.path());
+        let storage = Posix::new(tmp.path());
+
+        storage.create_path(Path::new("a/b/c"), true).unwrap();
+        for level in ["a", "a/b", "a/b/c"] {
+            assert_created_with(&tmp.path().join(level), 0o750);
+        }
+        // The pre-existing root is not touched.
+        assert_eq!(mode_of(tmp.path()), root_mode);
+
+        // Non-recursive create gets the same mode.
+        storage.create_path(Path::new("single"), false).unwrap();
+        assert_created_with(&tmp.path().join("single"), 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_write_atomic_path_creates_file_0640() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+
+        storage.write_atomic_path(Path::new("backup.info"), b"payload").unwrap();
+
+        let published = tmp.path().join("backup.info");
+        assert_eq!(fs::read(&published).unwrap(), b"payload");
+        assert_created_with(&published, 0o640);
+        assert!(!tmp.path().join("backup.info.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_with_modes_is_honoured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::with_modes(tmp.path(), 0o600, 0o700);
+
+        storage.create_path(Path::new("pg/sub"), true).unwrap();
+        assert_created_with(&tmp.path().join("pg"), 0o700);
+        assert_created_with(&tmp.path().join("pg/sub"), 0o700);
+
+        let mut writer = storage.open_write(Path::new("pg/sub/file")).unwrap();
+        writer.write(b"x").unwrap();
+        writer.close().unwrap();
+        assert_created_with(&tmp.path().join("pg/sub/file"), 0o600);
+
+        storage.write_atomic_path(Path::new("pg/backup_label"), b"label").unwrap();
+        assert_created_with(&tmp.path().join("pg/backup_label"), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_file_without_mode_keeps_historical_default() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Reference: what a plain `File::create` produces under this umask.
+        let reference = tmp.path().join("reference");
+        fs::File::create(&reference).unwrap();
+
+        let target = tmp.path().join("target");
+        crate::atomic_write_file(&target, b"data").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"data");
+        assert_eq!(mode_of(&target), mode_of(&reference));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_file_mode_creates_with_requested_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let target = tmp.path().join("segment");
+        crate::atomic_write_file_mode(&target, b"wal", Some(0o600)).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"wal");
+        assert_created_with(&target, 0o600);
+
+        // `None` is the historical behaviour.
+        let reference = tmp.path().join("reference");
+        fs::File::create(&reference).unwrap();
+        let plain = tmp.path().join("plain");
+        crate::atomic_write_file_mode(&plain, b"x", None).unwrap();
+        assert_eq!(mode_of(&plain), mode_of(&reference));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_mode_applies_mode_to_created_dirs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        crate::set_path_mode(&existing, 0o755).unwrap();
+
+        crate::create_dir_all_mode(&existing.join("x/y"), 0o770).unwrap();
+        assert_created_with(&existing.join("x"), 0o770);
+        assert_created_with(&existing.join("x/y"), 0o770);
+        assert_eq!(mode_of(&existing), 0o755);
+
+        // Already present: a no-op, not an error.
+        crate::create_dir_all_mode(&existing.join("x/y"), 0o770).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_path_mode_changes_mode_and_errors_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        fs::File::create(&file).unwrap();
+
+        crate::set_path_mode(&file, 0o600).unwrap();
+        assert_eq!(mode_of(&file), 0o600);
+        crate::set_path_mode(&file, 0o640).unwrap();
+        assert_eq!(mode_of(&file), 0o640);
+
+        let err = crate::set_path_mode(&tmp.path().join("missing"), 0o600).unwrap_err();
+        assert!(matches!(err, StorageError::NotFound { .. }), "got {err:?}");
     }
 
     #[test]

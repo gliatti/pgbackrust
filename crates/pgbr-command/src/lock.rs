@@ -79,9 +79,10 @@ fn stop_file(config: &LoadedConfig) -> PathBuf {
 /// writing the temporary file, or renaming it into place fails.
 pub fn stop(config: &LoadedConfig) -> Result<(), CommandError> {
     let path = stop_file(config);
-    // Best-effort: ensure the lock-path directory exists.
+    // Ensure the lock-path directory exists, created with the lock/log
+    // directory mode (0770) rather than a world-writable 0777.
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        pgbr_storage::create_dir_all_mode(parent, pgbr_storage::LOCK_LOG_PATH_MODE)
             .map_err(|err| CommandError::Other(format!("unable to create lock path '{}': {err}", parent.display())))?;
     }
 
@@ -89,11 +90,36 @@ pub fn stop(config: &LoadedConfig) -> Result<(), CommandError> {
     // Atomic-ish publish: write to a temp file, then rename. This keeps a
     // concurrent `is_stopped` from observing a partial file.
     let tmp = path.with_extension("stop.tmp");
-    std::fs::write(&tmp, body)
+    write_stop_tmp(&tmp, body)
         .map_err(|err| CommandError::Other(format!("unable to write stop file '{}': {err}", tmp.display())))?;
     std::fs::rename(&tmp, &path)
         .map_err(|err| CommandError::Other(format!("unable to publish stop file '{}': {err}", path.display())))?;
     Ok(())
+}
+
+/// Write the temporary stop file `tmp` with `body`, creating it with mode
+/// [`pgbr_storage::LOCK_LOG_FILE_MODE`] (0660) on Unix — never 0666.
+///
+/// A leftover `tmp` (e.g. from a crashed `stop`) is removed first and the
+/// file is then created exclusively (`O_CREAT | O_EXCL`), so the mode always
+/// applies and a pre-planted symlink at `tmp` is never followed.
+fn write_stop_tmp(tmp: &Path, body: &[u8]) -> std::io::Result<()> {
+    if let Err(err) = std::fs::remove_file(tmp)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err);
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(pgbr_storage::LOCK_LOG_FILE_MODE);
+    }
+    let mut file = options.open(tmp)?;
+    file.write_all(body)?;
+    file.flush()
 }
 
 /// Remove the stop file written by [`stop`].
@@ -261,8 +287,9 @@ pub fn lock_acquire(lock_path: &Path, stanza: &str, lock_type: LockType) -> Resu
         return Ok(Vec::new());
     }
 
-    // Ensure the lock directory exists (C: `storagePathCreateP`).
-    std::fs::create_dir_all(lock_path)
+    // Ensure the lock directory exists (C: `storagePathCreateP`), with the
+    // lock/log directory mode (0770) rather than a world-writable 0777.
+    pgbr_storage::create_dir_all_mode(lock_path, pgbr_storage::LOCK_LOG_PATH_MODE)
         .map_err(|err| CommandError::Other(format!("unable to create lock path '{}': {err}", lock_path.display())))?;
 
     let mut handles = Vec::with_capacity(names.len());
@@ -279,11 +306,16 @@ pub fn lock_acquire(lock_path: &Path, stanza: &str, lock_type: LockType) -> Resu
 /// exclusive lock, then write the PID. Separated out so an error after a
 /// successful open still releases via the local `File` dropping.
 fn acquire_one(path: &Path, type_name: &str) -> Result<LockHandle, CommandError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    // A freshly created lock file gets the lock/log file mode (0660), never
+    // a world-writable 0666.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(pgbr_storage::LOCK_LOG_FILE_MODE);
+    }
+    let mut file = options
         .open(path)
         .map_err(|err| CommandError::Other(format!("unable to open lock file '{}': {err}", path.display())))?;
 
@@ -565,5 +597,79 @@ mod tests {
 
         let body = std::fs::read(lock_path.join("demo.stop")).expect("read stop file");
         assert_eq!(body, b"force=1\n", "force=1\\n marker expected, got {body:?}");
+    }
+
+    /// GHSA-5qj2-9x5v-7c87: the lock directory must be created 0770 and the
+    /// lock / stop files 0660 — never the world-writable 0777 / 0666.
+    ///
+    /// The requested modes are still filtered by the test process umask
+    /// (0770 becomes 0750 under the usual 022), so each check asserts the
+    /// resulting mode grants nothing beyond the lock/log mode (in particular
+    /// no "other" bits) while keeping the owner bits it needs.
+    #[cfg(unix)]
+    mod unix_modes {
+        use super::*;
+
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use pgbr_storage::{LOCK_LOG_FILE_MODE, LOCK_LOG_PATH_MODE};
+
+        fn assert_mode_within(path: &Path, max: u32, owner: u32) {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            let p = path.display();
+            assert_eq!(mode & !max, 0, "{p}: mode {mode:o} exceeds {max:o}");
+            assert_eq!(mode & owner, owner, "{p}: mode {mode:o} lacks owner bits");
+            assert_eq!(mode & 0o007, 0, "{p}: mode {mode:o} grants access to others");
+        }
+
+        #[test]
+        fn lock_acquire_creates_dir_0770_and_file_0660() {
+            let dir = TempDir::new().unwrap();
+            let lock_path = dir.path().join("locks");
+            assert!(!lock_path.exists(), "precondition: lock-path must not exist yet");
+
+            let handles = lock_acquire(&lock_path, "demo", LockType::Backup).unwrap();
+            assert_eq!(handles.len(), 1);
+
+            assert_mode_within(&lock_path, LOCK_LOG_PATH_MODE, 0o700);
+            assert_mode_within(handles[0].path(), LOCK_LOG_FILE_MODE, 0o600);
+        }
+
+        #[test]
+        fn stop_creates_dir_0770_and_stop_file_0660() {
+            let dir = TempDir::new().unwrap();
+            let lock_path = dir.path().join("locks");
+            let cfg = config_local_locked(Some("demo"), &lock_path, Vec::new());
+
+            stop(&cfg).unwrap();
+
+            assert_mode_within(&lock_path, LOCK_LOG_PATH_MODE, 0o700);
+            assert_mode_within(&lock_path.join("demo.stop"), LOCK_LOG_FILE_MODE, 0o600);
+            assert!(
+                !lock_path.join("demo.stop.tmp").exists(),
+                "temp stop file must be renamed away"
+            );
+        }
+
+        #[test]
+        fn stop_replaces_stale_world_writable_tmp() {
+            // A leftover temp file with a lax mode (e.g. from a crashed run on
+            // the old 0666 code) must not leak its mode into the stop file.
+            let dir = TempDir::new().unwrap();
+            let lock_path = dir.path().to_path_buf();
+            let stale = lock_path.join("demo.stop.tmp");
+            std::fs::write(&stale, b"stale").unwrap();
+            std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+            let cfg = config_local_locked(Some("demo"), &lock_path, Vec::new());
+
+            stop(&cfg).unwrap();
+
+            let stop_path = lock_path.join("demo.stop");
+            assert_mode_within(&stop_path, LOCK_LOG_FILE_MODE, 0o600);
+            assert!(
+                std::fs::read(&stop_path).unwrap().is_empty(),
+                "stale tmp body must not survive"
+            );
+        }
     }
 }

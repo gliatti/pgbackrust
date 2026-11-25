@@ -140,7 +140,74 @@ impl From<IoError> for StorageError {
 /// content; callers should treat the write as failed and ignore the stale temp
 /// file (a later successful write replaces it).
 pub fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    crate::posix::write_atomic_local(path, bytes)
+    crate::posix::write_atomic_local(path, bytes, None)
+}
+
+/// Mode for files pgBackRust creates in a repository (`rw-r-----`).
+pub const REPO_FILE_MODE: u32 = 0o640;
+/// Mode for directories pgBackRust creates in a repository (`rwxr-x---`).
+pub const REPO_PATH_MODE: u32 = 0o750;
+/// Mode for files written into a PG data directory (`rw-------`), as `initdb` does.
+pub const PG_FILE_MODE: u32 = 0o600;
+/// Mode for directories created in a PG data directory (`rwx------`), as `initdb` does.
+pub const PG_PATH_MODE: u32 = 0o700;
+/// Mode for lock / stop / log files (`rw-rw----`).
+pub const LOCK_LOG_FILE_MODE: u32 = 0o660;
+/// Mode for lock / log directories (`rwxrwx---`).
+pub const LOCK_LOG_PATH_MODE: u32 = 0o770;
+
+/// [`atomic_write_file`] with an explicit creation mode for the published file.
+///
+/// With `mode = Some(m)` the sibling temp file is *created* with mode `m`
+/// (`OpenOptionsExt::mode`, still subject to the process umask) rather than
+/// chmod'ed afterwards, so the file is never visible with a looser default —
+/// not even transiently. `None` is exactly [`atomic_write_file`]. The mode is
+/// ignored on non-Unix platforms.
+///
+/// # Errors
+///
+/// Same as [`atomic_write_file`].
+pub fn atomic_write_file_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), StorageError> {
+    crate::posix::write_atomic_local(path, bytes, mode)
+}
+
+/// `create_dir_all` that gives every directory it creates the mode `mode`.
+///
+/// The mode is applied at creation time (`DirBuilderExt::mode`, still subject
+/// to the process umask). Directories that already exist are left untouched.
+/// On non-Unix platforms the mode is ignored and this is a plain
+/// `create_dir_all`.
+///
+/// # Errors
+///
+/// Returns a [`StorageError`] if any directory cannot be created (permission
+/// denied, a path component is a file, …).
+pub fn create_dir_all_mode(path: &Path, mode: u32) -> Result<(), StorageError> {
+    crate::posix::create_dir_with_mode(path, mode, true).map_err(|err| crate::posix::map_io(&err, path))
+}
+
+/// Set the permission bits of `path` to `mode` (`chmod(2)`; symlinks are
+/// followed). On non-Unix platforms the mode is ignored, but a missing `path`
+/// is still reported as an error.
+///
+/// # Errors
+///
+/// Returns [`StorageError::NotFound`] if `path` does not exist, or another
+/// [`StorageError`] if the mode cannot be changed.
+pub fn set_path_mode(path: &Path, mode: u32) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, permissions).map_err(|err| crate::posix::map_io(&err, path))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::metadata(path)
+            .map(|_| ())
+            .map_err(|err| crate::posix::map_io(&err, path))
+    }
 }
 
 /// `fsync(2)` the directory containing `path` so a just-published rename (or

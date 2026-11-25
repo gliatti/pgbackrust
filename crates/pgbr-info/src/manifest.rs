@@ -250,6 +250,22 @@ struct BlockValue {
     size: u64,
 }
 
+/// JSON shape of a `[target:path]` value. Every key is optional and omitted
+/// when `None`, so a directory recording nothing renders as `{}` — exactly what
+/// manifests written before directory mode recording carry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PathValue {
+    /// Unix directory mode bits, as a decimal JSON number (`0o750` == `488`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<u32>,
+    /// Owner user id (uid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<u32>,
+    /// Owner group id (gid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<u32>,
+}
+
 /// JSON shape of a `[target:link]` value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LinkValue {
@@ -358,6 +374,30 @@ pub struct ManifestFile {
 pub struct ManifestPath {
     /// Repository-relative path, e.g. `"pg_data/base/1"`.
     pub path: String,
+    /// Unix directory mode bits (e.g. `0o750`), as captured at backup time.
+    /// `None` on non-Unix platforms and on manifests that predate directory
+    /// mode recording (`base={}`). Serialised as a decimal JSON number, like
+    /// [`ManifestFile::mode`]. C ref: `ManifestPath.mode`.
+    pub mode: Option<u32>,
+    /// Owner user id (uid) captured at backup time. `None` when not recorded.
+    /// C ref: `ManifestPath.user`.
+    pub user: Option<u32>,
+    /// Owner group id (gid) captured at backup time. `None` when not recorded.
+    /// C ref: `ManifestPath.group`.
+    pub group: Option<u32>,
+}
+
+impl ManifestPath {
+    /// A path entry for `path` with no recorded mode / owner (all `None`).
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            mode: None,
+            user: None,
+            group: None,
+        }
+    }
 }
 
 /// One symlink entry in `[target:link]`.
@@ -613,8 +653,17 @@ impl Manifest {
 
         let mut paths = Vec::new();
         if let Some(rows) = file.sections.get(TARGET_PATH_SECTION) {
-            for path in rows.keys() {
-                paths.push(ManifestPath { path: path.clone() });
+            for (path, raw_value) in rows {
+                let value: PathValue = serde_json::from_str(raw_value).map_err(|err| InfoError::Json {
+                    context: format!("[{TARGET_PATH_SECTION}].{path}"),
+                    error: err,
+                })?;
+                paths.push(ManifestPath {
+                    path: path.clone(),
+                    mode: value.mode,
+                    user: value.user,
+                    group: value.group,
+                });
             }
         }
 
@@ -716,7 +765,16 @@ impl Manifest {
 
         // [target:path]
         for entry in &self.paths {
-            file.set(TARGET_PATH_SECTION, &entry.path, "{}");
+            let value = PathValue {
+                mode: entry.mode,
+                user: entry.user,
+                group: entry.group,
+            };
+            let json = serde_json::to_string(&value).map_err(|err| InfoError::Json {
+                context: format!("[{TARGET_PATH_SECTION}].{}", entry.path),
+                error: err,
+            })?;
+            file.set(TARGET_PATH_SECTION, &entry.path, json);
         }
 
         // [backrest] — format / version markers. The checksum is filled in by
@@ -805,9 +863,7 @@ mod tests {
                 },
             ],
             option_checksum_page: None,
-            paths: vec![ManifestPath {
-                path: "pg_data".to_owned(),
-            }],
+            paths: vec![ManifestPath::new("pg_data")],
             links: vec![ManifestLink {
                 path: "pg_data/pg_wal".to_owned(),
                 destination: "/var/lib/pg_wal".to_owned(),
@@ -886,9 +942,7 @@ mod tests {
                 },
             ],
             option_checksum_page: None,
-            paths: vec![ManifestPath {
-                path: "pg_data".to_owned(),
-            }],
+            paths: vec![ManifestPath::new("pg_data")],
             links: Vec::new(),
         };
 
@@ -959,9 +1013,7 @@ mod tests {
                 },
             ],
             option_checksum_page: None,
-            paths: vec![ManifestPath {
-                path: "pg_data".to_owned(),
-            }],
+            paths: vec![ManifestPath::new("pg_data")],
             links: Vec::new(),
         };
 
@@ -1000,6 +1052,87 @@ mod tests {
         assert_eq!(no_mode.mode, None);
         assert_eq!(no_mode.user, None);
         assert_eq!(no_mode.group, None);
+    }
+
+    #[test]
+    fn manifest_path_mode_owner_round_trips() {
+        // A directory recording mode/user/group must render them as decimal JSON
+        // numbers into its `[target:path]` entry and re-parse them; a directory
+        // with all three `None` must still render as `{}`.
+        let mut manifest = sample();
+        manifest.paths = vec![
+            ManifestPath {
+                path: "pg_data/dir_with_mode".to_owned(),
+                mode: Some(0o750),
+                user: Some(1000),
+                group: Some(1001),
+            },
+            ManifestPath {
+                path: "pg_data/dir_mode_only".to_owned(),
+                mode: Some(0o700),
+                user: None,
+                group: None,
+            },
+            ManifestPath::new("pg_data/dir_bare"),
+        ];
+
+        let text = manifest.to_text().unwrap();
+        let line_value = |key: &str| -> String {
+            let prefix = format!("{key}=");
+            let found = text.lines().find_map(|line| line.strip_prefix(prefix.as_str()));
+            found
+                .unwrap_or_else(|| panic!("missing [target:path] line for {key}: {text}"))
+                .to_owned()
+        };
+        // `0o750` == 488, `0o700` == 448.
+        assert_eq!(
+            line_value("pg_data/dir_with_mode"),
+            r#"{"mode":488,"user":1000,"group":1001}"#
+        );
+        // `None` keys are omitted, not rendered as `null`.
+        assert_eq!(line_value("pg_data/dir_mode_only"), r#"{"mode":448}"#);
+        assert_eq!(line_value("pg_data/dir_bare"), "{}");
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed, manifest);
+        let with_mode = parsed.paths.iter().find(|p| p.path == "pg_data/dir_with_mode").unwrap();
+        assert_eq!(with_mode.mode, Some(0o750));
+        assert_eq!(with_mode.user, Some(1000));
+        assert_eq!(with_mode.group, Some(1001));
+    }
+
+    #[test]
+    fn manifest_path_legacy_empty_value_parses_as_none() {
+        // Manifests written before directory mode recording carry `pg_data={}`.
+        // They must keep parsing, with mode/user/group all `None`.
+        let manifest = sample();
+        let text = manifest.to_text().unwrap();
+        assert!(
+            text.lines().any(|line| line == "pg_data={}"),
+            "a path without mode/owner must render as the legacy `{{}}`: {text}"
+        );
+
+        let parsed = Manifest::from_text(&text).unwrap();
+        assert_eq!(parsed.paths, vec![ManifestPath::new("pg_data")]);
+        let path = &parsed.paths[0];
+        assert_eq!(path.mode, None);
+        assert_eq!(path.user, None);
+        assert_eq!(path.group, None);
+    }
+
+    #[test]
+    fn manifest_path_rejects_malformed_value() {
+        // A `[target:path]` value is now parsed, so a non-JSON value is a typed
+        // JSON error naming the entry rather than being silently ignored.
+        let manifest = sample();
+        let mut file = manifest.to_file().unwrap();
+        file.set(TARGET_PATH_SECTION, "pg_data", "not-json");
+        let text = format::checksumed_render_checked(&file).unwrap();
+        let err = Manifest::from_text(&text).unwrap_err();
+        assert!(
+            matches!(&err, InfoError::Json { context, .. } if context == "[target:path].pg_data"),
+            "expected a JSON error for the malformed path entry, got {err:?}"
+        );
     }
 
     #[test]

@@ -14,14 +14,14 @@
 // item in the crate stays unsafe-free.
 #![cfg_attr(not(test), deny(unsafe_code))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pgbr_config::{
     Cfg, CliResolveError, CompileError, IniFile, LoadError, LoadedConfig, OptionValue, ResolvedCli, RuntimeContext, compile,
     env_values_from_process, load_config_with_env_multi, parse_cli, parse_ini, resolve_cli,
 };
 use pgbr_protocol::ProtocolError;
-use pgbr_storage::StorageError;
+use pgbr_storage::{PG_FILE_MODE, PG_PATH_MODE, StorageError};
 
 pub mod remote_storage;
 mod storage_helper;
@@ -429,7 +429,11 @@ fn build_pg_storage_or_placeholder(loaded: &LoadedConfig) -> Result<Box<dyn pgbr
         // A missing `pg-path` is fine for repo-only commands; substitute an
         // inert posix backend rooted at ".". Any other error (e.g. pg-host
         // NotSupportedYet) is real and propagates.
-        Err(CliRunError::StorageConfig(_)) => Ok(Box::new(pgbr_storage::Posix::new(PathBuf::from(".")))),
+        Err(CliRunError::StorageConfig(_)) => Ok(Box::new(pgbr_storage::Posix::with_modes(
+            PathBuf::from("."),
+            PG_FILE_MODE,
+            PG_PATH_MODE,
+        ))),
         Err(other) => Err(other),
     }
 }
@@ -978,17 +982,33 @@ fn open_log_file(loaded: &LoadedConfig) {
     };
     let full = PathBuf::from(&log_path).join(file_name);
 
-    if let Some(parent) = full.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        eprintln!("unable to create log path {}: {err}", parent.display());
-        return;
+    match create_log_file(&full) {
+        Ok(file) => install_log_file_fd(file),
+        Err(msg) => eprintln!("{msg}"),
+    }
+}
+
+/// Create the parent directory tree of `full` (mode
+/// [`pgbr_storage::LOCK_LOG_PATH_MODE`], 0770) and open `full` for append,
+/// creating it with mode [`pgbr_storage::LOCK_LOG_FILE_MODE`] (0660) on Unix —
+/// never world-readable/writable (GHSA-5qj2-9x5v-7c87). Both modes are still
+/// filtered by the process umask. Returns a ready-to-print message on failure.
+fn create_log_file(full: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = full.parent() {
+        pgbr_storage::create_dir_all_mode(parent, pgbr_storage::LOCK_LOG_PATH_MODE)
+            .map_err(|err| format!("unable to create log path {}: {err}", parent.display()))?;
     }
 
-    match std::fs::OpenOptions::new().create(true).append(true).open(&full) {
-        Ok(file) => install_log_file_fd(file),
-        Err(err) => eprintln!("unable to open log file {}: {err}", full.display()),
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(pgbr_storage::LOCK_LOG_FILE_MODE);
     }
+    options
+        .open(full)
+        .map_err(|err| format!("unable to open log file {}: {err}", full.display()))
 }
 
 /// Process-global slot that owns the open log [`std::fs::File`] for the lifetime
@@ -1827,6 +1847,37 @@ option:
             log_dir.path().join("demo-backup.log").exists(),
             "init_logging should open <log-path>/<stanza>-<command>.log"
         );
+    }
+
+    /// GHSA-5qj2-9x5v-7c87: the log directory must be created 0770 and the log
+    /// file 0660 (never world-accessible). The umask can only remove bits, so
+    /// assert the resulting mode is a subset of the target with the owner bits
+    /// intact and no world bits.
+    #[cfg(unix)]
+    #[test]
+    fn create_log_file_uses_lock_log_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log_dir = tmp.path().join("pgbackrust");
+        let full = log_dir.join("demo-backup.log");
+        let _file = super::create_log_file(&full).expect("create log file");
+
+        let dir_mode = std::fs::metadata(&log_dir).expect("log dir metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode & !pgbr_storage::LOCK_LOG_PATH_MODE,
+            0,
+            "log dir mode {dir_mode:o} exceeds 0770"
+        );
+        assert_eq!(dir_mode & 0o700, 0o700, "log dir mode {dir_mode:o} lost owner rwx");
+
+        let file_mode = std::fs::metadata(&full).expect("log file metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode & !pgbr_storage::LOCK_LOG_FILE_MODE,
+            0,
+            "log file mode {file_mode:o} exceeds 0660"
+        );
+        assert_eq!(file_mode & 0o600, 0o600, "log file mode {file_mode:o} lost owner rw");
     }
 
     #[test]

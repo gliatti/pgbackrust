@@ -46,6 +46,18 @@ assert_contains() {
   fi
 }
 
+# assert that a path inside a node has exactly the given octal mode (stat %a)
+assert_mode() {
+  local n="$1" path="$2" want="$3" what="${4:-$path}"
+  local got
+  got=$(node "$n" stat -c '%a' "$path")
+  if [ "$got" = "$want" ]; then
+    pass "$what mode $got"
+  else
+    fail "$what mode $got != $want"
+  fi
+}
+
 # wait until a shell predicate succeeds (bounded)
 wait_for() {
   local desc="$1" tries="${2:-30}" sleep_s="${3:-1}"; shift 3 || true

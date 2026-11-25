@@ -203,9 +203,7 @@ mod tests {
                 },
             ],
             option_checksum_page: None,
-            paths: vec![ManifestPath {
-                path: "pg_data".to_owned(),
-            }],
+            paths: vec![ManifestPath::new("pg_data")],
             links: vec![ManifestLink {
                 path: "pg_data/pg_wal".to_owned(),
                 destination: "/var/lib/pg_wal".to_owned(),

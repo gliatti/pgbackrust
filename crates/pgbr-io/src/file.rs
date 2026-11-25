@@ -66,26 +66,59 @@ pub struct FileWrite {
     file: Option<File>,
 }
 
+/// Permission bits applied to files created by [`FileWrite::create`] and
+/// [`FileWrite::create_new`] (owner read/write, group read). Set explicitly so
+/// a zero process umask (`neutral-umask`) never yields world-readable files.
+const DEFAULT_FILE_MODE: u32 = 0o640;
+
+/// Apply `mode` as the creation permission bits on `opts` (Unix only).
+#[cfg(unix)]
+fn set_create_mode(opts: &mut OpenOptions, mode: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(mode);
+}
+
+/// No-op on non-Unix platforms: there is no POSIX mode to apply.
+#[cfg(not(unix))]
+const fn set_create_mode(_opts: &mut OpenOptions, _mode: u32) {}
+
 impl FileWrite {
-    /// Open `path` for writing, creating the file if needed and truncating any
-    /// existing content.
+    /// Open `path` for writing, creating the file if needed (mode `0640` on
+    /// Unix, subject to the process umask) and truncating any existing
+    /// content.
     ///
     /// # Errors
     ///
     /// Returns [`IoError::Backend`] formatted as `"open {path}: {os_err}"` if
     /// the file cannot be opened.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        Self::create_with_mode(path, DEFAULT_FILE_MODE)
+    }
+
+    /// Open `path` for writing, creating the file if needed with permission
+    /// bits `mode` (subject to the process umask) and truncating any existing
+    /// content.
+    ///
+    /// The mode only applies when the file is created; an existing file keeps
+    /// its permissions. On non-Unix platforms `mode` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IoError::Backend`] formatted as `"open {path}: {os_err}"` if
+    /// the file cannot be opened.
+    pub fn create_with_mode(path: impl AsRef<Path>, mode: u32) -> Result<Self, IoError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        set_create_mode(&mut opts, mode);
+        let file = opts
             .open(&path)
             .map_err(|err| IoError::Backend(format!("open {}: {err}", path.display())))?;
         Ok(Self { path, file: Some(file) })
     }
 
-    /// Open `path` for writing, failing if the file already exists.
+    /// Open `path` for writing, failing if the file already exists. The file
+    /// is created with mode `0640` on Unix (subject to the process umask).
     ///
     /// # Errors
     ///
@@ -93,9 +126,10 @@ impl FileWrite {
     /// the file cannot be opened — including the `AlreadyExists` case.
     pub fn create_new(path: impl AsRef<Path>) -> Result<Self, IoError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        set_create_mode(&mut opts, DEFAULT_FILE_MODE);
+        let file = opts
             .open(&path)
             .map_err(|err| IoError::Backend(format!("open {}: {err}", path.display())))?;
         Ok(Self { path, file: Some(file) })
@@ -245,6 +279,49 @@ mod tests {
             Ok(_) => panic!("create_new should have failed on existing path"),
             Err(other) => panic!("expected Backend, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_write_create_uses_mode_0640() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let mut w = FileWrite::create(&path).unwrap();
+        w.close().unwrap();
+        assert_eq!(file_mode(&path), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_write_create_new_uses_mode_0640() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let mut w = FileWrite::create_new(&path).unwrap();
+        w.close().unwrap();
+        assert_eq!(file_mode(&path), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_write_create_with_mode_applies_mode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+
+        let mut w = FileWrite::create_with_mode(&path, 0o600).unwrap();
+        w.write(b"s3cr3t").unwrap();
+        w.close().unwrap();
+        assert_eq!(file_mode(&path), 0o600);
+
+        let mut r = FileRead::open(&path).unwrap();
+        assert_eq!(r.read_all().unwrap(), b"s3cr3t");
     }
 
     #[test]

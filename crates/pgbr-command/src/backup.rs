@@ -716,6 +716,21 @@ fn file_mode_owner(_abs_path: &Path) -> (Option<u32>, Option<u32>, Option<u32>) 
     (None, None, None)
 }
 
+/// Build the [`ManifestPath`] for a walked directory, recording its Unix mode /
+/// owner (via [`file_mode_owner`]) so restore can recreate the directory with
+/// its original permissions instead of a umask-derived default. For a non-local
+/// PG data dir the stat misses and every field stays `None`. C ref:
+/// `ManifestPath.mode/user/group` in `src/info/manifest.c`.
+fn manifest_path(entry: WalkEntry) -> ManifestPath {
+    let (mode, user, group) = file_mode_owner(&entry.info.path);
+    ManifestPath {
+        path: entry.rel,
+        mode,
+        user,
+        group,
+    }
+}
+
 /// One entry discovered by [`walk`]: its PG-data-relative path plus the
 /// `StorageInfo` the backend reported for it.
 struct WalkEntry {
@@ -2166,7 +2181,8 @@ fn read_source(pg_storage: &dyn Storage, job: &CopyJob) -> Result<Vec<u8>, Comma
 /// plaintext checksum + the number of repo bytes written.
 ///
 /// This is the per-file unit of work run on a dispatcher worker thread. It does
-/// all of its I/O through `std::fs` against absolute paths, so it needs no
+/// all of its I/O directly against absolute paths (`std::fs` reads, and
+/// [`write_local_repo_object`] for the mode-restricted repo write), so it needs no
 /// `Storage` handle and no borrow from the caller — only the owned `transform`
 /// captured by the worker closure. This fast path is used **only** when **both**
 /// the repo and the PG data dir are local (`Posix`/`Cifs`); a non-local repo
@@ -2178,13 +2194,31 @@ fn copy_file(job: &CopyJob, transform: &RepoTransform) -> Result<CopyResult, Com
 
     let (repo_bytes, result) = transform_and_validate(job, &bytes, transform)?;
 
-    if let Some(parent) = job.abs_dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
-    }
-    std::fs::write(&job.abs_dest, &repo_bytes)
-        .map_err(|err| CommandError::Other(format!("write {}: {err}", job.abs_dest.display())))?;
+    write_local_repo_object(&job.abs_dest, &repo_bytes)?;
 
     Ok(result)
+}
+
+/// Write one repo object at the absolute local path `abs_dest` (the local-repo
+/// fast path), creating its parent directories first.
+///
+/// Directories are created [`pgbr_storage::REPO_PATH_MODE`] (`0750`) and the
+/// object is written atomically (temp file + rename) at
+/// [`pgbr_storage::REPO_FILE_MODE`] (`0640`), so the repo never holds
+/// world-readable/writable backup data regardless of the process umask — the
+/// same modes the `Posix` repo storage applies.
+///
+/// # Errors
+///
+/// [`CommandError::Other`] naming the path when the directory creation or the
+/// write fails.
+fn write_local_repo_object(abs_dest: &Path, repo_bytes: &[u8]) -> Result<(), CommandError> {
+    if let Some(parent) = abs_dest.parent() {
+        pgbr_storage::create_dir_all_mode(parent, pgbr_storage::REPO_PATH_MODE)
+            .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
+    }
+    pgbr_storage::atomic_write_file_mode(abs_dest, repo_bytes, Some(pgbr_storage::REPO_FILE_MODE))
+        .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))
 }
 
 /// Copy one file into the repo through the [`Storage`] trait, for a non-local
@@ -2416,17 +2450,12 @@ fn run_bundled_copy_serial(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFile>
                 }
             } else {
                 // Over the limit: its own object at `<rel><suffix>`, as in the
-                // unbundled path. A local repo writes via `std::fs` (the fast
-                // path); a non-local repo must write through the `Storage` trait
-                // so the object lands on the remote/object repo, not locally.
+                // unbundled path. A local repo writes directly via
+                // `write_local_repo_object` (the fast path); a non-local repo
+                // must write through the `Storage` trait so the object lands on
+                // the remote/object repo, not locally.
                 if ctx.repo_storage.is_local() {
-                    let abs_dest = job.abs_dest.clone();
-                    if let Some(parent) = abs_dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
-                    }
-                    std::fs::write(&abs_dest, &repo_bytes)
-                        .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
+                    write_local_repo_object(&job.abs_dest, &repo_bytes)?;
                 } else {
                     if let Some(parent) = Path::new(&job.rel_dest).parent() {
                         ctx.repo_storage.create_path(parent, true)?;
@@ -3013,14 +3042,9 @@ fn run_bundled_copy_parallel(ctx: BundledCopyCtx<'_>) -> Result<(Vec<ManifestFil
                 } else {
                     // Over-the-limit whole file: standalone repo object. Both repo
                     // and PG data dir are local here (parallel branch invariant),
-                    // so `std::fs::write` against the absolute destination is the
+                    // so a direct write against the absolute destination is the
                     // correct write — same code path the serial path takes.
-                    if let Some(parent) = abs_dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|err| CommandError::Other(format!("create {}: {err}", parent.display())))?;
-                    }
-                    std::fs::write(&abs_dest, &worker.repo_bytes)
-                        .map_err(|err| CommandError::Other(format!("write {}: {err}", abs_dest.display())))?;
+                    write_local_repo_object(&abs_dest, &worker.repo_bytes)?;
                     // `rel_dest` is unused on the local path but kept on the plan so
                     // a future non-local-aware parallel implementation can reuse it.
                     let _ = rel_dest;
@@ -3986,7 +4010,7 @@ fn plan_backup(
         // recreates it, but its contents are never captured. The walk does not
         // descend into these dirs, so only the bare directory entry arrives.
         if is_excluded_dir(&entry.rel) && entry.info.kind == StorageKind::Path && !is_user_excluded(&entry.rel, excludes) {
-            plan.paths.push(ManifestPath { path: entry.rel });
+            plan.paths.push(manifest_path(entry));
             continue;
         }
         // Anything underneath an excluded runtime dir, an excluded root file,
@@ -4013,7 +4037,7 @@ fn plan_backup(
                     plan.copy_jobs.push(job);
                 }
             },
-            StorageKind::Path => plan.paths.push(ManifestPath { path: entry.rel }),
+            StorageKind::Path => plan.paths.push(manifest_path(entry)),
             StorageKind::Link => {
                 // Record the link's real target. Filesystem backends resolve it
                 // via `read_link`; backends without link-target support (the
@@ -5327,6 +5351,55 @@ mod tests {
         assert_eq!(file.mode, Some(0o640), "manifest must record the source file mode");
         assert_eq!(file.user, Some(src_meta.uid()), "manifest must record the source uid");
         assert_eq!(file.group, Some(src_meta.gid()), "manifest must record the source gid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_records_directory_mode_and_owner() {
+        // A source directory with an explicit, non-default mode must have that
+        // mode (and the process's uid/gid) recorded on its manifest path entry,
+        // so restore can recreate it with its original permissions.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation-data-dir-mode");
+
+        let abs_dir = pg_s.info(Path::new("base/1")).expect("stat source dir").path;
+        std::fs::set_permissions(&abs_dir, std::fs::Permissions::from_mode(0o705)).expect("chmod dir");
+        let dir_meta = std::fs::metadata(&abs_dir).expect("dir metadata");
+
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+        let dir = manifest.paths.iter().find(|p| p.path == "base/1");
+        let dir = dir.expect("base/1 path in manifest");
+        assert_eq!(dir.mode, Some(0o705), "manifest must record the directory mode");
+        assert_eq!(dir.user, Some(dir_meta.uid()), "manifest must record the directory uid");
+        assert_eq!(dir.group, Some(dir_meta.gid()), "manifest must record the directory gid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_local_fast_path_writes_restricted_repo_modes() {
+        // The local-repo fast path writes repo objects directly (not through
+        // the `Storage` trait); they must still land 0640 in 0750 directories,
+        // never world-readable regardless of the process umask.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation-data-repo-mode");
+
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        let object_meta = std::fs::metadata(backup_root.join("base/1/1259")).expect("repo object");
+        let object_mode = object_meta.permissions().mode() & 0o7777;
+        assert_eq!(object_mode, pgbr_storage::REPO_FILE_MODE, "repo object mode {object_mode:o}");
+        let dir_meta = std::fs::metadata(backup_root.join("base/1")).expect("repo dir");
+        let dir_mode = dir_meta.permissions().mode() & 0o7777;
+        assert_eq!(dir_mode, pgbr_storage::REPO_PATH_MODE, "repo dir mode {dir_mode:o}");
     }
 
     #[test]
@@ -9812,9 +9885,7 @@ mod tests {
             db_system_id: 6_873_049_345_984_568_091,
             files: Vec::new(),
             option_checksum_page: None,
-            paths: vec![ManifestPath {
-                path: "pg_data".to_owned(),
-            }],
+            paths: vec![ManifestPath::new("pg_data")],
             links: Vec::new(),
         };
         let manifest_rel = PathBuf::from(format!("backup/{stanza}/{label}/backup.manifest"));
