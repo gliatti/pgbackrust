@@ -106,8 +106,10 @@ pub fn active_user_pass(config: &LoadedConfig) -> Result<Option<String>, Command
 /// The sub-key is stored, encrypted under the user passphrase, in the `[cipher]`
 /// section of the stanza's `archive.info`; this loads `archive.info` keyed with
 /// the user passphrase, recovers the recorded sub-key, and resolves it through
-/// [`RepoKeys::resolve`]. A repository with no `archive.info` yet (uninitialised)
-/// returns `Ok(None)`.
+/// [`RepoKeys::resolve`]. A repository with neither `archive.info` nor its
+/// `.copy` mirror (uninitialised) returns `Ok(None)`; a repository holding only
+/// the `.copy` (the crash window of [`InfoArchive::save_keyed`], which writes
+/// the mirror first) resolves through the loader's crash-recovery fallback.
 ///
 /// # Errors
 ///
@@ -125,7 +127,8 @@ pub fn repo_sub_key(repo: &dyn Storage, config: &LoadedConfig, index: u32, stanz
     })?;
 
     let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
-    if !repo.exists(&info_path)? {
+    let copy_path = PathBuf::from(format!("archive/{stanza}/archive.info.copy"));
+    if !repo.exists(&info_path)? && !repo.exists(&copy_path)? {
         return Ok(None);
     }
     let (_, recorded) =

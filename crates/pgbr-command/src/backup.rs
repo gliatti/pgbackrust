@@ -790,6 +790,28 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
     Ok(())
 }
 
+/// Refuse to back up onto an encrypted repository without a cipher sub-key.
+///
+/// An encrypted repository whose sub-key could not be resolved (e.g. its
+/// `archive.info` is missing) would otherwise yield a cipher-less transform
+/// and silently store the data, manifest and `backup_label` in cleartext
+/// (GHSA-8265-5345-wr5g).
+///
+/// # Errors
+///
+/// [`CommandError::Other`] when the active repository is encrypted and
+/// `transform` carries no cipher key.
+fn require_cipher_key_on_encrypted_repo(config: &LoadedConfig, transform: &RepoTransform) -> Result<(), CommandError> {
+    if crate::cipher::cipher_type(config, crate::cipher::active_repo_index(config)).is_encrypted()
+        && transform.cipher_pass.is_none()
+    {
+        return Err(CommandError::Other(
+            "backup: repository is encrypted but no cipher sub-key could be resolved (missing archive.info?); refusing to write plaintext".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// `backup` — take a backup of the active stanza, driven through the
 /// `PostgreSQL` backup-control protocol when a DB connection is configured.
 ///
@@ -836,6 +858,7 @@ pub fn backup(
     // behaviour unchanged.
     let sub_key = crate::cipher::active_sub_key(repo_storage, config, stanza)?;
     let transform = RepoTransform::from_options_with_key(config, sub_key);
+    require_cipher_key_on_encrypted_repo(config, &transform)?;
     let process_max = process_max(config);
     // Resolve the effective `--checksum-page` value: honour an explicit user
     // value, else read `global/pg_control` and default to the cluster's
@@ -4552,7 +4575,7 @@ fn run_backup(
         (Some(control), Some(start_lsn)) => {
             let (timeline, wal_segment_size) = resolve_wal_geometry(&mut **control)?;
             let stop = control.backup_stop()?;
-            write_backup_label_files(repo_storage, &backup_root, &stop)?;
+            write_backup_label_files(repo_storage, &backup_root, &stop, transform)?;
             Some(build_bracket(&start_lsn, &stop, timeline, wal_segment_size)?)
         }
         _ => None,
@@ -4788,29 +4811,37 @@ fn validate_server_against_stanza(control: &mut dyn BackupControl, info: &InfoBa
     Ok(server)
 }
 
-/// Write the `backup_label` and (when non-empty) `tablespace_map` files
-/// returned by `pg_backup_stop` into the backup root.
+/// Write the `pg_backup_stop` `backup_label` / `tablespace_map` into the backup root.
 ///
 /// pgBackRust stores these alongside the copied data so a restore can place
 /// `backup_label` at the data-root and re-create the tablespace symlinks from
 /// `tablespace_map`. An empty `spcmapfile` (a cluster with no tablespaces) is
 /// not written.
 ///
+/// Both files go through the same `transform` as the data files (compress
+/// then encrypt with the repository sub-key, SHA-1 KDF) and carry its
+/// compression suffix: `backup_label{suffix}` / `tablespace_map{suffix}`. On an
+/// encrypted repository they are therefore never stored in cleartext
+/// (GHSA-8265-5345-wr5g). The identity transform has an empty suffix and a
+/// pass-through chain, so an unencrypted, uncompressed repository keeps the
+/// byte-for-byte plain `backup_label` / `tablespace_map` files.
+///
 /// # Errors
 ///
-/// [`CommandError::Storage`] / [`CommandError::Io`] on write failure.
-fn write_backup_label_files(repo_storage: &dyn Storage, backup_root: &str, stop: &BackupStopResult) -> Result<(), CommandError> {
-    write_repo_file(
-        repo_storage,
-        &format!("{backup_root}/backup_label"),
-        stop.label_file.as_bytes(),
-    )?;
+/// [`CommandError::Storage`] / [`CommandError::Io`] on transform or write
+/// failure.
+fn write_backup_label_files(
+    repo_storage: &dyn Storage,
+    backup_root: &str,
+    stop: &BackupStopResult,
+    transform: &RepoTransform,
+) -> Result<(), CommandError> {
+    let suffix = transform.repo_suffix();
+    let label_bytes = transform.apply_forward_keyed(stop.label_file.as_bytes())?;
+    write_repo_file(repo_storage, &format!("{backup_root}/backup_label{suffix}"), &label_bytes)?;
     if !stop.spcmap_file.is_empty() {
-        write_repo_file(
-            repo_storage,
-            &format!("{backup_root}/tablespace_map"),
-            stop.spcmap_file.as_bytes(),
-        )?;
+        let spcmap_bytes = transform.apply_forward_keyed(stop.spcmap_file.as_bytes())?;
+        write_repo_file(repo_storage, &format!("{backup_root}/tablespace_map{suffix}"), &spcmap_bytes)?;
     }
     Ok(())
 }
@@ -7319,6 +7350,160 @@ mod tests {
             !backup_root.join("tablespace_map").exists(),
             "no tablespace_map when spcmapfile is empty"
         );
+    }
+
+    /// A fake primary whose `backup_stop` returns `label_file` / `spcmap_file`.
+    fn fake_primary_with_files(label_file: &str, spcmap_file: &str) -> FakeBackupControl {
+        FakeBackupControl::primary(
+            140_010,
+            STANZA_SYSTEM_ID,
+            "0/16B3E40",
+            BackupStopResult {
+                lsn: "0/16B3F00".to_owned(),
+                label_file: label_file.to_owned(),
+                spcmap_file: spcmap_file.to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn control_driven_backup_encrypts_backup_label_and_tablespace_map() {
+        // GHSA-8265-5345-wr5g: on an encrypted repository the backup_label and
+        // tablespace_map stored in the backup root must go through the same
+        // keyed transform as the data files, never in cleartext.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let label_text = "START WAL LOCATION: 0/16B3E40 (file 000000010000000000000001)\n";
+        let spcmap_text = "16400 /mnt/secret_tablespace\n";
+        let transform = RepoTransform::with_key(CompressType::None, 0, Some("repo-sub-key".to_owned()));
+        let mut control = fake_primary_with_files(label_text, spcmap_text);
+        run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &transform, false).expect("encrypted backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        // No compression: the suffix is empty, so the names are unchanged.
+        let stored_label = std::fs::read(backup_root.join("backup_label")).expect("backup_label stored");
+        assert!(stored_label.starts_with(b"Salted__"), "backup_label must be encrypted");
+        assert!(
+            !stored_label
+                .windows(b"START WAL LOCATION".len())
+                .any(|w| w == b"START WAL LOCATION"),
+            "backup_label text must not appear in cleartext"
+        );
+        assert_eq!(
+            transform.apply_reverse_keyed(&stored_label).expect("decrypt backup_label"),
+            label_text.as_bytes(),
+            "backup_label decrypts back to the pg_backup_stop label"
+        );
+
+        let stored_spcmap = std::fs::read(backup_root.join("tablespace_map")).expect("tablespace_map stored");
+        assert!(stored_spcmap.starts_with(b"Salted__"), "tablespace_map must be encrypted");
+        assert!(
+            !stored_spcmap
+                .windows(b"secret_tablespace".len())
+                .any(|w| w == b"secret_tablespace"),
+            "tablespace_map text must not appear in cleartext"
+        );
+        assert_eq!(
+            transform.apply_reverse_keyed(&stored_spcmap).expect("decrypt tablespace_map"),
+            spcmap_text.as_bytes(),
+            "tablespace_map decrypts back to the pg_backup_stop spcmap"
+        );
+    }
+
+    #[test]
+    fn control_driven_backup_identity_writes_plain_backup_label() {
+        // Non-regression: the identity transform keeps the bare names and the
+        // byte-for-byte pg_backup_stop contents.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let label_text = "START WAL LOCATION: 0/16B3E40\nLABEL: identity\n";
+        let spcmap_text = "16400 /mnt/ts1\n";
+        let mut control = fake_primary_with_files(label_text, spcmap_text);
+        run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &RepoTransform::identity(), false).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert_eq!(
+            std::fs::read(backup_root.join("backup_label")).unwrap(),
+            label_text.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(backup_root.join("tablespace_map")).unwrap(),
+            spcmap_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn control_driven_backup_compresses_backup_label_with_suffix() {
+        // A gz transform (no cipher) stores the aux files with the compression
+        // suffix, and they gunzip back to the pg_backup_stop contents.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "base/1/1259", b"relation contents");
+
+        let label_text = "START WAL LOCATION: 0/16B3E40\nLABEL: gz\n";
+        let spcmap_text = "16400 /mnt/ts1\n";
+        let transform = RepoTransform::with_key(CompressType::Gz, 6, None);
+        let mut control = fake_primary_with_files(label_text, spcmap_text);
+        run_backup_with_fake_opts(&repo_s, &pg_s, &mut control, false, &transform, false).expect("backup");
+
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert!(!backup_root.join("backup_label").exists(), "no bare backup_label under gz");
+        assert!(
+            !backup_root.join("tablespace_map").exists(),
+            "no bare tablespace_map under gz"
+        );
+        let stored_label = std::fs::read(backup_root.join("backup_label.gz")).expect("backup_label.gz stored");
+        assert_eq!(
+            transform.apply_reverse_keyed(&stored_label).expect("gunzip backup_label"),
+            label_text.as_bytes()
+        );
+        let stored_spcmap = std::fs::read(backup_root.join("tablespace_map.gz")).expect("tablespace_map.gz stored");
+        assert_eq!(
+            transform.apply_reverse_keyed(&stored_spcmap).expect("gunzip tablespace_map"),
+            spcmap_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn backup_refuses_encrypted_repo_without_sub_key() {
+        // An encrypted repository whose archive.info is missing resolves no
+        // sub-key; backup must refuse rather than silently write plaintext.
+        let (repo_dir, _pg, repo_s, pg_s) = posix_pair();
+        init_stanza(&repo_s, "demo");
+        seed_cluster(&pg_s);
+
+        let lock_dir = tempfile::tempdir().expect("lock tempdir");
+        let mut cfg = typed_cfg_locked("demo", "full", lock_dir.path());
+        cfg.options.insert(
+            ("repo-cipher-type".to_owned(), Some(1)),
+            OptionValue::StringId("aes-256-cbc".to_owned()),
+        );
+        cfg.options.insert(
+            ("repo-cipher-pass".to_owned(), Some(1)),
+            OptionValue::String("user-secret".to_owned()),
+        );
+        assert!(!repo_s.exists(Path::new("archive/demo/archive.info")).unwrap());
+
+        let err = backup(&cfg, &repo_s, &[(1, &repo_s as &dyn Storage)], &pg_s).expect_err("must refuse plaintext backup");
+        assert!(
+            err.to_string().contains("refusing to write plaintext"),
+            "unexpected error: {err}"
+        );
+
+        // Nothing was written: the stanza dir still only holds the seeded backup.info.
+        let entries: Vec<String> = std::fs::read_dir(repo_dir.path().join("backup/demo"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().all(|name| name.starts_with("backup.info")),
+            "no backup directory created, found {entries:?}"
+        );
+        assert!(!repo_dir.path().join("archive").exists(), "no archive written");
     }
 
     #[test]
