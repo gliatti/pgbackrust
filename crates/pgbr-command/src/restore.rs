@@ -4461,7 +4461,7 @@ mod tests {
         manifest.save(repo, &path).expect("save manifest");
     }
 
-    /// A (repo, pg-target) pair whose PG storage uses PostgreSQL's modes
+    /// A (repo, pg-target) pair whose PG storage uses `initdb`-style modes
     /// (`0600` files / `0700` dirs), as the CLI builds the PGDATA storage.
     #[cfg(unix)]
     fn posix_pair_pg_modes() -> (TempDir, TempDir, Posix, Posix) {
