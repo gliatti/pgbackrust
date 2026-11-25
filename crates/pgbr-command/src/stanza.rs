@@ -1236,6 +1236,21 @@ mod tests {
     }
 
     #[test]
+    fn query_result_to_identity_accepts_pg19() {
+        // PG 19.0: values as reported by pg_control_system() on a live 19.0.
+        let identity = query_result_to_identity(DbIdentityRow {
+            server_version_num: 190_000,
+            system_identifier: 7_712_156_903_589_449_743,
+            catalog_version_no: 202_610_061,
+            pg_control_version: 1905,
+        })
+        .expect("PG 19 rows map cleanly");
+        assert_eq!(identity.version, "19");
+        assert_eq!(identity.header.catalog_version_no, 202_610_061);
+        assert_eq!(identity.header.pg_control_version, 1905);
+    }
+
+    #[test]
     fn query_result_to_identity_rejects_unknown_version() {
         let v = version::by_label("16").expect("PG 16 in registry");
         let err = query_result_to_identity(DbIdentityRow {
@@ -1288,6 +1303,7 @@ mod tests {
         assert_eq!(pg_version_label_from_num(100_000), Some("10"));
         assert_eq!(pg_version_label_from_num(160_004), Some("16"));
         assert_eq!(pg_version_label_from_num(180_000), Some("18"));
+        assert_eq!(pg_version_label_from_num(190_000), Some("19"));
         assert_eq!(pg_version_label_from_num(80_400), None); // PG 8.4 unsupported
         assert_eq!(pg_version_label_from_num(990_000), None);
     }

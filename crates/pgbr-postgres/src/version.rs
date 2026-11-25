@@ -23,7 +23,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionInterface {
     /// Major version label as it appears in `postgres.yaml` (`"9.6"`, `"10"`,
-    /// ..., `"18"`). Stable identifier used in error messages.
+    /// ..., `"19"`). Stable identifier used in error messages.
     pub label: &'static str,
     /// `CATALOG_VERSION_NO` from the upstream `PostgreSQL` release.
     pub catalog_version_no: u32,
@@ -111,6 +111,16 @@ pub const SUPPORTED: &[VersionInterface] = &[
         wal_block_size: 8192,
         block_size: 8192,
     },
+    // PG 19: not in the vendored C header (it predates 19). Taken from the
+    // 19.0 server headers (`catalog/catversion.h`, `catalog/pg_control.h`)
+    // and confirmed with `pg_controldata` on a fresh 19.0 `initdb`.
+    VersionInterface {
+        label: "19",
+        catalog_version_no: 202_610_061,
+        pg_control_version: 1905,
+        wal_block_size: 8192,
+        block_size: 8192,
+    },
 ];
 
 /// Look up a [`VersionInterface`] by its label.
@@ -126,7 +136,7 @@ pub fn by_catalog_version_no(catalog_version_no: u32) -> Option<&'static Version
 }
 
 /// Map a `pg_control_version` to the matching `PostgreSQL` major-version
-/// label (`"9.6"`, `"10"`, …, `"18"`).
+/// label (`"9.6"`, `"10"`, …, `"19"`).
 ///
 /// `pg_control_version` is **not** a unique key for a PG major: a single
 /// on-disk control format spans several releases when the catalog evolves
@@ -151,7 +161,7 @@ pub fn pg_control_version_to_pg_version(pg_control_version: u32) -> Option<&'sta
         .map(|v| v.label)
 }
 
-/// Map a `PostgreSQL` major-version label (`"9.6"`, `"10"`, …, `"18"`) to
+/// Map a `PostgreSQL` major-version label (`"9.6"`, `"10"`, …, `"19"`) to
 /// its `pg_control_version`.
 ///
 /// Inverse of [`pg_control_version_to_pg_version`] (modulo that function's
@@ -249,6 +259,17 @@ mod tests {
         assert_eq!(pg_control_version_to_pg_version(1201), Some("12"));
         assert_eq!(pg_control_version_to_pg_version(1700), Some("17"));
         assert_eq!(pg_control_version_to_pg_version(1800), Some("18"));
+        assert_eq!(pg_control_version_to_pg_version(1905), Some("19"));
+    }
+
+    #[test]
+    fn pg19_registry_entry() {
+        // PG 19.0: catversion.h / pg_control.h, confirmed by pg_controldata.
+        let entry = by_catalog_version_no(202_610_061).expect("PG 19 entry by catalog version");
+        assert_eq!(entry.label, "19");
+        assert_eq!(entry.pg_control_version, 1905);
+        // PG 19 uses 1905, not a round 1900.
+        assert_eq!(pg_control_version_to_pg_version(1900), None);
     }
 
     #[test]

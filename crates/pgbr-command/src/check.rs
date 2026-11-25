@@ -1345,6 +1345,7 @@ mod tests {
         assert_eq!(pg_version_label_from_num(160_004), Some("16"));
         assert_eq!(pg_version_label_from_num(100_000), Some("10"));
         assert_eq!(pg_version_label_from_num(90_600), Some("9.6"));
+        assert_eq!(pg_version_label_from_num(190_000), Some("19"));
         assert_eq!(pg_version_label_from_num(999_999), None);
     }
 

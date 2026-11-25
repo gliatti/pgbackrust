@@ -303,7 +303,8 @@ const CHECK_POINT_OFFSET: usize = 32;
 /// `float8ByVal` bool and its 3 bytes of alignment padding, landing a
 /// constant 36 bytes past `blcksz` at 252. (PG 18 adds
 /// `default_char_signedness` *after* `data_checksum_version`, leaving the
-/// offset unchanged.)
+/// offset unchanged.) PG 19 (1905) breaks this layout and has its own
+/// constant, [`OFFSETS_V1905`].
 ///
 /// Reconstructed from the upstream `ControlFileData` struct in
 /// `src/include/catalog/pg_control.h` for each matching release
@@ -348,14 +349,47 @@ const OFFSETS_V1100: ControlOffsets = ControlOffsets {
     data_checksum_version: 244,
 };
 
+/// Offsets for the `pg_control_version == 1905` (PG 19) layout, where
+/// `blcksz` lands at 224, `xlog_seg_size` at 240 and
+/// `data_checksum_version` at 268.
+///
+/// Three changes move the tail relative to [`OFFSETS_WIDE`]:
+///
+/// - the embedded `CheckPoint` copy grows by 8 bytes (it gains
+///   `bool logicalDecodingEnabled` and `MultiXactOffset` widens to 8
+///   bytes), pushing `blcksz` from 216 to 224;
+/// - `ControlFileData` gains `uint32 slru_pages_per_segment` between
+///   `relseg_size` and `xlog_blcksz`, pushing `xlog_seg_size` a further 4
+///   bytes (228 + 12 = 240);
+/// - `ControlFileData` gains `uint32 data_checksum_version_init` (at 264)
+///   just before `data_checksum_version`, pushing it to 268.
+///
+/// The "`data_checksum_version` sits 36 bytes past `blcksz`" invariant of
+/// the older layouts therefore no longer holds: it is 44 bytes here. The
+/// struct is 312 bytes, with `crc` at 308.
+///
+/// Measured with `offsetof` against the `postgresql-server-dev-19` 19.0
+/// headers on x86-64, and confirmed against a real 19.0 `initdb`
+/// `global/pg_control` (see `decode_real_pg19_pg_control`).
+const OFFSETS_V1905: ControlOffsets = ControlOffsets {
+    state: STATE_OFFSET,
+    check_point: CHECK_POINT_OFFSET,
+    block_size: 224,
+    wal_segment_size: 240,
+    data_checksum_version: 268,
+};
+
 /// Resolve the [`ControlOffsets`] for a decoded `pg_control_version`, or
 /// `None` if no layout is known for it.
 const fn offsets_for(pg_control_version: u32) -> Option<ControlOffsets> {
     match pg_control_version {
-        // Every supported version except PG 11 shares the wide layout.
+        // Every supported version up to PG 18 except PG 11 shares the wide
+        // layout.
         960 | 1002 | 1201 | 1300 | 1700 | 1800 => Some(OFFSETS_WIDE),
         // PG 11 alone shifts blcksz/xlog_seg_size back by 8 bytes.
         1100 => Some(OFFSETS_V1100),
+        // PG 19 grows CheckPoint and ControlFileData (see OFFSETS_V1905).
+        1905 => Some(OFFSETS_V1905),
         _ => None,
     }
 }
@@ -424,10 +458,12 @@ fn read_u64_at(bytes: &[u8], off: usize) -> Option<u64> {
 ///
 /// Implements the layout for every `pg_control_version` in
 /// [`crate::version::SUPPORTED`]: 960 (PG 9.6), 1002 (PG 10), 1100
-/// (PG 11), 1201 (PG 12), 1300 (PG 13–16), 1700 (PG 17) and 1800
-/// (PG 18). All share `state`/`checkpoint` offsets; PG 11 alone shifts
-/// `block_size`/`wal_segment_size`/`data_checksum_version` back by 8 bytes
-/// (see [`OFFSETS_V1100`] vs [`OFFSETS_WIDE`]). If the buffer ends before a
+/// (PG 11), 1201 (PG 12), 1300 (PG 13–16), 1700 (PG 17), 1800 (PG 18) and
+/// 1905 (PG 19). All share `state`/`checkpoint` offsets, and three layouts
+/// cover the rest: PG 11 shifts `block_size`/`wal_segment_size`/
+/// `data_checksum_version` back by 8 bytes (see [`OFFSETS_V1100`] vs
+/// [`OFFSETS_WIDE`]), and PG 19 pushes them forward by 8/12/16 bytes (see
+/// [`OFFSETS_V1905`]). If the buffer ends before a
 /// given field's offset that field is left `None` even for an implemented
 /// version.
 ///
@@ -826,6 +862,77 @@ mod tests {
         assert_eq!(OFFSETS_V1100.block_size + 8, OFFSETS_WIDE.block_size);
         assert_eq!(OFFSETS_V1100.data_checksum_version + 8, OFFSETS_WIDE.data_checksum_version);
         assert_eq!(read_u32_at(&buf, OFFSETS_WIDE.block_size), Some(0));
+    }
+
+    #[test]
+    fn decode_data_reads_fields_for_v1905() {
+        assert_self_consistent("19");
+    }
+
+    #[test]
+    fn decode_data_v1905_offsets_differ_from_wide() {
+        // PG 19's CheckPoint grows by 8 bytes, then slru_pages_per_segment
+        // (+4) and data_checksum_version_init (+4) push the later fields.
+        assert_eq!(OFFSETS_V1905.block_size, OFFSETS_WIDE.block_size + 8);
+        assert_eq!(OFFSETS_V1905.wal_segment_size, OFFSETS_WIDE.wal_segment_size + 12);
+        assert_eq!(OFFSETS_V1905.data_checksum_version, OFFSETS_WIDE.data_checksum_version + 16);
+
+        // A v1905 buffer read with the wide offsets misses its fields.
+        let buf = synth_data("19", 1 /* DB_SHUTDOWNED */, 0xfeed, 8192, 32 * 1024 * 1024, 1);
+        assert_eq!(read_u32_at(&buf, OFFSETS_WIDE.block_size), Some(0));
+        assert_eq!(read_u32_at(&buf, OFFSETS_WIDE.data_checksum_version), Some(0));
+    }
+
+    /// Real `global/pg_control` (first 312 bytes, the whole
+    /// `ControlFileData`) from a PG 19.0 `initdb -k` after a clean shutdown,
+    /// dumped with `od -A d -t x1`. Rows 144 and 160 are all zero.
+    #[rustfmt::skip]
+    const REAL_PG19_PG_CONTROL: [u8; 312] = [
+        0x0f, 0x90, 0x86, 0xd2, 0xd7, 0x15, 0x07, 0x6b, 0x71, 0x07, 0x00, 0x00, 0x8d, 0x95, 0x13, 0x0c, // 000
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xdd, 0x15, 0x07, 0x6b, 0x00, 0x00, 0x00, 0x00, // 016
+        0x28, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, // 032
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // 048
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 064
+        0x01, 0x40, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 080
+        0x8e, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // 096
+        0xdd, 0x15, 0x07, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 112
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 128
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 144
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 160
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, // 176
+        0x08, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, // 192
+        0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x87, 0xd6, 0x32, 0x41, // 208
+        0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, // 224
+        0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0xcc, 0x07, 0x00, 0x00, // 240
+        0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // 256
+        0x01, 0x76, 0x6e, 0xec, 0x73, 0x0d, 0x2b, 0x4b, 0x9b, 0x2d, 0xb9, 0x44, 0x24, 0x2f, 0x7e, 0x02, // 272
+        0x9c, 0x01, 0xfe, 0x78, 0xaa, 0x88, 0x83, 0x64, 0x68, 0x51, 0xe1, 0xf9, 0x7c, 0x78, 0xb4, 0x2f, // 288
+        0xd5, 0x00, 0x00, 0x00, 0x73, 0x4f, 0x11, 0x80, // 304
+    ];
+
+    #[test]
+    fn decode_real_pg19_pg_control() {
+        let bytes = REAL_PG19_PG_CONTROL;
+
+        // The fixture is intact: the stored CRC-32C (offset 308) covers
+        // bytes 0..308.
+        let stored = u32::from_le_bytes([bytes[308], bytes[309], bytes[310], bytes[311]]);
+        assert_eq!(stored, 0x8011_4f73);
+        assert_eq!(crate::crc32c_one(&bytes[..308]), stored);
+
+        let data = decode_pg_control_data(&bytes).expect("real PG 19 pg_control decodes");
+        assert_eq!(data.header.system_identifier, 7_712_156_903_589_449_743);
+        assert_eq!(data.header.pg_control_version, 1905);
+        assert_eq!(data.header.catalog_version_no, 202_610_061);
+        assert_eq!(data.state, Some(DbState::Shutdowned));
+        assert_eq!(data.checkpoint, Some(0x0300_0028));
+        assert_eq!(data.block_size, Some(8192));
+        assert_eq!(data.wal_segment_size, Some(16_777_216));
+        assert_eq!(data.data_checksum_version, Some(1));
+        assert_eq!(data.page_checksums_enabled(), Some(true));
+
+        let (version, _) = identify(&bytes).expect("real PG 19 pg_control identifies");
+        assert_eq!(version.label, "19");
     }
 
     #[test]

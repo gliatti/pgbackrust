@@ -39,7 +39,7 @@ const TABLESPACE_PREFIX: &str = "PG_";
 pub struct TablespaceDirName {
     /// The `PostgreSQL` major-version label as it appears in the directory
     /// name and in [`crate::version::SUPPORTED`] (`"9.6"`, `"10"`, …,
-    /// `"18"`). Borrowed from the input slice.
+    /// `"19"`). Borrowed from the input slice.
     pub pg_version_label: String,
     /// The `catalog_version_no` embedded in the directory name. This is the
     /// authoritative key for pinning the directory to a single PG major (a
@@ -54,7 +54,7 @@ pub struct TablespaceDirName {
 /// Splits on `_`. A valid name has exactly three `_`-separated fields:
 /// the literal `PG`, the major-version label, and a decimal
 /// `catalog_version_no`. The version label itself never contains `_`
-/// (it is `"9.6"`, `"10"`, …, `"18"`), so a three-field split is exact.
+/// (it is `"9.6"`, `"10"`, …, `"19"`), so a three-field split is exact.
 ///
 /// Returns `None` when the name is not a tablespace version directory:
 /// missing/extra fields, a wrong prefix, an empty version label, or a
@@ -87,7 +87,7 @@ pub fn parse_tablespace_dir_name(name: &str) -> Option<TablespaceDirName> {
     // Exactly three `_`-separated fields: "PG", "<version>", "<catalog>".
     // Using a fixed split rather than `splitn`/`rsplit` because none of the
     // three legitimate fields contains an underscore (the version label is
-    // `9.6` / `10` / … / `18`).
+    // `9.6` / `10` / … / `19`).
     let mut fields = name.split('_');
     let prefix = fields.next()?;
     let version = fields.next()?;
@@ -214,6 +214,15 @@ mod tests {
         assert_eq!(v.label, "16");
         assert_eq!(v.pg_control_version, 1300);
         assert_eq!(parsed.catalog_version, 202_307_071);
+    }
+
+    #[test]
+    fn identify_resolves_pg19_real_name() {
+        // Directory name created by `CREATE TABLESPACE` on PG 19.0.
+        let (v, parsed) = identify_tablespace_dir_name("PG_19_202610061").expect("PG 19 identified");
+        assert_eq!(v.label, "19");
+        assert_eq!(v.catalog_version_no, 202_610_061);
+        assert_eq!(parsed.catalog_version, 202_610_061);
     }
 
     #[test]

@@ -209,7 +209,9 @@ const WAL_LONG_HEADER_LEN: usize = XLP_SEG_SIZE_OFFSET + 4;
 /// `src/include/access/xlog_internal.h`. The magic bumps every major (and
 /// occasionally a minor with a WAL-format change), so it identifies the version
 /// that wrote a WAL segment. Provenance matches the C tree's per-version
-/// `walMagic` in `src/postgres/interface/version.vendor.h`.
+/// `walMagic` in `src/postgres/interface/version.vendor.h`. PG 19 (`0xD122`)
+/// postdates that header: it comes from the 19.0 `access/xlog_internal.h` and the
+/// first bytes of a real 19.0 WAL segment.
 const WAL_MAGIC_VERSIONS: &[(u16, &str)] = &[
     (0xD093, "9.6"),
     (0xD097, "10"),
@@ -220,7 +222,8 @@ const WAL_MAGIC_VERSIONS: &[(u16, &str)] = &[
     (0xD110, "15"),
     (0xD113, "16"),
     (0xD116, "17"),
-    (0xD117, "18"),
+    (0xD118, "18"),
+    (0xD122, "19"),
 ];
 
 /// Decoded long page header from the first page of a WAL segment.
@@ -518,7 +521,39 @@ mod tests {
         assert_eq!(wal_version_from_magic(0xD10D), Some("14"));
         assert_eq!(wal_version_from_magic(0xD113), Some("16"));
         assert_eq!(wal_version_from_magic(0xD093), Some("9.6"));
+        assert_eq!(wal_version_from_magic(0xD118), Some("18"));
+        assert_eq!(wal_version_from_magic(0xD122), Some("19"));
+        // 0xD117 was wrongly listed for PG 18; the released value is 0xD118.
+        assert_eq!(wal_version_from_magic(0xD117), None);
         assert_eq!(wal_version_from_magic(0x0000), None, "unknown magic");
+    }
+
+    #[test]
+    fn every_supported_version_has_a_wal_magic() {
+        for v in crate::version::SUPPORTED {
+            assert!(
+                WAL_MAGIC_VERSIONS.iter().any(|(_, label)| *label == v.label),
+                "PG {} has no WAL_MAGIC_VERSIONS entry",
+                v.label,
+            );
+        }
+    }
+
+    #[test]
+    fn parse_real_pg19_wal_header() {
+        // First 40 bytes of 000000010000000000000003 from a PG 19.0 cluster.
+        #[rustfmt::skip]
+        let buf: [u8; 40] = [
+            0x22, 0xd1, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x90, 0x86, 0xd2, 0xd7, 0x15, 0x07, 0x6b,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00,
+        ];
+        let header = parse_wal_header(&buf).expect("real PG 19 long header parses");
+        assert_eq!(header.magic, 0xD122);
+        assert_eq!(header.version, Some("19"));
+        assert_eq!(header.timeline, 1);
+        assert_eq!(header.system_id, 7_712_156_903_589_449_743);
+        assert_eq!(header.segment_size, 16_777_216);
     }
 
     #[test]

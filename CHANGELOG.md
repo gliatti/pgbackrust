@@ -13,6 +13,20 @@ format version is distinct from the product version tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **PostgreSQL 19 support.** Version registry entry (catalog `202610061`,
+  `pg_control` version `1905`), the new PG 19 `pg_control` layout (`blcksz`,
+  `xlog_seg_size` and `data_checksum_version` at 224/240/268) and the PG 19 WAL
+  magic `0xD122`. The Docker integration topology selects its major with
+  `PGBR_PG_VERSION` (default 16).
+
+### Fixed
+
+- **PG 18 WAL magic.** The WAL magic table listed `0xD117` for PG 18 instead of
+  `0xD118`, so a PG 18 segment had no version and `archive-push` skipped the
+  WAL-header version cross-check.
+
 ## [0.1.0] - 2026-06-02
 
 First tagged release of the Rust rewrite (epic

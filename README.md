@@ -47,7 +47,7 @@ The build is driven entirely by Cargo. The `pgbackrust` binary is produced by
 | `pgbr-storage` | `Storage` trait + backends: `Posix`, `Cifs`, `S3` (SigV4), `Azure` (Shared Key), `Gcs` (bearer token), `Sftp` (ssh2). |
 | `pgbr-db` | Safe libpq wrapper (`Connection`, `QueryResult`). |
 | `pgbr-protocol` | JSON-line `Request` / `Response` message types + codec. |
-| `pgbr-postgres` | `crc32c_one`, version registry (PG 9.6 .. 18), `pg_control` header parsing, and `pg_checksum_page`. |
+| `pgbr-postgres` | `crc32c_one`, version registry (PG 9.6 .. 19), `pg_control` header parsing, and `pg_checksum_page`. |
 | `pgbr-info` | On-disk info files: `InfoArchive`, `InfoBackup`, `Manifest`, shared INI+SHA-1 format. |
 | `pgbr-command` | Every command implementation plus the dispatch entry point — `dispatch_multi` (the real router over all configured repositories) and its single-repo wrapper `dispatch` (see below). |
 | `pgbr-cli` | The `pgbackrust` binary: parse argv → load config → resolve → `pgbr_command::dispatch`. |

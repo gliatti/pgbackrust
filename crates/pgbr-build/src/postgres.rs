@@ -4,7 +4,7 @@
 //! versions. The C generator reads this list to emit per-version interface
 //! tables in `src/postgres/interface.auto.c.inc` and `src/postgres/version.auto.h`.
 //!
-//! Versions are parsed as strings (e.g. `"9.6"`, `"10"`, `"18"`) because the
+//! Versions are parsed as strings (e.g. `"9.6"`, `"10"`, `"19"`) because the
 //! YAML mixes float (`9.6`) and integer (`10`) literals.
 
 use serde::Deserialize;
@@ -77,13 +77,18 @@ mod tests {
     fn parses_repository_fixture() {
         let parsed = parse_postgres(crate::inputs::POSTGRES_YAML).unwrap();
 
-        // Sanity: the file lists at least 9.6 through 18 today. Pin the first
+        // Sanity: the file lists at least 9.6 through 19 today. Pin the first
         // and last; let the middle move with future PG releases without
         // breaking the test.
         assert!(
             parsed.versions.first().is_some_and(|v| v == "9.6"),
             "first version: {:?}",
             parsed.versions.first()
+        );
+        assert!(
+            parsed.versions.last().is_some_and(|v| v == "19"),
+            "last version: {:?}",
+            parsed.versions.last()
         );
         assert!(
             parsed.versions.iter().any(|v| v == "10"),

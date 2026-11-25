@@ -569,6 +569,13 @@ mod tests {
         };
         assert_eq!(pg18.release_major(), 18);
         assert!(pg18.uses_pg_backup_start());
+
+        let pg19 = BackupServerInfo {
+            server_version_num: 190_000,
+            system_identifier: 1,
+        };
+        assert_eq!(pg19.release_major(), 19);
+        assert!(pg19.uses_pg_backup_start());
     }
 
     #[test]
