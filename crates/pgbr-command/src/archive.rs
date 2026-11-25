@@ -925,22 +925,26 @@ fn load_drain_archive_id(
 /// encrypted, with no cipher sub-key, i.e. in cleartext (GHSA-8265-5345-wr5g).
 /// Matches upstream, which requires every repository to be initialised before
 /// WAL is pushed to it. Repository positions map to group indexes through
-/// [`configured_repo_indexes`], as everywhere else in this module.
+/// [`configured_repo_indexes`], as everywhere else in this module. The
+/// `archive.info.copy` mirror counts as initialised: the info writer stores the
+/// `.copy` first, so a crash can leave only the mirror, and the loader
+/// explicitly recovers from it.
 ///
 /// # Errors
 ///
 /// [`CommandError::Other`] naming the first repository index whose
-/// `archive/<stanza>/archive.info` is absent; [`CommandError::Storage`] when the
-/// existence probe itself fails.
+/// `archive/<stanza>/archive.info` (and `.copy` mirror) is absent;
+/// [`CommandError::Storage`] when the existence probe itself fails.
 fn require_archive_info_in_all_repos(
     config: &LoadedConfig,
     repo_storages: &[&dyn Storage],
     stanza: &str,
 ) -> Result<(), CommandError> {
     let info_path = PathBuf::from(format!("archive/{stanza}/archive.info"));
+    let copy_path = PathBuf::from(format!("archive/{stanza}/archive.info.copy"));
     let indexes = configured_repo_indexes(config);
     for (pos, repo) in repo_storages.iter().enumerate() {
-        if repo.exists(&info_path)? {
+        if repo.exists(&info_path)? || repo.exists(&copy_path)? {
             continue;
         }
         // Defensive fallback (positions and indexes are kept in lock-step by
@@ -3760,6 +3764,61 @@ mod tests {
                 "{label} must carry the cipher magic"
             );
         }
+    }
+
+    #[test]
+    fn push_accepts_repo_with_only_archive_info_copy() {
+        // Crash recovery: the info writer stores the `.copy` mirror first, so a
+        // crash can leave a repo with only `archive.info.copy`. The loader
+        // recovers from the mirror, so the initialisation gate must accept it
+        // (and the push must still store ciphertext resolved from the mirror).
+        let repo1 = tempfile::tempdir().expect("repo1 tempdir");
+        let repo2 = tempfile::tempdir().expect("repo2 tempdir");
+        let pg = tempfile::tempdir().expect("pg tempdir");
+        let repo1_s = Posix::new(repo1.path());
+        let repo2_s = Posix::new(repo2.path());
+        let pg_s = Posix::new(pg.path());
+        seed_encrypted_archive_info(
+            &repo1_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass1",
+            "Z2hzYS04MjY1LWNvcHkxLWtleQ==",
+        );
+        seed_encrypted_archive_info(
+            &repo2_s,
+            "demo",
+            TEST_SYSTEM_ID,
+            "14",
+            "userpass2",
+            "Z2hzYS04MjY1LWNvcHkyLWtleQ==",
+        );
+        // Keep only the `.copy` mirror in repo2 (the crash window's state).
+        std::fs::remove_file(repo2.path().join("archive/demo/archive.info")).expect("drop primary archive.info");
+        assert!(
+            repo2_s.exists(Path::new("archive/demo/archive.info.copy")).expect("exists"),
+            "the .copy mirror must remain"
+        );
+
+        let wal_source = format!("pg_wal/{SEGMENT}");
+        put(&pg_s, &wal_source, WAL_BODY);
+
+        let mut cfg = fake_config(Some("demo"), vec![wal_source]);
+        cfg.options
+            .insert(("archive-header-check".to_owned(), None), OptionValue::Boolean(false));
+        set_repo_cipher(&mut cfg, 1, "userpass1");
+        set_repo_cipher(&mut cfg, 2, "userpass2");
+
+        push(&cfg, &[&repo1_s as &dyn Storage, &repo2_s as &dyn Storage], &pg_s)
+            .expect("push must accept a repo holding only archive.info.copy");
+
+        let stored = read(&repo2_s, &format!("archive/demo/14-1/{SEGMENT}"));
+        assert_eq!(
+            &stored[..CIPHER_MAGIC.len()],
+            CIPHER_MAGIC,
+            "repo2 must store ciphertext keyed from the .copy mirror"
+        );
     }
 
     #[test]

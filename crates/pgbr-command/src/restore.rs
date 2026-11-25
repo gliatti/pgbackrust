@@ -1731,6 +1731,11 @@ fn restore_transform(metadata: &serde_json::Value, config: &LoadedConfig, sub_ke
     RepoTransform::with_key(base.compress_type, base.compress_level, sub_key.map(str::to_owned))
 }
 
+/// OpenSSL `Salted__` framing magic: the first 8 bytes of every encrypted
+/// repository file (see `pgbr-io`'s cipher filter). Used to tell real
+/// ciphertext from a legacy cleartext copy when a reverse transform fails.
+const CIPHER_SALT_MAGIC: &[u8; 8] = b"Salted__";
+
 /// Read `path` from `repo` in full, mapping a missing file to `Ok(None)`.
 fn read_repo_optional(repo: &dyn Storage, path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
     match repo.open_read(path) {
@@ -1749,17 +1754,20 @@ fn read_repo_optional(repo: &dyn Storage, path: &Path) -> Result<Option<Vec<u8>>
 /// - identity `transform` — the bare `{backup_dir}/{base}` is read verbatim;
 /// - otherwise `{base}{suffix}` is tried first, then the bare `{base}`, and the
 ///   bytes found go through [`RepoTransform::apply_reverse_keyed`]. When the
-///   bytes come from the bare path and the reverse fails, they are a legacy
-///   backup's cleartext copy (written before these files were transformed):
-///   they are returned verbatim with a warning.
+///   bytes come from the bare path, the reverse fails, and they do NOT carry
+///   the `Salted__` cipher framing, they are a legacy backup's cleartext copy
+///   (written before these files were transformed): they are returned verbatim
+///   with a warning. Bytes WITH the framing that fail to decode are real
+///   ciphertext (wrong key, tampered or corrupt) and stay an error.
 ///
 /// Both paths absent is `Ok(None)` — a DB-free backup writes neither file.
 ///
 /// # Errors
 ///
 /// [`CommandError::Storage`] when a read fails for a reason other than a
-/// missing file; the reverse-transform error when the suffixed file cannot
-/// be decoded (wrong key or corrupt bytes).
+/// missing file; the reverse-transform error when the suffixed file — or a
+/// bare `Salted__`-framed file under an encrypted transform — cannot be
+/// decoded (wrong key or corrupt bytes).
 fn read_aux_backup_file(
     repo: &dyn Storage,
     backup_dir: &Path,
@@ -1783,15 +1791,21 @@ fn read_aux_backup_file(
     let Some(bytes) = read_repo_optional(repo, &bare_path)? else {
         return Ok(None);
     };
-    let decoded = transform.apply_reverse_keyed(&bytes);
-    Ok(Some(decoded.unwrap_or_else(|err| {
-        log_warn(&format!(
-            "restore: {base} in {} could not be decoded with the backup transform ({err}); \
-             restoring it verbatim as a legacy cleartext copy",
-            backup_dir.display()
-        ));
-        bytes
-    })))
+    match transform.apply_reverse_keyed(&bytes) {
+        Ok(decoded) => Ok(Some(decoded)),
+        // Bytes carrying the cipher framing are real ciphertext, never a legacy
+        // cleartext copy: failing to decode them (wrong key, tampered or
+        // corrupt) must surface, not restore raw ciphertext into PGDATA.
+        Err(err) if transform.is_encrypted() && bytes.starts_with(CIPHER_SALT_MAGIC) => Err(err.into()),
+        Err(err) => {
+            log_warn(&format!(
+                "restore: {base} in {} could not be decoded with the backup transform ({err}); \
+                 restoring it verbatim as a legacy cleartext copy",
+                backup_dir.display()
+            ));
+            Ok(Some(bytes))
+        }
+    }
 }
 
 /// Resolves each manifest file to a physical [`RestoreSource`], following a
@@ -4817,6 +4831,25 @@ mod tests {
 
         let result = super::read_aux_backup_file(&repo_s, dir, "backup_label", &transform);
         assert!(result.is_err(), "corrupt backup_label.gz must fail, got {result:?}");
+    }
+
+    #[test]
+    fn read_aux_backup_file_rejects_corrupt_ciphertext_on_bare_path() {
+        // Bytes with the Salted__ framing are real ciphertext: failing to
+        // decrypt them must be an error, never the legacy verbatim fallback
+        // (which would restore raw ciphertext into PGDATA).
+        let (_repo, _pg, repo_s, _pg_s) = posix_pair();
+        let dir = Path::new("backup/demo/20240101-120000F");
+        repo_s.create_path(dir, true).unwrap();
+        write_repo_raw(
+            &repo_s,
+            "backup/demo/20240101-120000F/backup_label",
+            b"Salted__garbage-that-cannot-decrypt",
+        );
+        let transform = RepoTransform::with_key(CompressType::None, 0, Some(AUX_SUB_KEY.to_owned()));
+
+        let result = super::read_aux_backup_file(&repo_s, dir, "backup_label", &transform);
+        assert!(result.is_err(), "undecryptable Salted__ bytes must fail, got {result:?}");
     }
 
     #[test]
