@@ -17,6 +17,14 @@
 #                                (removed from the tree; still in git history)
 #
 # IMPORTANT: never add a *real* secret under these paths — it would be ignored.
+#
+# ignored-matches (below) target INLINE test fixtures that live in crate source
+# files (crates/**/src/*.rs) alongside real code — those paths CANNOT be
+# path-ignored without blinding the scanner to genuine secrets, so the exact
+# synthetic values are ignored instead. Added 2026-07-04: fake cloud pagination
+# cursors (S3 NextContinuationToken / Azure NextMarker) in the list()
+# pagination unit tests; the live fixtures now use obviously-fake placeholders,
+# these entries cover the original values still present in git history.
 version: 2
 
 secret:
@@ -25,3 +33,8 @@ secret:
     - "integration/**"
     - "test/certificate/**"
     - "doc/resource/fake-cert/**"
+  ignored-matches:
+    - name: "s3 list() test fixture: fake NextContinuationToken (pagination cursor, not a credential)"
+      match: "1ueGcxLPRx1Tr/XY7zn+1n"
+    - name: "azure list() test fixture: fake NextMarker (pagination cursor, not a credential)"
+      match: "2!72!MDAwMDI1IQ=="

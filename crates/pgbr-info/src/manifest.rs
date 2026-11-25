@@ -45,7 +45,6 @@
 
 use std::path::Path;
 
-use pgbr_io::{IoRead, IoWrite};
 use pgbr_storage::Storage;
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser::Serializer;
@@ -53,7 +52,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::InfoError;
 use crate::archive::{
-    bytes_to_text, decode_maybe_encrypted, encode_maybe_encrypted, json_string, parse_required_string, parse_required_u64,
+    bytes_to_text, copy_path, decode_maybe_encrypted, encode_maybe_encrypted, json_string, log_copy_recovery,
+    parse_required_string, parse_required_u64, read_and_decode, write_with_copy,
 };
 use crate::format::{self, BACKREST_SECTION, InfoFile};
 
@@ -402,8 +402,8 @@ pub struct Manifest {
 
 impl Manifest {
     /// Read `backup.manifest` from `path` via `storage`. Streams through
-    /// [`IoRead::read_all`] so any backend can plug in. Plaintext convenience
-    /// wrapper over [`Manifest::load_keyed`] with no passphrase.
+    /// [`pgbr_io::IoRead::read_all`] so any backend can plug in. Plaintext
+    /// convenience wrapper over [`Manifest::load_keyed`] with no passphrase.
     ///
     /// # Errors
     ///
@@ -423,15 +423,32 @@ impl Manifest {
     /// keyed). When `passphrase` is `None`, the bytes are parsed directly, so an
     /// unencrypted repository behaves byte-for-byte like the plaintext load.
     ///
+    /// Crash-recovery fallback: like `archive.info` / `backup.info`, if the
+    /// primary fails to load (storage error, parse error, or checksum mismatch)
+    /// the sibling `<path>.copy` mirror — written first by
+    /// [`Manifest::save_keyed`] — is tried next. When the `.copy` succeeds it is
+    /// returned and a `WARN` line is logged noting crash recovery was needed;
+    /// when both fail, the primary's error is propagated.
+    ///
     /// # Errors
     ///
     /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`]; a
     /// wrong passphrase (garbage plaintext) and other format / checksum failures
     /// surface as [`InfoError::Format`].
     pub fn load_keyed(storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<Self, InfoError> {
-        let mut reader: Box<dyn IoRead> = storage.open_read(path)?;
-        let bytes = reader.read_all()?;
-        Self::from_bytes_keyed(&bytes, passphrase)
+        match read_and_decode(storage, path, passphrase, Self::from_bytes_keyed) {
+            Ok(value) => Ok(value),
+            Err(primary_err) => {
+                let copy = copy_path(path);
+                match read_and_decode(storage, &copy, passphrase, Self::from_bytes_keyed) {
+                    Ok(value) => {
+                        log_copy_recovery(path, &primary_err);
+                        Ok(value)
+                    }
+                    Err(_copy_err) => Err(primary_err),
+                }
+            }
+        }
     }
 
     /// Decode a `backup.manifest` document that may be encrypted under
@@ -455,9 +472,15 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`InfoError::Io`] if the cipher filter fails.
+    /// [`InfoError::Io`] if the cipher filter fails, or
+    /// [`InfoError::Format`] ([`InfoFormatError::UnsafeName`]) if an entry key
+    /// (a `PGDATA`-relative path) would inject INI structure into the rendered
+    /// document. See [`Manifest::to_text`].
+    ///
+    /// [`InfoFormatError::UnsafeName`]: crate::InfoFormatError::UnsafeName
     pub fn to_bytes_keyed(&self, passphrase: Option<&str>) -> Result<Vec<u8>, InfoError> {
-        encode_maybe_encrypted(self.to_text().as_bytes(), passphrase)
+        let text = self.to_text()?;
+        encode_maybe_encrypted(text.as_bytes(), passphrase)
     }
 
     /// Write `backup.manifest` to `path` via `storage`. Plaintext convenience
@@ -470,21 +493,24 @@ impl Manifest {
         self.save_keyed(storage, path, None)
     }
 
-    /// Write `backup.manifest` to `path` via `storage`, encrypting under
-    /// `passphrase` (the repository sub-key) when the repository is encrypted.
-    /// When `passphrase` is `None` the bytes are written verbatim, identical to
-    /// the plaintext save.
+    /// Write `backup.manifest` (and its `.copy` mirror) to `path` via `storage`,
+    /// encrypting under `passphrase` (the repository sub-key) when the repository
+    /// is encrypted. When `passphrase` is `None` the bytes are written verbatim,
+    /// identical to the plaintext save.
+    ///
+    /// Crash-safety: routes both files through [`Storage::write_atomic_path`]
+    /// (temp + rename), the `.copy` first, matching `archive.info` /
+    /// `backup.info`. A crash between the two writes leaves a fresh `.copy` that
+    /// [`Manifest::load_keyed`] falls back to.
     ///
     /// # Errors
     ///
-    /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`].
+    /// Storage / I/O failures surface as [`InfoError::Storage`] / [`InfoError::Io`];
+    /// an entry key that would corrupt the INI envelope surfaces as
+    /// [`InfoError::Format`] (see [`Manifest::to_bytes_keyed`]).
     pub fn save_keyed(&self, storage: &dyn Storage, path: &Path, passphrase: Option<&str>) -> Result<(), InfoError> {
         let bytes = self.to_bytes_keyed(passphrase)?;
-        let mut writer: Box<dyn IoWrite> = storage.open_write(path)?;
-        writer.write(&bytes)?;
-        writer.flush()?;
-        writer.close()?;
-        Ok(())
+        write_with_copy(storage, path, &bytes)
     }
 
     /// Decode an in-memory `backup.manifest` document. Verifies the SHA-1 checksum.
@@ -500,9 +526,17 @@ impl Manifest {
     }
 
     /// Render this `Manifest` to text, with the `backrest-checksum` recomputed.
-    #[must_use]
-    pub fn to_text(&self) -> String {
-        format::checksumed_render(&self.to_file())
+    ///
+    /// # Errors
+    ///
+    /// [`InfoError::Json`] if a `[target:file]` / `[target:link]` entry fails to
+    /// serialise (in practice unreachable for these plain structs, but the error
+    /// is propagated rather than masked), or [`InfoError::Format`]
+    /// ([`crate::InfoFormatError::UnsafeName`]) if an entry key would corrupt the
+    /// INI envelope.
+    pub fn to_text(&self) -> Result<String, InfoError> {
+        let file = self.to_file()?;
+        format::checksumed_render_checked(&file).map_err(InfoError::from)
     }
 
     /// Total size of all files in the manifest.
@@ -612,7 +646,7 @@ impl Manifest {
         })
     }
 
-    fn to_file(&self) -> InfoFile {
+    fn to_file(&self) -> Result<InfoFile, InfoError> {
         let mut file = InfoFile::new();
 
         // [backup]
@@ -661,7 +695,10 @@ impl Manifest {
                 bundle_offset: entry.bundle_offset,
                 block_map,
             };
-            let json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
+            let json = serde_json::to_string(&value).map_err(|err| InfoError::Json {
+                context: format!("[{TARGET_FILE_SECTION}].{}", entry.path),
+                error: err,
+            })?;
             file.set(TARGET_FILE_SECTION, &entry.path, json);
         }
 
@@ -670,7 +707,10 @@ impl Manifest {
             let value = LinkValue {
                 destination: entry.destination.clone(),
             };
-            let json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
+            let json = serde_json::to_string(&value).map_err(|err| InfoError::Json {
+                context: format!("[{TARGET_LINK_SECTION}].{}", entry.path),
+                error: err,
+            })?;
             file.set(TARGET_LINK_SECTION, &entry.path, json);
         }
 
@@ -684,16 +724,17 @@ impl Manifest {
         file.set(BACKREST_SECTION, KEY_FORMAT, BACKREST_FORMAT.to_string());
         file.set(BACKREST_SECTION, KEY_VERSION, json_string(BACKREST_VERSION));
 
-        file
+        Ok(file)
     }
 }
 
 /// Read a required `i64`-valued key (timestamps can in principle predate the epoch).
 fn parse_required_i64(file: &InfoFile, section: &'static str, key: &'static str) -> Result<i64, InfoError> {
     let raw = file.get(section, key).ok_or(InfoError::MissingField { section, key })?;
-    raw.trim()
-        .parse::<i64>()
-        .map_err(|_| InfoError::MissingField { section, key })
+    raw.trim().parse::<i64>().map_err(|_| InfoError::InvalidValue {
+        context: format!("[{section}].{key}"),
+        value: raw.to_owned(),
+    })
 }
 
 /// Render a `bool` as pgBackRust's `y` / `n` short form used in info-file
@@ -777,10 +818,10 @@ mod tests {
     #[test]
     fn parse_renders_round_trip() {
         let manifest = sample();
-        let text = manifest.to_text();
+        let text = manifest.to_text().unwrap();
         let parsed = Manifest::from_text(&text).unwrap();
         // Re-render and re-parse: a parse->render->parse cycle must be structurally stable.
-        let text2 = parsed.to_text();
+        let text2 = parsed.to_text().unwrap();
         let parsed2 = Manifest::from_text(&text2).unwrap();
         assert_eq!(parsed, parsed2);
         assert_eq!(parsed, manifest);
@@ -851,7 +892,7 @@ mod tests {
             links: Vec::new(),
         };
 
-        let text = manifest.to_text();
+        let text = manifest.to_text().unwrap();
         // The referenced file carries a "reference" key; the self-contained one does not.
         assert!(
             text.contains("\"reference\":\"20240101-120000F\""),
@@ -924,7 +965,7 @@ mod tests {
             links: Vec::new(),
         };
 
-        let text = manifest.to_text();
+        let text = manifest.to_text().unwrap();
         // The mode-bearing file records mode (decimal `0o640` == 416) plus uid/gid.
         let with_mode_line = text
             .lines()
@@ -1007,7 +1048,7 @@ mod tests {
             links: Vec::new(),
         };
 
-        let text = manifest.to_text();
+        let text = manifest.to_text().unwrap();
         let bundled_line = text.lines().find(|l| l.starts_with("pg_data/bundled=")).unwrap();
         assert!(bundled_line.contains("\"bni\":1"), "bundle id recorded: {bundled_line}");
         assert!(
@@ -1091,7 +1132,7 @@ mod tests {
             links: Vec::new(),
         };
 
-        let text = manifest.to_text();
+        let text = manifest.to_text().unwrap();
         let blocky_line = text.lines().find(|l| l.starts_with("pg_data/blocky=")).unwrap();
         assert!(blocky_line.contains("\"blk\""), "block map recorded: {blocky_line}");
         let whole_line = text.lines().find(|l| l.starts_with("pg_data/whole=")).unwrap();
@@ -1108,7 +1149,7 @@ mod tests {
     #[test]
     fn checksum_mismatch_detected() {
         let manifest = sample();
-        let mut text = manifest.to_text();
+        let mut text = manifest.to_text().unwrap();
         // Flip a body byte in the backup label. The checksum line itself is untouched, so
         // the comparison must report a mismatch.
         let needle = "20240101-120000F";
@@ -1154,7 +1195,7 @@ mod tests {
         // the plaintext path, so unencrypted repositories are unaffected.
         let manifest = sample();
         let plaintext = manifest.to_bytes_keyed(None).unwrap();
-        assert_eq!(plaintext, manifest.to_text().into_bytes());
+        assert_eq!(plaintext, manifest.to_text().unwrap().into_bytes());
         let parsed = Manifest::from_bytes_keyed(&plaintext, None).unwrap();
         assert_eq!(parsed, manifest);
     }
@@ -1175,6 +1216,76 @@ mod tests {
         );
         let loaded = Manifest::load_keyed(&storage, path, Some(&sub_key)).unwrap();
         assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn hostile_file_name_is_rejected_on_render() {
+        // A manifest entry whose path embeds a newline + a bogus section is the
+        // INI-injection vector: the checksum is computed *after* render, so an
+        // unchecked render would produce a document that both parses and passes
+        // its own checksum. The checked write path must reject it cleanly.
+        let mut manifest = sample();
+        manifest.files.push(ManifestFile {
+            path: "x\n[target:link]\npg_data/pg_wal".to_owned(),
+            size: 1,
+            timestamp: 1,
+            checksum: Some("dead".to_owned()),
+            checksum_page: None,
+            reference: None,
+            mode: None,
+            user: None,
+            group: None,
+            bundle_id: None,
+            bundle_offset: None,
+            block_map: None,
+        });
+
+        // Both the plaintext and the encrypted write paths must error, not smuggle.
+        let err = manifest.to_bytes_keyed(None).unwrap_err();
+        assert!(
+            matches!(err, InfoError::Format(InfoFormatError::UnsafeName { kind: "key", .. })),
+            "hostile file name must fail as UnsafeName, got {err:?}"
+        );
+        assert!(manifest.to_bytes_keyed(Some("pw")).is_err());
+
+        // And it must fail at the storage save entry point too.
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Posix::new(dir.path());
+        assert!(manifest.save(&storage, Path::new("backup.manifest")).is_err());
+    }
+
+    #[test]
+    fn save_keyed_writes_primary_and_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Posix::new(dir.path());
+        let manifest = sample();
+
+        storage.create_path(Path::new("backup/demo"), true).unwrap();
+        let path = Path::new("backup/demo/backup.manifest");
+        manifest.save(&storage, path).unwrap();
+
+        assert!(storage.exists(path).unwrap(), "primary written");
+        assert!(
+            storage.exists(Path::new("backup/demo/backup.manifest.copy")).unwrap(),
+            ".copy mirror written"
+        );
+    }
+
+    #[test]
+    fn load_keyed_falls_back_to_copy_on_primary_corruption() {
+        // Crash between the .copy and the primary write: the .copy is valid and
+        // the primary is garbage. load_keyed must recover via the .copy.
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Posix::new(dir.path());
+        let manifest = sample();
+
+        storage.create_path(Path::new("backup/demo"), true).unwrap();
+        let path = Path::new("backup/demo/backup.manifest");
+        manifest.save(&storage, path).unwrap();
+        std::fs::write(dir.path().join("backup/demo/backup.manifest"), b"NOT A VALID MANIFEST\n").unwrap();
+
+        let reloaded = Manifest::load(&storage, path).unwrap();
+        assert_eq!(reloaded, manifest, "recovered from .copy fallback");
     }
 
     #[test]

@@ -434,12 +434,26 @@ struct ListEntry {
     modified: Option<i64>,
 }
 
-/// Parse a `ListObjectsV2` XML response body into its `<Contents>` entries.
-fn parse_list_objects_v2(xml: &str) -> Result<Vec<ListEntry>, String> {
+/// A single parsed page of a `ListObjectsV2` response: the `<Contents>` entries
+/// plus the pagination state needed to fetch the next page.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ListPage {
+    entries: Vec<ListEntry>,
+    /// `true` when the result was truncated and a further request is required.
+    is_truncated: bool,
+    /// The `<NextContinuationToken>` to re-inject as `continuation-token` on the
+    /// next request. Present only when `is_truncated` is `true`.
+    next_continuation_token: Option<String>,
+}
+
+/// Parse a `ListObjectsV2` XML response body into one [`ListPage`]: the
+/// `<Contents>` entries plus the `<IsTruncated>` / `<NextContinuationToken>`
+/// pagination markers.
+fn parse_list_objects_v2(xml: &str) -> Result<ListPage, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut entries = Vec::new();
+    let mut page = ListPage::default();
     let mut in_contents = false;
     let mut cur_tag: Option<String> = None;
     let mut key = String::new();
@@ -460,15 +474,26 @@ fn parse_list_objects_v2(xml: &str) -> Result<Vec<ListEntry>, String> {
                 cur_tag = Some(name);
             }
             Ok(Event::Text(e)) => {
-                if !in_contents {
-                    continue;
-                }
                 let text = e.xml_content().map_err(|err| err.to_string())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("Key") => key = text,
-                    Some("Size") => size = text.trim().parse().unwrap_or(0),
-                    Some("LastModified") => modified = parse_rfc3339_secs(&text),
-                    _ => {}
+                if in_contents {
+                    match cur_tag.as_deref() {
+                        Some("Key") => key = text,
+                        Some("Size") => size = text.trim().parse().unwrap_or(0),
+                        Some("LastModified") => modified = parse_rfc3339_secs(&text),
+                        _ => {}
+                    }
+                } else {
+                    // Top-level pagination markers live outside <Contents>.
+                    match cur_tag.as_deref() {
+                        Some("IsTruncated") => page.is_truncated = text.trim().eq_ignore_ascii_case("true"),
+                        Some("NextContinuationToken") => {
+                            let token = text.trim();
+                            if !token.is_empty() {
+                                page.next_continuation_token = Some(token.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -476,7 +501,7 @@ fn parse_list_objects_v2(xml: &str) -> Result<Vec<ListEntry>, String> {
                 let name = String::from_utf8_lossy(name.as_ref()).into_owned();
                 if name == "Contents" {
                     in_contents = false;
-                    entries.push(ListEntry {
+                    page.entries.push(ListEntry {
                         key: std::mem::take(&mut key),
                         size,
                         modified,
@@ -490,7 +515,7 @@ fn parse_list_objects_v2(xml: &str) -> Result<Vec<ListEntry>, String> {
         }
     }
 
-    Ok(entries)
+    Ok(page)
 }
 
 /// Parse an RFC-3339 / ISO-8601 timestamp (e.g. `2009-10-12T17:50:30.000Z`)
@@ -762,46 +787,71 @@ impl Storage for S3 {
             prefix.push('/');
         }
 
-        let timestamp = Self::now_timestamp();
-        // Canonical query string: params sorted by name, both name and value
-        // percent-encoded (slashes too).
-        let query = if prefix.is_empty() {
-            "list-type=2".to_string()
-        } else {
-            format!("list-type=2&prefix={}", uri_encode(&prefix, true))
-        };
         let canonical_uri = self.bucket_canonical_uri();
-        let extra = self.request_extra_headers(false);
-        let headers = self.signed_headers("GET", &canonical_uri, &query, &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
 
-        let url = format!("{}?{}", self.base_url(), query);
-        let mut req = self.agent.get(&url);
-        for (name, value) in &headers {
-            req = req.set(name, value);
-        }
+        // Follow `IsTruncated` / `NextContinuationToken` until the listing is
+        // exhausted (via the shared paginate driver), so a listing larger than
+        // the per-response cap (1000 keys) is returned in full rather than
+        // silently truncated to the first page.
+        let mut entries = crate::pagination::paginate(|marker: Option<&str>| {
+            let timestamp = Self::now_timestamp();
+            // Canonical query string: params sorted by name, both name and value
+            // percent-encoded (slashes too). `continuation-token` sorts before
+            // both `list-type` and `prefix`.
+            let mut query = String::new();
+            if let Some(token) = marker {
+                query.push_str("continuation-token=");
+                query.push_str(&uri_encode(token, true));
+                query.push('&');
+            }
+            query.push_str("list-type=2");
+            if !prefix.is_empty() {
+                query.push_str("&prefix=");
+                query.push_str(&uri_encode(&prefix, true));
+            }
 
-        let body = match req.call() {
-            Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+            let extra = self.request_extra_headers(false);
+            let headers = self.signed_headers("GET", &canonical_uri, &query, &timestamp, EMPTY_PAYLOAD_SHA256, &extra);
+
+            let url = format!("{}?{}", self.base_url(), query);
+            let mut req = self.agent.get(&url);
+            for (name, value) in &headers {
+                req = req.set(name, value);
+            }
+
+            let body = match req.call() {
+                Ok(resp) => resp.into_string().map_err(|err| StorageError::Backend {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                })?,
+                Err(err) => return Err(map_ureq_error(err, &prefix)),
+            };
+
+            let page = parse_list_objects_v2(&body).map_err(|message| StorageError::Backend {
                 path: path.to_path_buf(),
-                message: err.to_string(),
-            })?,
-            Err(err) => return Err(map_ureq_error(err, &prefix)),
-        };
+                message,
+            })?;
 
-        let parsed = parse_list_objects_v2(&body).map_err(|message| StorageError::Backend {
-            path: path.to_path_buf(),
-            message,
+            let mapped: Vec<StorageInfo> = page
+                .entries
+                .into_iter()
+                .map(|e| StorageInfo {
+                    path: PathBuf::from(e.key),
+                    kind: StorageKind::File,
+                    size: e.size,
+                    modified: e.modified,
+                })
+                .collect();
+
+            // A truncated response with a usable token continues the walk; any
+            // other case (not truncated, or truncated without a token) ends it.
+            let next = match (page.is_truncated, page.next_continuation_token) {
+                (true, Some(token)) => Some(token),
+                _ => None,
+            };
+            Ok((mapped, next))
         })?;
 
-        let mut entries: Vec<StorageInfo> = parsed
-            .into_iter()
-            .map(|e| StorageInfo {
-                path: PathBuf::from(e.key),
-                kind: StorageKind::File,
-                size: e.size,
-                modified: e.modified,
-            })
-            .collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -1263,7 +1313,8 @@ mod tests {
     </Contents>
 </ListBucketResult>"#;
 
-        let entries = parse_list_objects_v2(xml).unwrap();
+        let page = parse_list_objects_v2(xml).unwrap();
+        let entries = &page.entries;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].key, "archive/000000010000000000000001");
         assert_eq!(entries[0].size, 16_777_216);
@@ -1272,6 +1323,9 @@ mod tests {
 
         // 2009-10-12T17:50:30Z == 1255369830 epoch seconds.
         assert_eq!(entries[0].modified, Some(1_255_369_830));
+
+        assert!(!page.is_truncated);
+        assert_eq!(page.next_continuation_token, None);
     }
 
     #[test]
@@ -1282,7 +1336,51 @@ mod tests {
     <KeyCount>0</KeyCount>
     <IsTruncated>false</IsTruncated>
 </ListBucketResult>"#;
-        assert!(parse_list_objects_v2(xml).unwrap().is_empty());
+        assert!(parse_list_objects_v2(xml).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn list_parses_truncated_page_then_final_page() {
+        // First page: truncated, carries a continuation token to fetch more.
+        let page1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>examplebucket</Name>
+    <Prefix>archive/</Prefix>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1</MaxKeys>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>example-next-page-token</NextContinuationToken>
+    <Contents>
+        <Key>archive/000000010000000000000001</Key>
+        <LastModified>2009-10-12T17:50:30.000Z</LastModified>
+        <Size>16</Size>
+    </Contents>
+</ListBucketResult>"#;
+        let parsed1 = parse_list_objects_v2(page1).unwrap();
+        assert_eq!(parsed1.entries.len(), 1);
+        assert_eq!(parsed1.entries[0].key, "archive/000000010000000000000001");
+        assert!(parsed1.is_truncated);
+        assert_eq!(parsed1.next_continuation_token.as_deref(), Some("example-next-page-token"));
+
+        // Second page: not truncated, no further token — the loop terminates.
+        let page2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>examplebucket</Name>
+    <Prefix>archive/</Prefix>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>archive/000000010000000000000002</Key>
+        <LastModified>2009-10-12T17:51:00.000Z</LastModified>
+        <Size>42</Size>
+    </Contents>
+</ListBucketResult>"#;
+        let parsed2 = parse_list_objects_v2(page2).unwrap();
+        assert_eq!(parsed2.entries.len(), 1);
+        assert_eq!(parsed2.entries[0].key, "archive/000000010000000000000002");
+        assert!(!parsed2.is_truncated);
+        assert_eq!(parsed2.next_continuation_token, None);
     }
 
     #[test]
