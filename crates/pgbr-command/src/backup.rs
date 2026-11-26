@@ -46,10 +46,29 @@
 //!   first segment (everything before the first `_`). Its `backup.info` entry
 //!   records `backup-type: "incr"` plus `backup-reference: [<prior label>]`.
 //!
-//! Symlink targets are resolved via [`Storage::read_link`]; on filesystem
-//! backends each [`ManifestLink`] records the link's real `destination`. Backends
-//! without link-target support (remote/object stores) still record an empty
-//! destination, which remains a follow-up for remote tablespace backups.
+//! # Tablespaces and symlinked runtime directories
+//!
+//! Symlink targets are resolved via [`Storage::read_link`] (supported by the
+//! filesystem backends and by the remote protocol), so each [`ManifestLink`]
+//! records the link's real `destination`.
+//!
+//! A tablespace link `pg_tblspc/<oid>` is recorded as a [`ManifestLink`] **and
+//! its contents are backed up**: the walk follows the link into the tablespace
+//! location and captures the cluster's own version directory
+//! `PG_<version>_<catalog>` (read from `global/pg_control`, see
+//! `cluster_tablespace_dir`) with every sub-directory and file beneath it, all
+//! recorded under `pg_tblspc/<oid>/PG_<version>_<catalog>/…`. Other entries in
+//! the tablespace location (another major's version directory, stray files) are
+//! not part of this cluster and are skipped. C ref: `manifestBuildInfo`
+//! (`src/info/manifest/manifest.c`), which follows `pg_tblspc` links and keeps
+//! only the `tablespaceId` directory. A tablespace link whose target cannot be
+//! resolved, or a further symlink inside a tablespace, fails the backup: a
+//! backup that cannot be restored is worse than a failed one.
+//!
+//! A built-in excluded runtime directory that is itself a symlink (typically
+//! `pg_wal` relocated with `initdb --waldir`) is recorded as a [`ManifestLink`]
+//! with its destination so restore recreates the link, while its contents stay
+//! excluded exactly as for a plain directory.
 //!
 //! The real work lives in [`backup_inner_typed`], which takes the backup type,
 //! label, and start timestamp as parameters so tests can pin them;
@@ -64,8 +83,10 @@ use pgbr_config::{LoadedConfig, LockType, OptionValue};
 use pgbr_info::manifest::ChecksumPage;
 use pgbr_info::{InfoBackup, Manifest, ManifestFile, ManifestLink, ManifestPath};
 use pgbr_io::{Filter, Sha1};
-use pgbr_postgres::control::read_pg_control_data;
+use pgbr_postgres::control::{read_pg_control_data, read_pg_control_header};
 use pgbr_postgres::lsn::{lsn_text_to_wal_segment, parse_lsn, wal_segment_range};
+use pgbr_postgres::tablespace::parse_tablespace_dir_name;
+use pgbr_postgres::version::by_catalog_version_no;
 use pgbr_protocol::message::{OkResponse, Request, Response};
 use pgbr_protocol::parallel::{Job, ParallelExecutor};
 use pgbr_storage::{Storage, StorageError, StorageInfo, StorageKind};
@@ -195,6 +216,10 @@ const EXCLUDE_PREFIXES: &[&str] = &[
     // (`src/info/manifest/manifest.c`) skips `MANIFEST_TARGET_PGDATA/log`.
     "log",
 ];
+
+/// PG-data-relative directory holding one symlink per tablespace
+/// (`pg_tblspc/<oid>` → the tablespace location). C ref: `PG_PATH_PGTBLSPC`.
+const PG_TBLSPC_DIR: &str = "pg_tblspc";
 
 /// Exact PG-data **root-level** file names pgBackRust always excludes.
 ///
@@ -746,15 +771,49 @@ struct WalkEntry {
 /// The backend's `StorageInfo::path` is rooted at the backend root (absolute
 /// for `Posix`), so the relative path is reconstructed here by joining the
 /// directory we are listing with each entry's file name.
-fn walk(storage: &dyn Storage, dir: &Path) -> Result<Vec<WalkEntry>, CommandError> {
+///
+/// Symlinks are never followed, with one exception: a tablespace link
+/// `pg_tblspc/<oid>` is emitted as a link entry **and** descended into, so the
+/// tablespace's version directory (and everything below it) is enumerated under
+/// `pg_tblspc/<oid>/…`. `tablespace_dir` names the cluster's own version
+/// directory (`PG_<version>_<catalog>`, see [`cluster_tablespace_dir`]); when it
+/// is `None` (unreadable `pg_control`) every child whose name parses as a
+/// tablespace version directory is taken instead. C ref: `manifestBuildInfo`
+/// (`src/info/manifest/manifest.c`), which follows `pg_tblspc` links and keeps
+/// only the `tablespaceId` directory of the tablespace location.
+///
+/// `excludes` are the user `--exclude` entries: a tablespace link the user
+/// excluded is emitted (so [`plan_backup`] applies the exclusion uniformly) but
+/// never followed — a dangling link the user asked to skip must not fail the
+/// walk.
+fn walk(
+    storage: &dyn Storage,
+    dir: &Path,
+    tablespace_dir: Option<&str>,
+    excludes: &[String],
+) -> Result<Vec<WalkEntry>, CommandError> {
     let mut out = Vec::new();
-    walk_into(storage, dir, "", &mut out)?;
+    walk_into(storage, dir, "", tablespace_dir, excludes, &mut out)?;
     Ok(out)
 }
 
 /// Inner recursion for [`walk`]. `rel_prefix` is the `/`-separated relative
 /// path of `dir` (empty for the root).
-fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<WalkEntry>) -> Result<(), CommandError> {
+///
+/// # Errors
+///
+/// Propagates listing failures. A non-user-excluded tablespace link whose target
+/// cannot be listed (a dangling link, a permission problem) fails with a
+/// [`CommandError::Other`] naming the tablespace, rather than silently producing
+/// a backup without it.
+fn walk_into(
+    storage: &dyn Storage,
+    dir: &Path,
+    rel_prefix: &str,
+    tablespace_dir: Option<&str>,
+    excludes: &[String],
+    out: &mut Vec<WalkEntry>,
+) -> Result<(), CommandError> {
     for info in storage.list(dir)? {
         let name = match info.path.file_name().and_then(|n| n.to_str()) {
             Some(name) => name.to_owned(),
@@ -781,13 +840,103 @@ fn walk_into(storage: &dyn Storage, dir: &Path, rel_prefix: &str, out: &mut Vec<
                 // never descend into it: its contents are transient (and may
                 // vanish mid-walk), and pgBackRust captures only the dir itself.
                 if descend {
-                    walk_into(storage, &child_dir, &rel, out)?;
+                    walk_into(storage, &child_dir, &rel, tablespace_dir, excludes, out)?;
+                }
+            }
+            // A tablespace link `pg_tblspc/<oid>`: record the link itself, then
+            // follow it (the backend resolves the path through the link) and
+            // descend into the cluster's version directory only. A link the user
+            // excluded is emitted (plan_backup drops it with the rest of the
+            // exclusion) but never followed: a dangling link the user asked to
+            // skip must not fail the backup.
+            StorageKind::Link if rel_prefix == PG_TBLSPC_DIR => {
+                let link_dir = PathBuf::from(&rel);
+                out.push(WalkEntry { rel: rel.clone(), info });
+                if is_user_excluded(&rel, excludes) {
+                    continue;
+                }
+                let children = storage.list(&link_dir).map_err(|err| {
+                    CommandError::Other(format!(
+                        "cannot list tablespace {rel}: {err} (is the tablespace link dangling or unreadable?)"
+                    ))
+                })?;
+                for child in children {
+                    if child.kind != StorageKind::Path {
+                        // Stray files / links in the tablespace location are
+                        // not part of this cluster's data.
+                        continue;
+                    }
+                    let Some(child_name) = child.path.file_name().and_then(|n| n.to_str()).map(ToOwned::to_owned) else {
+                        continue;
+                    };
+                    // Only this cluster's `PG_<version>_<catalog>` directory; a
+                    // tablespace location shared with another major (pg_upgrade
+                    // leftovers) holds that major's directory side by side.
+                    let wanted = tablespace_dir.map_or_else(
+                        || parse_tablespace_dir_name(&child_name).is_some(),
+                        |dir_name| child_name == dir_name,
+                    );
+                    if !wanted {
+                        continue;
+                    }
+                    let child_rel = format!("{rel}/{child_name}");
+                    let child_dir = link_dir.join(&child_name);
+                    out.push(WalkEntry {
+                        rel: child_rel.clone(),
+                        info: child,
+                    });
+                    walk_into(storage, &child_dir, &child_rel, tablespace_dir, excludes, out)?;
                 }
             }
             _ => out.push(WalkEntry { rel, info }),
         }
     }
     Ok(())
+}
+
+/// The name of this cluster's per-version directory inside every tablespace
+/// location: `PG_<version>_<catalog>` (e.g. `PG_16_202307071`).
+///
+/// `PostgreSQL` creates `TABLESPACE_VERSION_DIRECTORY` under each tablespace
+/// location so several majors can share it (`pg_upgrade`); only the running
+/// cluster's directory belongs to this backup. The version label and catalog
+/// number come from the version-stable header of `global/pg_control`. C ref:
+/// `pgTablespaceId` (`src/postgres/interface.c`).
+///
+/// Returns `None` — after logging an explicit `WARN` — when `pg_control` cannot
+/// be read or names an unknown release; [`walk`] then falls back to a structural
+/// match (every child whose name parses as `PG_<version>_<catalog>`), so the
+/// tablespace contents are still captured.
+fn cluster_tablespace_dir(pg_storage: &dyn Storage) -> Option<String> {
+    let mut reader = match pg_storage.open_read(Path::new("global/pg_control")) {
+        Ok(reader) => reader,
+        Err(err) => {
+            log_warn(&format!(
+                "tablespace: could not read global/pg_control ({err}); backing up every PG_<version>_<catalog> directory found \
+                 in each tablespace"
+            ));
+            return None;
+        }
+    };
+    let header = match read_pg_control_header(&mut reader) {
+        Ok(header) => header,
+        Err(err) => {
+            log_warn(&format!(
+                "tablespace: could not decode global/pg_control ({err}); backing up every PG_<version>_<catalog> directory \
+                 found in each tablespace"
+            ));
+            return None;
+        }
+    };
+    let Some(version) = by_catalog_version_no(header.catalog_version_no) else {
+        log_warn(&format!(
+            "tablespace: unknown catalog version {} in global/pg_control; backing up every PG_<version>_<catalog> directory \
+             found in each tablespace",
+            header.catalog_version_no
+        ));
+        return None;
+    };
+    Some(format!("PG_{}_{}", version.label, version.catalog_version_no))
 }
 
 /// Refuse to back up onto an encrypted repository without a cipher sub-key.
@@ -4004,9 +4153,26 @@ struct BackupPlan {
 /// two are applied together, so `--exclude` extends (never replaces) the
 /// built-in set.
 ///
+/// Tablespaces: the walk follows each `pg_tblspc/<oid>` link into the
+/// tablespace's `tablespace_dir` version directory (see [`walk`] and
+/// [`cluster_tablespace_dir`]), so the link is recorded as a [`ManifestLink`]
+/// with its resolved destination and the tablespace's directories / files as
+/// ordinary [`ManifestPath`] / [`ManifestFile`] entries under
+/// `pg_tblspc/<oid>/PG_<version>_<catalog>/…` — copied, or referenced on a
+/// diff / incr, exactly like files in the data root.
+///
+/// A built-in excluded runtime directory that is a symlink (e.g. a relocated
+/// `pg_wal`) is recorded as a [`ManifestLink`] only — no [`ManifestPath`], and
+/// its contents are never captured.
+///
 /// # Errors
 ///
-/// Propagates walk / read failures and any error from [`plan_file`].
+/// Propagates walk / read failures and any error from [`plan_file`]. Fails with
+/// [`CommandError::Other`] when a tablespace link's or a symlinked runtime
+/// directory's target cannot be resolved (the backend does not support
+/// [`Storage::read_link`] — an empty destination would make the backup
+/// unrestorable) or when a symlink is found *inside* a tablespace (not
+/// supported: following it could escape the tablespace or loop).
 #[allow(clippy::too_many_arguments)]
 fn plan_backup(
     pg_storage: &dyn Storage,
@@ -4018,6 +4184,7 @@ fn plan_backup(
     checksum_page: bool,
     page_header_check: bool,
     excludes: &[String],
+    tablespace_dir: Option<&str>,
 ) -> Result<BackupPlan, CommandError> {
     let mut plan = BackupPlan {
         referenced: Vec::new(),
@@ -4027,13 +4194,39 @@ fn plan_backup(
         links: Vec::new(),
     };
 
-    for entry in walk(pg_storage, Path::new("."))? {
+    for entry in walk(pg_storage, Path::new("."), tablespace_dir, excludes)? {
         // A built-in excluded runtime directory (`pg_notify`, `pg_wal`, …) is
         // kept in the manifest as an *empty* path so a fresh-PGDATA restore
         // recreates it, but its contents are never captured. The walk does not
         // descend into these dirs, so only the bare directory entry arrives.
         if is_excluded_dir(&entry.rel) && entry.info.kind == StorageKind::Path && !is_user_excluded(&entry.rel, excludes) {
             plan.paths.push(manifest_path(entry));
+            continue;
+        }
+        // The same runtime directory as a symlink (`pg_wal` relocated with
+        // `initdb --waldir`): record the link with its destination so restore
+        // recreates it, but — as for the plain directory — never its contents
+        // (the walk does not follow it). No `ManifestPath` is recorded for the
+        // name: restore must materialise a link there, not a directory. An
+        // unresolvable target is an error, NOT an empty-destination fallback:
+        // restore rejects any manifest link with an empty destination up front,
+        // so recording one would make the whole backup unrestorable.
+        if is_excluded_dir(&entry.rel) && entry.info.kind == StorageKind::Link && !is_user_excluded(&entry.rel, excludes) {
+            let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
+                Ok(target) => target.to_string_lossy().into_owned(),
+                Err(StorageError::Unsupported { .. }) => {
+                    return Err(CommandError::Other(format!(
+                        "cannot resolve the target of symlinked runtime directory '{}': the PostgreSQL storage does not \
+                         support reading symlinks",
+                        entry.rel
+                    )));
+                }
+                Err(err) => return Err(err.into()),
+            };
+            plan.links.push(ManifestLink {
+                path: entry.rel,
+                destination,
+            });
             continue;
         }
         // Anything underneath an excluded runtime dir, an excluded root file,
@@ -4062,20 +4255,47 @@ fn plan_backup(
             },
             StorageKind::Path => plan.paths.push(manifest_path(entry)),
             StorageKind::Link => {
-                // Record the link's real target. Filesystem backends resolve it
-                // via `read_link`; backends without link-target support (the
-                // remote/object stores) return `StorageError::Unsupported`, in
-                // which case we fall back to an empty destination — the same
-                // known-limitation behaviour as before, kept out of the restore
-                // path's hard error only for those backends. A genuine local I/O
-                // failure maps to `Backend`/`Io`, NOT `Unsupported`, so it
-                // propagates and fails the backup loudly instead of silently
-                // recording an empty (unrestorable) symlink target.
+                // Where the link sits relative to `pg_tblspc/`: `Some("<oid>")`
+                // for a tablespace link, `Some("<oid>/…")` for a link found
+                // inside a tablespace, `None` elsewhere in the data dir.
+                let under_tblspc = entry.rel.strip_prefix(PG_TBLSPC_DIR).and_then(|rest| rest.strip_prefix('/'));
+                // A symlink *inside* a tablespace is not supported: the walk does
+                // not follow it, and following it could escape the tablespace or
+                // loop. Fail loudly rather than record a partial tablespace.
+                if under_tblspc.is_some_and(|rest| rest.contains('/')) {
+                    return Err(CommandError::Other(format!(
+                        "symlink inside tablespace '{}' is not supported",
+                        entry.rel
+                    )));
+                }
+                let is_tablespace_link = under_tblspc.is_some();
+                // Record the link's real target. Filesystem backends and the
+                // remote protocol resolve it via `read_link`; a backend without
+                // link-target support returns `StorageError::Unsupported`, in
+                // which case a generic link falls back to an empty destination
+                // (known limitation). A *tablespace* link with no resolvable
+                // target fails the backup instead: its contents were captured
+                // but restore could never relink them — a silently unrestorable
+                // backup is worse than a failed one. A genuine I/O failure maps
+                // to `Backend`/`Io`, NOT `Unsupported`, so it always propagates.
                 let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
                     Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(StorageError::Unsupported { .. }) if is_tablespace_link => {
+                        return Err(CommandError::Other(format!(
+                            "cannot resolve the target of tablespace link '{}': the PostgreSQL storage does not support \
+                             reading symlinks",
+                            entry.rel
+                        )));
+                    }
                     Err(StorageError::Unsupported { .. }) => String::new(),
                     Err(err) => return Err(err.into()),
                 };
+                if is_tablespace_link && destination.is_empty() {
+                    return Err(CommandError::Other(format!(
+                        "tablespace link '{}' has an empty target",
+                        entry.rel
+                    )));
+                }
                 plan.links.push(ManifestLink {
                     path: entry.rel,
                     destination,
@@ -4151,7 +4371,10 @@ fn resolve_prior(
 ///    no qualifying prior exists (a diff with no full, an incr with no backup at
 ///    all) the backup is promoted to a full instead.
 /// 3. Recursively walk the PG data dir via `pg_storage`, applying
-///    [`EXCLUDE_PREFIXES`].
+///    [`EXCLUDE_PREFIXES`]. Each tablespace link `pg_tblspc/<oid>` is followed
+///    into the cluster's `PG_<version>_<catalog>` directory (named from
+///    `global/pg_control`, see [`cluster_tablespace_dir`]), so tablespace files
+///    are captured under `pg_tblspc/<oid>/…` like any other file.
 /// 4. For each non-excluded file: compute the **plaintext** SHA-1 + size
 ///    (recorded in the [`Manifest`]). For a diff/incr, if the prior's manifest
 ///    holds an entry with the same size **and** checksum, record the file with a
@@ -4161,8 +4384,10 @@ fn resolve_prior(
 ///    (compress then encrypt), write the transformed bytes to
 ///    `backup/<stanza>/<label>/<relpath><suffix>`, and record `reference: None`.
 /// 5. Record directories as [`ManifestPath`] and symlinks as [`ManifestLink`]
-///    (with the link target resolved via [`Storage::read_link`] where the
-///    backend supports it — see module docs).
+///    (with the link target resolved via [`Storage::read_link`] — see module
+///    docs). A tablespace link must resolve (the backup fails otherwise); a
+///    symlinked runtime directory such as `pg_wal` is recorded as a link only,
+///    its contents excluded.
 /// 6. Save `backup.manifest`, then add a `[backup:current]` entry to
 ///    `backup.info` — including the applied compress-type, encrypted flag, and
 ///    (for a diff/incr) the `backup-reference` chain — and save it.
@@ -4454,6 +4679,9 @@ fn run_backup(
     // Walk the PG dir and classify every entry: referenced files (decided here,
     // not copied), copy jobs (dispatched to workers), directories, and links.
     // User `--exclude` entries are applied alongside the built-in exclusions.
+    // Tablespace links are followed into this cluster's own version directory,
+    // named from `global/pg_control` (structural fallback when unreadable).
+    let tablespace_dir = cluster_tablespace_dir(pg_storage);
     let mut plan = plan_backup(
         pg_storage,
         &abs_repo_backup_root,
@@ -4464,6 +4692,7 @@ fn run_backup(
         checksum_page,
         integrity.page_header_check,
         excludes,
+        tablespace_dir.as_deref(),
     )?;
 
     // resume: split the planned copy jobs into the files an aborted prior backup
@@ -5511,7 +5740,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1259", b"x");
         seed_file(&pg_s, "global/pg_control", b"y");
 
-        let entries = walk(&pg_s, Path::new(".")).expect("walk");
+        let entries = walk(&pg_s, Path::new("."), None, &[]).expect("walk");
         let rels: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
 
         assert!(rels.contains(&"PG_VERSION"));
@@ -5526,6 +5755,338 @@ mod tests {
         assert_eq!(leaf.info.kind, StorageKind::File);
         let dir = entries.iter().find(|e| e.rel == "base/1").unwrap();
         assert_eq!(dir.info.kind, StorageKind::Path);
+    }
+
+    // ---- tablespaces + symlinked runtime directories (issue #11) ------------
+
+    /// The PG 14 tablespace version directory matching `synth_pg_control_v14`.
+    const TS_DIR_14: &str = "PG_14_202107181";
+    /// A tablespace OID used by the fixtures.
+    #[cfg(unix)]
+    const TS_OID: &str = "16400";
+    /// The tablespace relation file the fixtures seed in the PG 14 directory.
+    #[cfg(unix)]
+    const TS_REL: &str = "pg_tblspc/16400/PG_14_202107181/16384/16385";
+
+    /// Populate an external tablespace location and link it into PGDATA as
+    /// `pg_tblspc/<TS_OID>`: the cluster's PG 14 version directory (one
+    /// database with one relation file), a foreign PG 13 version directory
+    /// (a `pg_upgrade` leftover), and a stray top-level file.
+    #[cfg(unix)]
+    fn seed_tablespace(pg_root: &Path, location: &Path) {
+        std::fs::create_dir_all(location.join(format!("{TS_DIR_14}/16384"))).unwrap();
+        std::fs::write(
+            location.join(format!("{TS_DIR_14}/16384/16385")),
+            b"tablespace-relation-16385",
+        )
+        .unwrap();
+        std::fs::create_dir_all(location.join("PG_13_202007201/16384")).unwrap();
+        std::fs::write(location.join("PG_13_202007201/16384/16385"), b"other-major-relation").unwrap();
+        std::fs::write(location.join("stray.txt"), b"not cluster data").unwrap();
+        std::fs::create_dir_all(pg_root.join("pg_tblspc")).unwrap();
+        std::os::unix::fs::symlink(location, pg_root.join("pg_tblspc").join(TS_OID)).unwrap();
+    }
+
+    /// Run [`plan_backup`] as a plain full backup (no prior, no excludes).
+    #[cfg(unix)]
+    fn plan_full(pg: &Posix, repo_root: &Path, tablespace_dir: Option<&str>) -> Result<BackupPlan, CommandError> {
+        let backup_root = format!("backup/demo/{LABEL}");
+        plan_backup(
+            pg,
+            &repo_root.join(&backup_root),
+            &backup_root,
+            &RepoTransform::identity(),
+            None,
+            None,
+            false,
+            false,
+            &[],
+            tablespace_dir,
+        )
+    }
+
+    /// Every file path a plan will record (copied or referenced).
+    #[cfg(unix)]
+    fn planned_files(plan: &BackupPlan) -> Vec<String> {
+        plan.copy_skeletons
+            .iter()
+            .chain(plan.referenced.iter())
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cluster_tablespace_dir_reads_pg_control() {
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(0));
+        assert_eq!(cluster_tablespace_dir(&pg_s).as_deref(), Some(TS_DIR_14));
+    }
+
+    #[test]
+    fn cluster_tablespace_dir_falls_back_to_none() {
+        // Missing pg_control → None (structural fallback), not an error.
+        let (_repo, _pg, _repo_s, pg_s) = posix_pair();
+        assert_eq!(cluster_tablespace_dir(&pg_s), None);
+        // Undecodable (too short) pg_control → None as well.
+        seed_file(&pg_s, "global/pg_control", b"\x01\x02\x03\x04");
+        assert_eq!(cluster_tablespace_dir(&pg_s), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_captures_tablespace_contents() {
+        // A full backup must record the tablespace link with its real target,
+        // the version directory tree as paths, and the tablespace file — copied
+        // byte-for-byte into the repo under pg_tblspc/<oid>/PG_…/.
+        let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair();
+        let location = tempfile::tempdir().expect("tablespace tempdir");
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(0));
+        seed_tablespace(pg_dir.path(), location.path());
+
+        backup_inner("demo", &repo_s, &pg_s, LABEL, 1_704_110_400, &RepoTransform::identity()).expect("backup");
+
+        let manifest = Manifest::load(&repo_s, Path::new(&format!("backup/demo/{LABEL}/backup.manifest"))).expect("load manifest");
+
+        // The link, with its real destination.
+        let link = manifest
+            .links
+            .iter()
+            .find(|l| l.path == format!("pg_tblspc/{TS_OID}"))
+            .expect("tablespace link in manifest");
+        assert_eq!(link.destination, location.path().to_string_lossy());
+
+        // Directories: pg_tblspc itself plus the version tree; the link name is
+        // a link, never a path.
+        let path_set: Vec<&str> = manifest.paths.iter().map(|p| p.path.as_str()).collect();
+        assert!(path_set.contains(&"pg_tblspc"), "{path_set:?}");
+        assert!(path_set.contains(&"pg_tblspc/16400/PG_14_202107181"), "{path_set:?}");
+        assert!(path_set.contains(&"pg_tblspc/16400/PG_14_202107181/16384"), "{path_set:?}");
+        assert!(!path_set.contains(&"pg_tblspc/16400"), "{path_set:?}");
+
+        // The tablespace file, with its checksum; nothing from the foreign
+        // version directory or the stray file.
+        let content: &[u8] = b"tablespace-relation-16385";
+        let file = manifest.file(TS_REL).expect("tablespace file in manifest");
+        assert_eq!(file.checksum.as_deref(), Some(sha1_hex(content).as_str()));
+        assert_eq!(file.size, content.len() as u64);
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|f| f.path.contains("PG_13_") || f.path.contains("stray")),
+            "only the cluster's version directory is captured"
+        );
+
+        // Bytes are in the repo.
+        let backup_root = repo_dir.path().join(format!("backup/demo/{LABEL}"));
+        assert_eq!(std::fs::read(backup_root.join(TS_REL)).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_skips_foreign_tablespace_version_dir() {
+        // With the cluster's version directory known, a sibling directory of
+        // another major (and a stray file) in the tablespace is not planned.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let location = tempfile::tempdir().expect("tablespace tempdir");
+        seed_tablespace(pg_dir.path(), location.path());
+
+        let plan = plan_full(&pg_s, repo_dir.path(), Some(TS_DIR_14)).expect("plan");
+        let files = planned_files(&plan);
+        assert_eq!(files, vec![TS_REL.to_owned()], "only the PG 14 file is planned");
+        assert!(!plan.paths.iter().any(|p| p.path.contains("PG_13_")));
+        assert_eq!(plan.links.len(), 1);
+        assert_eq!(plan.links[0].path, "pg_tblspc/16400");
+        assert_eq!(plan.links[0].destination, location.path().to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_tablespace_structural_fallback_without_pg_control() {
+        // No known version directory: every child that parses as
+        // PG_<version>_<catalog> is taken; the stray file still is not.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let location = tempfile::tempdir().expect("tablespace tempdir");
+        seed_tablespace(pg_dir.path(), location.path());
+
+        let plan = plan_full(&pg_s, repo_dir.path(), None).expect("plan");
+        let mut files = planned_files(&plan);
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["pg_tblspc/16400/PG_13_202007201/16384/16385".to_owned(), TS_REL.to_owned(),]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_records_symlinked_pg_wal_as_link_only() {
+        // pg_wal relocated outside PGDATA: recorded as a link with its target,
+        // no ManifestPath for the name, and none of its contents captured.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let wal = tempfile::tempdir().expect("wal tempdir");
+        std::fs::write(wal.path().join("000000010000000000000001"), b"wal-segment").unwrap();
+        std::fs::create_dir_all(wal.path().join("archive_status")).unwrap();
+        std::os::unix::fs::symlink(wal.path(), pg_dir.path().join("pg_wal")).unwrap();
+        seed_file(&pg_s, "PG_VERSION", b"14\n");
+
+        let plan = plan_full(&pg_s, repo_dir.path(), Some(TS_DIR_14)).expect("plan");
+        let link = plan.links.iter().find(|l| l.path == "pg_wal").expect("pg_wal link");
+        assert_eq!(link.destination, wal.path().to_string_lossy());
+        assert!(!plan.paths.iter().any(|p| p.path == "pg_wal" || p.path.starts_with("pg_wal/")));
+        assert!(!planned_files(&plan).iter().any(|f| f.starts_with("pg_wal")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_user_excluded_symlinked_pg_wal_is_dropped() {
+        // A user --exclude of the symlinked runtime dir drops the link too.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let wal = tempfile::tempdir().expect("wal tempdir");
+        std::os::unix::fs::symlink(wal.path(), pg_dir.path().join("pg_wal")).unwrap();
+        let backup_root = format!("backup/demo/{LABEL}");
+        let plan = plan_backup(
+            &pg_s,
+            &repo_dir.path().join(&backup_root),
+            &backup_root,
+            &RepoTransform::identity(),
+            None,
+            None,
+            false,
+            false,
+            &["pg_wal".to_owned()],
+            None,
+        )
+        .expect("plan");
+        assert!(plan.links.is_empty(), "user-excluded pg_wal link must be dropped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_rejects_symlink_inside_tablespace() {
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let location = tempfile::tempdir().expect("tablespace tempdir");
+        let elsewhere = tempfile::tempdir().expect("link target tempdir");
+        seed_tablespace(pg_dir.path(), location.path());
+        std::os::unix::fs::symlink(elsewhere.path(), location.path().join(format!("{TS_DIR_14}/16384/nested"))).unwrap();
+
+        let Err(err) = plan_full(&pg_s, repo_dir.path(), Some(TS_DIR_14)) else {
+            panic!("a symlink inside a tablespace must fail the plan");
+        };
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("symlink inside tablespace 'pg_tblspc/16400/PG_14_202107181/16384/nested'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_rejects_dangling_tablespace_link() {
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let gone = pg_dir.path().join("no-such-tablespace-location");
+        std::fs::create_dir_all(pg_dir.path().join("pg_tblspc")).unwrap();
+        std::os::unix::fs::symlink(&gone, pg_dir.path().join("pg_tblspc").join(TS_OID)).unwrap();
+
+        let Err(err) = plan_full(&pg_s, repo_dir.path(), Some(TS_DIR_14)) else {
+            panic!("a dangling tablespace link must fail the plan");
+        };
+        match err {
+            CommandError::Other(msg) => {
+                assert!(
+                    msg.contains("cannot list tablespace pg_tblspc/16400"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_user_excluded_dangling_tablespace_link_is_skipped() {
+        // A dangling tablespace link the user excluded with --exclude must
+        // neither fail the walk nor leave a link entry in the plan.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let gone = pg_dir.path().join("no-such-tablespace-location");
+        std::fs::create_dir_all(pg_dir.path().join("pg_tblspc")).unwrap();
+        std::os::unix::fs::symlink(&gone, pg_dir.path().join("pg_tblspc").join(TS_OID)).unwrap();
+
+        let backup_root = format!("backup/demo/{LABEL}");
+        let plan = plan_backup(
+            &pg_s,
+            &repo_dir.path().join(&backup_root),
+            &backup_root,
+            &RepoTransform::identity(),
+            None,
+            None,
+            false,
+            false,
+            &[format!("pg_tblspc/{TS_OID}")],
+            Some(TS_DIR_14),
+        )
+        .expect("plan must succeed when the dangling tablespace is user-excluded");
+        assert!(plan.links.is_empty(), "the excluded tablespace link must be dropped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incr_references_unchanged_tablespace_file() {
+        // Full, then an incr: the unchanged tablespace file is referenced to the
+        // full (not re-copied); a changed tablespace file is copied.
+        let (repo_dir, pg_dir, repo_s, pg_s) = posix_pair();
+        let location = tempfile::tempdir().expect("tablespace tempdir");
+        init_stanza(&repo_s, "demo");
+        seed_file(&pg_s, "global/pg_control", &synth_pg_control_v14(0));
+        seed_tablespace(pg_dir.path(), location.path());
+        let changed_rel = "pg_tblspc/16400/PG_14_202107181/16384/16386";
+        let changed_abs = location.path().join(format!("{TS_DIR_14}/16384/16386"));
+        std::fs::write(&changed_abs, b"original tablespace contents").unwrap();
+
+        let full = backup_inner_typed(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Full,
+            Some(LABEL),
+            1_704_110_400,
+            &RepoTransform::identity(),
+        )
+        .expect("full backup");
+        assert_eq!(full.label, LABEL);
+
+        let modified: &[u8] = b"MODIFIED tablespace contents, a different size";
+        std::fs::write(&changed_abs, modified).unwrap();
+
+        let incr = backup_inner_typed(
+            "demo",
+            &repo_s,
+            &pg_s,
+            BackupType::Incr,
+            None,
+            1_704_196_800,
+            &RepoTransform::identity(),
+        )
+        .expect("incr backup");
+        let manifest =
+            Manifest::load(&repo_s, Path::new(&format!("backup/demo/{}/backup.manifest", incr.label))).expect("load incr manifest");
+        let incr_root = repo_dir.path().join(format!("backup/demo/{}", incr.label));
+
+        let unchanged = manifest.file(TS_REL).expect("unchanged tablespace file in manifest");
+        assert_eq!(unchanged.reference.as_deref(), Some(LABEL));
+        assert!(
+            !incr_root.join(TS_REL).exists(),
+            "unchanged tablespace file must not be re-copied"
+        );
+
+        let changed = manifest.file(changed_rel).expect("changed tablespace file in manifest");
+        assert_eq!(changed.reference, None);
+        assert_eq!(std::fs::read(incr_root.join(changed_rel)).unwrap(), modified);
+        assert!(manifest.links.iter().any(|l| l.path == "pg_tblspc/16400"));
     }
 
     #[test]
@@ -9467,13 +10028,16 @@ mod tests {
         assert_eq!(outcome.file_count, 3, "3 non-excluded files expected");
 
         // The source for every data file was read THROUGH the worker. A full
-        // backup performs no reference-detection reads, so the only `open_read`s on
-        // `pg_storage` are the copy-path source reads added by the fix: one per
-        // data file. If the buggy `std::fs` path had run, this would be zero.
+        // backup performs no reference-detection reads, so the `open_read`s on
+        // `pg_storage` are the copy-path source reads added by the fix — one per
+        // data file — plus the single `global/pg_control` header read by
+        // `cluster_tablespace_dir` (the 4-byte fixture fails to decode, logging a
+        // WARN and falling back to the structural tablespace match). If the buggy
+        // `std::fs` path had run, the copy reads would be zero.
         assert_eq!(
             reads.load(Ordering::SeqCst),
-            3,
-            "each source file must be read through the worker (open_read), not std::fs"
+            4,
+            "each source file must be read through the worker (open_read, 3 files + 1 pg_control header), not std::fs"
         );
 
         // The copied bytes really landed in the local repo, byte-for-byte — the

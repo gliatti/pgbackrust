@@ -83,6 +83,11 @@
 //! never treated as stray. Removed files and directories are both counted in
 //! [`RestoreOutcome::entries_removed`].
 //!
+//! Known limitation: because symlinks are never descended, stray files and
+//! directories *inside* a tablespace (below `pg_tblspc/<oid>`, i.e. in the
+//! external tablespace location) are not reconciled by `--delta` — only the
+//! manifest's own files there are re-checked and re-copied.
+//!
 //! # Symlink re-creation
 //!
 //! Every `[target:link]` entry is re-created as a real symlink in the PG target
@@ -91,6 +96,22 @@
 //! backends that do not support symlinks return the trait's default
 //! "unsupported" error and the link is counted in [`RestoreOutcome::skipped_links`]
 //! instead. Successful re-creations are counted in [`RestoreOutcome::links_created`].
+//!
+//! Links are materialised **first**, before the manifest's directories, the
+//! runtime skeleton and any file copy. Restore order is therefore: links (and
+//! their target directories), `[target:path]` directories, the `PostgreSQL`
+//! runtime skeleton, then the file copies. The backup records a tablespace as a
+//! `pg_tblspc/<oid>` link plus paths/files under `pg_tblspc/<oid>/PG_<ver>_<cat>/…`,
+//! so creating the link first makes every later create/copy go through it and
+//! the bytes land in the (possibly remapped) external location; a symlinked
+//! `pg_wal` likewise receives `pg_wal/archive_status` through the link. The
+//! target directory is created for tablespace links and for links standing in
+//! for a runtime directory (e.g. `pg_wal`); other generic links may dangle.
+//!
+//! On a `--delta` / `--force` re-restore, a symlink already present at the link
+//! path is kept when it points at the wanted target and replaced when it points
+//! elsewhere (e.g. a new `--tablespace-map`); a real directory or file where a
+//! symlink is expected is a hard error.
 //!
 //! # Tablespace remapping
 //!
@@ -2436,22 +2457,118 @@ struct LinkCounts {
     as_dir: usize,
 }
 
+/// Whether a non-tablespace manifest link stands in for one of the `PostgreSQL`
+/// runtime directories restore guarantees (see [`PG_RUNTIME_SKELETON_DIRS`]) —
+/// e.g. a `pg_wal` relocated onto another volume through a symlink. The link's
+/// PG-data-relative name (see [`link_relative_name`]) must equal the root
+/// component of a skeleton entry (`pg_wal` for `pg_wal` / `pg_wal/archive_status`).
+///
+/// Such a link's target directory must exist: the server cannot start without
+/// it, and the skeleton step creates subdirectories (`pg_wal/archive_status`)
+/// *through* the link, which would fail on a dangling one.
+fn is_runtime_dir_link(link_path: &str) -> bool {
+    let name = link_relative_name(link_path);
+    PG_RUNTIME_SKELETON_DIRS
+        .iter()
+        .any(|dir| dir.split_once('/').map_or(*dir, |(root, _)| root) == name)
+}
+
+/// What already occupies a link's path in the PG target when restore is about
+/// to (re-)create the symlink — relevant to a `--delta` / `--force` restore over
+/// a previously restored (or the original) PGDATA.
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingLink {
+    /// Nothing at the path: create the symlink normally.
+    Absent,
+    /// A symlink already pointing at the wanted target: keep it as-is.
+    Same,
+    /// A symlink pointing somewhere else (the recorded value is carried for the
+    /// log line): remove it, then create the wanted one.
+    Different(PathBuf),
+}
+
+/// Inspect the entry at `link_path` before a symlink is created there (see
+/// [`ExistingLink`]). Read-only.
+///
+/// A symlink (even a dangling one — [`Storage::info`] does not follow it) is
+/// compared against `target`. A real directory, file or special entry where the
+/// manifest expects a symlink is a hard error: silently removing a directory
+/// that may hold data (e.g. a former in-PGDATA tablespace or `pg_wal`) is not a
+/// decision restore takes on the operator's behalf.
+fn inspect_existing_link(
+    pg: &dyn Storage,
+    link: &ManifestLink,
+    link_path: &Path,
+    target: &Path,
+) -> Result<ExistingLink, CommandError> {
+    let info = match pg.info(link_path) {
+        Ok(info) => info,
+        Err(StorageError::NotFound { .. }) => return Ok(ExistingLink::Absent),
+        Err(err) => {
+            return Err(CommandError::Other(format!("inspect link path {}: {err}", link.path)));
+        }
+    };
+    match info.kind {
+        StorageKind::Link => {
+            let current = pg
+                .read_link(link_path)
+                .map_err(|err| CommandError::Other(format!("read existing symlink {}: {err}", link.path)))?;
+            if current.as_path() == target {
+                Ok(ExistingLink::Same)
+            } else {
+                Ok(ExistingLink::Different(current))
+            }
+        }
+        StorageKind::Path => Err(CommandError::Other(format!(
+            "cannot create symlink {} -> {}: a real directory already exists at that path; \
+             move or remove it (or restore into an empty PGDATA) so the link can be re-created",
+            link.path,
+            target.display()
+        ))),
+        StorageKind::File | StorageKind::Special => Err(CommandError::Other(format!(
+            "cannot create symlink {} -> {}: a non-symlink entry already exists at that path; \
+             move or remove it so the link can be re-created",
+            link.path,
+            target.display()
+        ))),
+    }
+}
+
 /// Materialise every `[target:link]` entry in the PG target.
 ///
-/// Called **before** the file-copy pass so that `pg_tblspc/<oid>` (and other)
-/// symlinks — and the external tablespace target directories they point at —
-/// exist before any file is copied into them. Copying first would materialise
-/// `pg_tblspc/<oid>` as a real directory inside PGDATA and the tablespace would
-/// never be relocated.
+/// Called **first** in [`restore_inner`] — before the `[target:path]`
+/// directories, the runtime skeleton and the file-copy pass — so that
+/// `pg_tblspc/<oid>` (and other) symlinks, and the external target directories
+/// they point at, exist before anything is created *through* them. The manifest
+/// records the tablespace's contents as paths/files under
+/// `pg_tblspc/<oid>/PG_<ver>_<cat>/…` (and the skeleton includes
+/// `pg_wal/archive_status`); creating any of those first would materialise
+/// `pg_tblspc/<oid>` (or `pg_wal`) as a real directory inside PGDATA, the
+/// symlink could then not be created, and the tablespace would never relocate.
+/// Once the link exists, the later directory creates and file copies resolve
+/// lexically to `PGDATA/pg_tblspc/<oid>/…` and the OS follows the symlink, so
+/// the bytes physically land in the (possibly remapped) external location.
 ///
 /// Under the default `repo-symlink=y` each link becomes a real symlink at its
-/// (possibly remapped) destination. A backend that cannot create symlinks (the
-/// [`Storage::create_symlink`] trait default) leaves the link uncreated and
-/// counts it in `skipped`; a *genuine* I/O error creating a link is a hard
-/// failure. For a tablespace link the failure is always hard — a tablespace that
-/// silently did not relocate would corrupt the restore. Under `--no-repo-symlink`
-/// the entry is laid out as a plain directory inside PGDATA instead (counted in
-/// `as_dir`).
+/// (possibly remapped) destination. The target directory is created (mode
+/// [`pgbr_storage::PG_PATH_MODE`]) for a tablespace link and for a link standing
+/// in for a runtime directory ([`is_runtime_dir_link`], e.g. `pg_wal`); any other
+/// generic link points at an operator-managed location restore does not
+/// fabricate, so it may be left dangling (matching pgBackRust).
+///
+/// An entry already present at the link path (a `--delta` / `--force` re-restore)
+/// is tolerated: a symlink to the same target is kept and counted as created, a
+/// symlink to another target (e.g. a new `--tablespace-map`) is replaced, and a
+/// real directory or file is a hard error with an operator hint (see
+/// [`inspect_existing_link`]).
+///
+/// A backend that cannot create symlinks (the [`Storage::create_symlink`] trait
+/// default) leaves the link uncreated and counts it in `skipped`; a *genuine* I/O
+/// error creating a link is a hard failure. For a tablespace link the failure is
+/// always hard — a tablespace that silently did not relocate would corrupt the
+/// restore. Under `--no-repo-symlink` the entry is laid out as a plain directory
+/// inside PGDATA instead (counted in `as_dir`). A dry run mutates nothing: it
+/// only logs what it would create.
 fn materialize_links(
     pg: &dyn Storage,
     manifest: &Manifest,
@@ -2476,6 +2593,17 @@ fn materialize_links(
         let is_tablespace = tablespace_oid(link).is_some();
         match link_plan(want_repo_symlink) {
             LinkPlan::PlainDir => {
+                if is_tablespace {
+                    // The tablespace's files will be restored INSIDE PGDATA under
+                    // pg_tblspc/<oid>/ instead of relocating to the recorded (or
+                    // remapped) external location — a working but silently
+                    // un-relocated layout the operator should know about.
+                    log_warn(&format!(
+                        "restore: tablespace link {} is laid out as a plain directory inside PGDATA (--no-repo-symlink); \
+                         its contents will not be relocated to {}",
+                        link.path, link.destination
+                    ));
+                }
                 if dry_run {
                     log_info(&format!("dry-run: would create directory {} (link as dir)", link.path));
                 } else {
@@ -2503,19 +2631,58 @@ fn materialize_links(
                     continue;
                 }
 
+                // Tolerate what a previous restore (or the original cluster) left
+                // at the link path: keep a symlink that already points at the
+                // wanted target, replace one that points elsewhere, refuse a real
+                // directory / file. Inspected BEFORE the target directory is
+                // created so a refused restore mutates nothing outside PGDATA.
+                let existing = inspect_existing_link(pg, link, &link_path, &target)?;
+
                 // For a TABLESPACE link, ensure the (possibly external) target
-                // directory exists so files copied through `pg_tblspc/<oid>` land
-                // in the real location; a missing tablespace target would make the
-                // copy fail or, worse, materialise the OID as a plain dir. Generic
-                // links (e.g. `pg_wal`) point at operator-managed directories that
-                // restore must not fabricate, so their target is left untouched
-                // (PostgreSQL / the operator owns it) — a dangling generic link is
-                // acceptable and matches pgBackRust.
+                // directory exists so paths and files created through
+                // `pg_tblspc/<oid>` land in the real location; a missing
+                // tablespace target would make those creates fail. The same holds
+                // for a link standing in for a runtime directory (e.g. `pg_wal`):
+                // the cluster cannot start without it and the runtime skeleton
+                // (`pg_wal/archive_status`) is created through the link. This runs
+                // even when the symlink itself is kept (`ExistingLink::Same`), so
+                // a delta re-restore recreates a target an operator removed. Other
+                // generic links point at operator-managed locations restore must
+                // not fabricate, so their target is left untouched — a dangling
+                // generic link is acceptable and matches pgBackRust.
                 if is_tablespace && let Err(err) = pgbr_storage::create_dir_all_mode(&target, pgbr_storage::PG_PATH_MODE) {
                     return Err(CommandError::Other(format!(
                         "create tablespace target {}: {err}",
                         target.display()
                     )));
+                }
+                if !is_tablespace
+                    && is_runtime_dir_link(&link.path)
+                    && let Err(err) = pgbr_storage::create_dir_all_mode(&target, pgbr_storage::PG_PATH_MODE)
+                {
+                    return Err(CommandError::Other(format!(
+                        "create link target {} for {}: {err}",
+                        target.display(),
+                        link.path
+                    )));
+                }
+
+                match existing {
+                    ExistingLink::Absent => {}
+                    ExistingLink::Same => {
+                        counts.created += 1;
+                        continue;
+                    }
+                    ExistingLink::Different(current) => {
+                        log_info(&format!(
+                            "restore: replacing symlink {} -> {} (was -> {})",
+                            link.path,
+                            target.display(),
+                            current.display()
+                        ));
+                        pg.remove(&link_path, true)
+                            .map_err(|err| CommandError::Other(format!("remove existing symlink {}: {err}", link.path)))?;
+                    }
                 }
 
                 match pg.create_symlink(&link_path, &target) {
@@ -2644,15 +2811,89 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         }
     }
 
-    // 1. Re-create every directory recorded in the manifest. A dry-run counts the
-    //    directories it would create but makes none.
+    // Traversal guard: links are materialised FIRST (step 1 below), so any other
+    // manifest entry whose path lies under a link's path would be created
+    // THROUGH the symlink — i.e. outside PGDATA, at the link's
+    // (manifest-controlled, possibly absolute) destination. The lexical path
+    // confinement above cannot see that, and a forged manifest could use it to
+    // mkdir / chmod / unlink-and-replace entries outside PGDATA (e.g. a generic
+    // link `x -> /etc` paired with a link `x/resolv.conf`, whose
+    // materialisation would replace the real `/etc/resolv.conf`). Only a
+    // TABLESPACE link legitimately carries paths and files beneath it
+    // (`pg_tblspc/<oid>/PG_…`, written through by design); the backup never
+    // records anything under a generic or runtime link, and never a link nested
+    // under another link. A manifest that does is corrupt or malicious: refuse
+    // it before any mutation.
+    let link_prefixes: Vec<(&str, bool)> = manifest
+        .links
+        .iter()
+        .map(|l| (l.path.as_str(), tablespace_oid(l).is_some()))
+        .collect();
+    let under_link = |entry: &str, tablespace_ok: bool| -> Option<&str> {
+        link_prefixes.iter().find_map(|&(link_path, is_tablespace)| {
+            (entry.strip_prefix(link_path).is_some_and(|rest| rest.starts_with('/')) && !(tablespace_ok && is_tablespace))
+                .then_some(link_path)
+        })
+    };
+    for path in &manifest.paths {
+        if let Some(link_path) = under_link(&path.path, true) {
+            return Err(CommandError::Other(format!(
+                "manifest target:path '{}' lies under the non-tablespace link '{link_path}' and would be created through \
+                 it, outside PGDATA; refusing to restore",
+                path.path
+            )));
+        }
+    }
+    for file in &manifest.files {
+        if let Some(link_path) = under_link(&file.path, true) {
+            return Err(CommandError::Other(format!(
+                "manifest target:file '{}' lies under the non-tablespace link '{link_path}' and would be written through \
+                 it, outside PGDATA; refusing to restore",
+                file.path
+            )));
+        }
+    }
+    for link in &manifest.links {
+        if let Some(link_path) = under_link(&link.path, false) {
+            return Err(CommandError::Other(format!(
+                "manifest target:link '{}' is nested under link '{link_path}' and would be created through it, outside \
+                 PGDATA; refusing to restore",
+                link.path
+            )));
+        }
+    }
+
+    // 1. Materialise `[target:link]` symlinks (and their external tablespace /
+    //    runtime-directory target directories) FIRST — before any directory,
+    //    the runtime skeleton or a file is created. The manifest records a
+    //    tablespace's contents under `pg_tblspc/<oid>/PG_<ver>_<cat>/…` and the
+    //    skeleton includes `pg_wal/archive_status`; creating either first would
+    //    turn `pg_tblspc/<oid>` (or a symlinked `pg_wal`) into a real directory
+    //    inside PGDATA, the symlink could no longer be created and the
+    //    tablespace would never relocate. With the link in place, every later
+    //    create/copy goes *through* it into the external location. A tablespace
+    //    link that cannot be created is a hard error (see `materialize_links`).
+    let link_counts = materialize_links(
+        pg,
+        &manifest,
+        want_repo_symlink,
+        &ts_map,
+        ts_map_all.as_deref(),
+        &links_map,
+        dry_run,
+    )?;
+
+    // 1b. Re-create every directory recorded in the manifest. A dry-run counts
+    //     the directories it would create but makes none. Directories under a
+    //     symlink materialised in step 1 (`pg_tblspc/<oid>/PG_<ver>_<cat>/…`) are
+    //     created through it, i.e. in the external tablespace location.
     //
-    //    A directory whose manifest entry recorded a Unix mode gets it back
-    //    (masked to `0o7777`) right after creation; one without a recorded mode
-    //    keeps the PG storage's directory mode (`0700` for the PGDATA storage).
-    //    The chmod goes through the absolute path `pg.info` resolves, so it is
-    //    applied only on a local PG target (a non-local backend's path is not a
-    //    local filesystem path). C ref: path mode in `src/command/restore/restore.c`.
+    //     A directory whose manifest entry recorded a Unix mode gets it back
+    //     (masked to `0o7777`) right after creation; one without a recorded mode
+    //     keeps the PG storage's directory mode (`0700` for the PGDATA storage).
+    //     The chmod goes through the absolute path `pg.info` resolves, so it is
+    //     applied only on a local PG target (a non-local backend's path is not a
+    //     local filesystem path). C ref: path mode in `src/command/restore/restore.c`.
     let local_pg_paths = pg.is_local();
     let mut paths_created = 0;
     for path in &manifest.paths {
@@ -2666,9 +2907,10 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         paths_created += 1;
     }
 
-    // 1b. Guarantee the PostgreSQL runtime-directory skeleton exists. The backup
+    // 1c. Guarantee the PostgreSQL runtime-directory skeleton exists. The backup
     //     keeps the transient runtime *directories* in the manifest (recreated by
-    //     step 1) but never descends into them, so their required *subdirectories*
+    //     step 1b, or symlinked by step 1 — the skeleton is then created through
+    //     the link) but never descends into them, so their required *subdirectories*
     //     (e.g. `pg_wal/archive_status`, `pg_logical/snapshots`) are not recorded.
     //     A fresh-PGDATA restore (the standard way to seed a streaming standby)
     //     would then leave PostgreSQL unable to start — e.g. `FATAL: could not
@@ -2682,21 +2924,6 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
             pg.create_path(Path::new(dir), true)?;
         }
     }
-
-    // 1c. Materialise `[target:link]` symlinks (and their external tablespace
-    //     target directories) BEFORE the copy pass. If the copy ran first it
-    //     would create `pg_tblspc/<oid>` as a real directory inside PGDATA and
-    //     the tablespace would never relocate. A tablespace link that cannot be
-    //     created is a hard error (see `materialize_links`).
-    let link_counts = materialize_links(
-        pg,
-        &manifest,
-        want_repo_symlink,
-        &ts_map,
-        ts_map_all.as_deref(),
-        &links_map,
-        dry_run,
-    )?;
 
     // 2. Plan every file copy on the main thread — reference resolution,
     //    db-include/exclude filtering, delta matching, and source-backup /
@@ -2847,8 +3074,8 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         0
     };
 
-    // 4. `[target:link]` symlinks were materialised in step 1c (before the copy
-    //    pass); reuse those counts.
+    // 4. `[target:link]` symlinks were materialised in step 1 (before any
+    //    directory or file); reuse those counts.
     let links_created = link_counts.created;
     let skipped_links = link_counts.skipped;
     let links_as_dir = link_counts.as_dir;
@@ -3658,6 +3885,11 @@ mod tests {
         let stanza = "demo";
         let label = "20240101-120000F";
 
+        // `pg_wal` is a runtime directory, so restore creates its link target:
+        // keep the recorded destination inside a tempdir (never `/var/lib`).
+        let ext = tempfile::tempdir().expect("external wal tempdir");
+        let wal_dest = ext.path().join("pg_wal").to_string_lossy().into_owned();
+
         seed_backup_info(&repo_s, stanza, &[label]);
         seed_backup(
             &repo_s,
@@ -3665,7 +3897,7 @@ mod tests {
             label,
             &[],
             &["pg_data"],
-            &[("pg_data/pg_wal", "/var/lib/pg_wal")],
+            &[("pg_data/pg_wal", wal_dest.as_str())],
         );
 
         let outcome: RestoreOutcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
@@ -3674,7 +3906,7 @@ mod tests {
 
         // The symlink exists in the target and points at the recorded destination.
         let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
-        assert_eq!(read, Path::new("/var/lib/pg_wal"), "symlink must point at the destination");
+        assert_eq!(read, Path::new(&wal_dest), "symlink must point at the destination");
     }
 
     // ---- recovery config generation ----------------------------------------
@@ -5725,6 +5957,388 @@ mod tests {
         assert_eq!(read, Path::new(&new_loc_str), "symlink must point at the mapped destination");
     }
 
+    // ---- tablespace contents restored through the link (issue #11) ---------
+
+    /// Version directory of the seeded tablespace (`PG_<ver>_<catalog>`).
+    const TS_VER_DIR: &str = "PG_14_202107181";
+    /// Relation segment bytes seeded inside the tablespace.
+    const TS_REL: &[u8] = b"tablespace relation segment bytes";
+
+    /// Path of the seeded tablespace relation file, manifest-relative.
+    fn ts_rel_path() -> String {
+        format!("pg_tblspc/16395/{TS_VER_DIR}/16384/16385")
+    }
+
+    /// Seed a backup laid out the way the backup now records a tablespace (bare
+    /// manifest paths): a `pg_tblspc/16395` link to `ts_dest`, the version and
+    /// database directories as `[target:path]`, and one relation file under it.
+    fn seed_tablespace_backup(repo_s: &Posix, stanza: &str, label: &str, ts_dest: &str) {
+        let rel = ts_rel_path();
+        let ver = format!("pg_tblspc/16395/{TS_VER_DIR}");
+        let db = format!("{ver}/16384");
+        seed_backup_info(repo_s, stanza, &[label]);
+        seed_backup(
+            repo_s,
+            stanza,
+            label,
+            &[(rel.as_str(), TS_REL, Some(sha1_hex(TS_REL)))],
+            &["base", "pg_tblspc", ver.as_str(), db.as_str()],
+            &[("pg_tblspc/16395", ts_dest)],
+        );
+    }
+
+    #[test]
+    fn is_runtime_dir_link_matches_skeleton_roots_only() {
+        // A link standing in for a runtime directory (bare or `pg_data/`-prefixed)
+        // matches; a nested skeleton path, a tablespace link or an arbitrary link
+        // does not.
+        assert!(super::is_runtime_dir_link("pg_wal"));
+        assert!(super::is_runtime_dir_link("pg_data/pg_wal"));
+        assert!(super::is_runtime_dir_link("pg_stat_tmp"));
+        assert!(super::is_runtime_dir_link("pg_logical"));
+        assert!(!super::is_runtime_dir_link("pg_wal/archive_status"));
+        assert!(!super::is_runtime_dir_link("pg_tblspc/16395"));
+        assert!(!super::is_runtime_dir_link("pg_log"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_tablespace_contents_land_in_external_target() {
+        // The link is materialised BEFORE the `[target:path]` directories under
+        // it, so `pg_tblspc/16395` stays a symlink and the version dir + relation
+        // bytes physically land in the external tablespace location.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tablespace tempdir");
+        let ts_dest = ext.path().join("ts1");
+        let ts_dest_str = ts_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_tablespace_backup(&repo_s, stanza, label, &ts_dest_str);
+
+        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1);
+        assert_eq!(outcome.files_restored, 1);
+
+        let link_meta = std::fs::symlink_metadata(pg.path().join("pg_tblspc/16395")).expect("stat link");
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "pg_tblspc/16395 must remain a symlink, not a real directory"
+        );
+        assert_eq!(
+            std::fs::read_link(pg.path().join("pg_tblspc/16395")).expect("read_link"),
+            ts_dest,
+            "the symlink must point at the recorded destination"
+        );
+        assert!(
+            ts_dest.join(TS_VER_DIR).join("16384").is_dir(),
+            "the tablespace directories must be created in the external location"
+        );
+        assert_eq!(
+            std::fs::read(ts_dest.join(TS_VER_DIR).join("16384/16385")).expect("read external relation"),
+            TS_REL,
+            "the relation bytes must physically land in the external location"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_delta_rerestore_keeps_existing_tablespace_link() {
+        // A `--delta` re-restore over a target that already carries the same
+        // tablespace symlink must not fail with EEXIST: the link is kept (counted
+        // as created) and the unchanged relation is delta-skipped.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tablespace tempdir");
+        let ts_dest = ext.path().join("ts1");
+        let ts_dest_str = ts_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_tablespace_backup(&repo_s, stanza, label, &ts_dest_str);
+
+        restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("first restore");
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta re-restore");
+        assert_eq!(outcome.links_created, 1, "the existing link is kept and counted");
+        assert_eq!(outcome.files_skipped, 1, "the unchanged tablespace file is delta-skipped");
+        assert_eq!(outcome.files_restored, 0);
+
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("pg_tblspc/16395"))
+                .expect("stat link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(pg.path().join("pg_tblspc/16395")).expect("read_link"),
+            ts_dest
+        );
+        assert_eq!(
+            std::fs::read(ts_dest.join(TS_VER_DIR).join("16384/16385")).expect("read external relation"),
+            TS_REL
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_delta_replaces_tablespace_link_pointing_elsewhere() {
+        // A re-restore with a new --tablespace-map replaces the existing symlink
+        // (pointing at the old location) and restores the bytes into the new one.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tablespace tempdir");
+        let old_dest = ext.path().join("ts_old");
+        let new_dest = ext.path().join("ts_new");
+        let old_dest_str = old_dest.to_string_lossy().into_owned();
+        let new_dest_str = new_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_tablespace_backup(&repo_s, stanza, label, &old_dest_str);
+
+        restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("first restore");
+        assert_eq!(
+            std::fs::read_link(pg.path().join("pg_tblspc/16395")).expect("read_link"),
+            old_dest
+        );
+
+        let mut remap = cfg_delta(Some(stanza), None, true);
+        remap.options.insert(
+            ("tablespace-map".to_owned(), None),
+            OptionValue::Hash({
+                let mut m = BTreeMap::new();
+                m.insert("16395".to_owned(), new_dest_str);
+                m
+            }),
+        );
+        let outcome = restore_inner(&remap, &repo_s, &pg_s).expect("remapped delta re-restore");
+        assert_eq!(outcome.links_created, 1);
+        assert_eq!(outcome.files_restored, 1, "the relation is copied into the new location");
+
+        assert_eq!(
+            std::fs::read_link(pg.path().join("pg_tblspc/16395")).expect("read_link"),
+            new_dest,
+            "the stale symlink must be replaced by one at the remapped destination"
+        );
+        assert_eq!(
+            std::fs::read(new_dest.join(TS_VER_DIR).join("16384/16385")).expect("read remapped relation"),
+            TS_REL
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_errors_on_real_directory_where_tablespace_link_expected() {
+        // A real directory already sitting at `pg_tblspc/<oid>` is never silently
+        // removed: the restore fails with an operator hint.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tablespace tempdir");
+        let ts_dest = ext.path().join("ts1");
+        let ts_dest_str = ts_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_tablespace_backup(&repo_s, stanza, label, &ts_dest_str);
+
+        std::fs::create_dir_all(pg.path().join("pg_tblspc/16395")).expect("pre-create real dir");
+
+        let err = restore_inner(&with_force(cfg(Some(stanza), None)), &repo_s, &pg_s)
+            .expect_err("a real directory in place of the link must fail");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("pg_tblspc/16395") && msg.contains("real directory already exists"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        assert!(
+            !std::fs::symlink_metadata(pg.path().join("pg_tblspc/16395"))
+                .expect("stat dir")
+                .file_type()
+                .is_symlink(),
+            "the pre-existing directory must be left untouched"
+        );
+        assert!(
+            !ts_dest.exists(),
+            "a refused restore must not create the external tablespace target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_dry_run_creates_no_link_nor_target() {
+        // A dry run reports the link but creates neither the symlink, nor its
+        // external target, nor the directories under it.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tablespace tempdir");
+        let ts_dest = ext.path().join("ts1");
+        let ts_dest_str = ts_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_tablespace_backup(&repo_s, stanza, label, &ts_dest_str);
+
+        let mut dry = cfg(Some(stanza), None);
+        dry.options.insert(("dry-run".to_owned(), None), OptionValue::Boolean(true));
+        let outcome = restore_inner(&dry, &repo_s, &pg_s).expect("dry-run restore");
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.links_created, 1, "the dry run counts the link it would create");
+
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("pg_tblspc/16395")).is_err(),
+            "dry run must not create the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("pg_tblspc")).is_err(),
+            "dry run must not create the link's parent"
+        );
+        assert!(!ts_dest.exists(), "dry run must not create the external target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_symlinked_pg_wal_creates_target_and_skeleton_through_link() {
+        // A `pg_wal` link (recorded by the backup when `pg_wal` is a symlink, with
+        // no `pg_wal` path) gets its target created, and the runtime skeleton's
+        // `pg_wal/archive_status` is created THROUGH the link — the cluster
+        // layout is complete and startable.
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external wal tempdir");
+        let wal_dest = ext.path().join("wal");
+        let wal_dest_str = wal_dest.to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["base", "base/1"],
+            &[("pg_wal", wal_dest_str.as_str())],
+        );
+
+        let outcome = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect("restore");
+        assert_eq!(outcome.links_created, 1);
+
+        let link = pg.path().join("pg_wal");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat pg_wal")
+                .file_type()
+                .is_symlink(),
+            "pg_wal must be a symlink"
+        );
+        assert_eq!(std::fs::read_link(&link).expect("read_link"), wal_dest);
+        assert!(wal_dest.is_dir(), "the pg_wal link target must be created");
+        assert!(
+            wal_dest.join("archive_status").is_dir(),
+            "pg_wal/archive_status must be created through the link"
+        );
+        for dir in ["pg_notify", "pg_logical/snapshots", "pg_tblspc", "base/1"] {
+            assert!(pg.path().join(dir).is_dir(), "{dir} must exist after restore");
+        }
+    }
+
+    // ---- manifest link-traversal guard --------------------------------------
+
+    /// A forged manifest pairing a generic link with a second link nested under
+    /// it (`x -> /etc`, then `x/inner`) must be rejected before any mutation:
+    /// materialising the nested link would unlink-and-replace an entry at the
+    /// first link's external destination.
+    #[test]
+    fn restore_rejects_link_nested_under_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["base"],
+            &[("x", ext_str.as_str()), ("x/inner", "/attacker")],
+        );
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("nested link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:link 'x/inner'") && msg.contains("nested under link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        // Rejected during validation: nothing was materialised, not even `x`.
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+    }
+
+    /// A `[target:file]` entry under a generic (non-tablespace) link would be
+    /// written through the symlink into its external destination: rejected.
+    #[test]
+    fn restore_rejects_file_under_generic_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let payload: &[u8] = b"evil";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("x/evil", payload, Some(sha1_hex(payload)))],
+            &["base"],
+            &[("x", ext_str.as_str())],
+        );
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("file under a generic link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:file 'x/evil'") && msg.contains("under the non-tablespace link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+        assert!(!ext.path().join("evil").exists(), "nothing may be written at the destination");
+    }
+
+    /// A `[target:path]` entry under a generic (non-tablespace) link would be
+    /// created (and chmod'ed) through the symlink at its external destination:
+    /// rejected. Entries under a TABLESPACE link stay allowed (see
+    /// `restore_tablespace_contents_land_in_external_target`).
+    #[test]
+    fn restore_rejects_path_under_generic_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["base", "x/sub"], &[("x", ext_str.as_str())]);
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("path under a generic link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:path 'x/sub'") && msg.contains("under the non-tablespace link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+        assert!(
+            !ext.path().join("sub").exists(),
+            "no directory may be created at the destination"
+        );
+    }
+
     // ---- generic link remapping (--link-map) -------------------------------
 
     #[test]
@@ -5816,6 +6430,11 @@ mod tests {
         let stanza = "demo";
         let label = "20240101-120000F";
 
+        // `pg_wal` is a runtime directory, so restore creates its link target:
+        // keep the recorded destination inside a tempdir (never `/var/lib`).
+        let ext = tempfile::tempdir().expect("external wal tempdir");
+        let original_wal = ext.path().join("original_wal").to_string_lossy().into_owned();
+
         seed_backup_info(&repo_s, stanza, &[label]);
         seed_backup(
             &repo_s,
@@ -5823,7 +6442,7 @@ mod tests {
             label,
             &[],
             &["pg_data"],
-            &[("pg_data/pg_wal", "/var/lib/original_wal")],
+            &[("pg_data/pg_wal", original_wal.as_str())],
         );
 
         // A --link-map naming a DIFFERENT link must not touch pg_wal.
@@ -5844,7 +6463,7 @@ mod tests {
         let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
         assert_eq!(
             read,
-            Path::new("/var/lib/original_wal"),
+            Path::new(&original_wal),
             "unmapped link must keep its recorded destination"
         );
     }
@@ -6760,6 +7379,11 @@ mod tests {
         let stanza = "demo";
         let label = "20240101-120000F";
 
+        // `pg_wal` is a runtime directory, so restore creates its link target:
+        // keep the recorded destination inside a tempdir (never `/var/lib`).
+        let ext = tempfile::tempdir().expect("external wal tempdir");
+        let wal_dest = ext.path().join("pg_wal").to_string_lossy().into_owned();
+
         seed_backup_info(&repo_s, stanza, &[label]);
         seed_backup(
             &repo_s,
@@ -6767,7 +7391,7 @@ mod tests {
             label,
             &[],
             &["pg_data"],
-            &[("pg_data/pg_wal", "/var/lib/pg_wal")],
+            &[("pg_data/pg_wal", wal_dest.as_str())],
         );
 
         let cfg = restore_cfg(stanza, vec![(("link-all", None), OptionValue::Boolean(true))]);
@@ -6778,7 +7402,7 @@ mod tests {
         let read = std::fs::read_link(pg.path().join("pg_data/pg_wal")).expect("read_link");
         assert_eq!(
             read,
-            Path::new("/var/lib/pg_wal"),
+            Path::new(&wal_dest),
             "link-all must point the symlink at the stored destination"
         );
     }
