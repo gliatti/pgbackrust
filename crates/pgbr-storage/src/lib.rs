@@ -42,7 +42,7 @@ pub use crate::azure::{Azure, AzureAuth, AzureConfig};
 pub use crate::cifs::Cifs;
 pub use crate::gcs::{Gcs, GcsAuth, GcsConfig};
 pub use crate::http::HttpOptions;
-pub use crate::path_validate::validate_relative;
+pub use crate::path_validate::{normalize_object_key, normalize_under_root, validate_relative};
 pub use crate::posix::Posix;
 pub use crate::remote::{RemoteStorage, StorageInfoDto, StorageKindDto, StorageRequestHandler};
 pub use crate::s3::{S3, S3Config};

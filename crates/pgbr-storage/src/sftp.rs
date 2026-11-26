@@ -11,11 +11,15 @@
 //!
 //! ## Path resolution
 //!
-//! Like `Posix`, all paths are interpreted relative to a configured `base_path`
-//! (the remote root): a relative path is joined onto `base_path`, an absolute
-//! path is taken verbatim. Joining is done with forward slashes regardless of
-//! the host OS, because SFTP servers are POSIX-pathed even when the client runs
-//! on Windows — see [`resolve_remote`].
+//! Like `Posix`, all paths are confined to a configured `base_path` (the remote
+//! root): a relative path is lexically normalised (`.`, `..`, repeated
+//! separators) and joined onto `base_path`, and an absolute path is accepted
+//! only when it lies lexically under `base_path`. Any path that would escape
+//! the root — an absolute path elsewhere or a `..` climbing above it — is
+//! rejected with a `StorageError::Backend` (GHSA-vq5g-8277-5pwc). Joining is
+//! done with forward slashes regardless of the host OS, because SFTP servers
+//! are POSIX-pathed even when the client runs on Windows — see
+//! [`resolve_remote`].
 //!
 //! ## Error mapping
 //!
@@ -46,6 +50,7 @@ use ssh2::{
     Session,
 };
 
+use crate::path_validate::normalize_under_root;
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
 // SFTP status codes from the SSH File Transfer Protocol (the `LIBSSH2_FX_*`
@@ -317,27 +322,45 @@ impl Sftp {
 
     /// Resolve `path` against `base_path` and render it as a POSIX-style remote
     /// path string (the form SFTP servers expect, regardless of client OS).
-    fn resolve(&self, path: &Path) -> PathBuf {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] when `path` would escape `base_path`
+    /// (see [`resolve_remote`]).
+    fn resolve(&self, path: &Path) -> Result<PathBuf, StorageError> {
         resolve_remote(&self.base_path, path)
     }
 }
 
-/// Join `path` onto `base` for the remote server.
+/// Confine `path` under `base` and render it for the remote server.
 ///
-/// An absolute `path` is taken verbatim; a relative `path` is joined onto
-/// `base`. Separators are always rendered as `/` because the remote is
-/// POSIX-pathed even when this client runs on Windows. Pure (no I/O) so it can
-/// be unit-tested without a live server.
-#[must_use]
-pub fn resolve_remote(base: &Path, path: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    };
+/// Backslash separators a Windows host may have introduced are first turned
+/// into `/`. The path is then lexically normalised against `base` via
+/// `normalize_under_root`: a relative `path` has its `.` / `..` / repeated
+/// separators collapsed and is joined onto `base`; an absolute `path` is
+/// accepted only when it lies lexically under `base`. The result is always
+/// rendered with `/` separators because the remote is POSIX-pathed even when
+/// this client runs on Windows. Pure (no I/O) so it can be unit-tested without
+/// a live server.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Backend`] (message mentions "path validation") when
+/// `path` is absolute but outside `base`, or when a `..` component would climb
+/// above `base` (GHSA-vq5g-8277-5pwc).
+pub fn resolve_remote(base: &Path, path: &Path) -> Result<PathBuf, StorageError> {
     // Normalise any backslash separators a Windows host may have introduced to
     // forward slashes — the SFTP server's filesystem is POSIX.
-    PathBuf::from(joined.to_string_lossy().replace('\\', "/"))
+    let path = PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+    let relative = normalize_under_root(base, &path)?;
+    // `base.join("")` would append a trailing separator; the root itself is
+    // just `base`.
+    let joined = if relative.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(relative)
+    };
+    Ok(PathBuf::from(joined.to_string_lossy().replace('\\', "/")))
 }
 
 /// Map an SFTP status code (the inner value of [`ErrorCode::SFTP`]) and the
@@ -542,7 +565,7 @@ fn info_from_stat(path: PathBuf, stat: &FileStat) -> StorageInfo {
 
 impl Storage for Sftp {
     fn exists(&self, path: &Path) -> Result<bool, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         match self.sftp.stat(&resolved) {
             Ok(_) => Ok(true),
             Err(err) => match map_ssh_error(&err, &resolved) {
@@ -553,13 +576,13 @@ impl Storage for Sftp {
     }
 
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let stat = self.sftp.stat(&resolved).map_err(|err| map_ssh_error(&err, &resolved))?;
         Ok(info_from_stat(resolved, &stat))
     }
 
     fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let entries = self.sftp.readdir(&resolved).map_err(|err| map_ssh_error(&err, &resolved))?;
 
         let mut result: Vec<StorageInfo> = entries
@@ -576,7 +599,7 @@ impl Storage for Sftp {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let file = self.sftp.open(&resolved).map_err(|err| map_ssh_error(&err, &resolved))?;
         Ok(Box::new(SftpRead {
             file,
@@ -586,7 +609,7 @@ impl Storage for Sftp {
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         // Create/truncate with the repository file mode (0o640), matching the
         // Posix backend default — never world-readable (GHSA-5qj2-9x5v-7c87).
         let file = self
@@ -605,7 +628,7 @@ impl Storage for Sftp {
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         match self.sftp.unlink(&resolved) {
             Ok(()) => Ok(()),
             Err(err) => match map_ssh_error(&err, &resolved) {
@@ -616,8 +639,8 @@ impl Storage for Sftp {
     }
 
     fn rename(&self, source: &Path, target: &Path) -> Result<(), StorageError> {
-        let resolved_source = self.resolve(source);
-        let resolved_target = self.resolve(target);
+        let resolved_source = self.resolve(source)?;
+        let resolved_target = self.resolve(target)?;
         // ATOMIC | OVERWRITE matches the C driver / POSIX rename(2): replace the
         // target if it exists. NATIVE lets the server pick its best primitive.
         self.sftp
@@ -630,7 +653,7 @@ impl Storage for Sftp {
     }
 
     fn create_path(&self, path: &Path, recursive: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         if recursive {
             self.mkdir_recursive(&resolved)
         } else {
@@ -641,7 +664,7 @@ impl Storage for Sftp {
     }
 
     fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
 
         if recursive {
             // Empty the directory first, depth-first, then rmdir it.
@@ -760,15 +783,33 @@ mod tests {
     fn resolve_remote_joins_relative_against_base() {
         let base = Path::new("/srv/repo");
         assert_eq!(
-            resolve_remote(base, Path::new("archive/x")),
+            resolve_remote(base, Path::new("archive/x")).unwrap(),
             PathBuf::from("/srv/repo/archive/x")
         );
     }
 
     #[test]
-    fn resolve_remote_takes_absolute_verbatim() {
+    fn resolve_remote_absolute_under_base_accepted() {
         let base = Path::new("/srv/repo");
-        assert_eq!(resolve_remote(base, Path::new("/etc/passwd")), PathBuf::from("/etc/passwd"));
+        assert_eq!(
+            resolve_remote(base, Path::new("/srv/repo/x")).unwrap(),
+            PathBuf::from("/srv/repo/x")
+        );
+    }
+
+    #[test]
+    fn resolve_remote_absolute_outside_base_rejected() {
+        // GHSA-vq5g-8277-5pwc: an absolute path is no longer taken verbatim.
+        let base = Path::new("/srv/repo");
+        let err = resolve_remote(base, Path::new("/etc/passwd")).unwrap_err();
+        assert!(matches!(err, StorageError::Backend { .. }), "unexpected error: {err:?}");
+    }
+
+    #[test]
+    fn resolve_remote_parent_escape_rejected() {
+        let base = Path::new("/srv/repo");
+        let err = resolve_remote(base, Path::new("../../etc")).unwrap_err();
+        assert!(matches!(err, StorageError::Backend { .. }), "unexpected error: {err:?}");
     }
 
     #[test]
@@ -776,7 +817,7 @@ mod tests {
         // A relative path that a Windows host might render with backslashes still
         // resolves to a POSIX remote path.
         let base = Path::new("/srv/repo");
-        let resolved = resolve_remote(base, Path::new("archive\\sub\\file"));
+        let resolved = resolve_remote(base, Path::new("archive\\sub\\file")).unwrap();
         assert_eq!(resolved, PathBuf::from("/srv/repo/archive/sub/file"));
     }
 

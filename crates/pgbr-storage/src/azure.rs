@@ -323,12 +323,18 @@ impl Azure {
         ]
     }
 
-    /// Translate a `Path` into an Azure blob key. Backend-relative: any leading
-    /// `/` is stripped, and Windows-style separators are normalised to `/`.
-    fn key_for(path: &Path) -> String {
-        let raw = path.to_string_lossy();
-        let normalised = raw.replace('\\', "/");
-        normalised.trim_start_matches('/').to_string()
+    /// Translate a `Path` into an Azure blob key via
+    /// [`crate::path_validate::normalize_object_key`]. Backend-relative: any
+    /// leading `/` is stripped, Windows-style separators are normalised to `/`,
+    /// `.` and empty components are collapsed, and `..` is resolved lexically,
+    /// so a given logical path always maps to one canonical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] when `..` components would climb above
+    /// the container root.
+    fn key_for(path: &Path) -> Result<String, StorageError> {
+        crate::path_validate::normalize_object_key(path)
     }
 
     /// Current time formatted as an RFC-1123 / HTTP date (`x-ms-date`).
@@ -618,7 +624,7 @@ impl Storage for Azure {
     }
 
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let ms_headers = Self::ms_base_headers();
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("HEAD", "", "", &ms_headers, &resource);
@@ -648,7 +654,7 @@ impl Storage for Azure {
     }
 
     fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
-        let mut prefix = Self::key_for(path);
+        let mut prefix = Self::key_for(path)?;
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
@@ -732,7 +738,7 @@ impl Storage for Azure {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let ms_headers = Self::ms_base_headers();
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("GET", "", "", &ms_headers, &resource);
@@ -762,7 +768,7 @@ impl Storage for Azure {
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         Ok(Box::new(AzureWrite {
             azure: self.clone(),
             key,
@@ -772,7 +778,7 @@ impl Storage for Azure {
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let ms_headers = Self::ms_base_headers();
         let resource = self.canonicalized_resource(&key, &[]);
         let authorization = self.authorization("DELETE", "", "", &ms_headers, &resource);
@@ -1203,8 +1209,18 @@ mod tests {
 
     #[test]
     fn key_for_strips_leading_slash_and_normalises() {
-        assert_eq!(Azure::key_for(Path::new("/repo/archive/x")), "repo/archive/x");
-        assert_eq!(Azure::key_for(Path::new("repo/archive/x")), "repo/archive/x");
+        assert_eq!(Azure::key_for(Path::new("/repo/archive/x")).unwrap(), "repo/archive/x");
+        assert_eq!(Azure::key_for(Path::new("repo/archive/x")).unwrap(), "repo/archive/x");
+    }
+
+    #[test]
+    fn key_for_rejects_parent_escape() {
+        assert!(matches!(Azure::key_for(Path::new("../x")), Err(StorageError::Backend { .. })));
+    }
+
+    #[test]
+    fn key_for_normalizes_dot_dot_inside() {
+        assert_eq!(Azure::key_for(Path::new("a/../b")).unwrap(), "b");
     }
 
     #[test]

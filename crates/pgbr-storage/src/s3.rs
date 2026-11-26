@@ -396,12 +396,18 @@ impl S3 {
         headers
     }
 
-    /// Translate a `Path` into an S3 object key. Backend-relative: any leading
-    /// `/` is stripped, and Windows-style separators are normalised to `/`.
-    fn key_for(path: &Path) -> String {
-        let raw = path.to_string_lossy();
-        let normalised = raw.replace('\\', "/");
-        normalised.trim_start_matches('/').to_string()
+    /// Translate a `Path` into an S3 object key via
+    /// [`crate::path_validate::normalize_object_key`]. Backend-relative: any
+    /// leading `/` is stripped, Windows-style separators are normalised to `/`,
+    /// `.` and empty components are collapsed, and `..` is resolved lexically,
+    /// so a given logical path always maps to one canonical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] when `..` components would climb above
+    /// the bucket root.
+    fn key_for(path: &Path) -> Result<String, StorageError> {
+        crate::path_validate::normalize_object_key(path)
     }
 }
 
@@ -755,7 +761,7 @@ impl Storage for S3 {
     }
 
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
         let extra = self.request_extra_headers(false);
@@ -782,7 +788,7 @@ impl Storage for S3 {
     }
 
     fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
-        let mut prefix = Self::key_for(path);
+        let mut prefix = Self::key_for(path)?;
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
@@ -857,7 +863,7 @@ impl Storage for S3 {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
         let extra = self.request_extra_headers(false);
@@ -885,7 +891,7 @@ impl Storage for S3 {
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         Ok(Box::new(S3Write {
             s3: self.clone(),
             key,
@@ -895,7 +901,7 @@ impl Storage for S3 {
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let timestamp = Self::now_timestamp();
         let canonical_uri = self.canonical_uri(&key);
         let extra = self.request_extra_headers(false);
@@ -1254,8 +1260,18 @@ mod tests {
 
     #[test]
     fn key_for_strips_leading_slash_and_normalises() {
-        assert_eq!(S3::key_for(Path::new("/repo/archive/x")), "repo/archive/x");
-        assert_eq!(S3::key_for(Path::new("repo/archive/x")), "repo/archive/x");
+        assert_eq!(S3::key_for(Path::new("/repo/archive/x")).unwrap(), "repo/archive/x");
+        assert_eq!(S3::key_for(Path::new("repo/archive/x")).unwrap(), "repo/archive/x");
+    }
+
+    #[test]
+    fn key_for_rejects_parent_escape() {
+        assert!(matches!(S3::key_for(Path::new("../x")), Err(StorageError::Backend { .. })));
+    }
+
+    #[test]
+    fn key_for_normalizes_dot_dot_inside() {
+        assert_eq!(S3::key_for(Path::new("a/../b")).unwrap(), "b");
     }
 
     #[test]

@@ -58,6 +58,32 @@ assert_contains "$out" "status: ok" "info"
 assert_contains "$out" "full backup" "info"
 assert_contains "$out" "incr backup" "info"
 
+info "repo-* path confinement (GHSA-vq5g-8277-5pwc: CWE-22)"
+# The victim is owned by postgres (the user running pgbackrust): a root-owned
+# file in sticky /tmp could not be removed by postgres anyway, which would make
+# the repo-rm assertion pass even with the vulnerable code.
+pg_as principal bash -c "echo outside > /tmp/outside-repo"
+if pg_as principal pgbackrust --stanza=$STANZA repo-ls / >/dev/null 2>&1; then
+  fail "repo-ls / must be rejected (host root is outside the repository)"
+fi
+if pg_as principal pgbackrust --stanza=$STANZA repo-get /etc/hostname >/dev/null 2>&1; then
+  fail "repo-get /etc/hostname must be rejected"
+fi
+if pg_as principal pgbackrust --stanza=$STANZA repo-get ../../../../etc/hostname >/dev/null 2>&1; then
+  fail "repo-get with ..-escape must be rejected"
+fi
+if pg_as principal pgbackrust --stanza=$STANZA repo-rm /tmp/outside-repo >/dev/null 2>&1; then
+  fail "repo-rm /tmp/outside-repo must be rejected"
+fi
+node principal test -f /tmp/outside-repo || fail "repo-rm must not delete outside the repository"
+pass "repo-ls / , repo-get /etc/hostname, repo-get ..-escape, repo-rm /tmp/outside-repo all rejected"
+node principal rm -f /tmp/outside-repo
+# repo1-path is /srv/depot/pgbackrust, local to principal (see pgbackrust.conf above).
+out=$(pg_as principal pgbackrust --stanza=$STANZA repo-ls /srv/depot/pgbackrust)
+assert_contains "$out" "backup" "repo-ls absolute path under repo root is accepted"
+out=$(pg_as principal pgbackrust --stanza=$STANZA repo-ls)
+assert_contains "$out" "archive" "repo-ls default still lists the repo root"
+
 info "restore --delta to original path after stop"
 pg_as principal bash -c "$BIN/pg_ctl -D $DATADIR -w stop" || true
 pg_as principal pgbackrust --stanza=$STANZA --delta restore
