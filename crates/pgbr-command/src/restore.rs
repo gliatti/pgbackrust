@@ -2811,6 +2811,58 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         }
     }
 
+    // Traversal guard: links are materialised FIRST (step 1 below), so any other
+    // manifest entry whose path lies under a link's path would be created
+    // THROUGH the symlink — i.e. outside PGDATA, at the link's
+    // (manifest-controlled, possibly absolute) destination. The lexical path
+    // confinement above cannot see that, and a forged manifest could use it to
+    // mkdir / chmod / unlink-and-replace entries outside PGDATA (e.g. a generic
+    // link `x -> /etc` paired with a link `x/resolv.conf`, whose
+    // materialisation would replace the real `/etc/resolv.conf`). Only a
+    // TABLESPACE link legitimately carries paths and files beneath it
+    // (`pg_tblspc/<oid>/PG_…`, written through by design); the backup never
+    // records anything under a generic or runtime link, and never a link nested
+    // under another link. A manifest that does is corrupt or malicious: refuse
+    // it before any mutation.
+    let link_prefixes: Vec<(&str, bool)> = manifest
+        .links
+        .iter()
+        .map(|l| (l.path.as_str(), tablespace_oid(l).is_some()))
+        .collect();
+    let under_link = |entry: &str, tablespace_ok: bool| -> Option<&str> {
+        link_prefixes.iter().find_map(|&(link_path, is_tablespace)| {
+            (entry.strip_prefix(link_path).is_some_and(|rest| rest.starts_with('/')) && !(tablespace_ok && is_tablespace))
+                .then_some(link_path)
+        })
+    };
+    for path in &manifest.paths {
+        if let Some(link_path) = under_link(&path.path, true) {
+            return Err(CommandError::Other(format!(
+                "manifest target:path '{}' lies under the non-tablespace link '{link_path}' and would be created through \
+                 it, outside PGDATA; refusing to restore",
+                path.path
+            )));
+        }
+    }
+    for file in &manifest.files {
+        if let Some(link_path) = under_link(&file.path, true) {
+            return Err(CommandError::Other(format!(
+                "manifest target:file '{}' lies under the non-tablespace link '{link_path}' and would be written through \
+                 it, outside PGDATA; refusing to restore",
+                file.path
+            )));
+        }
+    }
+    for link in &manifest.links {
+        if let Some(link_path) = under_link(&link.path, false) {
+            return Err(CommandError::Other(format!(
+                "manifest target:link '{}' is nested under link '{link_path}' and would be created through it, outside \
+                 PGDATA; refusing to restore",
+                link.path
+            )));
+        }
+    }
+
     // 1. Materialise `[target:link]` symlinks (and their external tablespace /
     //    runtime-directory target directories) FIRST — before any directory,
     //    the runtime skeleton or a file is created. The manifest records a
@@ -6180,6 +6232,111 @@ mod tests {
         for dir in ["pg_notify", "pg_logical/snapshots", "pg_tblspc", "base/1"] {
             assert!(pg.path().join(dir).is_dir(), "{dir} must exist after restore");
         }
+    }
+
+    // ---- manifest link-traversal guard --------------------------------------
+
+    /// A forged manifest pairing a generic link with a second link nested under
+    /// it (`x -> /etc`, then `x/inner`) must be rejected before any mutation:
+    /// materialising the nested link would unlink-and-replace an entry at the
+    /// first link's external destination.
+    #[test]
+    fn restore_rejects_link_nested_under_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[],
+            &["base"],
+            &[("x", ext_str.as_str()), ("x/inner", "/attacker")],
+        );
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("nested link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:link 'x/inner'") && msg.contains("nested under link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        // Rejected during validation: nothing was materialised, not even `x`.
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+    }
+
+    /// A `[target:file]` entry under a generic (non-tablespace) link would be
+    /// written through the symlink into its external destination: rejected.
+    #[test]
+    fn restore_rejects_file_under_generic_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        let payload: &[u8] = b"evil";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("x/evil", payload, Some(sha1_hex(payload)))],
+            &["base"],
+            &[("x", ext_str.as_str())],
+        );
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("file under a generic link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:file 'x/evil'") && msg.contains("under the non-tablespace link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+        assert!(!ext.path().join("evil").exists(), "nothing may be written at the destination");
+    }
+
+    /// A `[target:path]` entry under a generic (non-tablespace) link would be
+    /// created (and chmod'ed) through the symlink at its external destination:
+    /// rejected. Entries under a TABLESPACE link stay allowed (see
+    /// `restore_tablespace_contents_land_in_external_target`).
+    #[test]
+    fn restore_rejects_path_under_generic_link() {
+        let (_repo, pg, repo_s, pg_s) = posix_pair();
+        let ext = tempfile::tempdir().expect("external tempdir");
+        let ext_str = ext.path().to_string_lossy().into_owned();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(&repo_s, stanza, label, &[], &["base", "x/sub"], &[("x", ext_str.as_str())]);
+
+        let err = restore_inner(&cfg(Some(stanza), None), &repo_s, &pg_s).expect_err("path under a generic link must be rejected");
+        match err {
+            CommandError::Other(msg) => assert!(
+                msg.contains("target:path 'x/sub'") && msg.contains("under the non-tablespace link 'x'"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected CommandError::Other, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(pg.path().join("x")).is_err(),
+            "validation must reject the manifest before any link is created"
+        );
+        assert!(
+            !ext.path().join("sub").exists(),
+            "no directory may be created at the destination"
+        );
     }
 
     // ---- generic link remapping (--link-map) -------------------------------
