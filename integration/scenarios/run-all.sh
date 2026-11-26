@@ -49,9 +49,14 @@ trap '$COMPOSE down -v >/dev/null 2>&1 || true' EXIT
 # 4. run scenarios (filtered by optional args)
 #
 # The numbered scenarios (auto-discovered by the glob below) are:
-#   01-local-minimal      02-remote-pull-ssh   03-pitr            04-encryption
-#   05-standby            06-tablespaces       07-async-queuing   08-multi-repo
-#   09-tls                10-bundling-block    11-s3              12-repo-sync
+#   01-local-minimal      02-remote-pull-ssh    03-pitr               04-encryption
+#   05-standby            06-tablespaces        07-async-queuing      08-multi-repo
+#   09-tls                10-bundling-block     11-s3                 12-repo-sync
+#   13-verify-encrypted   14-zstd-diff-expire   15-compress-bz2-lz4   16-pitr-name
+#   17-pitr-xid           18-pitr-lsn           19-pitr-pause         20-remote-push-ssh
+#   21-alt-datadir        22-backup-standby     23-info-json-expire-set
+#   24-annotate           25-checksum-page      26-verify-plain       27-start-stop
+#   28-stanza-delete      29-repo-cmds
 #
 # Each scenario runs against a freshly reset topology: `down -v` wipes every
 # volume (principal-data, secondaire-data, depot-repo, minio-data) so no
