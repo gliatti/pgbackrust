@@ -74,8 +74,14 @@
 //! manifest so the target ends up matching the backup exactly. After the copy
 //! pass, the PG target is walked recursively and any regular file whose
 //! manifest-relative path is absent from the manifest's `[target:file]` set is
-//! removed (counted in [`RestoreOutcome::files_removed`]). Empty directories are
-//! left alone — directory reconciliation is still deferred.
+//! removed. Directories absent from the manifest's `[target:path]` set (and not
+//! an ancestor of anything the manifest keeps) are then removed deepest-first —
+//! e.g. a leftover `pg_replslot/<slot>/` whose `state` file the backup excluded,
+//! which would otherwise make the server PANIC at startup. Symlinks (tablespace
+//! links) are never followed nor removed. The `PostgreSQL` runtime skeleton
+//! (`pg_wal/archive_status`, `pg_logical/snapshots`, …) restore guarantees is
+//! never treated as stray. Removed files and directories are both counted in
+//! [`RestoreOutcome::entries_removed`].
 //!
 //! # Symlink re-creation
 //!
@@ -335,9 +341,11 @@ pub struct RestoreOutcome {
     /// Number of files skipped because the target already matched the manifest
     /// (delta restore only; always `0` without `--delta`).
     pub files_skipped: usize,
-    /// Number of stray target files removed because they were absent from the
-    /// manifest (delta restore only; always `0` without `--delta`).
-    pub files_removed: usize,
+    /// Number of stray target entries removed because they were absent from the
+    /// manifest — regular files **and** directories combined (delta restore
+    /// only; always `0` without `--delta`). On a dry-run this is the number of
+    /// entries that *would* be removed.
+    pub entries_removed: usize,
     /// Number of directories created in the PG target.
     pub paths_created: usize,
     /// Number of `[target:link]` symlinks re-created in the PG target.
@@ -1224,12 +1232,28 @@ fn run_delta_jobs(jobs: &[DeltaJob], worker_count: usize) -> std::collections::H
     matched
 }
 
-/// Recursively collect every regular file under `dir` in the PG target,
-/// returning paths relative to the target root (matching the manifest's
-/// `[target:file]` key format). Symlinks and directories are not collected.
+/// What a recursive walk of the PG target found, as target-relative paths
+/// (matching the manifest's `[target:file]` / `[target:path]` key format).
+#[derive(Default)]
+struct TargetWalk {
+    /// Regular files.
+    files: Vec<PathBuf>,
+    /// Real directories (never symlinks), in pre-order (parent before child).
+    dirs: Vec<PathBuf>,
+    /// Symlinks and special files. They are never removed nor descended into,
+    /// and their parent directories are always kept so a non-recursive
+    /// directory removal can never trip over them.
+    pinned: Vec<PathBuf>,
+}
+
+/// Recursively walk `dir` in the PG target, recording every regular file,
+/// real sub-directory and symlink/special entry beneath it (see
+/// [`TargetWalk`]). Symlinks — e.g. tablespace links under `pg_tblspc` — are
+/// recorded as pinned and never followed.
 ///
-/// Used by delta restore to find stray files absent from the manifest.
-fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CommandError> {
+/// Used by delta restore to find stray files and directories absent from the
+/// manifest.
+fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut TargetWalk) -> Result<(), CommandError> {
     let entries = match pg.list(dir) {
         Ok(entries) => entries,
         // A directory recorded in the manifest may not actually exist on the
@@ -1246,10 +1270,13 @@ fn collect_target_files(pg: &dyn Storage, dir: &Path, out: &mut Vec<PathBuf>) ->
         };
         let rel = dir.join(name);
         match entry.kind {
-            StorageKind::File => out.push(rel),
-            StorageKind::Path => collect_target_files(pg, &rel, out)?,
-            // Symlinks / specials are left untouched (symlink handling deferred).
-            StorageKind::Link | StorageKind::Special => {}
+            StorageKind::File => out.files.push(rel),
+            StorageKind::Path => {
+                out.dirs.push(rel.clone());
+                collect_target_files(pg, &rel, out)?;
+            }
+            // Symlinks / specials are left untouched and not followed.
+            StorageKind::Link | StorageKind::Special => out.pinned.push(rel),
         }
     }
 
@@ -2806,10 +2833,11 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
     run_restore_jobs(jobs, repo, worker_count, JobRetry::from_options(config))?;
 
     // 3. Delta restore removes target files absent from the manifest so the
-    //    target matches the backup exactly. Walk every restored directory root
-    //    and delete any regular file not listed in `[target:file]`. A dry-run
-    //    only *counts* the stray files (read-only walk) and removes none.
-    let files_removed = if delta {
+    //    target matches the backup exactly. Walk every restored directory root,
+    //    delete any regular file not listed in `[target:file]`, then any
+    //    directory not listed in `[target:path]` (deepest-first). A dry-run
+    //    only *counts* the stray entries (read-only walk) and removes none.
+    let entries_removed = if delta {
         if dry_run {
             count_stray_files(pg, &manifest)?
         } else {
@@ -2901,7 +2929,7 @@ pub fn restore_inner(config: &LoadedConfig, repo: &dyn Storage, pg: &dyn Storage
         label,
         files_restored,
         files_skipped,
-        files_removed,
+        entries_removed,
         paths_created,
         links_created,
         skipped_links,
@@ -2960,19 +2988,91 @@ fn append_to_existing(pg: &dyn Storage, rel: &Path, block: &str) -> Result<Vec<u
     Ok(existing)
 }
 
-/// Collect every regular file under the manifest's directory roots that is not
-/// listed in the manifest's `[target:file]` set (the stray files a delta restore
-/// would remove). Read-only.
+/// Target entries a delta restore removes because the manifest does not
+/// describe them (see [`stray_files`]).
+struct StrayEntries {
+    /// Regular files absent from `[target:file]`.
+    files: Vec<PathBuf>,
+    /// Directories absent from `[target:path]` (and not an ancestor of anything
+    /// kept), ordered deepest-first so nested directories unwind child-first.
+    dirs: Vec<PathBuf>,
+}
+
+impl StrayEntries {
+    /// Total number of entries (files + directories) to remove.
+    const fn total(&self) -> usize {
+        self.files.len() + self.dirs.len()
+    }
+}
+
+/// Insert every proper ancestor directory of the `/`-joined `path` into `set`
+/// (`a/b/c` → `a`, `a/b`).
+fn insert_ancestors(set: &mut std::collections::BTreeSet<String>, path: &str) {
+    for (idx, _) in path.match_indices('/') {
+        if idx > 0 {
+            set.insert(path[..idx].to_owned());
+        }
+    }
+}
+
+/// `/`-joined string form of a target-relative path, matching manifest keys.
+fn manifest_key(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Collect every target entry under the manifest's directory roots that the
+/// manifest does not describe (what a delta restore would remove). Read-only.
+///
+/// * **Files**: every regular file absent from the manifest's `[target:file]`
+///   set.
+/// * **Directories**: every real directory (symlinks are never followed nor
+///   removed) absent from `[target:path]` that is also not an ancestor of a
+///   kept manifest file, path or link, nor of an on-disk symlink/special
+///   entry. Such a directory only holds stray files and stray sub-directories,
+///   so once the stray files are gone it can be removed non-recursively,
+///   deepest-first. This matters e.g. for `pg_replslot/<slot>/`: the backup
+///   excludes its contents, and a leftover empty slot directory makes
+///   the server PANIC at startup looking for its `state` file.
 ///
 /// Roots are the top-level components of the manifest's recorded paths and
 /// files, so the walk covers exactly the tree the backup describes without
-/// descending into unrelated parts of the filesystem. Shared by
-/// [`remove_stray_files`] and the dry-run [`count_stray_files`].
-fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<Vec<PathBuf>, CommandError> {
+/// descending into unrelated parts of the filesystem; the roots themselves are
+/// never candidates. Shared by [`remove_stray_files`] and the dry-run
+/// [`count_stray_files`].
+fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<StrayEntries, CommandError> {
     use std::collections::BTreeSet;
 
     // The set of paths the manifest captured — anything else under the roots is stray.
     let kept: BTreeSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+
+    // Directories that must survive: recorded paths (and recorded links, which
+    // may have been materialised as plain directories), plus every ancestor of
+    // anything the manifest expects.
+    let mut kept_dirs: BTreeSet<String> = BTreeSet::new();
+    for path in &manifest.paths {
+        kept_dirs.insert(path.path.clone());
+        insert_ancestors(&mut kept_dirs, &path.path);
+    }
+    for link in &manifest.links {
+        kept_dirs.insert(link.path.clone());
+        insert_ancestors(&mut kept_dirs, &link.path);
+    }
+    for file in &manifest.files {
+        insert_ancestors(&mut kept_dirs, &file.path);
+    }
+    // The PostgreSQL runtime skeleton. Step 1b of `restore_inner` guarantees
+    // these directories exist precisely because the manifest does NOT record
+    // the subdirectories (`pg_wal/archive_status`, `pg_logical/snapshots`, …);
+    // cleanup must not undo that guarantee right after it was made. Keep each
+    // entry both PGDATA-relative (how this port's backups key the manifest and
+    // how step 1b creates them) and under the `pg_data/` manifest-target prefix
+    // (pgBackRust-style keys, see `link_relative_name`), plus their ancestors.
+    for dir in PG_RUNTIME_SKELETON_DIRS {
+        for key in [(*dir).to_owned(), format!("pg_data/{dir}")] {
+            insert_ancestors(&mut kept_dirs, &key);
+            kept_dirs.insert(key);
+        }
+    }
 
     // Top-level directory roots to walk: the first component of every recorded
     // path and file. A `BTreeSet` dedups them so each root is walked once.
@@ -2988,7 +3088,7 @@ fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<Vec<PathBuf>, Co
         }
     }
 
-    let mut present = Vec::new();
+    let mut present = TargetWalk::default();
     for root in &roots {
         // A first path component can be a top-level DIRECTORY (e.g. `base` from
         // `base/1/PG_VERSION`) or a root-level FILE (e.g. `PG_VERSION`, whose only
@@ -2997,39 +3097,55 @@ fn stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<Vec<PathBuf>, Co
         // directories, record a root-level file as present, skip what's absent.
         match pg.info(root) {
             Ok(info) if info.kind == StorageKind::Path => collect_target_files(pg, root, &mut present)?,
-            Ok(info) if info.kind == StorageKind::File => present.push(root.clone()),
+            Ok(info) if info.kind == StorageKind::File => present.files.push(root.clone()),
             // symlink / special, or recorded-but-absent on the target: nothing to walk.
             Ok(_) | Err(StorageError::NotFound { .. }) => {}
             Err(err) => return Err(CommandError::Storage(err)),
         }
     }
 
-    let mut stray = Vec::new();
-    for rel in present {
-        // Compare against the manifest's `/`-joined string keys.
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if !kept.contains(rel_str.as_str()) {
-            stray.push(rel);
-        }
+    // Never remove a directory holding a symlink/special entry we leave alone.
+    for rel in &present.pinned {
+        insert_ancestors(&mut kept_dirs, &manifest_key(rel));
     }
-    Ok(stray)
+
+    // Compare against the manifest's `/`-joined string keys.
+    let files: Vec<PathBuf> = present
+        .files
+        .into_iter()
+        .filter(|rel| !kept.contains(manifest_key(rel).as_str()))
+        .collect();
+    let mut dirs: Vec<PathBuf> = present
+        .dirs
+        .into_iter()
+        .filter(|rel| !kept_dirs.contains(&manifest_key(rel)))
+        .collect();
+    // Deepest-first so a nested stray directory is emptied before its parent.
+    dirs.sort_by_key(|rel| std::cmp::Reverse(rel.components().count()));
+
+    Ok(StrayEntries { files, dirs })
 }
 
-/// Delete every stray target file (see [`stray_files`]), returning the count.
+/// Delete every stray target file, then every stray target directory
+/// (deepest-first, non-recursively), as described by [`stray_files`].
+/// Returns the total number of entries removed (files + directories).
 fn remove_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
     let stray = stray_files(pg, manifest)?;
-    let mut files_removed = 0;
-    for rel in stray {
-        pg.remove(&rel, false)?;
-        files_removed += 1;
+    let total = stray.total();
+    for rel in &stray.files {
+        pg.remove(rel, false)?;
     }
-    Ok(files_removed)
+    for rel in &stray.dirs {
+        pg.remove_path(rel, false, false)?;
+    }
+    Ok(total)
 }
 
-/// Count the stray target files (see [`stray_files`]) a delta restore *would*
-/// remove, without deleting any. The dry-run counterpart of [`remove_stray_files`].
+/// Count the stray target files and directories (see [`stray_files`]) a delta
+/// restore *would* remove, without deleting any. The dry-run counterpart of
+/// [`remove_stray_files`]; it counts exactly the same set.
 fn count_stray_files(pg: &dyn Storage, manifest: &Manifest) -> Result<usize, CommandError> {
-    Ok(stray_files(pg, manifest)?.len())
+    Ok(stray_files(pg, manifest)?.total())
 }
 
 /// `restore` — restore a backup into a PG data directory.
@@ -3049,13 +3165,13 @@ pub fn restore(config: &LoadedConfig, repo_storage: &dyn Storage, pg_storage: &d
         "restore:"
     };
     log_info(&format!(
-        "{} backup {} — {} file(s) restored, {} skipped, {} removed, {} path(s) created, {} link(s) created, \
+        "{} backup {} — {} file(s) restored, {} skipped, {} stray entry(ies) removed, {} path(s) created, {} link(s) created, \
          {} link(s) skipped, {} link(s) as dir, {} recovery file(s) written",
         prefix,
         outcome.label,
         outcome.files_restored,
         outcome.files_skipped,
-        outcome.files_removed,
+        outcome.entries_removed,
         outcome.paths_created,
         outcome.links_created,
         outcome.skipped_links,
@@ -4182,7 +4298,7 @@ mod tests {
 
         let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
         assert_eq!(outcome.files_restored, 1);
-        assert_eq!(outcome.files_removed, 2, "both stray files must be removed");
+        assert_eq!(outcome.entries_removed, 2, "both stray files must be removed");
 
         assert!(
             pg_s.exists(Path::new("pg_data/keep.txt")).unwrap(),
@@ -4196,6 +4312,199 @@ mod tests {
             !pg_s.exists(Path::new("pg_data/sub/orphan.txt")).unwrap(),
             "nested stray file must be removed"
         );
+    }
+
+    #[test]
+    fn delta_removes_empty_dir_absent_from_manifest() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/keep.txt", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data"],
+            &[],
+        );
+
+        // An empty directory the manifest knows nothing about.
+        pg_s.create_path(Path::new("pg_data/stray_dir"), true).unwrap();
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.entries_removed, 1, "the stray directory is counted");
+        assert!(
+            !pg_s.exists(Path::new("pg_data/stray_dir")).unwrap(),
+            "stray empty directory must be removed"
+        );
+        assert!(pg_s.exists(Path::new("pg_data/keep.txt")).unwrap());
+    }
+
+    #[test]
+    fn delta_removes_stray_replslot_dir_but_keeps_recorded_parent() {
+        // Mirrors the real failure: `pg_replslot` is recorded (contents
+        // excluded by the backup), but the live target still holds a slot
+        // directory with its `state` file. Leaving the empty slot dir behind
+        // makes PostgreSQL PANIC at startup.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"PG_VERSION contents".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/PG_VERSION", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data", "pg_data/pg_replslot"],
+            &[],
+        );
+        seed_pg_file(&pg_s, "pg_data/pg_replslot/someslot/state", b"slot state");
+        // A deeper nested stray tree unwinds too.
+        seed_pg_file(&pg_s, "pg_data/pg_replslot/other/a/b/junk", b"junk");
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        // 2 files + someslot, other, other/a, other/a/b.
+        assert_eq!(outcome.entries_removed, 6);
+        assert!(!pg_s.exists(Path::new("pg_data/pg_replslot/someslot/state")).unwrap());
+        assert!(
+            !pg_s.exists(Path::new("pg_data/pg_replslot/someslot")).unwrap(),
+            "stray slot directory must be removed"
+        );
+        assert!(!pg_s.exists(Path::new("pg_data/pg_replslot/other")).unwrap());
+        assert!(
+            pg_s.exists(Path::new("pg_data/pg_replslot")).unwrap(),
+            "recorded pg_replslot directory must remain"
+        );
+    }
+
+    #[test]
+    fn delta_keeps_dirs_recorded_in_manifest() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            // `pg_data/base` is not recorded as a path but is the ancestor of a
+            // kept file; `pg_data/pg_wal/archive_status` is recorded explicitly.
+            &[("pg_data/base/1/keep", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data", "pg_data/pg_wal/archive_status"],
+            &[],
+        );
+        pg_s.create_path(Path::new("pg_data/pg_wal/archive_status"), true).unwrap();
+        pg_s.create_path(Path::new("pg_data/base/1"), true).unwrap();
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.entries_removed, 0, "nothing stray on the target");
+        assert!(pg_s.exists(Path::new("pg_data/pg_wal/archive_status")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_data/pg_wal")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_data/base/1/keep")).unwrap());
+    }
+
+    #[test]
+    fn delta_keeps_runtime_skeleton_dirs_not_in_manifest() {
+        // Real manifests never record the runtime skeleton's subdirectories
+        // (step 1b recreates them); delta cleanup must not remove them.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/base/1/keep", bytes, Some(sha1_hex(bytes)))],
+            // Neither `pg_wal`, `pg_wal/archive_status` nor `pg_logical/*` recorded.
+            &["pg_data"],
+            &[],
+        );
+        pg_s.create_path(Path::new("pg_data/pg_wal/archive_status"), true).unwrap();
+        pg_s.create_path(Path::new("pg_data/pg_logical/snapshots"), true).unwrap();
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.entries_removed, 0, "runtime skeleton dirs are not stray");
+        assert!(pg_s.exists(Path::new("pg_data/pg_wal/archive_status")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_data/pg_logical/snapshots")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_data/base/1/keep")).unwrap());
+    }
+
+    #[test]
+    fn delta_keeps_runtime_skeleton_created_by_restore_unprefixed() {
+        // This port's backups key the manifest PGDATA-relative (`pg_wal`, not
+        // `pg_data/pg_wal`), and step 1b creates the skeleton at the PG root.
+        // With `pg_wal` recorded (so it is a walked root) but not its
+        // `archive_status` child, the subdirectory step 1b just created must
+        // survive the delta cleanup.
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("base/1/keep", bytes, Some(sha1_hex(bytes)))],
+            &["base", "pg_wal", "pg_logical"],
+            &[],
+        );
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        assert_eq!(outcome.entries_removed, 0, "skeleton created by step 1b is not stray");
+        assert!(pg_s.exists(Path::new("pg_wal/archive_status")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_logical/snapshots")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_logical/mappings")).unwrap());
+    }
+
+    #[test]
+    fn delta_dry_run_counts_same_stray_entries_as_real_run() {
+        let (_repo, _pg, repo_s, pg_s) = posix_pair();
+        let stanza = "demo";
+        let label = "20240101-120000F";
+
+        let bytes = b"a managed file".as_slice();
+        seed_backup_info(&repo_s, stanza, &[label]);
+        seed_backup(
+            &repo_s,
+            stanza,
+            label,
+            &[("pg_data/keep.txt", bytes, Some(sha1_hex(bytes)))],
+            &["pg_data", "pg_data/pg_replslot"],
+            &[],
+        );
+        seed_pg_file(&pg_s, "pg_data/stray.txt", b"stray");
+        seed_pg_file(&pg_s, "pg_data/pg_replslot/someslot/state", b"slot state");
+        pg_s.create_path(Path::new("pg_data/empty/nested"), true).unwrap();
+
+        let mut dry = cfg_delta(Some(stanza), None, true);
+        dry.options.insert(("dry-run".to_owned(), None), OptionValue::Boolean(true));
+        let dry_outcome = restore_inner(&dry, &repo_s, &pg_s).expect("dry-run delta restore");
+        assert!(dry_outcome.dry_run);
+        // Nothing removed by the dry-run.
+        assert!(pg_s.exists(Path::new("pg_data/pg_replslot/someslot/state")).unwrap());
+        assert!(pg_s.exists(Path::new("pg_data/empty/nested")).unwrap());
+
+        let outcome = restore_inner(&cfg_delta(Some(stanza), None, true), &repo_s, &pg_s).expect("delta restore");
+        // 2 files + someslot, empty, empty/nested.
+        assert_eq!(outcome.entries_removed, 5);
+        assert_eq!(
+            dry_outcome.entries_removed, outcome.entries_removed,
+            "dry-run must count exactly what the real run removes"
+        );
+        assert!(!pg_s.exists(Path::new("pg_data/empty")).unwrap());
+        assert!(!pg_s.exists(Path::new("pg_data/pg_replslot/someslot")).unwrap());
     }
 
     #[test]
@@ -4225,7 +4534,7 @@ mod tests {
         let outcome = restore_inner(&with_force(cfg(Some(stanza), None)), &repo_s, &pg_s).expect("restore");
         assert_eq!(outcome.files_restored, 1, "matching file is still restored without --delta");
         assert_eq!(outcome.files_skipped, 0);
-        assert_eq!(outcome.files_removed, 0);
+        assert_eq!(outcome.entries_removed, 0);
         assert!(
             pg_s.exists(Path::new("pg_data/stray.txt")).unwrap(),
             "stray file must survive a non-delta restore"
