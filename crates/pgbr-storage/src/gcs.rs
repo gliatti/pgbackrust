@@ -424,12 +424,18 @@ impl Gcs {
         headers
     }
 
-    /// Translate a `Path` into a GCS object key. Backend-relative: any leading
-    /// `/` is stripped, and Windows-style separators are normalised to `/`.
-    fn key_for(path: &Path) -> String {
-        let raw = path.to_string_lossy();
-        let normalised = raw.replace('\\', "/");
-        normalised.trim_start_matches('/').to_string()
+    /// Translate a `Path` into a GCS object key via
+    /// [`crate::path_validate::normalize_object_key`]. Backend-relative: any
+    /// leading `/` is stripped, Windows-style separators are normalised to `/`,
+    /// `.` and empty components are collapsed, and `..` is resolved lexically,
+    /// so a given logical path always maps to one canonical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] when `..` components would climb above
+    /// the bucket root.
+    fn key_for(path: &Path) -> Result<String, StorageError> {
+        crate::path_validate::normalize_object_key(path)
     }
 }
 
@@ -741,7 +747,7 @@ impl Storage for Gcs {
     }
 
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
         let mut req = self.agent.head(&url).set(&auth_name, &auth_value);
@@ -764,7 +770,7 @@ impl Storage for Gcs {
     }
 
     fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
-        let mut prefix = Self::key_for(path);
+        let mut prefix = Self::key_for(path)?;
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
@@ -839,7 +845,7 @@ impl Storage for Gcs {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
         let mut req = self.agent.get(&url).set(&auth_name, &auth_value);
@@ -862,7 +868,7 @@ impl Storage for Gcs {
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         Ok(Box::new(GcsWrite {
             gcs: self.clone(),
             key,
@@ -872,7 +878,7 @@ impl Storage for Gcs {
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
-        let key = Self::key_for(path);
+        let key = Self::key_for(path)?;
         let url = self.object_url(&key);
         let (auth_name, auth_value) = self.auth_header()?;
         let mut req = self.agent.delete(&url).set(&auth_name, &auth_value);
@@ -990,8 +996,18 @@ mod tests {
 
     #[test]
     fn key_for_strips_leading_slash_and_normalises() {
-        assert_eq!(Gcs::key_for(Path::new("/repo/archive/x")), "repo/archive/x");
-        assert_eq!(Gcs::key_for(Path::new("repo/archive/x")), "repo/archive/x");
+        assert_eq!(Gcs::key_for(Path::new("/repo/archive/x")).unwrap(), "repo/archive/x");
+        assert_eq!(Gcs::key_for(Path::new("repo/archive/x")).unwrap(), "repo/archive/x");
+    }
+
+    #[test]
+    fn key_for_rejects_parent_escape() {
+        assert!(matches!(Gcs::key_for(Path::new("../x")), Err(StorageError::Backend { .. })));
+    }
+
+    #[test]
+    fn key_for_normalizes_dot_dot_inside() {
+        assert_eq!(Gcs::key_for(Path::new("a/../b")).unwrap(), "b");
     }
 
     #[test]

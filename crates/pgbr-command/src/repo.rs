@@ -23,6 +23,21 @@
 //! to the user passphrase for a stanza-less `repo-get` of an `archive.info` /
 //! `backup.info` file. This is what lets `repo-get` read an encrypted backup
 //! file back out of the repository.
+//!
+//! # Path confinement (GHSA-vq5g-8277-5pwc)
+//!
+//! Every user-supplied path parameter of `repo-ls` / `repo-get` / `repo-put` /
+//! `repo-rm` is confined to the active repository root (`repoN-path`) by
+//! `repo_param_path` before it reaches the storage backend, through
+//! [`pgbr_storage::normalize_under_root`]. A relative path is normalized
+//! lexically (`.`, repeated separators and `..` collapse) and rejected when a
+//! `..` would climb above the root; an absolute path is accepted only when it
+//! lies lexically under the configured root (it is then rewritten relative to
+//! it); anything else — `/`, `/etc/hostname`, `../outside` — is rejected with a
+//! `path validation` [`StorageError::Backend`] before any I/O. Paths are thus
+//! always relative to the repository root, so these commands can never list,
+//! read, write or delete outside it. The `--recurse` walk of `repo-ls` re-lists
+//! the paths returned by the backend itself, which are already under the root.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +48,36 @@ use pgbr_storage::{Storage, StorageError, StorageInfo, StorageKind};
 
 use crate::CommandError;
 use crate::pipeline::RepoTransform;
+
+/// Default repository path (mirrors the `repo-path` default in config.yaml).
+const DEFAULT_REPO_PATH: &str = "/var/lib/pgbackrust";
+
+/// Resolve the active repository's configured root (`repoN-path`), falling
+/// back to the ungrouped key and then to `DEFAULT_REPO_PATH`.
+fn active_repo_root(config: &LoadedConfig) -> PathBuf {
+    let index = crate::cipher::active_repo_index(config);
+    let opt = config
+        .options
+        .get(&("repo-path".to_owned(), Some(index)))
+        .or_else(|| config.options.get(&("repo-path".to_owned(), None)));
+    match opt {
+        Some(OptionValue::Path(s) | OptionValue::String(s)) if !s.is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(DEFAULT_REPO_PATH),
+    }
+}
+
+/// Confine a user-supplied repo command path parameter to the repository
+/// root. Returns the normalized RELATIVE path handed to the storage backend.
+///
+/// # Errors
+///
+/// [`CommandError::Storage`] wrapping a `path validation`
+/// [`StorageError::Backend`] when `raw` is absolute outside the root or climbs
+/// out of it via `..`.
+fn repo_param_path(config: &LoadedConfig, raw: &str) -> Result<PathBuf, CommandError> {
+    let root = active_repo_root(config);
+    pgbr_storage::normalize_under_root(&root, Path::new(raw)).map_err(CommandError::Storage)
+}
 
 /// Adapter: expose `&mut R: std::io::Read` as an [`IoRead`] so a process stdin
 /// handle (or any `std::io::Read` source like `Cursor<Vec<u8>>`) can feed
@@ -188,9 +233,11 @@ pub struct LsEntry {
 ///
 /// # Errors
 ///
-/// Returns [`CommandError::Storage`] if the underlying `list` call fails.
+/// Returns [`CommandError::Storage`] if the path parameter escapes the
+/// repository root (`path validation`) or the underlying `list` call fails.
 pub fn ls_inner(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Vec<PathBuf>, CommandError> {
-    let target = config.params.first().map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let raw = config.params.first().map_or(".", String::as_str);
+    let target = repo_param_path(config, raw)?;
 
     let entries = repo_storage.list(&target)?;
     Ok(entries.into_iter().map(|info| info.path).collect())
@@ -252,9 +299,11 @@ fn collect_entries(
 ///
 /// # Errors
 ///
-/// Returns [`CommandError::Storage`] if any underlying `list` call fails.
+/// Returns [`CommandError::Storage`] if the path parameter escapes the
+/// repository root (`path validation`) or any underlying `list` call fails.
 pub fn ls_entries(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<Vec<LsEntry>, CommandError> {
-    let target = config.params.first().map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let raw = config.params.first().map_or(".", String::as_str);
+    let target = repo_param_path(config, raw)?;
     let recurse = recurse_opt(config);
 
     let mut entries = Vec::new();
@@ -379,16 +428,19 @@ pub fn ls(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), Comma
 /// # Errors
 ///
 /// - [`CommandError::MissingOption`] if no positional path was supplied.
-/// - [`CommandError::Storage`] if the open / read fails (a missing path
-///   surfaces as [`pgbr_storage::StorageError::NotFound`] unless
+/// - [`CommandError::Storage`] if the path escapes the repository root
+///   (`path validation`, checked before any I/O) or the open / read fails (a
+///   missing path surfaces as [`pgbr_storage::StorageError::NotFound`] unless
 ///   `--ignore-missing` is set).
 /// - [`CommandError::Io`] if a filter in the reverse chain fails (e.g. wrong
 ///   cipher password, corrupt compressed stream).
 /// - [`CommandError::Other`] if writing to `out` fails.
 pub fn get_to<W: Write>(config: &LoadedConfig, repo_storage: &dyn Storage, out: &mut W) -> Result<(), CommandError> {
-    let path = config.params.first().ok_or_else(|| CommandError::MissingOption {
+    let param = config.params.first().ok_or_else(|| CommandError::MissingOption {
         option: "<path>".to_owned(),
     })?;
+    let rel: PathBuf = repo_param_path(config, param)?;
+    let path = rel.as_path();
     let raw = boolean_opt(config, "raw").unwrap_or(false);
     let ignore_missing = boolean_opt(config, "ignore-missing").unwrap_or(false);
 
@@ -431,8 +483,8 @@ pub fn get_to<W: Write>(config: &LoadedConfig, repo_storage: &dyn Storage, out: 
 /// [`pgbr_io::copy`] — bounded memory, no full-file buffering. Honours
 /// `--ignore-missing`: returns `Ok(())` having written nothing when the file
 /// is absent and the flag is set.
-fn stream_exact<W: Write>(repo_storage: &dyn Storage, path: &str, ignore_missing: bool, out: &mut W) -> Result<(), CommandError> {
-    let mut reader = match repo_storage.open_read(Path::new(path)) {
+fn stream_exact<W: Write>(repo_storage: &dyn Storage, path: &Path, ignore_missing: bool, out: &mut W) -> Result<(), CommandError> {
+    let mut reader = match repo_storage.open_read(path) {
         Ok(r) => r,
         Err(StorageError::NotFound { .. }) if ignore_missing => return Ok(()),
         Err(err) => return Err(err.into()),
@@ -452,15 +504,15 @@ fn stream_exact<W: Write>(repo_storage: &dyn Storage, path: &str, ignore_missing
 /// [`StorageError::NotFound`].
 fn read_repo_bytes(
     repo_storage: &dyn Storage,
-    path: &str,
+    path: &Path,
     transform: &RepoTransform,
     ignore_missing: bool,
 ) -> Result<Option<Vec<u8>>, CommandError> {
-    match repo_storage.open_read(Path::new(path)) {
+    match repo_storage.open_read(path) {
         Ok(mut reader) => Ok(Some(reader.read_all()?)),
         Err(StorageError::NotFound { .. }) if !transform.repo_suffix().is_empty() => {
-            let suffixed = format!("{path}{}", transform.repo_suffix());
-            match repo_storage.open_read(Path::new(&suffixed)) {
+            let suffixed = with_suffix(path, transform.repo_suffix());
+            match repo_storage.open_read(&suffixed) {
                 Ok(mut reader) => Ok(Some(reader.read_all()?)),
                 Err(StorageError::NotFound { .. }) if ignore_missing => Ok(None),
                 Err(err) => Err(err.into()),
@@ -511,24 +563,27 @@ pub fn get(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), Comm
 /// # Errors
 ///
 /// - [`CommandError::MissingOption`] if no target path was supplied.
-/// - [`CommandError::Storage`] if the open / write / flush / close fails.
+/// - [`CommandError::Storage`] if the target path escapes the repository root
+///   (`path validation`, checked before any I/O) or the open / write / flush /
+///   close fails.
 /// - [`CommandError::Io`] if a filter in the forward chain fails.
 /// - [`CommandError::Other`] if reading from `input` fails.
 pub fn put_from<R: Read>(config: &LoadedConfig, repo_storage: &dyn Storage, input: &mut R) -> Result<(), CommandError> {
-    let path = config.params.first().ok_or_else(|| CommandError::MissingOption {
+    let param = config.params.first().ok_or_else(|| CommandError::MissingOption {
         option: "<path>".to_owned(),
     })?;
+    let rel: PathBuf = repo_param_path(config, param)?;
     let raw = boolean_opt(config, "raw").unwrap_or(false);
 
     // `--raw` short-circuits the transform: stream input verbatim to the
     // bare path via `pgbr_io::copy` (bounded memory).
     if raw {
-        return stream_to(repo_storage, path, input);
+        return stream_to(repo_storage, &rel, input);
     }
 
     let cipher_key = resolve_repo_key(config, repo_storage)?;
     let transform = RepoTransform::from_options_with_key(config, cipher_key);
-    let target = format!("{path}{}", transform.repo_suffix());
+    let target = with_suffix(&rel, transform.repo_suffix());
 
     // Identity transform: no compress / cipher filter so there is nothing to
     // buffer for. Stream input → storage chunk-by-chunk via `pgbr_io::copy`
@@ -549,18 +604,26 @@ pub fn put_from<R: Read>(config: &LoadedConfig, repo_storage: &dyn Storage, inpu
     // resolved repository sub-key — the same on-disk cipher format.
     let repo_bytes = transform.apply_forward_keyed(&plaintext)?;
 
-    let mut writer = repo_storage.open_write(Path::new(&target))?;
+    let mut writer = repo_storage.open_write(&target)?;
     writer.write(&repo_bytes)?;
     writer.flush()?;
     writer.close()?;
     Ok(())
 }
 
+/// Append the transform's compression `suffix` (e.g. `.gz`) to `path`
+/// losslessly (no UTF-8 round trip), yielding `<path><suffix>`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// Stream `input` into `repo_storage` at `target` via [`pgbr_io::copy`] —
 /// bounded memory, no full-input buffering. Flushes and closes the storage
 /// writer so the file is durable.
-fn stream_to<R: Read>(repo_storage: &dyn Storage, target: &str, input: &mut R) -> Result<(), CommandError> {
-    let mut writer = repo_storage.open_write(Path::new(target))?;
+fn stream_to<R: Read>(repo_storage: &dyn Storage, target: &Path, input: &mut R) -> Result<(), CommandError> {
+    let mut writer = repo_storage.open_write(target)?;
     let mut source = StdReadToIo::new(input);
     io_copy(&mut source, &mut writer)?;
     writer.flush()?;
@@ -594,13 +657,20 @@ pub fn put(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), Comm
 ///
 /// - [`CommandError::Other`] when a non-empty directory is targeted without
 ///   `--recurse`.
-/// - [`CommandError::Storage`] if a removal fails for a reason other than
+/// - [`CommandError::Storage`] if a path escapes the repository root
+///   (`path validation`) or a removal fails for a reason other than
 ///   "missing".
 pub fn rm(config: &LoadedConfig, repo_storage: &dyn Storage) -> Result<(), CommandError> {
     let recurse = recurse_opt(config);
-    for raw in &config.params {
-        let path = Path::new(raw);
-        remove_any(repo_storage, path, recurse)?;
+    // Validate every parameter up front so a rejected path anywhere in the
+    // list aborts before anything is removed.
+    let rels = config
+        .params
+        .iter()
+        .map(|raw| repo_param_path(config, raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    for rel in &rels {
+        remove_any(repo_storage, rel, recurse)?;
     }
     Ok(())
 }
@@ -719,7 +789,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandError, LsEntry, OutputFormat, SortOrder, get_to, ls_entries, put_from, render_ls, render_ls_json, render_ls_text, rm,
+        CommandError, LsEntry, OutputFormat, SortOrder, get_to, ls_entries, ls_inner, put_from, render_ls, render_ls_json,
+        render_ls_text, rm,
     };
     use crate::pipeline::RepoTransform;
 
@@ -1449,5 +1520,207 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         get_to(&get_cfg, &storage, &mut buf).expect("gz get_to should still succeed");
         assert_eq!(buf, payload, "buffered transform round trip must still work");
+    }
+
+    // ----- path confinement (GHSA-vq5g-8277-5pwc, CWE-22) ----------------
+    //
+    // Every user-supplied path must resolve under the configured `repo1-path`
+    // (here: the Posix tempdir root). Absolute paths outside it and `..`
+    // escapes are rejected before any I/O; absolute paths under it and `..`
+    // that stays inside it are normalized and accepted.
+
+    /// A config whose `repo1-path` is the tempdir backing `storage`.
+    fn confined_config(command: &str, repo: &TempDir, params: Vec<String>, extra: Vec<(&str, OptionValue)>) -> LoadedConfig {
+        let mut cfg = fake_config_with_groups(
+            command,
+            params,
+            vec![(
+                ("repo-path", Some(1)),
+                OptionValue::Path(repo.path().to_string_lossy().into_owned()),
+            )],
+        );
+        for (name, value) in extra {
+            cfg.options.insert((name.to_owned(), None), value);
+        }
+        cfg
+    }
+
+    /// Assert `err` is the `path validation` rejection raised by the
+    /// confinement guard.
+    fn assert_path_validation(err: &CommandError) {
+        match err {
+            CommandError::Storage(pgbr_storage::StorageError::Backend { message, .. }) => {
+                assert!(message.contains("path validation"), "message was {message:?}");
+            }
+            other => panic!("expected Storage(Backend path validation), got {other:?}"),
+        }
+    }
+
+    /// An absolute path string for `name` inside `dir`.
+    fn abs_in(dir: &TempDir, name: &str) -> String {
+        dir.path().join(name).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn repo_get_absolute_path_outside_root_rejected() {
+        let (repo, storage) = posix_repo();
+        let cfg = confined_config("repo-get", &repo, vec!["/etc/hostname".to_owned()], Vec::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let err = get_to(&cfg, &storage, &mut buf).expect_err("absolute path outside the repo must be rejected");
+        assert_path_validation(&err);
+        assert!(buf.is_empty(), "nothing may be read from outside the repository");
+
+        // Same rejection on the `--raw` short-circuit path.
+        let raw_cfg = confined_config(
+            "repo-get",
+            &repo,
+            vec!["/etc/hostname".to_owned()],
+            vec![("raw", OptionValue::Boolean(true))],
+        );
+        let err = get_to(&raw_cfg, &storage, &mut buf).expect_err("--raw must not bypass confinement");
+        assert_path_validation(&err);
+    }
+
+    #[test]
+    fn repo_get_absolute_path_under_root_accepted() {
+        let (repo, storage) = posix_repo();
+        std::fs::write(repo.path().join("file"), b"inside").expect("seed file");
+
+        let cfg = confined_config("repo-get", &repo, vec![abs_in(&repo, "file")], Vec::new());
+        let mut buf: Vec<u8> = Vec::new();
+        get_to(&cfg, &storage, &mut buf).expect("absolute path under the repo root must be accepted");
+        assert_eq!(buf, b"inside");
+    }
+
+    #[test]
+    fn repo_get_parent_escape_rejected() {
+        let (repo, storage) = posix_repo();
+        let cfg = confined_config("repo-get", &repo, vec!["../../../../etc/hostname".to_owned()], Vec::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let err = get_to(&cfg, &storage, &mut buf).expect_err("..-escape must be rejected");
+        assert_path_validation(&err);
+    }
+
+    #[test]
+    fn repo_ls_root_slash_rejected() {
+        let (repo, storage) = posix_repo();
+        let cfg = confined_config("repo-ls", &repo, vec!["/".to_owned()], Vec::new());
+        let err = ls_entries(&cfg, &storage).expect_err("listing the host root must be rejected");
+        assert_path_validation(&err);
+        let err = ls_inner(&cfg, &storage).expect_err("ls_inner must confine too");
+        assert_path_validation(&err);
+    }
+
+    #[test]
+    fn repo_ls_parent_escape_rejected() {
+        let (repo, storage) = posix_repo();
+        let cfg = confined_config("repo-ls", &repo, vec!["../outside".to_owned()], Vec::new());
+        let err = ls_entries(&cfg, &storage).expect_err("..-escape must be rejected");
+        assert_path_validation(&err);
+    }
+
+    #[test]
+    fn repo_ls_dot_dot_normalized_inside_root_ok() {
+        let (repo, storage) = posix_repo();
+        storage.create_path(Path::new("target"), false).expect("mkdir target");
+        seed(&storage, "target/file", b"x");
+
+        // `sub` does not even exist: normalization is purely lexical, so
+        // `sub/../target` is `target`, which stays inside the root.
+        let cfg = confined_config("repo-ls", &repo, vec!["sub/../target".to_owned()], Vec::new());
+        let names: Vec<String> = ls_entries(&cfg, &storage)
+            .expect("..-normalized path inside the root must be accepted")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["file"]);
+    }
+
+    #[test]
+    fn repo_ls_absolute_root_and_default_accepted() {
+        let (repo, storage) = posix_repo();
+        seed(&storage, "a.txt", b"a");
+
+        // The repository root itself, given absolutely.
+        let abs_cfg = confined_config("repo-ls", &repo, vec![repo.path().to_string_lossy().into_owned()], Vec::new());
+        let names: Vec<String> = ls_entries(&abs_cfg, &storage)
+            .expect("absolute repo root must be accepted")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["a.txt"]);
+
+        // No parameter: the repository root.
+        let default_cfg = confined_config("repo-ls", &repo, Vec::new(), Vec::new());
+        let names: Vec<String> = ls_entries(&default_cfg, &storage)
+            .expect("default listing must be accepted")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn repo_rm_absolute_outside_root_rejected() {
+        let (repo, storage) = posix_repo();
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"keep me").expect("seed outside file");
+
+        let cfg = confined_config("repo-rm", &repo, vec![abs_in(&outside, "victim.txt")], Vec::new());
+        let err = rm(&cfg, &storage).expect_err("removing outside the repository must be rejected");
+        assert_path_validation(&err);
+        assert!(victim.exists(), "the file outside the repository must still exist");
+    }
+
+    #[test]
+    fn repo_rm_rejects_before_removing_anything() {
+        // A rejected parameter anywhere in the list aborts the whole command
+        // before any removal happens.
+        let (repo, storage) = posix_repo();
+        seed(&storage, "inside.txt", b"x");
+        let cfg = confined_config(
+            "repo-rm",
+            &repo,
+            vec!["inside.txt".to_owned(), "../escape".to_owned()],
+            Vec::new(),
+        );
+        let err = rm(&cfg, &storage).expect_err("..-escape must be rejected");
+        assert_path_validation(&err);
+        assert!(repo.path().join("inside.txt").exists(), "no removal may happen on rejection");
+    }
+
+    #[test]
+    fn repo_put_absolute_outside_root_rejected() {
+        let (repo, storage) = posix_repo();
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let target = outside.path().join("planted.txt");
+
+        let cfg = confined_config("repo-put", &repo, vec![abs_in(&outside, "planted.txt")], Vec::new());
+        let mut input = Cursor::new(b"payload".to_vec());
+        let err = put_from(&cfg, &storage, &mut input).expect_err("writing outside the repository must be rejected");
+        assert_path_validation(&err);
+        assert!(!target.exists(), "nothing may be written outside the repository");
+    }
+
+    #[test]
+    fn repo_put_parent_escape_rejected() {
+        let (repo, storage) = posix_repo();
+        let escaped = repo
+            .path()
+            .parent()
+            .expect("tempdir has a parent")
+            .join("pgbr-ghsa-vq5g-escaped.txt");
+
+        let cfg = confined_config(
+            "repo-put",
+            &repo,
+            vec!["../pgbr-ghsa-vq5g-escaped.txt".to_owned()],
+            Vec::new(),
+        );
+        let mut input = Cursor::new(b"payload".to_vec());
+        let err = put_from(&cfg, &storage, &mut input).expect_err("..-escape must be rejected");
+        assert_path_validation(&err);
+        assert!(!escaped.exists(), "nothing may be written above the repository root");
     }
 }

@@ -1,16 +1,24 @@
 //! Filesystem-backed storage using `std::fs`.
 //!
-//! `Posix` is the local-disk backend. All paths passed to its trait methods are interpreted
-//! relative to the configured `root` (or accepted verbatim if absolute). The wrapper does not
-//! attempt to enforce a chroot — internal callers legitimately hand it already-rooted absolute
-//! paths (e.g. a manifest scan of `/var/lib/postgresql/data`), so `resolve` cannot reject them.
+//! `Posix` is the local-disk backend. Every path passed to its trait methods is confined under
+//! the configured `root` by `resolve` (GHSA-vq5g-8277-5pwc):
 //!
-//! **Untrusted (network-sourced) paths are NOT validated here.** A path arriving from a remote
-//! peer over the storage protocol is validated by [`crate::path_validate::validate_relative`]
-//! in [`crate::remote::StorageRequestHandler`] *before* it reaches this backend: the peer may
-//! neither pass an absolute path nor climb out of the root with `..`. Enforcing the chroot in
-//! the worker (rather than in `resolve`) keeps the internal already-rooted callers working while
-//! still closing the traversal hole for every network request. See `path_validate.rs`.
+//! - a relative path is lexically normalized (`.`, repeated separators and `..` collapse) and
+//!   joined onto `root`; a `..` that would climb out of `root` is rejected;
+//! - an absolute path is accepted only when it lies lexically *under* `root` (internal callers
+//!   legitimately hand the backend already-rooted absolute paths, e.g. a manifest scan of
+//!   `/var/lib/postgresql/data` on a backend rooted there, or the paths `list` itself returned);
+//!   any other absolute path is rejected.
+//!
+//! Rejections surface as [`StorageError::Backend`] whose message starts with `path validation`
+//! (see [`crate::path_validate::normalize_under_root`]). The check is purely lexical: it does
+//! not follow symlinks.
+//!
+//! This is defense in depth. Untrusted (network-sourced) paths are still validated first by
+//! [`crate::path_validate::validate_relative`] in [`crate::remote::StorageRequestHandler`], and
+//! the `repo-*` commands confine their user-supplied path parameters before reaching the
+//! backend; `resolve` is the last line that guarantees no caller can read, write or delete
+//! outside the storage root. See `path_validate.rs`.
 //!
 //! `PosixRead` / `PosixWrite` adapt `std::fs::File` into the `IoRead` / `IoWrite` traits from
 //! `pgbr-io`. When `pgbr-io` ships dedicated `FileRead` / `FileWrite` types in a later phase
@@ -25,8 +33,11 @@ use pgbr_io::{IoError, IoRead, IoWrite};
 
 use crate::{Storage, StorageError, StorageInfo, StorageKind};
 
-/// Local-filesystem storage backend rooted at `root`. Relative paths passed to the trait
-/// methods are joined onto `root`; absolute paths are accepted verbatim.
+/// Local-filesystem storage backend rooted at `root`.
+///
+/// Relative paths passed to the trait methods are normalized and joined onto `root`; absolute
+/// paths are accepted only when they lie under `root`. Anything that would escape `root` is
+/// rejected.
 ///
 /// Every file and directory the backend creates gets an explicit mode
 /// (`file_mode` / `path_mode`, Unix only) instead of the process default: with
@@ -67,21 +78,28 @@ impl Posix {
         &self.root
     }
 
-    /// Resolve `path` against the configured root.
+    /// Resolve `path` against the configured root, confining it under `root`.
     ///
-    /// A relative path is joined onto `root`; an absolute path is accepted
-    /// verbatim. This intentionally does **not** enforce a chroot: internal
-    /// callers pass already-rooted absolute paths (a manifest scan of a PG
-    /// data directory, a `.tmp` sibling built from an absolute target, …) and
-    /// must keep working. Untrusted network-sourced paths never reach here
-    /// un-validated — the remote worker checks them with
-    /// [`crate::path_validate::validate_relative`] first (see the module docs).
-    fn resolve(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
+    /// The path is lexically normalized by
+    /// [`crate::path_validate::normalize_under_root`]: a relative path is
+    /// joined onto `root` once `.` / `..` are collapsed, and an absolute path
+    /// is accepted only when it already lies under `root` (internal callers
+    /// pass such already-rooted paths, e.g. entries returned by `list`). The
+    /// root itself (`.`, `""` or `root` verbatim) resolves to `root`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Backend`] (message starting with `path validation`)
+    /// when `path` is absolute but not under `root`, or climbs out of `root`
+    /// via `..` components. Nothing is touched on disk in that case.
+    fn resolve(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        let rel = crate::path_validate::normalize_under_root(&self.root, path)?;
+        // `root.join("")` would append a trailing separator; keep the root
+        // spelled exactly as configured when `path` designates the root.
+        if rel.as_os_str().is_empty() {
+            return Ok(self.root.clone());
         }
+        Ok(self.root.join(rel))
     }
 }
 
@@ -250,7 +268,7 @@ impl Storage for Posix {
     }
 
     fn exists(&self, path: &Path) -> Result<bool, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         match fs::symlink_metadata(&resolved) {
             Ok(_) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -259,13 +277,13 @@ impl Storage for Posix {
     }
 
     fn info(&self, path: &Path) -> Result<StorageInfo, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let meta = fs::symlink_metadata(&resolved).map_err(|err| map_io(&err, &resolved))?;
         Ok(info_from_metadata(resolved, &meta))
     }
 
     fn list(&self, path: &Path) -> Result<Vec<StorageInfo>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let read_dir = fs::read_dir(&resolved).map_err(|err| map_io(&err, &resolved))?;
         let mut entries: Vec<StorageInfo> = Vec::new();
         for entry in read_dir {
@@ -279,7 +297,7 @@ impl Storage for Posix {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn IoRead>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let file = fs::File::open(&resolved).map_err(|err| map_io(&err, &resolved))?;
         Ok(Box::new(PosixRead {
             file,
@@ -289,7 +307,7 @@ impl Storage for Posix {
     }
 
     fn open_write(&self, path: &Path) -> Result<Box<dyn IoWrite>, StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let file = open_create_truncate(&resolved, Some(self.file_mode)).map_err(|err| map_io(&err, &resolved))?;
         Ok(Box::new(PosixWrite {
             file: Some(file),
@@ -303,12 +321,12 @@ impl Storage for Posix {
     /// the same directory, so a concurrent reader (or a crash mid-write)
     /// never observes a half-written primary.
     fn write_atomic_path(&self, path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         write_atomic_local(&resolved, bytes, Some(self.file_mode))
     }
 
     fn remove(&self, path: &Path, error_on_missing: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         match fs::remove_file(&resolved) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound && !error_on_missing => Ok(()),
@@ -317,18 +335,18 @@ impl Storage for Posix {
     }
 
     fn rename(&self, source: &Path, target: &Path) -> Result<(), StorageError> {
-        let resolved_source = self.resolve(source);
-        let resolved_target = self.resolve(target);
+        let resolved_source = self.resolve(source)?;
+        let resolved_target = self.resolve(target)?;
         fs::rename(&resolved_source, &resolved_target).map_err(|err| map_io(&err, &resolved_source))
     }
 
     fn create_path(&self, path: &Path, recursive: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         create_dir_with_mode(&resolved, self.path_mode, recursive).map_err(|err| map_io(&err, &resolved))
     }
 
     fn remove_path(&self, path: &Path, recursive: bool, error_on_missing: bool) -> Result<(), StorageError> {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         let result = if recursive {
             fs::remove_dir_all(&resolved)
         } else {
@@ -345,7 +363,7 @@ impl Storage for Posix {
         // `link_path` is resolved against the configured root (it is a path inside
         // the managed tree); `target` is written into the link verbatim, exactly as
         // pgBackRust records it in the manifest (typically an absolute path).
-        let resolved = self.resolve(link_path);
+        let resolved = self.resolve(link_path)?;
         std::os::unix::fs::symlink(target, &resolved).map_err(|err| map_io(&err, &resolved))
     }
 
@@ -354,7 +372,7 @@ impl Storage for Posix {
         // whatever the link stores verbatim (typically an absolute path), which
         // is exactly what a backup records in the manifest and what a restore
         // hands back to `create_symlink`.
-        let resolved = self.resolve(path);
+        let resolved = self.resolve(path)?;
         fs::read_link(&resolved).map_err(|err| map_io(&err, &resolved))
     }
 }
@@ -752,14 +770,103 @@ mod tests {
         let info = storage.info(Path::new("rel.txt")).unwrap();
         assert_eq!(info.path, tmp.path().join("rel.txt"));
 
-        // Absolute path is taken verbatim, ignoring root.
+        // An absolute path already under the root resolves to the same file.
         let info_abs = storage.info(&tmp.path().join("rel.txt")).unwrap();
         assert_eq!(info_abs.path, tmp.path().join("rel.txt"));
 
-        // An absolute path outside the root still works (and is not chrooted).
+        // An absolute path outside the root is now rejected (GHSA-vq5g-8277-5pwc).
         let other_tmp = tempfile::tempdir().unwrap();
         write_file(&other_tmp.path().join("outside.txt"), b"o");
-        let info_outside = storage.info(&other_tmp.path().join("outside.txt")).unwrap();
-        assert_eq!(info_outside.path, other_tmp.path().join("outside.txt"));
+        let err = storage.info(&other_tmp.path().join("outside.txt")).unwrap_err();
+        assert!(matches!(err, StorageError::Backend { .. }), "got {err:?}");
+    }
+
+    /// Assert `err` is the `path validation` rejection and its message contains `needle`.
+    fn assert_path_validation(err: &StorageError, needle: &str) {
+        match err {
+            StorageError::Backend { message, .. } => {
+                assert!(message.contains("path validation"), "unexpected message: {message}");
+                assert!(message.contains(needle), "message {message:?} lacks {needle:?}");
+            }
+            other => panic!("expected Backend path-validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn posix_absolute_under_root_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        write_file(&tmp.path().join("sub/inside.txt"), b"inside");
+
+        let mut reader = storage.open_read(&tmp.path().join("sub/inside.txt")).unwrap();
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"inside");
+
+        // The root itself, spelled absolutely, lists the root.
+        let entries = storage.list(tmp.path()).unwrap();
+        assert!(entries.iter().any(|e| e.path.ends_with("sub")));
+    }
+
+    #[test]
+    fn posix_absolute_outside_root_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+        let other_tmp = tempfile::tempdir().unwrap();
+        let outside = other_tmp.path().join("secret.txt");
+        write_file(&outside, b"secret");
+
+        let Err(err) = storage.open_read(&outside) else {
+            panic!("open_read of a path outside the root must fail");
+        };
+        assert_path_validation(&err, "not under the storage root");
+
+        // Writes and deletes outside the root are refused too, leaving the file intact.
+        let Err(err) = storage.open_write(&outside) else {
+            panic!("open_write of a path outside the root must fail");
+        };
+        assert_path_validation(&err, "not under the storage root");
+        let err = storage.remove(&outside, true).unwrap_err();
+        assert_path_validation(&err, "not under the storage root");
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn posix_parent_escape_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // A real file one level above the root: a successful escape would find it.
+        write_file(&parent.path().join("x"), b"escaped");
+        let storage = Posix::new(&root);
+
+        let err = storage.list(Path::new("..")).unwrap_err();
+        assert_path_validation(&err, "escapes");
+        let Err(err) = storage.open_read(Path::new("../x")) else {
+            panic!("open_read of ../x must fail");
+        };
+        assert_path_validation(&err, "escapes");
+        let err = storage.exists(Path::new("sub/../../x")).unwrap_err();
+        assert_path_validation(&err, "escapes");
+        let err = storage.remove(Path::new("../x"), true).unwrap_err();
+        assert_path_validation(&err, "escapes");
+        assert_eq!(fs::read(parent.path().join("x")).unwrap(), b"escaped");
+    }
+
+    #[test]
+    fn posix_dot_dot_inside_root_normalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Posix::new(tmp.path());
+        write_file(&tmp.path().join("f"), b"normalized");
+
+        // `sub` need not exist: normalization is lexical.
+        let mut reader = storage.open_read(Path::new("sub/../f")).unwrap();
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"normalized");
+
+        let info = storage.info(Path::new("./sub/./../f")).unwrap();
+        assert_eq!(info.path, tmp.path().join("f"));
     }
 }

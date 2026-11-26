@@ -283,6 +283,96 @@ fn repo_put_reaches_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression (GHSA-vq5g-8277-5pwc, CWE-22): `repo-ls` / `repo-get` / `repo-rm`
+// took an absolute path parameter verbatim and did not neutralize `..`, so any
+// host path reachable by the process could be listed, read or deleted. Every
+// path parameter is now confined under `repoN-path`: a relative path is
+// normalized lexically and a `..` escape is rejected; an absolute path is only
+// accepted when it lies lexically under the repository root. Driven end to end
+// through `run_with_context`, the same entry the binary uses.
+// ---------------------------------------------------------------------------
+
+/// Run a `repo-*` command against `repo_root` (as `--repo1-path`) with the
+/// positional `params`, isolated from any host `pgbackrust.conf`.
+fn run_repo_command(command: &str, repo_root: &std::path::Path, params: &[&str]) -> Result<i32, CliRunError> {
+    let mut args = vec![
+        "--config=/definitely/missing/pgbackrust.conf".to_owned(),
+        command.to_owned(),
+        "--stanza=demo".to_owned(),
+        format!("--repo1-path={}", repo_root.display()),
+    ];
+    args.extend(params.iter().map(|p| (*p).to_owned()));
+    run_with_context(args, &ctx())
+}
+
+/// Assert `result` is a rejection whose message carries `path validation`
+/// (the confinement error), not a success nor an unrelated failure.
+fn assert_path_validation_rejected(what: &str, result: Result<i32, CliRunError>) {
+    match result {
+        Ok(code) => panic!("`{what}` must be rejected (path outside the repository), got exit code {code}"),
+        Err(err) => {
+            let rendered = format!("{err} / {err:?}");
+            assert!(
+                rendered.contains("path validation"),
+                "`{what}` must fail with a path-validation error, got: {rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn repo_ls_host_root_rejected() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    assert_path_validation_rejected("repo-ls /", run_repo_command("repo-ls", repo.path(), &["/"]));
+}
+
+#[test]
+fn repo_get_absolute_path_outside_repo_rejected() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    assert_path_validation_rejected(
+        "repo-get /etc/hostname",
+        run_repo_command("repo-get", repo.path(), &["/etc/hostname"]),
+    );
+}
+
+#[test]
+fn repo_get_parent_escape_rejected() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    // Rejected lexically, before any filesystem access: the error must be the
+    // confinement one, not a not-found from the escaped target.
+    assert_path_validation_rejected("repo-get ../../x", run_repo_command("repo-get", repo.path(), &["../../x"]));
+}
+
+#[test]
+fn repo_rm_absolute_path_outside_repo_rejected() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    // A victim file in a SEPARATE tempdir (the `/tmp/outside` vector): it is
+    // absolute and lexically outside the repository root.
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let victim = outside.path().join("outside");
+    std::fs::write(&victim, b"must survive").expect("seed victim file");
+    let victim_arg = victim.to_str().expect("utf-8 tempdir path");
+
+    assert_path_validation_rejected(
+        &format!("repo-rm {victim_arg}"),
+        run_repo_command("repo-rm", repo.path(), &[victim_arg]),
+    );
+    assert!(victim.exists(), "repo-rm must not delete a file outside the repository");
+}
+
+#[test]
+fn repo_ls_absolute_repo_root_accepted() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    std::fs::write(repo.path().join("backup.info"), b"[backrest]\n").expect("seed repo file");
+    let root_arg = repo.path().to_str().expect("utf-8 tempdir path");
+
+    match run_repo_command("repo-ls", repo.path(), &[root_arg]) {
+        Ok(code) => assert_eq!(code, 0, "`repo-ls <repo root>` must succeed"),
+        Err(err) => panic!("`repo-ls <repo root>` (absolute path AT the repository root) must be accepted: {err:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server commands.
 // ---------------------------------------------------------------------------
 
