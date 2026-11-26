@@ -48,7 +48,8 @@ node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
 node principal bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
 
 info "verify SSH reachability postgres@principal -> postgres@depot"
-pg_as principal ssh -o BatchMode=yes depot true && pass "principal->depot ssh"
+pg_as principal ssh -o BatchMode=yes depot true || fail "principal->depot ssh unreachable"
+pass "principal->depot ssh"
 
 info "stanza-create from principal (remote repo on depot)"
 pg_as principal pgbackrust --stanza=$STANZA stanza-create

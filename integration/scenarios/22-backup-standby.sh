@@ -80,7 +80,7 @@ node depot bash -c "install -d -o postgres -g postgres -m 0750 $REPO"
 info "create replication role + slot on principal for the standby"
 psql_on principal 5433 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='replicator') THEN CREATE ROLE replicator WITH REPLICATION LOGIN; END IF; END \$\$;"
 psql_on principal 5433 -c "SELECT pg_create_physical_replication_slot('secondaire') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='secondaire');" >/dev/null
-pg_as principal bash -c "grep -q 'replicator.*replication' $PRI_DATA/pg_hba.conf || echo 'host replication replicator all trust' >> $PRI_DATA/pg_hba.conf"
+pg_as principal bash -c "grep -q 'replication replicator' $PRI_DATA/pg_hba.conf || echo 'host replication replicator all trust' >> $PRI_DATA/pg_hba.conf"
 pg_as principal bash -c "$BIN/pg_ctl -D $PRI_DATA -w reload >/dev/null 2>&1 || true"
 
 info "stanza-create + check from depot (no standby yet)"
