@@ -2593,6 +2593,17 @@ fn materialize_links(
         let is_tablespace = tablespace_oid(link).is_some();
         match link_plan(want_repo_symlink) {
             LinkPlan::PlainDir => {
+                if is_tablespace {
+                    // The tablespace's files will be restored INSIDE PGDATA under
+                    // pg_tblspc/<oid>/ instead of relocating to the recorded (or
+                    // remapped) external location — a working but silently
+                    // un-relocated layout the operator should know about.
+                    log_warn(&format!(
+                        "restore: tablespace link {} is laid out as a plain directory inside PGDATA (--no-repo-symlink); \
+                         its contents will not be relocated to {}",
+                        link.path, link.destination
+                    ));
+                }
                 if dry_run {
                     log_info(&format!("dry-run: would create directory {} (link as dir)", link.path));
                 } else {
@@ -2620,13 +2631,22 @@ fn materialize_links(
                     continue;
                 }
 
+                // Tolerate what a previous restore (or the original cluster) left
+                // at the link path: keep a symlink that already points at the
+                // wanted target, replace one that points elsewhere, refuse a real
+                // directory / file. Inspected BEFORE the target directory is
+                // created so a refused restore mutates nothing outside PGDATA.
+                let existing = inspect_existing_link(pg, link, &link_path, &target)?;
+
                 // For a TABLESPACE link, ensure the (possibly external) target
                 // directory exists so paths and files created through
                 // `pg_tblspc/<oid>` land in the real location; a missing
                 // tablespace target would make those creates fail. The same holds
                 // for a link standing in for a runtime directory (e.g. `pg_wal`):
                 // the cluster cannot start without it and the runtime skeleton
-                // (`pg_wal/archive_status`) is created through the link. Other
+                // (`pg_wal/archive_status`) is created through the link. This runs
+                // even when the symlink itself is kept (`ExistingLink::Same`), so
+                // a delta re-restore recreates a target an operator removed. Other
                 // generic links point at operator-managed locations restore must
                 // not fabricate, so their target is left untouched — a dangling
                 // generic link is acceptable and matches pgBackRust.
@@ -2647,11 +2667,7 @@ fn materialize_links(
                     )));
                 }
 
-                // Tolerate what a previous restore (or the original cluster) left
-                // at the link path: keep a symlink that already points at the
-                // wanted target, replace one that points elsewhere, refuse a real
-                // directory / file.
-                match inspect_existing_link(pg, link, &link_path, &target)? {
+                match existing {
                     ExistingLink::Absent => {}
                     ExistingLink::Same => {
                         counts.created += 1;
@@ -6060,7 +6076,8 @@ mod tests {
         // removed: the restore fails with an operator hint.
         let (_repo, pg, repo_s, pg_s) = posix_pair();
         let ext = tempfile::tempdir().expect("external tablespace tempdir");
-        let ts_dest_str = ext.path().join("ts1").to_string_lossy().into_owned();
+        let ts_dest = ext.path().join("ts1");
+        let ts_dest_str = ts_dest.to_string_lossy().into_owned();
         let stanza = "demo";
         let label = "20240101-120000F";
         seed_tablespace_backup(&repo_s, stanza, label, &ts_dest_str);
@@ -6082,6 +6099,10 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the pre-existing directory must be left untouched"
+        );
+        assert!(
+            !ts_dest.exists(),
+            "a refused restore must not create the external tablespace target"
         );
     }
 

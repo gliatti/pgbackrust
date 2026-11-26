@@ -781,9 +781,19 @@ struct WalkEntry {
 /// tablespace version directory is taken instead. C ref: `manifestBuildInfo`
 /// (`src/info/manifest/manifest.c`), which follows `pg_tblspc` links and keeps
 /// only the `tablespaceId` directory of the tablespace location.
-fn walk(storage: &dyn Storage, dir: &Path, tablespace_dir: Option<&str>) -> Result<Vec<WalkEntry>, CommandError> {
+///
+/// `excludes` are the user `--exclude` entries: a tablespace link the user
+/// excluded is emitted (so [`plan_backup`] applies the exclusion uniformly) but
+/// never followed — a dangling link the user asked to skip must not fail the
+/// walk.
+fn walk(
+    storage: &dyn Storage,
+    dir: &Path,
+    tablespace_dir: Option<&str>,
+    excludes: &[String],
+) -> Result<Vec<WalkEntry>, CommandError> {
     let mut out = Vec::new();
-    walk_into(storage, dir, "", tablespace_dir, &mut out)?;
+    walk_into(storage, dir, "", tablespace_dir, excludes, &mut out)?;
     Ok(out)
 }
 
@@ -792,14 +802,16 @@ fn walk(storage: &dyn Storage, dir: &Path, tablespace_dir: Option<&str>) -> Resu
 ///
 /// # Errors
 ///
-/// Propagates listing failures. A tablespace link whose target cannot be listed
-/// (a dangling link, a permission problem) fails with a [`CommandError::Other`]
-/// naming the tablespace, rather than silently producing a backup without it.
+/// Propagates listing failures. A non-user-excluded tablespace link whose target
+/// cannot be listed (a dangling link, a permission problem) fails with a
+/// [`CommandError::Other`] naming the tablespace, rather than silently producing
+/// a backup without it.
 fn walk_into(
     storage: &dyn Storage,
     dir: &Path,
     rel_prefix: &str,
     tablespace_dir: Option<&str>,
+    excludes: &[String],
     out: &mut Vec<WalkEntry>,
 ) -> Result<(), CommandError> {
     for info in storage.list(dir)? {
@@ -828,15 +840,21 @@ fn walk_into(
                 // never descend into it: its contents are transient (and may
                 // vanish mid-walk), and pgBackRust captures only the dir itself.
                 if descend {
-                    walk_into(storage, &child_dir, &rel, tablespace_dir, out)?;
+                    walk_into(storage, &child_dir, &rel, tablespace_dir, excludes, out)?;
                 }
             }
             // A tablespace link `pg_tblspc/<oid>`: record the link itself, then
             // follow it (the backend resolves the path through the link) and
-            // descend into the cluster's version directory only.
+            // descend into the cluster's version directory only. A link the user
+            // excluded is emitted (plan_backup drops it with the rest of the
+            // exclusion) but never followed: a dangling link the user asked to
+            // skip must not fail the backup.
             StorageKind::Link if rel_prefix == PG_TBLSPC_DIR => {
                 let link_dir = PathBuf::from(&rel);
                 out.push(WalkEntry { rel: rel.clone(), info });
+                if is_user_excluded(&rel, excludes) {
+                    continue;
+                }
                 let children = storage.list(&link_dir).map_err(|err| {
                     CommandError::Other(format!(
                         "cannot list tablespace {rel}: {err} (is the tablespace link dangling or unreadable?)"
@@ -867,7 +885,7 @@ fn walk_into(
                         rel: child_rel.clone(),
                         info: child,
                     });
-                    walk_into(storage, &child_dir, &child_rel, tablespace_dir, out)?;
+                    walk_into(storage, &child_dir, &child_rel, tablespace_dir, excludes, out)?;
                 }
             }
             _ => out.push(WalkEntry { rel, info }),
@@ -4150,10 +4168,11 @@ struct BackupPlan {
 /// # Errors
 ///
 /// Propagates walk / read failures and any error from [`plan_file`]. Fails with
-/// [`CommandError::Other`] when a tablespace link's target cannot be resolved
-/// (the backend does not support [`Storage::read_link`]) or when a symlink is
-/// found *inside* a tablespace (not supported: following it could escape the
-/// tablespace or loop).
+/// [`CommandError::Other`] when a tablespace link's or a symlinked runtime
+/// directory's target cannot be resolved (the backend does not support
+/// [`Storage::read_link`] — an empty destination would make the backup
+/// unrestorable) or when a symlink is found *inside* a tablespace (not
+/// supported: following it could escape the tablespace or loop).
 #[allow(clippy::too_many_arguments)]
 fn plan_backup(
     pg_storage: &dyn Storage,
@@ -4175,7 +4194,7 @@ fn plan_backup(
         links: Vec::new(),
     };
 
-    for entry in walk(pg_storage, Path::new("."), tablespace_dir)? {
+    for entry in walk(pg_storage, Path::new("."), tablespace_dir, excludes)? {
         // A built-in excluded runtime directory (`pg_notify`, `pg_wal`, …) is
         // kept in the manifest as an *empty* path so a fresh-PGDATA restore
         // recreates it, but its contents are never captured. The walk does not
@@ -4188,11 +4207,20 @@ fn plan_backup(
         // `initdb --waldir`): record the link with its destination so restore
         // recreates it, but — as for the plain directory — never its contents
         // (the walk does not follow it). No `ManifestPath` is recorded for the
-        // name: restore must materialise a link there, not a directory.
+        // name: restore must materialise a link there, not a directory. An
+        // unresolvable target is an error, NOT an empty-destination fallback:
+        // restore rejects any manifest link with an empty destination up front,
+        // so recording one would make the whole backup unrestorable.
         if is_excluded_dir(&entry.rel) && entry.info.kind == StorageKind::Link && !is_user_excluded(&entry.rel, excludes) {
             let destination = match pg_storage.read_link(Path::new(&entry.rel)) {
                 Ok(target) => target.to_string_lossy().into_owned(),
-                Err(StorageError::Unsupported { .. }) => String::new(),
+                Err(StorageError::Unsupported { .. }) => {
+                    return Err(CommandError::Other(format!(
+                        "cannot resolve the target of symlinked runtime directory '{}': the PostgreSQL storage does not \
+                         support reading symlinks",
+                        entry.rel
+                    )));
+                }
                 Err(err) => return Err(err.into()),
             };
             plan.links.push(ManifestLink {
@@ -5712,7 +5740,7 @@ mod tests {
         seed_file(&pg_s, "base/1/1259", b"x");
         seed_file(&pg_s, "global/pg_control", b"y");
 
-        let entries = walk(&pg_s, Path::new("."), None).expect("walk");
+        let entries = walk(&pg_s, Path::new("."), None, &[]).expect("walk");
         let rels: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
 
         assert!(rels.contains(&"PG_VERSION"));
@@ -5976,6 +6004,33 @@ mod tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_user_excluded_dangling_tablespace_link_is_skipped() {
+        // A dangling tablespace link the user excluded with --exclude must
+        // neither fail the walk nor leave a link entry in the plan.
+        let (repo_dir, pg_dir, _repo_s, pg_s) = posix_pair();
+        let gone = pg_dir.path().join("no-such-tablespace-location");
+        std::fs::create_dir_all(pg_dir.path().join("pg_tblspc")).unwrap();
+        std::os::unix::fs::symlink(&gone, pg_dir.path().join("pg_tblspc").join(TS_OID)).unwrap();
+
+        let backup_root = format!("backup/demo/{LABEL}");
+        let plan = plan_backup(
+            &pg_s,
+            &repo_dir.path().join(&backup_root),
+            &backup_root,
+            &RepoTransform::identity(),
+            None,
+            None,
+            false,
+            false,
+            &[format!("pg_tblspc/{TS_OID}")],
+            Some(TS_DIR_14),
+        )
+        .expect("plan must succeed when the dangling tablespace is user-excluded");
+        assert!(plan.links.is_empty(), "the excluded tablespace link must be dropped");
     }
 
     #[cfg(unix)]
